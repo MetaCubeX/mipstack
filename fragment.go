@@ -11,15 +11,21 @@ import (
 const (
 	// fragmentMaximumSets bounds concurrent incomplete datagrams.
 	fragmentMaximumSets = 128
-	// fragmentMaximumPieces bounds fragment metadata per datagram.
-	fragmentMaximumPieces = 128
+	// fragmentMaximumPieces bounds fragment metadata per datagram while still
+	// permitting the RFC 8200-required 1500-byte packet to arrive as minimum
+	// eight-byte fragments.
+	fragmentMaximumPieces = 256
 	// fragmentMaximumBytes bounds payload retained across the stack.
 	fragmentMaximumBytes = 4 * 1024 * 1024
 	// fragmentMaximumDatagram is the IPv6 non-jumbogram payload limit. IPv4
 	// subtracts its minimum header before applying it.
 	fragmentMaximumDatagram = 65535
-	// fragmentLifetime expires incomplete fragment sets.
-	fragmentLifetime = 30 * time.Second
+	// fragmentIPv4Lifetime follows Linux's IP_FRAG_TIME from the first
+	// fragment. Later arrivals must not extend it.
+	fragmentIPv4Lifetime = 30 * time.Second
+	// fragmentIPv6Lifetime is RFC 8200's reassembly deadline from the first
+	// fragment.
+	fragmentIPv6Lifetime = 60 * time.Second
 )
 
 // fragmentKey identifies one IPv4 or IPv6 fragmented datagram.
@@ -38,43 +44,75 @@ type fragmentPiece struct {
 
 // fragmentSet retains one bounded, incomplete datagram.
 type fragmentSet struct {
-	pieces     []fragmentPiece
-	total      int
-	bytes      int
-	updated    time.Time
-	protocol   byte
-	source     netip.Addr
-	target     netip.Addr
-	identifier uint32
-	v6         bool
-	ecn        byte
-	options    ipPacketOptions
-	maximum    int
+	pieces      []fragmentPiece
+	total       int
+	bytes       int
+	created     time.Time
+	updated     time.Time
+	protocol    byte
+	source      netip.Addr
+	target      netip.Addr
+	identifier  uint32
+	v6          bool
+	ecnMask     byte
+	options     ipPacketOptions
+	maximum     int
+	maxSize     int
+	maxDFSize   int
+	header      []byte
+	nextHeader  int
+	firstPacket []byte
 }
 
 // parsedFragment is one validated fragment extracted from its IP envelope.
 type parsedFragment struct {
-	key        fragmentKey
-	offset     int
-	more       bool
-	payload    []byte
-	identifier uint32
-	ecn        byte
-	options    ipPacketOptions
-	maximum    int
+	key           fragmentKey
+	protocol      byte
+	offset        int
+	more          bool
+	payload       []byte
+	identifier    uint32
+	ecn           byte
+	options       ipPacketOptions
+	maximum       int
+	packetSize    int
+	df            bool
+	header        []byte
+	nextHeader    int
+	original      []byte
+	truncated     bool
+	parameter     bool
+	parameterCode byte
+	parameterAt   uint32
 }
 
 // runFragmentCleaner releases incomplete sets even when no later fragments
 // arrive.
 func (s *Stack) runFragmentCleaner() {
-	ticker := time.NewTicker(fragmentLifetime / 2)
-	defer ticker.Stop()
+	timer := time.NewTimer(time.Hour)
+	stopTimer(timer)
+	defer timer.Stop()
+	var timeout <-chan time.Time
 	for {
+		s.fragmentMu.Lock()
+		now := time.Now()
+		expired := s.cleanFragmentsLocked(now)
+		next, haveNext := s.nextFragmentExpiryLocked()
+		s.fragmentMu.Unlock()
+		s.sendFragmentTimeouts(expired)
+		stopTimer(timer)
+		timeout = nil
+		if haveNext {
+			delay := time.Until(next)
+			if delay < 0 {
+				delay = 0
+			}
+			resetTimer(timer, delay)
+			timeout = timer.C
+		}
 		select {
-		case now := <-ticker.C:
-			s.fragmentMu.Lock()
-			s.cleanFragmentsLocked(now)
-			s.fragmentMu.Unlock()
+		case <-timeout:
+		case <-s.fragmentWake:
 		case <-s.closeCh:
 			return
 		}
@@ -92,21 +130,24 @@ func (s *Stack) reassemblePacket(packet []byte, now time.Time) []byte {
 // from malformed input. pending is true only when the fragment was retained.
 func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, pending bool) {
 	fragment, ok := parseFragment(packet)
-	if !ok || !s.isLocal(fragment.key.target) || fragment.key.source.IsUnspecified() || fragment.key.source.IsMulticast() {
+	if !ok || fragment.truncated || fragment.parameter || !s.isLocal(fragment.key.target) || fragment.key.source.IsUnspecified() || fragment.key.source.IsMulticast() || fragment.key.source.Is4In6() {
 		return nil, false
 	}
 	s.fragmentMu.Lock()
-	defer s.fragmentMu.Unlock()
-	s.cleanFragmentsLocked(now)
+	expired := s.cleanFragmentsLocked(now)
+	defer func() {
+		s.fragmentMu.Unlock()
+		s.sendFragmentTimeouts(expired)
+	}()
 	set := s.fragments[fragment.key]
 	if set == nil {
 		for len(s.fragments) >= fragmentMaximumSets {
 			s.evictOldestFragmentLocked()
 		}
 		set = &fragmentSet{
-			total: -1, updated: now, protocol: fragment.key.protocol,
+			total: -1, created: now, updated: now, protocol: fragment.protocol,
 			source: fragment.key.source, target: fragment.key.target,
-			identifier: fragment.identifier, v6: fragment.key.v6, ecn: fragment.ecn, options: fragment.options,
+			identifier: fragment.identifier, v6: fragment.key.v6, ecnMask: 1 << fragment.ecn, options: fragment.options,
 			maximum: fragmentMaximumDatagram,
 		}
 		if fragment.key.v6 || fragment.offset == 0 {
@@ -115,34 +156,44 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, 
 			set.maximum -= 20
 		}
 		s.fragments[fragment.key] = set
+		select {
+		case s.fragmentWake <- struct{}{}:
+		default:
+		}
 	} else {
-		mergedECN, valid := mergeFragmentECN(set.ecn, fragment.ecn)
-		if !valid {
+		// RFC 8200 permits the Next Header fields of IPv6 fragments to
+		// differ and requires reassembly to use the value from offset zero.
+		// IPv4 includes Protocol in the reassembly key, so a mismatch there
+		// still identifies a different datagram.
+		if !set.v6 && set.protocol != fragment.protocol {
 			s.removeFragmentLocked(fragment.key, set)
 			return nil, false
 		}
-		set.ecn = mergedECN
 	}
-	if fragment.offset == 0 {
-		// Reassembly metadata follows the fragment containing the original
-		// upper-layer header, regardless of arrival order.
-		set.options = fragment.options
-		if !fragment.key.v6 {
-			set.maximum = fragment.maximum
-		}
+	if !fragment.key.v6 && fragment.more && len(fragment.payload)%8 != 0 {
+		trimmed := len(fragment.payload) &^ 7
+		discarded := len(fragment.payload) - trimmed
+		fragment.payload = fragment.payload[:trimmed]
+		fragment.original = fragment.original[:len(fragment.original)-discarded]
+		fragment.packetSize -= discarded
 	}
 	end := fragment.offset + len(fragment.payload)
-	if len(fragment.payload) == 0 || end > set.maximum || set.total > set.maximum || fragment.more && len(fragment.payload)%8 != 0 ||
-		set.total >= 0 && end > set.total || len(set.pieces) >= fragmentMaximumPieces {
+	if len(fragment.payload) == 0 || end > set.maximum || set.total > set.maximum ||
+		set.total >= 0 && end > set.total {
 		s.removeFragmentLocked(fragment.key, set)
 		return nil, false
 	}
+	duplicate := fragmentRangeCovered(set.pieces, fragment.offset, end)
 	for _, existing := range set.pieces {
 		existingEnd := existing.offset + len(existing.data)
 		if fragment.offset < existingEnd && existing.offset < end {
-			// RFC 5722 requires dropping the complete datagram on overlap.
-			s.removeFragmentLocked(fragment.key, set)
-			return nil, false
+			if !duplicate {
+				// RFC 5722 requires dropping the complete datagram on a
+				// partial overlap. Linux applies the same policy to IPv4.
+				s.removeFragmentLocked(fragment.key, set)
+				return nil, false
+			}
+			break
 		}
 	}
 	if !fragment.more {
@@ -151,16 +202,109 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, 
 			return nil, false
 		}
 		set.total = end
+		for _, existing := range set.pieces {
+			if existing.offset+len(existing.data) > set.total {
+				s.removeFragmentLocked(fragment.key, set)
+				return nil, false
+			}
+		}
 	}
-	if len(fragment.payload) > fragmentMaximumBytes-s.fragmentBytes {
+	if now.Before(set.created) {
+		// Concurrent Write calls can acquire fragmentMu out of arrival order.
+		// Reassembly lifetime is defined by the earliest fragment, not by the
+		// goroutine that happened to win the lock.
+		set.created = now
+		select {
+		case s.fragmentWake <- struct{}{}:
+		default:
+		}
+	}
+	if duplicate {
+		// Linux's shared IPv4/IPv6 fragment queue treats a completely
+		// covered range as a duplicate. Ignore its ECN and header metadata,
+		// but retain a newly learned final size so a duplicate last fragment
+		// can complete an otherwise contiguous queue.
+		if set.total < 0 {
+			return nil, true
+		}
+		sort.Slice(set.pieces, func(left, right int) bool { return set.pieces[left].offset < set.pieces[right].offset })
+		next := 0
+		for _, piece := range set.pieces {
+			if piece.offset != next {
+				return nil, true
+			}
+			next += len(piece.data)
+		}
+		if next != set.total {
+			return nil, true
+		}
+		return s.finishFragmentReassembly(fragment.key, set)
+	}
+	if fragment.offset == 0 {
+		// Reassembly metadata follows the fragment containing the original
+		// upper-layer header, regardless of arrival order.
+		set.protocol = fragment.protocol
+		set.options = fragment.options
+		set.nextHeader = fragment.nextHeader
+		set.maximum = fragment.maximum
+		if set.total > set.maximum {
+			s.removeFragmentLocked(fragment.key, set)
+			return nil, false
+		}
+		for _, existing := range set.pieces {
+			if existing.offset+len(existing.data) > set.maximum {
+				s.removeFragmentLocked(fragment.key, set)
+				return nil, false
+			}
+		}
+	}
+	if len(set.pieces) >= fragmentMaximumPieces {
 		s.removeFragmentLocked(fragment.key, set)
 		return nil, false
 	}
-	data := append([]byte(nil), fragment.payload...)
+	candidateECN := set.ecnMask | 1<<fragment.ecn
+	if candidateECN&1 != 0 && candidateECN != 1 {
+		s.removeFragmentLocked(fragment.key, set)
+		return nil, false
+	}
+	set.ecnMask = candidateECN
+	retainedBytes := len(fragment.payload)
+	if fragment.offset == 0 {
+		// firstPacket is needed for a possible reassembly-timeout error. Keep
+		// the piece as a slice of that copy instead of retaining a second copy
+		// of the same payload, and charge the complete allocation to the bound.
+		retainedBytes = len(fragment.original)
+	}
+	for retainedBytes > fragmentMaximumBytes-s.fragmentBytes && len(s.fragments) > 1 {
+		if !s.evictOldestFragmentExceptLocked(set) {
+			break
+		}
+	}
+	if retainedBytes > fragmentMaximumBytes-s.fragmentBytes {
+		s.removeFragmentLocked(fragment.key, set)
+		return nil, false
+	}
+	var data []byte
+	if fragment.offset == 0 {
+		set.firstPacket = append([]byte(nil), fragment.original...)
+		set.header = set.firstPacket[:len(fragment.header)]
+		payloadOffset := len(set.firstPacket) - len(fragment.payload)
+		data = set.firstPacket[payloadOffset:]
+	} else {
+		data = append([]byte(nil), fragment.payload...)
+	}
 	set.pieces = append(set.pieces, fragmentPiece{offset: fragment.offset, data: data})
-	set.bytes += len(data)
-	set.updated = now
-	s.fragmentBytes += len(data)
+	set.bytes += retainedBytes
+	if now.After(set.updated) {
+		set.updated = now
+	}
+	if fragment.packetSize > set.maxSize {
+		set.maxSize = fragment.packetSize
+	}
+	if fragment.df && fragment.packetSize > set.maxDFSize {
+		set.maxDFSize = fragment.packetSize
+	}
+	s.fragmentBytes += retainedBytes
 	if set.total < 0 {
 		return nil, true
 	}
@@ -175,15 +319,78 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, 
 	if next != set.total {
 		return nil, true
 	}
+	return s.finishFragmentReassembly(fragment.key, set)
+}
+
+// fragmentRangeCovered reports whether existing non-overlapping pieces cover
+// every byte in [start,end). Pieces need not have arrived in offset order.
+func fragmentRangeCovered(pieces []fragmentPiece, start, end int) bool {
+	if start >= end {
+		return false
+	}
+	for cursor := start; cursor < end; {
+		next := cursor
+		for _, piece := range pieces {
+			pieceEnd := piece.offset + len(piece.data)
+			if piece.offset <= cursor && pieceEnd > next {
+				next = pieceEnd
+			}
+		}
+		if next == cursor {
+			return false
+		}
+		cursor = next
+	}
+	return true
+}
+
+// finishFragmentReassembly builds and removes one contiguous fragment set.
+func (s *Stack) finishFragmentReassembly(key fragmentKey, set *fragmentSet) ([]byte, bool) {
 	payload := make([]byte, set.total)
 	for _, piece := range set.pieces {
 		copy(payload[piece.offset:], piece.data)
 	}
-	s.removeFragmentLocked(fragment.key, set)
-	set.options.trafficClass = set.options.trafficClass&^3 | set.ecn
-	packet = buildIPPacketWithOptions(set.source, set.target, set.protocol, payload, uint16(set.identifier), false, set.options)
-	setPacketECN(packet, set.ecn)
+	s.removeFragmentLocked(key, set)
+	ecn, valid := fragmentECN(set.ecnMask)
+	if !valid {
+		return nil, false
+	}
+	set.options.trafficClass = set.options.trafficClass&^3 | ecn
+	dontFragment := !set.v6 && set.maxDFSize != 0 && set.maxDFSize == set.maxSize
+	packet := buildReassembledPacket(set, payload, dontFragment)
+	setPacketECN(packet, ecn)
 	return packet, false
+}
+
+// buildReassembledPacket removes fragmentation state while preserving the
+// complete offset-zero IPv4 header or IPv6 unfragmentable header chain.
+func buildReassembledPacket(set *fragmentSet, payload []byte, dontFragment bool) []byte {
+	if !set.v6 {
+		if len(set.header) < 20 || len(set.header)+len(payload) > 65535 {
+			return nil
+		}
+		packet := make([]byte, len(set.header)+len(payload))
+		copy(packet, set.header)
+		copy(packet[len(set.header):], payload)
+		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+		field := uint16(0)
+		if dontFragment {
+			field = 0x4000
+		}
+		binary.BigEndian.PutUint16(packet[6:8], field)
+		packet[10], packet[11] = 0, 0
+		binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:len(set.header)]))
+		return packet
+	}
+	if len(set.header) < 40 || set.nextHeader < 0 || set.nextHeader >= len(set.header) || len(set.header)-40+len(payload) > 65535 {
+		return nil
+	}
+	packet := make([]byte, len(set.header)+len(payload))
+	copy(packet, set.header)
+	packet[set.nextHeader] = set.protocol
+	copy(packet[len(set.header):], payload)
+	binary.BigEndian.PutUint16(packet[4:6], uint16(len(packet)-40))
+	return packet
 }
 
 // parseFragment validates IPv4 fragmentation fields or an IPv6 fragment
@@ -199,22 +406,36 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 		headerSize := int(packet[0]&0x0f) * 4
 		totalSize := int(binary.BigEndian.Uint16(packet[2:4]))
 		field := binary.BigEndian.Uint16(packet[6:8])
-		if headerSize < 20 || totalSize <= headerSize || totalSize > len(packet) || checksum(packet[:headerSize]) != 0 || field&0x3fff == 0 || field&0xc000 != 0 {
-			return parsedFragment{}, false
-		}
-		if !validateIPv4Options(packet[20:headerSize]) {
+		// Linux accepts DF on received fragments and remembers the largest DF
+		// fragment for later PMTU handling. RFC 791's reserved flag still has
+		// to be zero.
+		if headerSize < 20 || totalSize <= headerSize || totalSize > len(packet) || checksum(packet[:headerSize]) != 0 || field&0x3fff == 0 || field&0x8000 != 0 {
 			return parsedFragment{}, false
 		}
 		source := netip.AddrFrom4([4]byte(packet[12:16]))
 		target := netip.AddrFrom4([4]byte(packet[16:20]))
 		identifier := uint32(binary.BigEndian.Uint16(packet[4:6]))
 		protocol := packet[9]
+		key := fragmentKey{source: source, target: target, identification: identifier, protocol: protocol}
+		if optionAt, malformed := malformedIPv4Option(packet[20:headerSize]); malformed {
+			return parsedFragment{
+				key: key, protocol: protocol, offset: int(field&0x1fff) * 8,
+				identifier: identifier, original: packet[:totalSize], parameter: true, parameterAt: uint32(20 + optionAt),
+			}, true
+		}
+		if !validateIPv4Options(packet[20:headerSize]) {
+			return parsedFragment{}, false
+		}
 		return parsedFragment{
-			key:    fragmentKey{source: source, target: target, identification: identifier, protocol: protocol},
-			offset: int(field&0x1fff) * 8, more: field&0x2000 != 0,
+			key:      key,
+			protocol: protocol,
+			offset:   int(field&0x1fff) * 8, more: field&0x2000 != 0,
 			payload: packet[headerSize:totalSize], identifier: identifier, ecn: packet[1] & 3,
-			options: ipPacketOptions{hopLimit: packet[8], trafficClass: packet[1]},
-			maximum: fragmentMaximumDatagram - headerSize,
+			options:    ipPacketOptions{hopLimit: packet[8], trafficClass: packet[1]},
+			maximum:    fragmentMaximumDatagram - headerSize,
+			packetSize: totalSize, df: field&0x4000 != 0,
+			header: packet[:headerSize], nextHeader: 9,
+			original: packet[:totalSize],
 		}, true
 	}
 	if packet[0]>>4 != 6 || len(packet) < 48 {
@@ -226,56 +447,87 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 	}
 	source := netip.AddrFrom16([16]byte(packet[8:24]))
 	target := netip.AddrFrom16([16]byte(packet[24:40]))
-	next, offset := packet[6], 40
-	seenHop, seenRouting, destinationHeaders := false, false, 0
+	next, nextHeader, offset := packet[6], 6, 40
+	seenHop := false
 	for offset <= end {
 		switch next {
 		case 0, 60:
+			if next == 0 && (offset != 40 || seenHop) {
+				return parsedFragment{
+					key: fragmentKey{source: source, target: target, v6: true}, original: packet[:end],
+					parameter: true, parameterCode: 1, parameterAt: uint32(nextHeader),
+				}, true
+			}
 			if end-offset < 8 {
 				return parsedFragment{}, false
 			}
 			length := (int(packet[offset+1]) + 1) * 8
-			if length > end-offset || !validateIPv6Options(packet[offset:offset+length]) {
+			if length > end-offset {
+				return parsedFragment{}, false
+			}
+			valid, action, optionOffset := inspectIPv6Options(packet[offset : offset+length])
+			if !valid {
+				if action >= 2 && (action == 2 || !target.IsMulticast()) {
+					return parsedFragment{
+						key: fragmentKey{source: source, target: target, v6: true}, original: packet[:end],
+						parameter: true, parameterCode: 2, parameterAt: uint32(offset + optionOffset),
+					}, true
+				}
 				return parsedFragment{}, false
 			}
 			if next == 0 {
-				if offset != 40 || seenHop {
-					return parsedFragment{}, false
-				}
 				seenHop = true
-			} else {
-				destinationHeaders++
-				if destinationHeaders > 2 {
-					return parsedFragment{}, false
-				}
 			}
-			next, offset = packet[offset], offset+length
+			next, nextHeader, offset = packet[offset], offset, offset+length
 		case 43:
-			if end-offset < 8 || seenRouting {
+			if end-offset < 8 {
 				return parsedFragment{}, false
 			}
 			length := (int(packet[offset+1]) + 1) * 8
-			if length > end-offset || packet[offset+3] != 0 {
+			if length > end-offset {
 				return parsedFragment{}, false
 			}
-			seenRouting = true
-			next, offset = packet[offset], offset+length
+			if packet[offset+3] != 0 {
+				return parsedFragment{
+					key: fragmentKey{source: source, target: target, v6: true}, original: packet[:end],
+					parameter: true, parameterCode: 0, parameterAt: uint32(offset + 2),
+				}, true
+			}
+			next, nextHeader, offset = packet[offset], offset, offset+length
 		case 44:
 			if end-offset < 8 {
 				return parsedFragment{}, false
 			}
 			field := binary.BigEndian.Uint16(packet[offset+2 : offset+4])
-			if field&0x0006 != 0 || field == 0 {
+			// The offset and M flag distinguish a real fragment from an
+			// atomic fragment. RFC 8200 says both reserved fields are ignored
+			// on reception, including on non-atomic fragments.
+			if field&0xfff9 == 0 {
 				return parsedFragment{}, false
 			}
 			protocol := packet[offset]
 			identifier := binary.BigEndian.Uint32(packet[offset+4 : offset+8])
+			fragmentOffset := int(field & 0xfff8)
+			more := field&1 != 0
+			payload := packet[offset+8 : end]
+			maximum := fragmentMaximumDatagram - (offset - 40)
+			parameter := more && len(payload)%8 != 0
+			parameterAt := uint32(4)
+			if fragmentOffset > maximum-len(payload) {
+				parameter = true
+				parameterAt = uint32(offset + 2)
+			}
 			return parsedFragment{
-				key:    fragmentKey{source: source, target: target, identification: identifier, protocol: protocol, v6: true},
-				offset: int(field & 0xfff8), more: field&1 != 0,
-				payload: packet[offset+8 : end], identifier: identifier, ecn: packet[1] >> 4 & 3,
+				key:      fragmentKey{source: source, target: target, identification: identifier, v6: true},
+				protocol: protocol,
+				offset:   fragmentOffset, more: more,
+				payload: payload, identifier: identifier, ecn: packet[1] >> 4 & 3,
 				options: ipPacketOptions{hopLimit: packet[7], trafficClass: (packet[0]&0x0f)<<4 | packet[1]>>4},
-				maximum: fragmentMaximumDatagram - (offset - 40),
+				header:  packet[:offset], nextHeader: nextHeader,
+				maximum:   maximum,
+				original:  packet[:end],
+				truncated: fragmentOffset == 0 && more && !ipv6FirstFragmentHeaderComplete(protocol, payload),
+				parameter: parameter, parameterAt: parameterAt,
 			}, true
 		default:
 			return parsedFragment{}, false
@@ -284,39 +536,138 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 	return parsedFragment{}, false
 }
 
-// mergeFragmentECN preserves RFC 3168's mandatory reassembly behavior. CE
-// dominates a consistent ECT codepoint; unspecified mixed Not-ECT/ECT and
-// ECT(0)/ECT(1) combinations are conservatively rejected.
-func mergeFragmentECN(current, incoming byte) (byte, bool) {
-	current &= 3
-	incoming &= 3
-	if current == incoming {
-		return current, true
+// ipv6FirstFragmentHeaderComplete enforces RFC 7112 for known upper-layer
+// protocols while allowing an unknown protocol to reach a raw IP socket. The
+// input begins immediately after the Fragment header.
+func ipv6FirstFragmentHeaderComplete(next byte, payload []byte) bool {
+	for offset := 0; ; {
+		switch next {
+		case 0, 43, 60, 135:
+			if len(payload)-offset < 8 {
+				return false
+			}
+			length := (int(payload[offset+1]) + 1) * 8
+			if length > len(payload)-offset {
+				return false
+			}
+			next, offset = payload[offset], offset+length
+		case 51:
+			if len(payload)-offset < 8 {
+				return false
+			}
+			length := (int(payload[offset+1]) + 2) * 4
+			if length > len(payload)-offset {
+				return false
+			}
+			next, offset = payload[offset], offset+length
+		case 44:
+			return false
+		case protocolTCP:
+			if len(payload)-offset < tcpHeaderSize {
+				return false
+			}
+			headerSize := int(payload[offset+12]>>4) * 4
+			return headerSize < tcpHeaderSize || headerSize <= len(payload)-offset
+		case protocolUDP, protocolICMPv4, protocolICMPv6, 50:
+			return len(payload)-offset >= 8
+		case 33, 132:
+			return len(payload)-offset >= 12
+		case 59:
+			return true
+		default:
+			return true
+		}
 	}
-	if current == 0 || incoming == 0 || current == 1 && incoming == 2 || current == 2 && incoming == 1 {
-		return 0, false
-	}
-	if current == 3 || incoming == 3 {
-		return 3, true
-	}
-	return 0, false
 }
 
-// cleanFragmentsLocked removes expired sets while s.fragmentMu is held.
-func (s *Stack) cleanFragmentsLocked(now time.Time) {
+// fragmentECN applies the RFC 3168 section 5.3 table used by Linux to the OR
+// mask of ECN codepoints observed in one datagram.
+func fragmentECN(mask byte) (byte, bool) {
+	switch mask {
+	case 1 << 0:
+		return 0, true
+	case 1 << 1:
+		return 1, true
+	case 1 << 2:
+		return 2, true
+	case 1 << 3, 1<<3 | 1<<1, 1<<3 | 1<<2, 1<<3 | 1<<1 | 1<<2:
+		return 3, true
+	default:
+		// Linux's ip_frag_ecn_table rejects every unlisted combination,
+		// including ECT(0) mixed with ECT(1) without a CE fragment.
+		return 0, false
+	}
+}
+
+// cleanFragmentsLocked removes expired sets while s.fragmentMu is held and
+// returns the offset-zero fragments eligible for an ICMP timeout response.
+func (s *Stack) cleanFragmentsLocked(now time.Time) []*fragmentSet {
+	var expired []*fragmentSet
 	for key, set := range s.fragments {
-		if now.Sub(set.updated) >= fragmentLifetime {
+		if !now.Before(fragmentExpiry(set)) {
 			s.removeFragmentLocked(key, set)
 			s.stats.fragmentTimeouts.Add(1)
+			if len(set.firstPacket) != 0 {
+				expired = append(expired, set)
+			}
 		}
+	}
+	return expired
+}
+
+// fragmentExpiry returns the fixed deadline measured from the first-arriving
+// fragment in one set.
+func fragmentExpiry(set *fragmentSet) time.Time {
+	lifetime := fragmentIPv4Lifetime
+	if set.v6 {
+		lifetime = fragmentIPv6Lifetime
+	}
+	return set.created.Add(lifetime)
+}
+
+// nextFragmentExpiryLocked returns the earliest pending deadline while
+// fragmentMu is held.
+func (s *Stack) nextFragmentExpiryLocked() (time.Time, bool) {
+	var next time.Time
+	for _, set := range s.fragments {
+		expiry := fragmentExpiry(set)
+		if next.IsZero() || expiry.Before(next) {
+			next = expiry
+		}
+	}
+	return next, !next.IsZero()
+}
+
+// expireFragments performs timeout responses after releasing fragmentMu so a
+// congested embedding link cannot block reassembly bookkeeping.
+func (s *Stack) expireFragments(now time.Time) {
+	s.fragmentMu.Lock()
+	expired := s.cleanFragmentsLocked(now)
+	s.fragmentMu.Unlock()
+	s.sendFragmentTimeouts(expired)
+}
+
+// sendFragmentTimeouts emits best-effort diagnostics for expired datagrams.
+func (s *Stack) sendFragmentTimeouts(expired []*fragmentSet) {
+	for _, set := range expired {
+		_ = s.sendFragmentReassemblyTimeout(set)
 	}
 }
 
 // evictOldestFragmentLocked makes room for a new set.
 func (s *Stack) evictOldestFragmentLocked() {
+	s.evictOldestFragmentExceptLocked(nil)
+}
+
+// evictOldestFragmentExceptLocked makes byte-capacity room without discarding
+// the datagram currently receiving a new fragment.
+func (s *Stack) evictOldestFragmentExceptLocked(except *fragmentSet) bool {
 	var oldestKey fragmentKey
 	var oldest *fragmentSet
 	for key, set := range s.fragments {
+		if set == except {
+			continue
+		}
 		if oldest == nil || set.updated.Before(oldest.updated) {
 			oldestKey, oldest = key, set
 		}
@@ -324,7 +675,9 @@ func (s *Stack) evictOldestFragmentLocked() {
 	if oldest != nil {
 		s.removeFragmentLocked(oldestKey, oldest)
 		s.stats.fragmentEvictions.Add(1)
+		return true
 	}
+	return false
 }
 
 // removeFragmentLocked deletes a set and updates global byte accounting.
@@ -336,6 +689,28 @@ func (s *Stack) removeFragmentLocked(key fragmentKey, set *fragmentSet) {
 	s.fragmentBytes -= set.bytes
 }
 
+// discardFragment removes any incomplete datagram matching key.
+func (s *Stack) discardFragment(key fragmentKey) {
+	s.fragmentMu.Lock()
+	if set := s.fragments[key]; set != nil {
+		s.removeFragmentLocked(key, set)
+	}
+	s.fragmentMu.Unlock()
+}
+
+// pruneFragments discards incomplete datagrams for addresses removed by a
+// configuration update. They must not later emit timeout errors from an
+// address the stack no longer owns.
+func (s *Stack) pruneFragments(network *networkState) {
+	s.fragmentMu.Lock()
+	for key, set := range s.fragments {
+		if !networkStateHasLocal(network, key.target) {
+			s.removeFragmentLocked(key, set)
+		}
+	}
+	s.fragmentMu.Unlock()
+}
+
 // ipPayloadPackets builds one packet or a complete source-fragmented sequence
 // using the current destination PMTU.
 func (s *Stack) ipPayloadPackets(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool) ([][]byte, error) {
@@ -344,7 +719,13 @@ func (s *Stack) ipPayloadPackets(source, target netip.Addr, protocol byte, paylo
 
 // ipPayloadPacketsWithOptions is the raw-output form of ipPayloadPackets.
 func (s *Stack) ipPayloadPacketsWithOptions(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions) ([][]byte, error) {
-	packet := buildIPPacketWithOptions(source, target, protocol, payload, s.nextPacketID(), !allowFragment, options)
+	var identification uint16
+	if source.Is4() && allowFragment {
+		// A router may fragment any IPv4 datagram without DF, so reserve its
+		// ID even when it currently fits the managed link MTU.
+		identification = s.nextIPv4ID()
+	}
+	packet := buildIPPacketWithOptions(source, target, protocol, payload, identification, !allowFragment, options)
 	if len(packet) == 0 {
 		return nil, syscall.EMSGSIZE
 	}
@@ -357,9 +738,9 @@ func (s *Stack) ipPayloadPacketsWithOptions(source, target netip.Addr, protocol 
 	}
 	var fragments [][]byte
 	if source.Is4() {
-		fragments = buildIPv4FragmentsWithOptions(source, target, protocol, payload, mtu, s.nextPacketID(), options)
+		fragments = buildIPv4FragmentsWithOptions(source, target, protocol, payload, mtu, identification, options)
 	} else {
-		fragments = buildIPv6FragmentsWithOptions(source, target, protocol, payload, mtu, s.nextFragmentID(), options)
+		fragments = buildIPv6FragmentsWithOptions(source, target, protocol, payload, mtu, s.nextIPv6FragmentID(), options)
 	}
 	if len(fragments) == 0 {
 		return nil, syscall.EMSGSIZE

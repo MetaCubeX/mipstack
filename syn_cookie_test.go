@@ -107,14 +107,14 @@ func TestSYNCookieValidationIPv4AndIPv6(t *testing.T) {
 		{name: "IPv6", local: netip.MustParseAddr("2001:db8::61"), remote: netip.MustParseAddr("2001:db8:1::61")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			state := &tcpPassiveState{cookieSet: true}
+			state := &tcpPassiveState{cookieSet: true, cookieActive: true, cookieEpoch: now, cookiePeriod: 0}
 			for index := range state.cookieKey {
 				state.cookieKey[index] = byte(index + 1)
 			}
 			key := tcpKey{local: netip.AddrPortFrom(test.local, 443), remote: netip.AddrPortFrom(test.remote, 50000)}
 			syn := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535, options: []byte{2, 4, 0x05, 0xb4, 4, 2}}
 			_, data := encodeSYNCookieOptions(syn, test.remote)
-			cookie := synCookieSequence(state.cookieKey, key, syn.sequence, synCookiePeriodNumber(now), data, data)
+			cookie := synCookieSequence(state.cookieKey, key, syn.sequence, synCookiePeriodNumber(now, state.cookieEpoch), data, data)
 			ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: cookie + 1, flags: tcpFlagACK, window: 4096}
 			if _, _, valid := state.validateSYNCookie(key, ack, now); !valid {
 				t.Fatal("valid SYN cookie was rejected")
@@ -126,6 +126,10 @@ func TestSYNCookieValidationIPv4AndIPv6(t *testing.T) {
 			}
 			if _, _, valid := state.validateSYNCookie(key, ack, now.Add(2*synCookiePeriod)); valid {
 				t.Fatal("expired SYN cookie was accepted")
+			}
+			state.cookieActive = false
+			if _, _, valid := state.validateSYNCookie(key, ack, now); valid {
+				t.Fatal("cookie ACK was accepted without recent cookie issuance")
 			}
 		})
 	}

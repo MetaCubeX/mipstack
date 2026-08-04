@@ -108,13 +108,15 @@ type Stack struct {
 	pathMTUMu sync.RWMutex
 	pathMTU   map[netip.Addr]pathMTUEntry
 
-	packetID       atomic.Uint32
+	ipv4ID         atomic.Uint32
+	ipv6FragmentID atomic.Uint32
 	closeCh        chan struct{}
 	timestampEpoch time.Time
 
 	fragmentMu    sync.Mutex
 	fragments     map[fragmentKey]*fragmentSet
 	fragmentBytes int
+	fragmentWake  chan struct{}
 
 	controlMu       sync.Mutex
 	controlLimiters [controlResponseClassCount]tokenBucket
@@ -210,6 +212,8 @@ const (
 	// controlResponseParameterProblem limits errors for unsupported IPv6
 	// options and upper-layer protocols.
 	controlResponseParameterProblem
+	// controlResponseFragmentTimeout limits ICMP reassembly timeout errors.
+	controlResponseFragmentTimeout
 	// controlResponseClassCount is the number of independent token buckets.
 	controlResponseClassCount
 )
@@ -259,12 +263,22 @@ func New(config Config) (*Stack, error) {
 	if err != nil {
 		return nil, err
 	}
+	ipv4ID, err := randomUint32()
+	if err != nil {
+		return nil, err
+	}
+	ipv6FragmentID, err := randomUint32()
+	if err != nil {
+		return nil, err
+	}
 	stack := &Stack{
 		outbound: make(chan []byte, outboundPacketQueue), loopback: make(chan []byte, loopbackPacketQueue),
 		tcp: make(map[tcpKey]*TCPConn), udp: make(map[udpKey]*UDPConn),
 		nextPort: [2]automaticPortCursor{ports4, ports6}, pathMTU: make(map[netip.Addr]pathMTUEntry),
-		closeCh: make(chan struct{}), timestampEpoch: time.Now(), fragments: make(map[fragmentKey]*fragmentSet),
+		closeCh: make(chan struct{}), timestampEpoch: time.Now(), fragments: make(map[fragmentKey]*fragmentSet), fragmentWake: make(chan struct{}, 1),
 	}
+	stack.ipv4ID.Store(ipv4ID)
+	stack.ipv6FragmentID.Store(ipv6FragmentID)
 	stack.network.Store(state)
 	return stack, nil
 }
@@ -331,6 +345,7 @@ func (s *Stack) UpdateConfig(config Config) error {
 	if ip != nil {
 		ip.updateConfig(s, state)
 	}
+	s.pruneFragments(state)
 	return nil
 }
 
@@ -346,7 +361,11 @@ func (s *Stack) RouteFor(destination netip.Addr) (Route, error) {
 	if !destination.IsValid() || destination.IsUnspecified() || destination.IsMulticast() || destination.Zone() != "" {
 		return Route{}, syscall.EINVAL
 	}
-	route, exists := s.network.Load().routeFor(destination)
+	state := s.network.Load()
+	if state.broadcastDestination(destination) {
+		return Route{}, syscall.EACCES
+	}
+	route, exists := state.routeFor(destination)
 	if !exists {
 		return Route{}, syscall.ENETUNREACH
 	}
@@ -434,10 +453,10 @@ func validateListenNetwork(network, protocol string, address netip.Addr) error {
 func (s *Stack) mtuFor(destination netip.Addr) int {
 	destination = destination.Unmap()
 	linkMTU := s.network.Load().mtu
-	now := time.Now()
 	s.pathMTUMu.RLock()
 	entry, exists := s.pathMTU[destination]
 	s.pathMTUMu.RUnlock()
+	now := time.Now()
 	if exists && now.Sub(entry.updated) < pathMTULifetime && entry.mtu < linkMTU {
 		return entry.mtu
 	}
@@ -446,8 +465,13 @@ func (s *Stack) mtuFor(destination netip.Addr) int {
 		current, currentExists := s.pathMTU[destination]
 		if currentExists && now.Sub(current.updated) >= pathMTULifetime {
 			delete(s.pathMTU, destination)
+			currentExists = false
 		}
 		s.pathMTUMu.Unlock()
+		if currentExists && current.mtu < linkMTU {
+			// Another ICMP update refreshed this entry after the stale read.
+			return current.mtu
+		}
 	}
 	return linkMTU
 }
@@ -501,9 +525,9 @@ func (s *Stack) observePathMTU(destination netip.Addr, mtu uint32) bool {
 	if mtu >= uint32(s.network.Load().mtu) {
 		return false
 	}
-	now := time.Now()
 	s.pathMTUMu.Lock()
 	defer s.pathMTUMu.Unlock()
+	now := time.Now()
 	current, exists := s.pathMTU[destination]
 	if exists && current.mtu <= int(mtu) && now.Sub(current.updated) < pathMTULifetime {
 		current.updated = now
@@ -554,8 +578,8 @@ func (s *Stack) Stats() StackStats {
 
 // allowControlResponse consumes one token from a control-response class.
 func (s *Stack) allowControlResponse(class controlResponseClass) bool {
-	now := time.Now()
 	s.controlMu.Lock()
+	now := time.Now()
 	bucket := &s.controlLimiters[class]
 	if bucket.updated.IsZero() {
 		bucket.tokens = controlResponseBurst
@@ -621,10 +645,7 @@ func (s *Stack) ready() error {
 	return nil
 }
 
-// sourceFor selects a local address in the destination's family. An address
-// whose configured prefix contains the destination wins by longest prefix;
-// otherwise the first address in that family is used as the default-route
-// source.
+// sourceFor selects the route-admitted local address preferred for destination.
 func (s *Stack) sourceFor(destination netip.Addr) (netip.Addr, error) {
 	return s.network.Load().sourceFor(destination, netip.Addr{})
 }
@@ -641,6 +662,15 @@ func randomPortOffset(count uint32) (uint16, error) {
 		return 0, err
 	}
 	return uint16(binary.BigEndian.Uint32(raw[:]) % count), nil
+}
+
+// randomUint32 seeds transport sequence and fragment identification spaces.
+func randomUint32() (uint32, error) {
+	var raw [4]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(raw[:]), nil
 }
 
 // randomAutomaticPortCursor independently randomizes both allocation ranges.
@@ -953,6 +983,7 @@ func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 		}
 		return 0, err
 	}
+	receivedAt := time.Now()
 	count := 0
 	for _, buffer := range buffers {
 		if offset < 0 || offset > len(buffer) {
@@ -961,7 +992,7 @@ func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 		if len(buffer) == offset {
 			continue
 		}
-		if err := s.handlePacket(buffer[offset:]); err != nil {
+		if err := s.handlePacketAt(buffer[offset:], receivedAt); err != nil {
 			return count, err
 		}
 		count++
@@ -1028,6 +1059,14 @@ func (s *Stack) writePacketUntil(packet []byte, state func() (time.Time, <-chan 
 		if closed {
 			return net.ErrClosed
 		}
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			select {
+			case <-changed:
+				continue
+			default:
+				return os.ErrDeadlineExceeded
+			}
+		}
 		timer, timeout := deadlineTimer(deadline)
 		select {
 		case queue <- packet:
@@ -1065,17 +1104,41 @@ func (s *Stack) recordOutput(loopback bool) {
 
 // handlePacket processes one packet supplied through Write.
 func (s *Stack) handlePacket(packet []byte) error {
+	return s.handlePacketAt(packet, time.Now())
+}
+
+// handlePacketAt preserves the embedding link's batch-arrival time across
+// parsing, reassembly, and transport dispatch.
+func (s *Stack) handlePacketAt(packet []byte, receivedAt time.Time) error {
 	s.stats.inboundPackets.Add(1)
 	parsed, ok := parseIPPacket(packet)
 	if !ok {
-		if reassembled, pending := s.reassemblePacketStatus(packet, time.Now()); reassembled != nil {
+		if fragment, valid := parseFragment(packet); valid && s.isLocal(fragment.key.target) &&
+			!fragment.key.source.IsUnspecified() && !fragment.key.source.IsMulticast() && !fragment.key.source.Is4In6() {
+			if fragment.truncated || fragment.parameter {
+				s.discardFragment(fragment.key)
+				s.stats.inboundDroppedPackets.Add(1)
+				code, at := byte(3), uint32(0)
+				if fragment.parameter && !fragment.truncated {
+					code, at = fragment.parameterCode, fragment.parameterAt
+				}
+				return s.sendParameterProblem(ipPacket{
+					source: fragment.key.source, target: fragment.key.target, original: fragment.original,
+					parameterError: true, parameterCode: code, parameterAt: at,
+				})
+			}
+		}
+		if reassembled, pending := s.reassemblePacketStatus(packet, receivedAt); reassembled != nil {
 			parsed, ok = parseIPPacket(reassembled)
 		} else if pending {
 			return nil
 		}
 	}
+	network := s.network.Load()
 	limitedBroadcast := parsed.source.Is4() && parsed.source == netip.AddrFrom4([4]byte{255, 255, 255, 255})
-	if !ok || !s.isLocal(parsed.target) || parsed.source.IsUnspecified() || parsed.source.IsMulticast() || limitedBroadcast {
+	foreignLoopback := parsed.source.IsLoopback() && !networkStateHasLocal(network, parsed.source)
+	if !ok || !networkStateHasLocal(network, parsed.target) || parsed.source.IsUnspecified() || parsed.source.IsMulticast() || parsed.source.Is4In6() || limitedBroadcast ||
+		network.invalidInboundSource(parsed.source) || foreignLoopback {
 		s.stats.inboundDroppedPackets.Add(1)
 		return nil
 	}
@@ -1086,6 +1149,7 @@ func (s *Stack) handlePacket(packet []byte) error {
 		return ErrClosed
 	}
 	if parsed.parameterError {
+		s.stats.inboundDroppedPackets.Add(1)
 		return s.sendParameterProblem(parsed)
 	}
 	s.mu.RLock()
@@ -1094,20 +1158,23 @@ func (s *Stack) handlePacket(packet []byte) error {
 	rawDelivered := ip != nil && ip.deliver(s, parsed)
 	switch parsed.protocol {
 	case protocolTCP:
-		return s.handleTCP(parsed)
+		return s.handleTCP(parsed, receivedAt)
 	case protocolUDP:
 		return s.handleUDP(parsed)
-	case protocolICMPv4, protocolICMPv6:
-		return s.handleICMP(parsed)
+	case protocolICMPv4:
+		if parsed.source.Is4() {
+			return s.handleICMP(parsed)
+		}
+	case protocolICMPv6:
+		if parsed.source.Is6() {
+			return s.handleICMP(parsed)
+		}
 	default:
-		if parsed.protocol == 59 {
-			return nil
-		}
-		if rawDelivered {
-			return nil
-		}
-		return s.sendProtocolUnreachable(parsed)
 	}
+	if parsed.protocol == 59 || rawDelivered {
+		return nil
+	}
+	return s.sendProtocolUnreachable(parsed)
 }
 
 // Close closes every socket and releases all stack resources.
@@ -1235,12 +1302,13 @@ func (s *Stack) removeTCP(connection *TCPConn) {
 	s.mu.Unlock()
 }
 
-// nextPacketID returns a process-local IPv4 identification value.
-func (s *Stack) nextPacketID() uint16 {
-	return uint16(s.packetID.Add(1))
+// nextIPv4ID returns an identification value for a possibly fragmented IPv4
+// datagram. DF packets use zero and do not consume this sequence.
+func (s *Stack) nextIPv4ID() uint16 {
+	return uint16(s.ipv4ID.Add(1))
 }
 
-// nextFragmentID returns an IPv6 fragment identification value.
-func (s *Stack) nextFragmentID() uint32 {
-	return s.packetID.Add(1)
+// nextIPv6FragmentID returns an IPv6 Fragment-header identification value.
+func (s *Stack) nextIPv6FragmentID() uint32 {
+	return s.ipv6FragmentID.Add(1)
 }

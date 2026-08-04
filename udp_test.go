@@ -221,9 +221,10 @@ func TestUDPWriteDeadlineInterruptsFullQueue(t *testing.T) {
 	if err = connection.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
+	target := netip.MustParseAddrPort("192.0.2.2:53")
 	done := make(chan error, 1)
 	go func() {
-		_, writeErr := connection.WriteTo([]byte("query"), net.UDPAddrFromAddrPort(netip.MustParseAddrPort("192.0.2.2:53")))
+		_, writeErr := connection.WriteTo([]byte("query"), net.UDPAddrFromAddrPort(target))
 		done <- writeErr
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -237,6 +238,9 @@ func TestUDPWriteDeadlineInterruptsFullQueue(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("WriteTo did not observe changed deadline")
+	}
+	if connection.(*UDPConn).acceptsError(target) {
+		t.Fatal("failed UDP write retained an ICMP correlation target")
 	}
 }
 
@@ -653,6 +657,12 @@ func TestUDPOversizedWriteReturnsMessageTooLong(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
+	if n, writeErr := connection.Write(make([]byte, 65535-20-udpHeaderSize)); writeErr != nil || n != 65535-20-udpHeaderSize {
+		t.Fatalf("maximum IPv4 UDP Write = %d, %v", n, writeErr)
+	}
+	if _, err = connection.Write(make([]byte, 65536-20-udpHeaderSize)); !errors.Is(err, syscall.EMSGSIZE) {
+		t.Fatalf("IPv4 UDP Write above 65507 bytes = %v, want EMSGSIZE", err)
+	}
 	if _, err = connection.Write(make([]byte, 65536-udpHeaderSize)); !errors.Is(err, syscall.EMSGSIZE) {
 		t.Fatalf("oversized UDP Write = %v, want EMSGSIZE", err)
 	}

@@ -124,6 +124,57 @@ func (s *Stack) handleICMP(packet ipPacket) error {
 	return nil
 }
 
+// sendFragmentReassemblyTimeout reports an expired datagram when its first
+// fragment was available. RFC 792 and RFC 4443 prohibit recursively reporting
+// another ICMP error, while RFC 4443 also caps the complete IPv6 error at the
+// minimum IPv6 MTU.
+func (s *Stack) sendFragmentReassemblyTimeout(set *fragmentSet) error {
+	fragment, ok := parseFragment(set.firstPacket)
+	if !ok || fragment.offset != 0 || packetInvokesICMPError(set.firstPacket) || !s.allowControlResponse(controlResponseFragmentTimeout) {
+		return nil
+	}
+	quoteLength := len(set.firstPacket)
+	if !set.v6 {
+		headerSize := int(set.firstPacket[0]&0x0f) * 4
+		if quoteLength > headerSize+8 {
+			quoteLength = headerSize + 8
+		}
+		icmp := make([]byte, 8+quoteLength)
+		icmp[0], icmp[1] = 11, 1
+		copy(icmp[8:], set.firstPacket[:quoteLength])
+		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+		return s.writeIPPayload(set.target, set.source, protocolICMPv4, icmp, false)
+	}
+	maximumQuote := ipv6MinimumMTU - 48
+	if quoteLength > maximumQuote {
+		quoteLength = maximumQuote
+	}
+	icmp := make([]byte, 8+quoteLength)
+	icmp[0], icmp[1] = 3, 1
+	copy(icmp[8:], set.firstPacket[:quoteLength])
+	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(set.target, set.source, protocolICMPv6, icmp))
+	return s.writeIPPayload(set.target, set.source, protocolICMPv6, icmp, false)
+}
+
+// packetInvokesICMPError follows a complete or first-fragment header chain
+// and applies the RFC 792/RFC 4443 recursive-error suppression rule.
+func packetInvokesICMPError(packet []byte) bool {
+	_, _, protocol, payload, ok := quotedIPPayload(packet)
+	if !ok || len(payload) == 0 {
+		return false
+	}
+	if protocol == protocolICMPv6 {
+		return payload[0] < 128
+	}
+	if protocol == protocolICMPv4 {
+		switch payload[0] {
+		case 3, 4, 5, 11, 12:
+			return true
+		}
+	}
+	return false
+}
+
 // parseICMPError extracts the quoted original packet from an ICMP error.
 func parseICMPError(packet ipPacket) (ICMPError, bool) {
 	icmp := packet.payload
@@ -135,7 +186,7 @@ func parseICMPError(packet ipPacket) (ICMPError, bool) {
 			return ICMPError{}, false
 		}
 		source, target, protocol, payload, ok := quotedIPPayload(icmp[8:])
-		if !ok {
+		if !ok || !source.Is4() || !target.Is4() {
 			return ICMPError{}, false
 		}
 		result := ICMPError{Reporter: packet.source, Type: icmp[0], Code: icmp[1], QuotedSource: source, QuotedTarget: target, QuotedProtocol: protocol, QuotedPayload: payload}
@@ -149,7 +200,7 @@ func parseICMPError(packet ipPacket) (ICMPError, bool) {
 	}
 	if packet.protocol == protocolICMPv6 && validICMPErrorCode(protocolICMPv6, icmp[0], icmp[1]) {
 		source, target, protocol, payload, ok := quotedIPPayload(icmp[8:])
-		if !ok {
+		if !ok || !source.Is6() || !target.Is6() {
 			return ICMPError{}, false
 		}
 		result := ICMPError{Reporter: packet.source, Type: icmp[0], Code: icmp[1], QuotedSource: source, QuotedTarget: target, QuotedProtocol: protocol, QuotedPayload: payload}
@@ -183,7 +234,9 @@ func validICMPErrorCode(protocol, messageType, code byte) bool {
 		case 3:
 			return code <= 1
 		case 4:
-			return code <= 2
+			// RFC 7112 assigns code 3 for an incomplete first-fragment header
+			// chain; RFC 8754 assigns code 4 for an SR upper-layer error.
+			return code <= 4
 		}
 	}
 	return false
@@ -243,7 +296,10 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 				if len(packet)-offset < 8 {
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
 				}
-				if binary.BigEndian.Uint16(packet[offset+2:offset+4])&0xfffe != 0 {
+				// A quoted first fragment is useful even when M is set. Only a
+				// nonzero offset prevents transport correlation; RFC 8200's
+				// reserved bits are ignored on reception.
+				if binary.BigEndian.Uint16(packet[offset+2:offset+4])&0xfff8 != 0 {
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
 				}
 				next, offset = packet[offset], offset+8
@@ -325,10 +381,31 @@ func (s *Stack) sendProtocolUnreachable(packet ipPacket) error {
 	return s.writeIPPayload(packet.target, packet.source, protocolICMPv6, icmp, false)
 }
 
-// sendParameterProblem reports an IPv6 option whose action bits require an
-// ICMP error. The pointer is the absolute byte offset of the option type.
+// sendParameterProblem reports a malformed IPv4 option or an IPv6 field whose
+// action requires an ICMP error. The pointer is an absolute byte offset.
 func (s *Stack) sendParameterProblem(packet ipPacket) error {
-	if !packet.source.Is6() || !s.allowControlResponse(controlResponseParameterProblem) {
+	if !packet.source.Is4() && !packet.source.Is6() {
+		return nil
+	}
+	if packet.source.Is4() {
+		if len(packet.original) < 20 || binary.BigEndian.Uint16(packet.original[6:8])&0x1fff != 0 {
+			return nil
+		}
+		if packetInvokesICMPError(packet.original) || !s.allowControlResponse(controlResponseParameterProblem) {
+			return nil
+		}
+		header := int(packet.original[0]&0x0f) * 4
+		quoteLength := len(packet.original)
+		if quoteLength > header+8 {
+			quoteLength = header + 8
+		}
+		icmp := make([]byte, 8+quoteLength)
+		icmp[0], icmp[1], icmp[4] = 12, packet.parameterCode, byte(packet.parameterAt)
+		copy(icmp[8:], packet.original[:quoteLength])
+		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+		return s.writeIPPayload(packet.target, packet.source, protocolICMPv4, icmp, false)
+	}
+	if packetInvokesICMPError(packet.original) || !s.allowControlResponse(controlResponseParameterProblem) {
 		return nil
 	}
 	maximumQuote := ipv6MinimumMTU - 48

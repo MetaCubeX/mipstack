@@ -139,11 +139,19 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 		if binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
 			return ipPacket{}, false
 		}
+		source := netip.AddrFrom4([4]byte(packet[12:16]))
+		target := netip.AddrFrom4([4]byte(packet[16:20]))
+		if optionAt, malformed := malformedIPv4Option(packet[20:headerSize]); malformed {
+			return ipPacket{
+				source: source, target: target, original: packet[:totalSize],
+				parameterError: true, parameterCode: 0, parameterAt: uint32(20 + optionAt),
+			}, true
+		}
 		if !validateIPv4Options(packet[20:headerSize]) {
 			return ipPacket{}, false
 		}
 		return ipPacket{
-			source: netip.AddrFrom4([4]byte(packet[12:16])), target: netip.AddrFrom4([4]byte(packet[16:20])),
+			source: source, target: target,
 			protocol: packet[9], protocolOffset: 9, ecn: packet[1] & 3, hopLimit: packet[8], trafficClass: packet[1],
 			payload: packet[headerSize:totalSize], original: packet[:totalSize],
 		}, true
@@ -163,10 +171,20 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 		source := netip.AddrFrom16([16]byte(packet[8:24]))
 		target := netip.AddrFrom16([16]byte(packet[24:40]))
 		next, nextOffset, offset := packet[6], 6, 40
-		seenHop, seenRouting, seenFragment, destinationHeaders := false, false, false, 0
+		seenHop := false
 		for offset <= end {
 			switch next {
 			case 0, 60:
+				if next == 0 && (offset != 40 || seenHop) {
+					// RFC 8200 permits Hop-by-Hop only immediately after the
+					// IPv6 header. A later value zero is therefore an
+					// unrecognized Next Header, not another extension header.
+					return ipPacket{
+						source: source, target: target, original: packet[:end], ecn: packet[1] >> 4 & 3,
+						hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4,
+						parameterError: true, parameterCode: 1, parameterAt: uint32(nextOffset),
+					}, true
+				}
 				if end-offset < 8 {
 					return ipPacket{}, false
 				}
@@ -186,19 +204,11 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 					return ipPacket{}, false
 				}
 				if next == 0 {
-					if offset != 40 || seenHop {
-						return ipPacket{}, false
-					}
 					seenHop = true
-				} else {
-					destinationHeaders++
-					if destinationHeaders > 2 {
-						return ipPacket{}, false
-					}
 				}
 				next, nextOffset, offset = packet[offset], offset, offset+length
 			case 43:
-				if end-offset < 8 || seenRouting || seenFragment {
+				if end-offset < 8 {
 					return ipPacket{}, false
 				}
 				length := (int(packet[offset+1]) + 1) * 8
@@ -212,15 +222,14 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 						parameterError: true, parameterCode: 0, parameterAt: uint32(offset + 2),
 					}, true
 				}
-				seenRouting = true
 				next, nextOffset, offset = packet[offset], offset, offset+length
 			case 44:
 				// Non-atomic fragments require bounded reassembly. Atomic
-				// fragments can safely continue as an ordinary packet.
-				if end-offset < 8 || seenFragment || binary.BigEndian.Uint16(packet[offset+2:offset+4]) != 0 {
+				// fragments can safely continue as an ordinary packet. RFC
+				// 8200 requires receivers to ignore both reserved fields.
+				if end-offset < 8 || binary.BigEndian.Uint16(packet[offset+2:offset+4])&0xfff9 != 0 {
 					return ipPacket{}, false
 				}
-				seenFragment = true
 				next, nextOffset, offset = packet[offset], offset, offset+8
 			default:
 				return ipPacket{
@@ -232,6 +241,94 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 		}
 	}
 	return ipPacket{}, false
+}
+
+// malformedIPv4Option returns the byte that Linux reports in an ICMP
+// Parameter Problem for malformed option framing or fields. Policy rejection
+// of a well-formed option, such as source routing, is left to
+// validateIPv4Options and is not misreported as a syntax error.
+func malformedIPv4Option(options []byte) (int, bool) {
+	var sourceRoute, recordRoute, timestamp bool
+	for offset := 0; offset < len(options); {
+		kind := options[offset]
+		switch kind {
+		case 0:
+			for padding := offset + 1; padding < len(options); padding++ {
+				if options[padding] != 0 {
+					return padding, true
+				}
+			}
+			return 0, false
+		case 1:
+			offset++
+			continue
+		}
+		if len(options)-offset < 2 {
+			return offset, true
+		}
+		length := int(options[offset+1])
+		if length < 2 || length > len(options)-offset {
+			return offset, true
+		}
+		switch kind {
+		case 131, 137: // Loose and strict source route.
+			if length < 3 {
+				return offset + 1, true
+			}
+			if options[offset+2] < 4 {
+				return offset + 2, true
+			}
+			if sourceRoute {
+				return offset, true
+			}
+			sourceRoute = true
+		case 7: // Record route.
+			if recordRoute {
+				return offset, true
+			}
+			recordRoute = true
+			if length < 3 {
+				return offset + 1, true
+			}
+			pointer := int(options[offset+2])
+			if pointer < 4 {
+				return offset + 2, true
+			}
+			if pointer <= length && pointer+3 > length {
+				return offset + 2, true
+			}
+		case 68: // Internet timestamp.
+			if timestamp {
+				return offset, true
+			}
+			timestamp = true
+			if length < 4 {
+				return offset + 1, true
+			}
+			pointer := int(options[offset+2])
+			if pointer < 5 {
+				return offset + 2, true
+			}
+			flag := options[offset+3] & 0x0f
+			if pointer <= length {
+				required := 4
+				if flag == 1 || flag == 3 {
+					required = 8
+				}
+				if pointer+required-1 > length {
+					return offset + 2, true
+				}
+			} else if flag != 3 && options[offset+3]>>4 == 15 {
+				return offset + 3, true
+			}
+		case 148: // Router Alert.
+			if length < 4 {
+				return offset + 1, true
+			}
+		}
+		offset += length
+	}
+	return 0, false
 }
 
 // validateIPv4Options checks complete TLV boundaries. Source-routing options
@@ -290,12 +387,6 @@ func inspectIPv6Options(header []byte) (bool, byte, int) {
 		offset += length
 	}
 	return true, 0, 0
-}
-
-// validateIPv6Options is the silent-validation form used by fragment parsing.
-func validateIPv6Options(header []byte) bool {
-	valid, _, _ := inspectIPv6Options(header)
-	return valid
 }
 
 // setPacketECN updates the two ECN bits and repairs the IPv4 header checksum.

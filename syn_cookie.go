@@ -25,7 +25,7 @@ const (
 // synCookieMSSValues are safe lower bounds for common advertised MSS values.
 // Selecting the greatest entry no larger than the peer's offer never causes a
 // reconstructed connection to transmit oversized segments.
-var synCookieMSSValues = [...]uint16{1, 256, 536, 1200, 1220, 1360, 1440, 8960}
+var synCookieMSSValues = [...]uint16{tcpMinimumPeerMSS, 256, 536, 1200, 1220, 1360, 1440, 8960}
 
 // synCookieOptions is the handshake state that can be reconstructed from a
 // final ACK without retaining the original SYN.
@@ -42,27 +42,51 @@ type synCookieOptions struct {
 // key returns the lazily initialized per-stack-listener secret. A random
 // source failure is retried on a later SYN instead of permanently disabling
 // cookies.
-func (state *tcpPassiveState) synCookieKey() ([16]byte, error) {
+func (state *tcpPassiveState) synCookieKey(now time.Time) ([16]byte, uint64, error) {
 	state.cookieMu.Lock()
 	defer state.cookieMu.Unlock()
 	if !state.cookieSet {
 		if _, err := rand.Read(state.cookieKey[:]); err != nil {
-			return [16]byte{}, err
+			return [16]byte{}, 0, err
 		}
+		state.cookieEpoch = now
 		state.cookieSet = true
 	}
-	return state.cookieKey, nil
+	return state.cookieKey, synCookiePeriodNumber(now, state.cookieEpoch), nil
+}
+
+// noteSYNCookie records the Linux-style recent-overflow window in which a
+// stateless final ACK is eligible for cookie validation.
+func (state *tcpPassiveState) noteSYNCookie(period uint64) {
+	state.cookieMu.Lock()
+	if !state.cookieActive || period > state.cookiePeriod {
+		state.cookiePeriod = period
+	}
+	state.cookieActive = true
+	state.cookieMu.Unlock()
+}
+
+// recentSYNCookieKey returns an existing key only after this passive state
+// actually issued a cookie in the current or preceding period.
+func (state *tcpPassiveState) recentSYNCookieKey(now time.Time) ([16]byte, uint64, bool) {
+	state.cookieMu.Lock()
+	defer state.cookieMu.Unlock()
+	period := synCookiePeriodNumber(now, state.cookieEpoch)
+	if !state.cookieSet || !state.cookieActive || period < state.cookiePeriod || period-state.cookiePeriod > 1 {
+		return [16]byte{}, 0, false
+	}
+	return state.cookieKey, period, true
 }
 
 // sendSYNCookie replies to a SYN without allocating a TCPConn.
 func (state *tcpPassiveState) sendSYNCookie(stack *Stack, key tcpKey, syn tcpSegment, now time.Time) error {
-	secret, err := state.synCookieKey()
+	secret, period, err := state.synCookieKey(now)
 	if err != nil {
 		return err
 	}
 	options, data := encodeSYNCookieOptions(syn, key.remote.Addr())
 	authenticatedData := synCookieAuthenticatedData(data, options.timestamp, options.ecn)
-	sequence := synCookieSequence(secret, key, syn.sequence, synCookiePeriodNumber(now), data, authenticatedData)
+	sequence := synCookieSequence(secret, key, syn.sequence, period, data, authenticatedData)
 	localMSS := tcpMSSForMTU(stack.mtuFor(key.remote.Addr()), key.local.Addr())
 	if localMSS < 1 {
 		return errors.New("mipstack: MTU is too small for TCP")
@@ -79,17 +103,18 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, key tcpKey, syn tcpSeg
 	if options.ecn {
 		flags |= tcpFlagECE
 	}
+	state.noteSYNCookie(period)
 	return stack.writeTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, 65535, tcpOptions, nil)
 }
 
 // validateSYNCookie authenticates a final ACK against the current or previous
 // time period and reconstructs its negotiated options.
 func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now time.Time) (uint32, synCookieOptions, bool) {
-	if ack.flags&tcpFlagACK == 0 || ack.flags&(tcpFlagSYN|tcpFlagRST) != 0 || ack.acknowledgement == 0 {
+	if ack.flags&tcpFlagACK == 0 || ack.flags&(tcpFlagSYN|tcpFlagRST) != 0 {
 		return 0, synCookieOptions{}, false
 	}
-	secret, err := state.synCookieKey()
-	if err != nil {
+	secret, period, active := state.recentSYNCookieKey(now)
+	if !active {
 		return 0, synCookieOptions{}, false
 	}
 	serverSequence := ack.acknowledgement - 1
@@ -98,7 +123,6 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	timestampValue, timestampEcho, timestamp := parseTCPTimestamp(ack.options)
 	ecn := timestamp && timestampEcho&1 != 0
 	authenticatedData := synCookieAuthenticatedData(data, timestamp, ecn)
-	period := synCookiePeriodNumber(now)
 	valid := false
 	for attempt := uint64(0); attempt < 2; attempt++ {
 		if attempt > period {
@@ -122,7 +146,8 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	return serverSequence, options, true
 }
 
-// encodeSYNCookieOptions converts a SYN's offered options into ten bits.
+// encodeSYNCookieOptions converts a SYN's offered options into eight sequence
+// bits. Timestamp and ECN flags are authenticated separately.
 func encodeSYNCookieOptions(syn tcpSegment, remoteAddress netip.Addr) (synCookieOptions, uint32) {
 	mss, scale, scaling, sack, timestamp, timestampValue := parseTCPOptions(syn.options, defaultTCPPeerMSS(remoteAddress), 65535)
 	mssIndex := 0
@@ -181,8 +206,12 @@ func synCookieAuthenticatedData(data uint32, timestamp, ecn bool) uint32 {
 }
 
 // synCookiePeriodNumber returns the monotonically advancing cookie period.
-func synCookiePeriodNumber(now time.Time) uint64 {
-	return uint64(now.Unix()) / uint64(synCookiePeriod/time.Second)
+func synCookiePeriodNumber(now, epoch time.Time) uint64 {
+	elapsed := now.Sub(epoch)
+	if elapsed <= 0 {
+		return 0
+	}
+	return uint64(elapsed / synCookiePeriod)
 }
 
 // synCookieSequence authenticates one tuple and its compact option data.

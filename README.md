@@ -55,9 +55,10 @@ _, err = stack.Read([][]byte{buffer}, sizes, 0)
 outboundPacket := buffer[:sizes[0]]
 ```
 
-The packet methods intentionally match the common batched userspace-TUN shape
-and currently process a batch size of one. `Start` is idempotent, while `Close`
-is terminal and unblocks pending packet and socket operations.
+The packet methods intentionally match the common batched userspace-TUN shape.
+`Read` produces one packet per call and `BatchSize` therefore returns one, while
+`Write` accepts every packet supplied in an inbound batch. `Start` is idempotent,
+while `Close` is terminal and unblocks pending packet and socket operations.
 
 For integration with userspace packet-device consumers, `Stack` also provides
 `MTU`, `Name`, and `BatchSize`. `LocalAddresses` returns an independent

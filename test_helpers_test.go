@@ -28,6 +28,7 @@ type testPacketLink struct {
 	dropTCPFIN            int
 	dropTCPAbove          int
 	sackTCP               bool
+	disableTCPSACK        bool
 	dropTCPOrdinals       map[int]bool
 	timestampTCP          bool
 	ecnTCP                bool
@@ -39,6 +40,7 @@ type testPacketLink struct {
 	tcp                    map[uint16]*testTCPPeer
 	maximumTCPBurst        int
 	clientSACKs            int
+	clientDataSACKs        int
 	clientACKs             int
 	clientTimestamps       int
 	clientECTPackets       int
@@ -277,8 +279,14 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 		peer.serverNext++
 		l.mu.Unlock()
 		options := []byte{2, 4, 0x05, 0x00, 4, 2, 1, 3, 3, 2}
+		if l.disableTCPSACK {
+			options = []byte{2, 4, 0x05, 0x00, 1, 3, 3, 2}
+		}
 		if l.disableTCPWindowScale {
-			options = []byte{2, 4, 0x05, 0x00, 4, 2}
+			options = []byte{2, 4, 0x05, 0x00}
+			if !l.disableTCPSACK {
+				options = append(options, 4, 2)
+			}
 		}
 		responseFlags := byte(tcpFlagSYN | tcpFlagACK)
 		if l.ecnTCP && flags&tcpFlagECE != 0 && flags&tcpFlagCWR != 0 {
@@ -297,6 +305,9 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 	}
 	if hasTCPOption(tcp[tcpHeaderSize:headerSize], 5) {
 		l.clientSACKs++
+		if len(payload) != 0 {
+			l.clientDataSACKs++
+		}
 	}
 	if value, _, present := parseTCPTimestamp(tcp[tcpHeaderSize:headerSize]); present {
 		peer.clientTimestamp = value
@@ -345,13 +356,16 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 		l.mu.Unlock()
 		return nil
 	}
-	if len(payload) != 0 && l.sackTCP && tcpSequenceGreater(sequence, peer.clientNext) {
+	if len(payload) != 0 && tcpSequenceGreater(sequence, peer.clientNext) {
 		if _, exists := peer.outOfOrder[sequence]; !exists {
 			peer.outOfOrder[sequence] = payload
 		}
 		acknowledgement := peer.clientNext
 		serverSequence := peer.serverNext
-		options := testSACKOptions(peer.outOfOrder)
+		var options []byte
+		if l.sackTCP {
+			options = testSACKOptions(peer.outOfOrder)
+		}
 		l.mu.Unlock()
 		return l.deliverTCP(serverPort, clientPort, serverSequence, acknowledgement, tcpFlagACK, 65535, options, nil)
 	}

@@ -2,7 +2,6 @@ package mipstack
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -35,43 +34,86 @@ const (
 	// an initial SYN.
 	tcpFlagCWR = byte(0x80)
 	// tcpReceiveCapacity bounds unread and out-of-order bytes per connection.
-	tcpReceiveCapacity = 256 * 1024
+	tcpReceiveCapacity = 1024 * 1024
 	// tcpSendCapacity bounds unacknowledged and not-yet-transmitted application
 	// bytes retained by one connection.
 	tcpSendCapacity = 256 * 1024
-	// tcpMaximumOutOfOrder bounds retained receive-range metadata.
-	tcpMaximumOutOfOrder = 256
-	// tcpInboundQueue bounds validated segments waiting for one actor.
-	tcpInboundQueue = 256
+	// tcpMaximumOutOfOrder bounds retained receive-range metadata. The limit
+	// accommodates a full default window split near IPv6's minimum MTU while
+	// still bounding adversarial sparse one-byte ranges.
+	tcpMaximumOutOfOrder = 4096
+	// tcpInboundQueue bounds validated segments waiting for one actor. It can
+	// absorb roughly one default receive window at ordinary MTUs, preventing a
+	// fast embedding link from manufacturing loss before the actor runs.
+	tcpInboundQueue = 1024
+	// tcpMaximumTimerDeferrals lets an actor drain every segment that could
+	// already have been queued when it resumed, then restores timer fairness
+	// even if a hostile sender continuously refills the queue.
+	tcpMaximumTimerDeferrals = tcpInboundQueue
+	// tcpInboundByteCapacity prevents maximum-size fragmented IP packets from
+	// turning the segment-count queue into tens of megabytes per connection.
+	// Two default receive windows retain normal high-bandwidth bursts while the
+	// actor accounts them into its receive scoreboard.
+	tcpInboundByteCapacity = 2 * tcpReceiveCapacity
+	// tcpInboundSegmentMetadata accounts for one queued channel value and the
+	// backing allocation shared by its option and payload slices.
+	tcpInboundSegmentMetadata = 128
 	// tcpAcceptQueue bounds completed passive handshakes waiting for Accept.
 	tcpAcceptQueue = 128
 	// tcpSYNBacklog bounds half-open and completed but unaccepted connections
 	// owned by one listener.
 	tcpSYNBacklog = 256
-	// tcpMaximumRetransmits bounds repeated transmission of one segment.
-	tcpMaximumRetransmits = 12
-	// tcpBlackHoleTimeouts requires repeated RTOs before inferring that ICMP
-	// Packet Too Big messages are being filtered.
-	tcpBlackHoleTimeouts = 2
+	// tcpMaximumRTOs matches Linux's default tcp_retries2 budget for
+	// consecutive retransmission timeouts without cumulative acknowledgement
+	// progress. Fast recovery, tail probes, and PMTU resegmentation do not
+	// consume it.
+	tcpMaximumRTOs = 15
+	// tcpActiveSYNMaximumAttempts is the initial SYN plus Linux's default six
+	// active-open retransmissions.
+	tcpActiveSYNMaximumAttempts = 7
+	// tcpPassiveSYNMaximumAttempts is the initial SYN-ACK plus Linux's default
+	// five passive-open retransmissions.
+	tcpPassiveSYNMaximumAttempts = 6
+	// tcpBlackHoleTimeouts enters optional black-hole probing only after the
+	// default Linux tcp_retries1 budget has been exceeded. Earlier timeouts are
+	// ordinary congestion evidence and must not make a busy path reduce its
+	// packet size merely because ICMP Packet Too Big was absent.
+	tcpBlackHoleTimeouts = 4
 	// tcpInitialRTO follows the RFC 6298 initial retransmission timeout.
 	tcpInitialRTO = time.Second
 	// tcpMinimumRTO avoids excessive retransmission on low-latency overlays.
 	tcpMinimumRTO = 200 * time.Millisecond
-	// tcpMaximumRTO bounds retry latency and zero-window probing.
-	tcpMaximumRTO = 60 * time.Second
+	// tcpMaximumRTO matches Linux's maximum retry and zero-window-probe RTO.
+	// It also satisfies RFC 6298's requirement that an optional cap be at
+	// least 60 seconds.
+	tcpMaximumRTO = 120 * time.Second
 	// tcpDelayedACKTimeout bounds acknowledgement delay for in-order data and
 	// non-critical receive-window growth.
 	tcpDelayedACKTimeout = 25 * time.Millisecond
 	// tcpTimeWaitDuration retains a completed tuple for twice the conventional
 	// 30-second maximum segment lifetime.
 	tcpTimeWaitDuration = 60 * time.Second
-	// tcpFINWaitDuration bounds FIN_WAIT_2 resource retention.
+	// tcpFINWaitDuration bounds orphaned FIN_WAIT_2 resource retention. A
+	// connection retained by an application after CloseWrite has no such
+	// timeout and may continue receiving until the peer closes.
 	tcpFINWaitDuration = 60 * time.Second
-	// tcpReceiveWindowScale uses TCP's largest valid shift so a caller may grow
-	// the receive buffer after connection establishment without renegotiation.
-	tcpReceiveWindowScale = uint8(14)
+	// tcpReceiveWindowScale closely fits the default receive capacity while
+	// preserving fine-grained window updates.
+	tcpReceiveWindowScale = uint8(4)
 	// tcpInitialCongestionMSS is the RFC 6928 upper initial-window bound.
 	tcpInitialCongestionMSS = 10
+	// tcpDuplicateACKThreshold is the RFC 5681 fast-retransmit threshold and
+	// RFC 6675 packet-count loss threshold.
+	tcpDuplicateACKThreshold = 3
+	// tcpMinimumPeerMSS matches Linux's default tcp_min_snd_mss. Accepting a
+	// one-byte advertised MSS lets an untrusted peer amplify ordinary buffered
+	// writes into hundreds of thousands of packets and scoreboard entries.
+	// A smaller path-derived MSS still wins when the managed MTU requires it.
+	tcpMinimumPeerMSS = 48
+	// tcpMaximumSACKSplitRanges bounds metadata created solely by adversarial
+	// byte-granular SACK edges. Once reached, a partially covered transmission
+	// remains unsacked and is conservatively retransmitted as a whole.
+	tcpMaximumSACKSplitRanges = 1024
 	// tcpDefaultKeepAliveIdle is the initial inactivity before probes.
 	tcpDefaultKeepAliveIdle = 2 * time.Hour
 	// tcpDefaultKeepAliveInterval spaces unanswered probes.
@@ -108,6 +150,90 @@ type tcpSegment struct {
 	ecn             byte
 	options         []byte
 	payload         []byte
+	retainedBytes   int64
+	receivedAt      time.Time
+}
+
+// tcpZeroWindowProbe is an allocation-free acknowledged byte used to elicit
+// a current window advertisement from a peer.
+var tcpZeroWindowProbe = [...]byte{0}
+
+// tcpReceiveWindow retains the furthest receive sequence promised to the
+// peer. Buffer occupancy may reduce newly available space, but it must not
+// move an already advertised right edge backwards.
+type tcpReceiveWindow struct {
+	right uint32
+	shift uint8
+}
+
+// newTCPReceiveWindow starts with the last window sent during the handshake.
+// A SYN-ACK is unscaled, while an active opener's final ACK is scaled.
+func newTCPReceiveWindow(receiveNext uint32, initial uint16, scaled, initialScaled bool) tcpReceiveWindow {
+	initialBytes := uint32(initial)
+	window := tcpReceiveWindow{}
+	if scaled {
+		window.shift = tcpReceiveWindowScale
+	}
+	if initialScaled {
+		initialBytes <<= window.shift
+	}
+	window.right = receiveNext + initialBytes
+	return window
+}
+
+// next returns the wire window that would be advertised with the currently
+// available storage, without committing that promise until a segment is sent.
+func (w *tcpReceiveWindow) next(receiveNext uint32, available, minimumIncrease int) (uint16, uint32) {
+	if available < 0 {
+		available = 0
+	}
+	maximum := uint32(65535) << w.shift
+	if uint64(available) > uint64(maximum) {
+		available = int(maximum)
+	}
+	desired := receiveNext + uint32(available>>w.shift)<<w.shift
+	right := w.right
+	if tcpSequenceGreater(desired, right) {
+		increase := desired - right
+		if minimumIncrease < 0 {
+			minimumIncrease = 0
+		}
+		if increase >= uint32(minimumIncrease) {
+			right = desired
+		}
+	}
+	if tcpSequenceLess(right, receiveNext) {
+		return 0, right
+	}
+	return uint16((right - receiveNext) >> w.shift), right
+}
+
+// advertise commits and returns the window carried by an outgoing segment.
+func (w *tcpReceiveWindow) advertise(receiveNext uint32, available, minimumIncrease int) uint16 {
+	window, right := w.next(receiveNext, available, minimumIncrease)
+	w.right = right
+	return window
+}
+
+// size returns the receive sequence space covered by prior advertisements.
+func (w *tcpReceiveWindow) size(receiveNext uint32) uint32 {
+	if tcpSequenceLess(w.right, receiveNext) {
+		return 0
+	}
+	return w.right - receiveNext
+}
+
+// tcpReceiveWindowIncrease is the RFC 1122 receiver SWS threshold:
+// min(one half of the receive buffer, one expected segment).
+func tcpReceiveWindowIncrease(capacity, mss int) int {
+	if capacity < 1 {
+		return 0
+	}
+	threshold := capacity/2 + capacity%2
+	if mss > 0 && threshold > mss {
+		threshold = mss
+	}
+	return threshold
 }
 
 // sentTCPSegment retains retransmission state for one sequence range.
@@ -121,6 +247,18 @@ type sentTCPSegment struct {
 	sacked        bool
 	sackRetried   bool
 	rackLost      bool
+	limited       bool
+	cwr           bool
+	sackSplit     bool
+}
+
+// tcpRACKSample identifies the newest transmission known to have been
+// delivered. RFC 8985 orders equal transmit timestamps by sequence number.
+type tcpRACKSample struct {
+	sentAt        time.Time
+	end           uint32
+	rtt           time.Duration
+	retransmitted bool
 }
 
 // tcpReceivedPiece retains one normalized out-of-order receive range.
@@ -142,21 +280,23 @@ type TCPConn struct {
 	// used by the standard library.
 	passive bool
 
-	inbound       chan tcpSegment
-	networkError  chan error
-	pathMTUUpdate chan struct{}
-	sendNotify    chan struct{}
-	windowUpdate  chan struct{}
-	abortCh       chan struct{}
-	done          chan struct{}
-	connected     chan error
-	lingerDone    chan struct{}
-	abortOnce     sync.Once
-	closeOnce     sync.Once
-	lingerOnce    sync.Once
-	readCallMu    sync.Mutex
-	writeCallMu   sync.Mutex
-	icmpSequence  atomic.Uint64
+	inbound          chan tcpSegment
+	networkError     chan error
+	pathMTUUpdate    chan struct{}
+	sendNotify       chan struct{}
+	windowUpdate     chan struct{}
+	abortCh          chan struct{}
+	done             chan struct{}
+	connected        chan error
+	lingerDone       chan struct{}
+	abortOnce        sync.Once
+	closeOnce        sync.Once
+	lingerOnce       sync.Once
+	readCallMu       sync.Mutex
+	writeCallMu      sync.Mutex
+	icmpSequence     atomic.Uint64
+	outOfOrderUnread atomic.Int64
+	inboundBytes     atomic.Int64
 
 	abortMu  sync.Mutex
 	abortErr error
@@ -199,6 +339,7 @@ type TCPConn struct {
 	peerWindow        uint32
 	peerWindowSeq     uint32
 	peerWindowACK     uint32
+	handshakeRTT      time.Duration
 }
 
 // tcpListenKey identifies one specific or wildcard passive TCP endpoint.
@@ -230,13 +371,17 @@ type tcpReuseEndpoints interface {
 }
 
 // tcpPassiveState owns exclusive listeners and an optional REUSEPORT
-// registry. Stack.mu protects every field.
+// registry. Stack.mu protects endpoint registries; cookieMu protects the
+// cookie key and recent-issuance period.
 type tcpPassiveState struct {
-	exclusive map[tcpListenKey]*TCPListener
-	reuse     tcpReuseEndpoints
-	cookieMu  sync.Mutex
-	cookieKey [16]byte
-	cookieSet bool
+	exclusive    map[tcpListenKey]*TCPListener
+	reuse        tcpReuseEndpoints
+	cookieMu     sync.Mutex
+	cookieKey    [16]byte
+	cookieSet    bool
+	cookieEpoch  time.Time
+	cookiePeriod uint64
+	cookieActive bool
 }
 
 // tcpListenerBinding supplies only the registration policy that differs
@@ -513,6 +658,14 @@ func (l *TCPListener) AcceptTCP() (*TCPConn, error) {
 		l.mu.Lock()
 		deadline, changed := l.deadline, l.changed
 		l.mu.Unlock()
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			select {
+			case <-changed:
+				continue
+			default:
+				return nil, l.operationError("accept", os.ErrDeadlineExceeded)
+			}
+		}
 		timer, timeout := deadlineTimer(deadline)
 		select {
 		case connection := <-l.accept:
@@ -596,11 +749,16 @@ func (l *TCPListener) removePending(connection *TCPConn) {
 
 // enqueue publishes one completed passive handshake to Accept.
 func (l *TCPListener) enqueue(connection *TCPConn) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	select {
+	case <-l.closed:
+		return false
+	default:
+	}
 	select {
 	case l.accept <- connection:
 		return true
-	case <-l.closed:
-		return false
 	default:
 		return false
 	}
@@ -725,30 +883,26 @@ func tcpNetAddr(endpoint netip.AddrPort) net.Addr {
 	return net.TCPAddrFromAddrPort(endpoint)
 }
 
-// randomUint32 returns an unpredictable TCP initial sequence number.
-func randomUint32() (uint32, error) {
-	var raw [4]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return 0, err
-	}
-	return binary.BigEndian.Uint32(raw[:]), nil
-}
-
 // tcpTimestamp returns a wrapping millisecond clock suitable for TSval.
 func (s *Stack) tcpTimestamp() uint32 {
-	return uint32(time.Since(s.timestampEpoch)/time.Millisecond) + 1
+	return s.tcpTimestampAt(time.Now())
+}
+
+// tcpTimestampAt converts one internal monotonic event time to a wire TSval.
+func (s *Stack) tcpTimestampAt(now time.Time) uint32 {
+	return uint32(now.Sub(s.timestampEpoch)/time.Millisecond) + 1
 }
 
 // handleTCP validates a segment, dispatches it by four-tuple, or emits RST for
 // an unbound destination.
-func (s *Stack) handleTCP(packet ipPacket) error {
+func (s *Stack) handleTCP(packet ipPacket, receivedAt time.Time) error {
 	tcp := packet.payload
 	if len(tcp) < tcpHeaderSize || transportChecksum(packet.source, packet.target, protocolTCP, tcp) != 0 {
 		s.stats.inboundDroppedPackets.Add(1)
 		return nil
 	}
 	headerSize := int(tcp[12]>>4) * 4
-	if headerSize < tcpHeaderSize || headerSize > len(tcp) || tcp[12]&0x0e != 0 {
+	if headerSize < tcpHeaderSize || headerSize > len(tcp) {
 		s.stats.inboundDroppedPackets.Add(1)
 		return nil
 	}
@@ -759,16 +913,14 @@ func (s *Stack) handleTCP(packet ipPacket) error {
 	segment := tcpSegment{
 		sequence: binary.BigEndian.Uint32(tcp[4:8]), acknowledgement: binary.BigEndian.Uint32(tcp[8:12]),
 		flags: tcp[13], window: binary.BigEndian.Uint16(tcp[14:16]), ecn: packet.ecn,
-		options: raw[:optionSize], payload: raw[optionSize:],
+		options: raw[:optionSize], payload: raw[optionSize:], receivedAt: receivedAt,
 	}
 	key := tcpKey{local: netip.AddrPortFrom(packet.target, targetPort), remote: netip.AddrPortFrom(packet.source, sourcePort)}
 	s.mu.RLock()
 	connection := s.tcp[key]
 	s.mu.RUnlock()
 	if connection != nil {
-		select {
-		case connection.inbound <- segment:
-		default:
+		if !connection.enqueueInbound(segment) {
 			s.stats.inboundDroppedPackets.Add(1)
 		}
 		return nil
@@ -843,9 +995,7 @@ func (state *tcpPassiveState) handleSYN(stack *Stack, packet ipPacket, segment t
 	stack.mu.Lock()
 	if connection := stack.tcp[key]; connection != nil {
 		stack.mu.Unlock()
-		select {
-		case connection.inbound <- segment:
-		default:
+		if !connection.enqueueInbound(segment) {
 			stack.stats.inboundDroppedPackets.Add(1)
 		}
 		return true, nil
@@ -871,7 +1021,7 @@ func (state *tcpPassiveState) handleSYN(stack *Stack, packet ipPacket, segment t
 	if listener == nil {
 		return false, nil
 	}
-	return true, state.sendSYNCookie(stack, key, segment, time.Now())
+	return true, state.sendSYNCookie(stack, key, segment, tcpSegmentEventTime(segment, time.Now()))
 }
 
 // handleSYNCookieACK allocates connection state only after authenticating a
@@ -883,16 +1033,14 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 	if listener == nil {
 		return false, nil
 	}
-	initialSequence, options, valid := state.validateSYNCookie(key, segment, time.Now())
+	initialSequence, options, valid := state.validateSYNCookie(key, segment, tcpSegmentEventTime(segment, time.Now()))
 	if !valid {
 		return false, nil
 	}
 	stack.mu.Lock()
 	if connection := stack.tcp[key]; connection != nil {
 		stack.mu.Unlock()
-		select {
-		case connection.inbound <- segment:
-		default:
+		if !connection.enqueueInbound(segment) {
 			stack.stats.inboundDroppedPackets.Add(1)
 		}
 		return true, nil
@@ -964,9 +1112,12 @@ func (s *Stack) writeTCPWithECN(source, target netip.Addr, sourcePort, targetPor
 	copy(tcp[tcpHeaderSize:headerSize], options)
 	copy(tcp[headerSize:], payload)
 	binary.BigEndian.PutUint16(tcp[16:18], transportChecksum(source, target, protocolTCP, tcp))
-	packet := buildIPPacket(source, target, protocolTCP, tcp, s.nextPacketID(), true)
+	// RFC 6864 makes Identification meaningless on this DF atomic datagram;
+	// Linux likewise emits zero instead of consuming the fragmentation ID
+	// sequence used by datagrams that routers may actually fragment.
+	packet := buildIPPacket(source, target, protocolTCP, tcp, 0, true)
 	if len(packet) == 0 || len(packet) > mtu {
-		return messageTooLong("tcp", net.TCPAddrFromAddrPort(netip.AddrPortFrom(source, sourcePort)), net.TCPAddrFromAddrPort(netip.AddrPortFrom(target, targetPort)))
+		return syscall.EMSGSIZE
 	}
 	setPacketECN(packet, ecn)
 	return s.writePacket(packet)
@@ -982,6 +1133,39 @@ func (c *TCPConn) deliverError(err error) {
 	case c.networkError <- err:
 	default:
 	}
+}
+
+// enqueueInbound reserves both segment-count and byte capacity before handing
+// one validated segment to the connection actor.
+func (c *TCPConn) enqueueInbound(segment tcpSegment) bool {
+	retained := int64(tcpInboundSegmentMetadata + len(segment.options) + len(segment.payload))
+	for {
+		current := c.inboundBytes.Load()
+		if retained > tcpInboundByteCapacity || current > int64(tcpInboundByteCapacity)-retained {
+			return false
+		}
+		if c.inboundBytes.CompareAndSwap(current, current+retained) {
+			break
+		}
+	}
+	segment.retainedBytes = retained
+	select {
+	case c.inbound <- segment:
+		return true
+	default:
+		c.inboundBytes.Add(-retained)
+		return false
+	}
+}
+
+// consumeInbound releases queue-byte accounting and clears it before a
+// segment is requeued internally across the handshake/established boundary.
+func (c *TCPConn) consumeInbound(segment tcpSegment) tcpSegment {
+	if segment.retainedBytes != 0 {
+		c.inboundBytes.Add(-segment.retainedBytes)
+		segment.retainedBytes = 0
+	}
+	return segment
 }
 
 // publishICMPSequenceRange atomically exposes the transmitted sequence span
@@ -1047,6 +1231,14 @@ func (c *TCPConn) read(buffer []byte) (int, error) {
 		}
 		deadline, changed, notified := c.readDeadline, c.readChanged, c.readNotify
 		c.mu.Unlock()
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			select {
+			case <-changed:
+				continue
+			default:
+				return 0, os.ErrDeadlineExceeded
+			}
+		}
 		timer, timeout := deadlineTimer(deadline)
 		select {
 		case <-notified:
@@ -1117,6 +1309,10 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 			err := c.connectionErrorLocked()
 			c.mu.Unlock()
 			return written, err
+		}
+		if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
+			c.mu.Unlock()
+			return written, os.ErrDeadlineExceeded
 		}
 		available := c.sendCapacity - len(c.sendBuffer)
 		if available > len(payload)-written {
@@ -1236,21 +1432,22 @@ func (c *TCPConn) CloseRead() error {
 // default queues FIN after accepted writes and finishes protocol processing in
 // the background.
 func (c *TCPConn) Close() error {
+	startedAt := time.Now()
 	closedNow := false
-	needFIN := false
 	linger := -1
+	abortive := false
 	c.closeOnce.Do(func() {
 		closedNow = true
 		c.mu.Lock()
-		needFIN = !c.writeClosed
-		if needFIN {
+		if !c.writeClosed {
 			c.writeClosed = true
 		}
 		linger = c.linger
+		abortive = linger == 0 || len(c.readBuffer) != 0 || c.outOfOrderUnread.Load() != 0
 		c.userClosed = true
 		c.readErr = net.ErrClosed
 		c.readBuffer = nil
-		if linger == 0 {
+		if abortive {
 			c.sendBuffer = nil
 			c.notifySendChangedLocked()
 		}
@@ -1260,21 +1457,21 @@ func (c *TCPConn) Close() error {
 	if !closedNow {
 		return c.operationError("close", net.ErrClosed)
 	}
-	if linger == 0 {
+	if abortive {
 		c.abort(net.ErrClosed)
 		return nil
 	}
-	if needFIN {
-		c.notifySend()
-	}
+	// Also wake an actor whose FIN was already acknowledged after CloseWrite;
+	// a later full Close makes that FIN_WAIT_2 state eligible for cleanup.
+	c.notifySend()
 	if linger > 0 {
-		timer := time.NewTimer(tcpLingerDuration(linger))
+		timer, timeout := deadlineTimer(startedAt.Add(tcpLingerDuration(linger)))
 		select {
 		case <-c.lingerDone:
 			stopTimer(timer)
 		case <-c.done:
 			stopTimer(timer)
-		case <-timer.C:
+		case <-timeout:
 			c.abort(net.ErrClosed)
 		}
 	}
@@ -1608,6 +1805,14 @@ func (c *TCPConn) discardingReads() bool {
 	return c.readClosed || c.userClosed
 }
 
+// applicationReceiveClosed reports whether Close, rather than the explicit
+// read half-close, made newly received application data undeliverable.
+func (c *TCPConn) applicationReceiveClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.userClosed
+}
+
 // appendReadBuffer retains as much contiguous data as the receive bound permits.
 func (c *TCPConn) appendReadBuffer(payload []byte, outOfOrderBytes int) int {
 	c.mu.Lock()
@@ -1631,14 +1836,30 @@ func (c *TCPConn) appendReadBuffer(payload []byte, outOfOrderBytes int) int {
 	return len(payload)
 }
 
-// receiveWindow returns the currently advertised wire window.
-func (c *TCPConn) receiveWindow(outOfOrderBytes int, scaled bool) uint16 {
+// receiveAvailable returns storage not occupied by delivered or out-of-order
+// data. CloseRead discards delivered bytes while preserving sequence state.
+func (c *TCPConn) receiveAvailable(outOfOrderBytes int) int {
+	available, _ := c.receiveSpace(outOfOrderBytes)
+	return available
+}
+
+// receiveSpace returns both current free storage and the configured bound so
+// the established actor can apply receiver-side silly-window avoidance.
+func (c *TCPConn) receiveSpace(outOfOrderBytes int) (available, capacity int) {
 	c.mu.Lock()
-	available := c.receiveCapacity - len(c.readBuffer) - outOfOrderBytes
+	capacity = c.receiveCapacity
+	available = capacity - len(c.readBuffer) - outOfOrderBytes
 	if c.userClosed || c.readClosed {
-		available = c.receiveCapacity - outOfOrderBytes
+		available = capacity - outOfOrderBytes
 	}
 	c.mu.Unlock()
+	return
+}
+
+// receiveWindow returns a wire window without prior advertisement state. It
+// is used during handshakes, before the established actor owns the right edge.
+func (c *TCPConn) receiveWindow(outOfOrderBytes int, scaled bool) uint16 {
+	available := c.receiveAvailable(outOfOrderBytes)
 	if available <= 0 {
 		return 0
 	}
@@ -1704,13 +1925,13 @@ func (c *TCPConn) runPassive(listener *TCPListener, syn tcpSegment, initialSeque
 	defer close(c.done)
 	if err := c.passiveHandshake(syn, initialSequence); err != nil {
 		if errors.Is(err, net.ErrClosed) {
-			_ = c.sendSegment(initialSequence+1, c.receiveNext, tcpFlagRST|tcpFlagACK, 0, nil)
+			_ = c.sendSegment(initialSequence+1, c.receiveNext, tcpFlagRST|tcpFlagACK, c.receiveWindow(0, false), nil)
 		}
 		c.finish(err)
 		return
 	}
 	if !listener.enqueue(c) {
-		_ = c.sendSegment(initialSequence+1, c.receiveNext, tcpFlagRST|tcpFlagACK, 0, nil)
+		_ = c.sendSegment(initialSequence+1, c.receiveNext, tcpFlagRST|tcpFlagACK, c.receiveWindow(0, false), nil)
 		c.finish(syscall.ECONNABORTED)
 		return
 	}
@@ -1736,12 +1957,14 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32) error
 	c.peerWindowACK = 0
 
 	rto := tcpInitialRTO
-	attempts := 0
+	transmissions := 0
+	timeoutAttempts := 0
 	timer := time.NewTimer(time.Hour)
 	stopTimer(timer)
 	defer timer.Stop()
 	var timeout <-chan time.Time
-	send := func() error {
+	var synSentAt time.Time
+	send := func(rearm bool) error {
 		options := tcpPassiveSYNOptions(localMSS, sack, windowScaling, timestamp, c.stack.tcpTimestamp(), c.recentTimestamp)
 		flags := byte(tcpFlagSYN | tcpFlagACK)
 		if c.peerECN {
@@ -1750,33 +1973,118 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32) error
 		if err := c.stack.writeTCPWithMTU(c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(), initialSequence, c.receiveNext, flags, c.receiveWindow(0, false), options, nil, c.mtu); err != nil {
 			return err
 		}
-		if attempts != 0 {
+		synSentAt = time.Now()
+		if transmissions != 0 {
 			c.stack.stats.tcpRetransmissions.Add(1)
 		}
-		attempts++
-		resetTimer(timer, rto)
-		timeout = timer.C
+		transmissions++
+		if rearm {
+			delay := synSentAt.Add(rto).Sub(time.Now())
+			if delay < 0 {
+				delay = 0
+			}
+			resetTimer(timer, delay)
+			timeout = timer.C
+		}
 		return nil
 	}
-	if err := send(); err != nil {
+	if err := send(true); err != nil {
 		return err
 	}
+	timerDeferrals := 0
 	for {
+		activeTimeout := timeout
+		queued := len(c.inbound)
+		if queued == 0 {
+			timerDeferrals = 0
+		} else if timerDeferrals < tcpMaximumTimerDeferrals {
+			// An ACK or retransmitted SYN that reached the stack before this
+			// actor was scheduled must be observed before an already-expired
+			// handshake timer. Otherwise select may manufacture a retry from
+			// host scheduling delay rather than network loss.
+			activeTimeout = nil
+		}
 		select {
 		case segment := <-c.inbound:
+			if timerDeferrals < tcpMaximumTimerDeferrals {
+				timerDeferrals++
+			}
+			segment = c.consumeInbound(segment)
+			receivedAt := tcpSegmentEventTime(segment, time.Now())
+			segmentLength := uint32(len(segment.payload))
+			if segment.flags&tcpFlagSYN != 0 {
+				segmentLength++
+			}
+			if segment.flags&tcpFlagFIN != 0 {
+				segmentLength++
+			}
+			receiveWindow := uint32(c.receiveWindow(0, false))
 			if segment.flags&tcpFlagRST != 0 {
 				if segment.sequence == c.receiveNext {
 					return syscall.ECONNRESET
 				}
+				if tcpSegmentAcceptable(segment.sequence, segmentLength, c.receiveNext, receiveWindow) && c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
+					if err := c.sendSegment(initialSequence+1, c.receiveNext, tcpFlagACK, c.receiveWindow(0, false), nil); err != nil {
+						return err
+					}
+				}
 				continue
 			}
+			if !c.passive && segment.flags&(tcpFlagSYN|tcpFlagACK) == tcpFlagSYN|tcpFlagACK && segment.acknowledgement == initialSequence+1 && segment.sequence+1 == c.receiveNext {
+				// During simultaneous open both endpoints send SYN-ACK. Its
+				// SYN repeats the already accepted IRS while its ACK completes
+				// our active half of the handshake.
+				if c.peerTimestamp {
+					value, _, present := parseTCPTimestamp(segment.options)
+					if !present || tcpSequenceLess(value, c.recentTimestamp) {
+						continue
+					}
+					c.recentTimestamp = value
+				}
+				c.peerWindow = uint32(segment.window)
+				c.peerWindowSeq = segment.sequence
+				c.peerWindowACK = segment.acknowledgement
+				if transmissions == 1 {
+					c.handshakeRTT = elapsedRTTSampleAt(synSentAt, receivedAt)
+				}
+				stopTimer(timer)
+				return c.sendSegment(initialSequence+1, c.receiveNext, tcpFlagACK, c.receiveWindow(0, c.peerWindowScaling), nil)
+			}
 			if segment.flags&tcpFlagSYN != 0 && segment.flags&tcpFlagACK == 0 && segment.sequence+1 == c.receiveNext {
-				if err := send(); err != nil {
+				// RFC 3168 section 6.1.1.1 permits an initiator to clear ECE
+				// and CWR after an ECN setup SYN times out. The retransmitted
+				// SYN must downgrade the stateful passive open as well as the
+				// SYN-ACK sent in response, or an ECN-intolerant path can never
+				// complete the fallback handshake.
+				if segment.flags&(tcpFlagECE|tcpFlagCWR) != tcpFlagECE|tcpFlagCWR {
+					c.peerECN = false
+				}
+				if c.peerTimestamp {
+					value, _, present := parseTCPTimestamp(segment.options)
+					if present && !tcpSequenceLess(value, c.recentTimestamp) {
+						c.recentTimestamp = value
+					}
+				}
+				if err := send(false); err != nil {
 					return err
 				}
 				continue
 			}
-			if segment.flags&tcpFlagACK == 0 || segment.acknowledgement != initialSequence+1 || segment.sequence != c.receiveNext {
+			if !tcpSegmentAcceptable(segment.sequence, segmentLength, c.receiveNext, receiveWindow) {
+				if c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
+					if err := c.sendSegment(initialSequence+1, c.receiveNext, tcpFlagACK, c.receiveWindow(0, false), nil); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			if segment.flags&tcpFlagACK != 0 && segment.acknowledgement != initialSequence+1 {
+				if err := c.stack.writeTCPWithMTU(c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(), segment.acknowledgement, 0, tcpFlagRST, 0, nil, nil, c.mtu); err != nil {
+					return err
+				}
+				continue
+			}
+			if segment.flags&tcpFlagACK == 0 || segment.flags&tcpFlagSYN != 0 || segment.acknowledgement != initialSequence+1 {
 				continue
 			}
 			if c.peerTimestamp {
@@ -1792,6 +2100,9 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32) error
 			}
 			c.peerWindowSeq = segment.sequence
 			c.peerWindowACK = segment.acknowledgement
+			if transmissions == 1 {
+				c.handshakeRTT = elapsedRTTSampleAt(synSentAt, receivedAt)
+			}
 			stopTimer(timer)
 			if len(segment.payload) != 0 || segment.flags&tcpFlagFIN != 0 {
 				c.inbound <- segment
@@ -1803,21 +2114,22 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32) error
 			if localMSS < 1 {
 				return errors.New("mipstack: MTU is too small for TCP")
 			}
-			if err := send(); err != nil {
+			if err := send(false); err != nil {
 				return err
 			}
 		case <-c.networkError:
 			// Network errors during passive open are soft; the peer's retry and
 			// the bounded SYN-ACK timeout decide whether the flow survives.
-		case <-timeout:
-			if attempts >= 6 {
+		case <-activeTimeout:
+			if timeoutAttempts >= tcpPassiveSYNMaximumAttempts-1 {
 				return os.ErrDeadlineExceeded
 			}
+			timeoutAttempts++
 			rto *= 2
 			if rto > tcpMaximumRTO {
 				rto = tcpMaximumRTO
 			}
-			if err := send(); err != nil {
+			if err := send(true); err != nil {
 				return err
 			}
 		case <-c.abortCh:
@@ -1835,39 +2147,80 @@ func (c *TCPConn) handshake(initialSequence uint32) error {
 		return errors.New("mipstack: MTU is too small for TCP")
 	}
 	rto := tcpInitialRTO
-	attempts := 0
+	transmissions := 0
+	timeoutAttempts := 0
+	ecnFallback := false
 	timer := time.NewTimer(time.Hour)
 	stopTimer(timer)
 	defer timer.Stop()
 	var timeout <-chan time.Time
-	send := func() error {
+	var lastSoftError error
+	var synSentAt time.Time
+	send := func(rearm bool) error {
 		options := tcpSYNOptions(localMSS, c.stack.tcpTimestamp())
 		flags := byte(tcpFlagSYN)
-		if attempts == 0 {
+		if !ecnFallback {
 			flags |= tcpFlagECE | tcpFlagCWR
 		}
 		if err := c.stack.writeTCPWithMTU(c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(), initialSequence, 0, flags, c.receiveWindow(0, false), options, nil, c.mtu); err != nil {
 			return err
 		}
-		if attempts != 0 {
+		synSentAt = time.Now()
+		if transmissions != 0 {
 			c.stack.stats.tcpRetransmissions.Add(1)
 		}
-		attempts++
-		resetTimer(timer, rto)
-		timeout = timer.C
+		transmissions++
+		if rearm {
+			delay := synSentAt.Add(rto).Sub(time.Now())
+			if delay < 0 {
+				delay = 0
+			}
+			resetTimer(timer, delay)
+			timeout = timer.C
+		}
 		return nil
 	}
-	if err := send(); err != nil {
+	if err := send(true); err != nil {
 		return err
 	}
+	timerDeferrals := 0
 	for {
+		activeTimeout := timeout
+		queued := len(c.inbound)
+		if queued == 0 {
+			timerDeferrals = 0
+		} else if timerDeferrals < tcpMaximumTimerDeferrals {
+			// Give segments already delivered by the stack precedence over a
+			// timer that became ready while this actor was not scheduled.
+			activeTimeout = nil
+		}
 		select {
 		case segment := <-c.inbound:
+			if timerDeferrals < tcpMaximumTimerDeferrals {
+				timerDeferrals++
+			}
+			segment = c.consumeInbound(segment)
+			receivedAt := tcpSegmentEventTime(segment, time.Now())
+			if segment.flags&tcpFlagACK != 0 && segment.acknowledgement != initialSequence+1 {
+				// RFC 9293 SYN-SENT processing: an unacceptable ACK elicits
+				// RST unless the incoming segment was itself a reset.
+				if segment.flags&tcpFlagRST == 0 {
+					_ = c.stack.writeTCPWithMTU(c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(), segment.acknowledgement, 0, tcpFlagRST, 0, nil, nil, c.mtu)
+				}
+				continue
+			}
 			if segment.flags&tcpFlagRST != 0 {
 				if segment.flags&tcpFlagACK != 0 && segment.acknowledgement == initialSequence+1 {
 					return syscall.ECONNREFUSED
 				}
 				continue
+			}
+			if segment.flags&tcpFlagSYN != 0 && segment.flags&tcpFlagACK == 0 {
+				// Crossed SYNs are a simultaneous open. Reuse SYN-RECEIVED
+				// processing with our existing ISS and wait for the peer's
+				// final ACK of the SYN-ACK.
+				stopTimer(timer)
+				return c.passiveHandshake(segment, initialSequence)
 			}
 			if segment.flags&(tcpFlagSYN|tcpFlagACK) != tcpFlagSYN|tcpFlagACK || segment.acknowledgement != initialSequence+1 {
 				continue
@@ -1876,35 +2229,51 @@ func (c *TCPConn) handshake(initialSequence uint32) error {
 			c.peerMSS, c.peerWindowScale, c.peerSACK = mss, scale, sack
 			c.peerWindowScaling = windowScaling
 			c.peerTimestamp, c.recentTimestamp = timestamp, timestampValue
-			c.peerECN = segment.flags&tcpFlagECE != 0 && segment.flags&tcpFlagCWR == 0
+			// Once an ECN setup SYN has timed out, RFC 3168 requires the
+			// legacy SYN retransmission to disable ECN for this connection.
+			// A delayed setup SYN-ACK cannot re-enable the negotiation after
+			// that fallback has started.
+			c.peerECN = !ecnFallback && segment.flags&tcpFlagECE != 0 && segment.flags&tcpFlagCWR == 0
 			c.receiveNext = segment.sequence + 1
 			// The window in SYN and SYN-ACK is never scaled. The negotiated
 			// shift applies only to later segments.
 			c.peerWindow = uint32(segment.window)
 			c.peerWindowSeq = segment.sequence
 			c.peerWindowACK = segment.acknowledgement
+			if transmissions == 1 {
+				c.handshakeRTT = elapsedRTTSampleAt(synSentAt, receivedAt)
+			}
 			stopTimer(timer)
-			return c.sendSegment(initialSequence+1, c.receiveNext, tcpFlagACK, 0, nil)
+			return c.sendSegment(initialSequence+1, c.receiveNext, tcpFlagACK, c.receiveWindow(0, c.peerWindowScaling), nil)
 		case <-c.pathMTUUpdate:
 			c.mtu = c.stack.mtuFor(c.key.remote.Addr())
 			localMSS = tcpMSSForMTU(c.mtu, c.key.local.Addr())
 			if localMSS < 1 {
 				return errors.New("mipstack: MTU is too small for TCP")
 			}
-			if err := send(); err != nil {
+			if err := send(false); err != nil {
 				return err
 			}
 		case err := <-c.networkError:
-			return err
-		case <-timeout:
-			if attempts >= 6 {
-				return os.ErrDeadlineExceeded
+			// RFC 1122 treats asynchronous network failures during an active
+			// open as soft errors except for an authenticated protocol or port
+			// unreachable. A later SYN retry may still establish the connection
+			// after a routing hint, while an explicit rejection ends this open.
+			if tcpActiveOpenHardError(err) {
+				return err
 			}
+			lastSoftError = err
+		case <-activeTimeout:
+			if timeoutAttempts >= tcpActiveSYNMaximumAttempts-1 {
+				return tcpTimeoutError(lastSoftError)
+			}
+			timeoutAttempts++
+			ecnFallback = true
 			rto *= 2
 			if rto > tcpMaximumRTO {
 				rto = tcpMaximumRTO
 			}
-			if err := send(); err != nil {
+			if err := send(true); err != nil {
 				return err
 			}
 		case <-c.abortCh:
@@ -1925,6 +2294,8 @@ func (c *TCPConn) established(sendNext uint32) error {
 		localMaximum -= 12
 	}
 	peerMSS := clampMSS(c.peerMSS, localMaximum)
+	pathMSS := localMaximum
+	receiveMSS := pathMSS
 	var (
 		sendUnacknowledged  = sendNext
 		peerScale           = c.peerWindowScale
@@ -1932,29 +2303,60 @@ func (c *TCPConn) established(sendNext uint32) error {
 		peerWindow          = c.peerWindow
 		peerWindowSequence  = c.peerWindowSeq
 		peerWindowACK       = c.peerWindowACK
+		maximumPeerWindow   = c.peerWindow
+		bytesAcknowledged   uint64
 		receiveNext         = c.receiveNext
 		congestionWindow    = initialTCPWindow(peerMSS)
 		slowStartThreshold  = ^uint32(0) >> 1
 		outstanding         []sentTCPSegment
 		outOfOrder          []tcpReceivedPiece
 		outOfOrderBytes     int
+		recentDSACK         tcpSACKBlock
+		haveRecentDSACK     bool
 		localFINSent        bool
 		localFINAcked       bool
 		remoteFINReceived   bool
+		timeWaitRequired    bool
+		finWaitArmed        bool
+		timeWaitArmed       bool
 		duplicateACKs       int
 		fastRecovery        bool
 		recoveryPoint       uint32
+		prrPriorFlight      uint32
+		prrDelivered        uint64
+		prrOut              uint64
 		recentSACK          uint32
-		tailProbeSent       bool
-		consecutiveRTOs     int
+		lastACKSent         = c.receiveNext
+		tailProbeActive     bool
+		tailProbeEnd        uint32
+		tailProbeRetransmit bool
+		tailProbeRTTSamples uint64
+		rtoAttempts         int
+		rtoRecovery         bool
+		rtoRecoveryPoint    uint32
+		blackHoleRTOs       int
 		lastSoftError       error
 		lastTimestampUpdate = time.Now()
 		ecnRecoveryPoint    uint32
+		ecnRecoveryActive   bool
 		controller          = newTCPCongestionController(c.stack.network.Load().congestionControl)
-		rackLatestSent      time.Time
+		rackLatestDelivered tcpRACKSample
+		rackForwardACK      uint32
+		rackForwardACKSet   bool
+		rackReorderingSeen  bool
+		rackReorderingScale = uint32(1)
+		rackDSACKRound      uint32
+		rackDSACKRoundSet   bool
+		rackReorderPersist  int
+		blackHoleMTU        int
+		blackHoleExpiry     time.Time
+		lastDataSent        time.Time
+		ecnHoldUntil        time.Time
 	)
 	c.publishICMPSequenceRange(sendUnacknowledged, sendNext)
 	rtt := rttEstimator{rto: tcpInitialRTO}
+	rtt.observe(c.handshakeRTT)
+	tailProbeRTTSamples = 0
 	retransmissionTimer := time.NewTimer(time.Hour)
 	persistTimer := time.NewTimer(time.Hour)
 	delayedACKTimer := time.NewTimer(time.Hour)
@@ -1979,25 +2381,44 @@ func (c *TCPConn) established(sendNext uint32) error {
 	var retransmit, persist, delayedACK <-chan time.Time
 	var liveness <-chan time.Time
 	var pathMTUProbe, pacing <-chan time.Time
-	var retransmissionProbe, retransmissionClose bool
+	var retransmissionProbe, retransmissionRACK, retransmissionClose bool
 	persistRTO := time.Second
+	persistAttempts := 0
 	ackPending := false
 	ackSegments := 0
-	lastAdvertisedWindow := c.receiveWindow(0, c.peerWindowScaling)
+	initialWindowScaled := c.peerWindowScaling && !c.passive
+	lastAdvertisedWindow := c.receiveWindow(0, initialWindowScaled)
+	receiveWindowState := newTCPReceiveWindow(receiveNext, lastAdvertisedWindow, c.peerWindowScaling, initialWindowScaled)
+	advertisedReceiveWindow := func() uint16 {
+		available, capacity := c.receiveSpace(outOfOrderBytes)
+		return receiveWindowState.advertise(receiveNext, available, tcpReceiveWindowIncrease(capacity, receiveMSS))
+	}
 	lastActivity := time.Now()
 	lastKeepAlive := time.Time{}
 	keepAliveProbes := 0
+	effectivePathMTU := func() int {
+		mtu := c.stack.mtuFor(c.key.remote.Addr())
+		if blackHoleMTU > 0 && blackHoleMTU < mtu {
+			mtu = blackHoleMTU
+		}
+		return mtu
+	}
 	armPathMTUProbe := func() {
 		stopTimer(pathMTUTimer)
 		pathMTUProbe = nil
-		if expiry, exists := c.stack.pathMTUExpiry(c.key.remote.Addr()); exists {
-			delay := time.Until(expiry)
-			if delay < 0 {
-				delay = 0
-			}
-			resetTimer(pathMTUTimer, delay)
-			pathMTUProbe = pathMTUTimer.C
+		expiry, exists := c.stack.pathMTUExpiry(c.key.remote.Addr())
+		if !blackHoleExpiry.IsZero() && (!exists || blackHoleExpiry.Before(expiry)) {
+			expiry, exists = blackHoleExpiry, true
 		}
+		if !exists {
+			return
+		}
+		delay := time.Until(expiry)
+		if delay < 0 {
+			delay = 0
+		}
+		resetTimer(pathMTUTimer, delay)
+		pathMTUProbe = pathMTUTimer.C
 	}
 	armPacing := func(delay time.Duration) {
 		if delay <= 0 {
@@ -2011,6 +2432,14 @@ func (c *TCPConn) established(sendNext uint32) error {
 		resetTimer(pacingTimer, delay)
 		pacing = pacingTimer.C
 	}
+	keepAliveEligible := func() bool {
+		if len(outstanding) != 0 {
+			return false
+		}
+		offset := int(sendNext - sendUnacknowledged)
+		_, total, writeClosed := c.sendSnapshot(offset, 0)
+		return offset >= total && (!writeClosed || localFINSent)
+	}
 	armLiveness := func() {
 		stopTimer(livenessTimer)
 		liveness = nil
@@ -2022,7 +2451,7 @@ func (c *TCPConn) established(sendNext uint32) error {
 		if options.idleTimeout > 0 {
 			deadline = lastActivity.Add(options.idleTimeout)
 		}
-		if options.keepAlive {
+		if options.keepAlive && keepAliveEligible() {
 			keepAliveDeadline := lastActivity.Add(options.keepAliveConfig.Idle)
 			if keepAliveProbes != 0 {
 				keepAliveDeadline = lastKeepAlive.Add(options.keepAliveConfig.Interval)
@@ -2040,24 +2469,67 @@ func (c *TCPConn) established(sendNext uint32) error {
 			liveness = livenessTimer.C
 		}
 	}
+	ageRACKReordering := func() {
+		if rackReorderPersist <= 0 {
+			return
+		}
+		rackReorderPersist--
+		if rackReorderPersist == 0 {
+			rackReorderingScale = 1
+		}
+	}
+	observeRACKReordering := func(end uint32, retransmitted bool) {
+		if rackAdvanceForwardACK(&rackForwardACK, &rackForwardACKSet, end, retransmitted) {
+			rackReorderingSeen = true
+		}
+	}
+	rackDeadline := func(now time.Time, haveSACKed bool) (time.Time, bool) {
+		if !peerSACK || len(outstanding) == 0 {
+			return time.Time{}, false
+		}
+		// In sequence-order transmission, a cumulatively ACKed original
+		// segment cannot have been sent after any remaining higher sequence.
+		// RACK has a candidate only after selective delivery or delivery of a
+		// retransmission has made transmit order differ from sequence order.
+		if !haveSACKed && !rackLatestDelivered.retransmitted {
+			return time.Time{}, false
+		}
+		reorderingWindow := rackReorderingWindow(rtt.minimum, rtt.srtt, rackReorderingScale)
+		if !rackReorderingSeen && (fastRecovery || sackedSegmentCount(outstanding) >= tcpDuplicateACKThreshold) {
+			reorderingWindow = 0
+		}
+		delay, exists := rackLossDelay(outstanding, rackLatestDelivered, now, reorderingWindow)
+		if !exists {
+			return time.Time{}, false
+		}
+		return now.Add(delay), true
+	}
 
 	armRetransmission := func() {
 		stopTimer(retransmissionTimer)
 		retransmit = nil
 		retransmissionProbe = false
+		retransmissionRACK = false
 		retransmissionClose = false
 		if len(outstanding) != 0 {
+			now := time.Now()
 			index := firstUnsackedSegment(outstanding)
 			deadline := outstanding[index].sentAt.Add(rtt.rto)
-			if !tailProbeSent {
+			haveSACKed := peerSACK && hasSACKedSegment(outstanding)
+			if peerSACK && peerWindow != 0 && ecnHoldUntil.IsZero() && !tailProbeActive && rtt.samples > tailProbeRTTSamples && !fastRecovery && !haveSACKed {
 				probeIndex := lastUnsackedSegment(outstanding)
-				probeDeadline := outstanding[probeIndex].sentAt.Add(tailLossProbeDelay(rtt.srtt, rtt.rto))
+				probeDeadline := outstanding[probeIndex].sentAt.Add(tailLossProbeDelay(rtt.srtt, rtt.rto, unsackedSegmentCount(outstanding) == 1))
 				if probeDeadline.Before(deadline) {
 					deadline = probeDeadline
 					retransmissionProbe = true
 				}
 			}
-			delay := time.Until(deadline)
+			if candidate, exists := rackDeadline(now, haveSACKed); exists && !candidate.After(deadline) {
+				deadline = candidate
+				retransmissionProbe = false
+				retransmissionRACK = true
+			}
+			delay := deadline.Sub(now)
 			if delay < 0 {
 				delay = 0
 			}
@@ -2065,26 +2537,83 @@ func (c *TCPConn) established(sendNext uint32) error {
 			retransmit = retransmissionTimer.C
 		}
 	}
-	armClose := func(duration time.Duration) {
-		resetTimer(retransmissionTimer, duration)
+	armRetransmissionAfterACK := func(acknowledgedAt time.Time) {
+		stopTimer(retransmissionTimer)
+		retransmit = nil
+		retransmissionProbe = false
+		retransmissionRACK = false
+		retransmissionClose = false
+		if len(outstanding) == 0 {
+			return
+		}
+		// RFC 6298 section 5.3 restarts the timer when TCP processes an ACK
+		// that cumulatively acknowledges new data. Packet arrival time remains
+		// the RTT/RACK sample clock, but host delay before the actor updates its
+		// scoreboard must not consume the newly installed RTO or tail-probe
+		// interval and manufacture an immediate retransmission.
+		now := time.Now()
+		deadline := now.Add(rtt.rto)
+		haveSACKed := peerSACK && hasSACKedSegment(outstanding)
+		if peerSACK && peerWindow != 0 && ecnHoldUntil.IsZero() && !tailProbeActive && rtt.samples > tailProbeRTTSamples && !fastRecovery && !haveSACKed {
+			probeDeadline := now.Add(tailLossProbeDelay(rtt.srtt, rtt.rto, unsackedSegmentCount(outstanding) == 1))
+			if probeDeadline.Before(deadline) {
+				deadline = probeDeadline
+				retransmissionProbe = true
+			}
+		}
+		if candidate, exists := rackDeadline(acknowledgedAt, haveSACKed); exists {
+			if !candidate.After(deadline) {
+				deadline = candidate
+				retransmissionProbe = false
+				retransmissionRACK = true
+			}
+		}
+		delay := deadline.Sub(now)
+		if delay < 0 {
+			delay = 0
+		}
+		resetTimer(retransmissionTimer, delay)
+		retransmit = retransmissionTimer.C
+	}
+	armClose := func(startedAt time.Time, duration time.Duration) {
+		delay := duration
+		if !startedAt.IsZero() {
+			delay = startedAt.Add(duration).Sub(time.Now())
+			if delay < 0 {
+				delay = 0
+			}
+		}
+		resetTimer(retransmissionTimer, delay)
 		retransmit = retransmissionTimer.C
 		retransmissionProbe = false
+		retransmissionRACK = false
 		retransmissionClose = true
 	}
-	armPersist := func() {
+	armPersist := func(sentAt time.Time) {
 		offset := int(sendNext - sendUnacknowledged)
 		_, total, writeClosed := c.sendSnapshot(offset, 0)
-		pending := offset < total || writeClosed && !localFINSent
+		// Linux keeps packets_out under the normal retransmission timer.
+		// Persist is needed only when no transmitted sequence is outstanding
+		// and a closed receive window prevents new data or FIN from being sent.
+		pending := len(outstanding) == 0 && (offset < total || writeClosed && !localFINSent)
 		if pending && peerWindow == 0 && persist == nil {
 			if persistRTO < rtt.rto {
 				persistRTO = rtt.rto
 			}
-			resetTimer(persistTimer, persistRTO)
+			delay := persistRTO
+			if !sentAt.IsZero() {
+				delay = sentAt.Add(persistRTO).Sub(time.Now())
+				if delay < 0 {
+					delay = 0
+				}
+			}
+			resetTimer(persistTimer, delay)
 			persist = persistTimer.C
 		} else if peerWindow != 0 || !pending {
 			stopTimer(persistTimer)
 			persist = nil
 			persistRTO = time.Second
+			persistAttempts = 0
 		}
 	}
 	clearDelayedACK := func() {
@@ -2093,21 +2622,31 @@ func (c *TCPConn) established(sendNext uint32) error {
 		ackPending = false
 		ackSegments = 0
 	}
-	sendACK := func() error {
-		var options []byte
-		if peerSACK {
-			maximumBlocks := 4
-			if c.peerTimestamp {
-				maximumBlocks = 3
-			}
-			options = tcpSACKOptions(outOfOrder, recentSACK, maximumBlocks)
+	sackOptions := func(reservePayload int) ([]byte, bool) {
+		if !peerSACK {
+			return nil, false
 		}
-		if err := c.sendSegmentWithOptions(sendNext, receiveNext, tcpFlagACK, outOfOrderBytes, options, nil); err != nil {
+		maximumBlocks := tcpSACKBlockLimit(c.mtu, c.key.local.Addr(), c.peerTimestamp, reservePayload)
+		options := tcpSACKOptions(outOfOrder, recentSACK, maximumBlocks, recentDSACK, haveRecentDSACK)
+		return options, haveRecentDSACK && len(options) >= 10
+	}
+	sendACKAt := func(sequence uint32) error {
+		options, dsackSent := sackOptions(0)
+		window := advertisedReceiveWindow()
+		if err := c.sendSegmentWithOptions(sequence, receiveNext, tcpFlagACK, window, options, nil); err != nil {
 			return err
 		}
-		lastAdvertisedWindow = c.receiveWindow(outOfOrderBytes, c.peerWindowScaling)
+		lastACKSent = receiveNext
+		lastAdvertisedWindow = window
+		if dsackSent {
+			haveRecentDSACK = false
+		}
 		clearDelayedACK()
 		return nil
+	}
+	sendACK := func() error {
+		sequence := tcpAcceptableSendSequence(sendUnacknowledged, sendNext, peerWindow, peerScale)
+		return sendACKAt(sequence)
 	}
 	sendChallengeACK := func() error {
 		if !c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
@@ -2115,7 +2654,13 @@ func (c *TCPConn) established(sendNext uint32) error {
 		}
 		return sendACK()
 	}
-	scheduleACK := func(immediate, data bool) error {
+	sendChallengeACKAt := func(sequence uint32) error {
+		if !c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
+			return nil
+		}
+		return sendACKAt(sequence)
+	}
+	scheduleACK := func(immediate, data bool, receivedAt time.Time) error {
 		ackPending = true
 		if data {
 			ackSegments++
@@ -2124,73 +2669,138 @@ func (c *TCPConn) established(sendNext uint32) error {
 			return sendACK()
 		}
 		if delayedACK == nil {
-			resetTimer(delayedACKTimer, tcpDelayedACKTimeout)
+			delay := receivedAt.Add(tcpDelayedACKTimeout).Sub(time.Now())
+			if delay < 0 {
+				delay = 0
+			}
+			resetTimer(delayedACKTimer, delay)
 			delayedACK = delayedACKTimer.C
 		}
 		return nil
 	}
+	var sendNextData func(uint32, bool) (bool, error)
+	sendNextData = func(congestionAllowance uint32, limitedTransmit bool) (bool, error) {
+		windowFlight := sendNext - sendUnacknowledged
+		congestionFlight := tcpCongestionFlight(outstanding, peerSACK, fastRecovery, peerMSS)
+		now := time.Now()
+		if !ecnHoldUntil.IsZero() {
+			if now.Before(ecnHoldUntil) {
+				armPacing(ecnHoldUntil.Sub(now))
+				return false, nil
+			}
+			ecnHoldUntil = time.Time{}
+		}
+		if congestionFlight == 0 && !lastDataSent.IsZero() && now.Sub(lastDataSent) > rtt.rto {
+			congestionWindow = tcpRestartWindow(congestionWindow, peerMSS)
+		}
+		congestionLimit := growCongestionWindow(congestionWindow, congestionAllowance)
+		if localFINSent || windowFlight >= peerWindow || congestionFlight >= congestionLimit {
+			return false, nil
+		}
+		offset := int(sendNext - sendUnacknowledged)
+		options, dsackSent := sackOptions(1)
+		optionSize := (len(options) + 3) &^ 3
+		if optionSize >= pathMSS {
+			// Preserve one data byte when an exceptionally small path cannot fit
+			// the optional SACK feedback in addition to negotiated timestamps.
+			options = nil
+			dsackSent = false
+			optionSize = 0
+		}
+		segmentMSS := tcpSegmentPayloadLimit(peerMSS, pathMSS, optionSize)
+		size := segmentMSS
+		if available := int(peerWindow - windowFlight); size > available {
+			size = available
+		}
+		if available := int(congestionLimit - congestionFlight); size > available {
+			size = available
+		}
+		if size <= 0 {
+			return false, nil
+		}
+		payload, total, writeClosed := c.sendSnapshot(offset, size)
+		if len(payload) == 0 {
+			return false, nil
+		}
+		if delay := controller.pacingDelay(now, congestionWindow, congestionFlight, peerMSS, rtt.srtt, slowStartThreshold); delay > 0 {
+			armPacing(delay)
+			return false, nil
+		}
+		if congestionAllowance == 0 {
+			if !c.socketOptions().noDelay && len(outstanding) != 0 && len(payload) < segmentMSS && !writeClosed {
+				return false, nil
+			}
+		}
+		flags := tcpFlagACK
+		if offset+len(payload) == total {
+			flags |= tcpFlagPSH
+		}
+		next := sendNext + uint32(len(payload))
+		carriesCWR := c.peerECN && c.sendCWR
+		c.publishICMPSequenceRange(sendUnacknowledged, next)
+		window := advertisedReceiveWindow()
+		if err := c.sendSegmentWithOptionsECN(sendNext, receiveNext, flags, window, options, payload, true); err != nil {
+			return false, err
+		}
+		sentAt := time.Now()
+		lastACKSent = receiveNext
+		lastAdvertisedWindow = window
+		if dsackSent {
+			haveRecentDSACK = false
+		}
+		if ackPending {
+			clearDelayedACK()
+		}
+		controller.onDataSend(len(payload), peerMSS, sentAt, congestionWindow, congestionFlight, rtt.srtt, slowStartThreshold)
+		outstanding = append(outstanding, sentTCPSegment{sequence: sendNext, end: next, flags: flags, payload: payload, sentAt: sentAt, transmissions: 1, limited: limitedTransmit, cwr: carriesCWR})
+		if fastRecovery && peerSACK {
+			prrOut += uint64(len(payload))
+		}
+		sendNext = next
+		lastDataSent = sentAt
+		return true, nil
+	}
 	fillWindow := func() error {
 		if localFINSent {
-			armPersist()
+			armPersist(time.Time{})
+			return nil
+		}
+		for {
+			sent, err := sendNextData(0, false)
+			if err != nil {
+				return err
+			}
+			if !sent {
+				break
+			}
+		}
+		if !ecnHoldUntil.IsZero() && time.Now().Before(ecnHoldUntil) {
 			return nil
 		}
 		windowFlight := sendNext - sendUnacknowledged
-		congestionFlight := outstandingBytes(outstanding, false)
-		for windowFlight < peerWindow && congestionFlight < congestionWindow {
-			offset := int(sendNext - sendUnacknowledged)
-			size := peerMSS
-			if available := int(peerWindow - windowFlight); size > available {
-				size = available
-			}
-			if available := int(congestionWindow - congestionFlight); size > available {
-				size = available
-			}
-			if size <= 0 {
-				break
-			}
-			payload, total, writeClosed := c.sendSnapshot(offset, size)
-			if len(payload) == 0 {
-				break
-			}
-			if delay := controller.pacingDelay(time.Now()); delay > 0 {
-				armPacing(delay)
-				break
-			}
-			if !c.socketOptions().noDelay && len(outstanding) != 0 && len(payload) < peerMSS && !writeClosed {
-				break
-			}
-			flags := tcpFlagACK
-			if offset+len(payload) == total {
-				flags |= tcpFlagPSH
-			}
-			next := sendNext + uint32(len(payload))
-			c.publishICMPSequenceRange(sendUnacknowledged, next)
-			if err := c.sendNewDataSegment(sendNext, receiveNext, flags, outOfOrderBytes, payload); err != nil {
-				return err
-			}
-			if ackPending {
-				lastAdvertisedWindow = c.receiveWindow(outOfOrderBytes, c.peerWindowScaling)
-				clearDelayedACK()
-			}
-			now := time.Now()
-			controller.onSend(len(payload), now)
-			outstanding = append(outstanding, sentTCPSegment{sequence: sendNext, end: sendNext + uint32(len(payload)), flags: flags, payload: payload, sentAt: now, transmissions: 1})
-			sendNext = next
-			windowFlight += uint32(len(payload))
-			congestionFlight += uint32(len(payload))
-		}
+		congestionFlight := tcpCongestionFlight(outstanding, peerSACK, fastRecovery, peerMSS)
 		offset := int(sendNext - sendUnacknowledged)
 		_, total, writeClosed := c.sendSnapshot(offset, 0)
 		if writeClosed && offset >= total && windowFlight < peerWindow && congestionFlight < congestionWindow {
 			c.publishICMPSequenceRange(sendUnacknowledged, sendNext+1)
-			if err := c.sendSegment(sendNext, receiveNext, tcpFlagACK|tcpFlagFIN, outOfOrderBytes, nil); err != nil {
+			options, dsackSent := sackOptions(0)
+			window := advertisedReceiveWindow()
+			if err := c.sendSegmentWithOptions(sendNext, receiveNext, tcpFlagACK|tcpFlagFIN, window, options, nil); err != nil {
 				return err
 			}
-			outstanding = append(outstanding, sentTCPSegment{sequence: sendNext, end: sendNext + 1, flags: tcpFlagACK | tcpFlagFIN, sentAt: time.Now(), transmissions: 1})
+			sentAt := time.Now()
+			lastACKSent = receiveNext
+			lastAdvertisedWindow = window
+			if dsackSent {
+				haveRecentDSACK = false
+			}
+			outstanding = append(outstanding, sentTCPSegment{sequence: sendNext, end: sendNext + 1, flags: tcpFlagACK | tcpFlagFIN, sentAt: sentAt, transmissions: 1})
 			sendNext++
+			// Only the endpoint that closes first, or closes simultaneously,
+			// enters TIME-WAIT. A FIN sent after the peer's FIN is LAST-ACK.
+			timeWaitRequired = !remoteFINReceived
 			localFINSent = true
 			if ackPending {
-				lastAdvertisedWindow = c.receiveWindow(outOfOrderBytes, c.peerWindowScaling)
 				clearDelayedACK()
 			}
 		}
@@ -2199,7 +2809,7 @@ func (c *TCPConn) established(sendNext uint32) error {
 		} else if !localFINAcked {
 			armRetransmission()
 		}
-		armPersist()
+		armPersist(time.Time{})
 		return nil
 	}
 	retransmitSegment := func(index int, timeout bool) error {
@@ -2210,17 +2820,22 @@ func (c *TCPConn) established(sendNext uint32) error {
 			index = firstUnsackedSegment(outstanding)
 		}
 		oldest := &outstanding[index]
+		sentSize := oldest.end - oldest.sequence
 		rackRetransmission := oldest.rackLost
-		if oldest.transmissions >= tcpMaximumRetransmits {
-			return tcpTimeoutError(lastSoftError)
-		}
-		if err := c.sendSegment(oldest.sequence, receiveNext, oldest.flags, outOfOrderBytes, oldest.payload); err != nil {
+		lostRetransmission := rackRetransmission && oldest.transmissions > 1
+		lostCWR := oldest.cwr
+		window := advertisedReceiveWindow()
+		if err := c.sendSegment(oldest.sequence, receiveNext, oldest.flags, window, oldest.payload); err != nil {
 			return err
 		}
-		oldest.sentAt = time.Now()
+		sentAt := time.Now()
+		lastACKSent = receiveNext
+		lastAdvertisedWindow = window
+		oldest.sentAt = sentAt
 		oldest.transmissions++
 		oldest.sackRetried = !timeout
 		oldest.rackLost = false
+		oldest.cwr = false
 		c.stack.stats.tcpRetransmissions.Add(1)
 		if !timeout && peerSACK {
 			c.stack.stats.tcpSACKRetransmissions.Add(1)
@@ -2228,11 +2843,29 @@ func (c *TCPConn) established(sendNext uint32) error {
 				c.stack.stats.tcpRACKRetransmissions.Add(1)
 			}
 		}
-		tailProbeSent = true
 		if timeout {
-			slowStartThreshold = controller.onCongestion(congestionWindow, peerMSS)
+			tailProbeActive = false
+			tailProbeRetransmit = false
+			flight := outstandingBytes(outstanding, false)
+			// RFC 5681 updates ssthresh only on the first timeout for one
+			// outstanding sequence range. Recomputing it after cwnd has already
+			// fallen to one SMSS would collapse CUBIC's retained threshold on
+			// every exponential-backoff retry.
+			if !rtoRecovery {
+				slowStartThreshold = controller.onTimeout(congestionWindow, flight, peerMSS)
+				rtoRecovery = true
+				rtoRecoveryPoint = sendNext
+				if c.peerECN {
+					c.sendCWR = true
+				}
+			}
 			congestionWindow = uint32(peerMSS)
 			fastRecovery = false
+			prrPriorFlight = 0
+			prrDelivered = 0
+			prrOut = 0
+			ecnRecoveryPoint = sendNext
+			ecnRecoveryActive = true
 			for index := range outstanding {
 				outstanding[index].sacked = false
 				outstanding[index].sackRetried = false
@@ -2240,37 +2873,119 @@ func (c *TCPConn) established(sendNext uint32) error {
 			}
 			rtt.backoff()
 		} else {
-			if !fastRecovery {
-				slowStartThreshold = controller.onCongestion(congestionWindow, peerMSS)
-				congestionWindow = slowStartThreshold + uint32(3*peerMSS)
+			tailProbeActive = false
+			tailProbeRetransmit = false
+			if !fastRecovery || lostRetransmission {
+				flight := lossRecoveryFlightSize(outstanding)
+				// RFC 3042 excludes Limited Transmit data only from the
+				// FlightSize calculation that enters this recovery episode. Any
+				// still-unacknowledged range is ordinary flight in later episodes.
+				for index := range outstanding {
+					outstanding[index].limited = false
+				}
+				if controller.algorithm == CongestionControlBBR {
+					flight = outstandingBytes(outstanding, false)
+				}
+				// RFC 3168 permits only one congestion-window reduction for
+				// dropped and/or CE-marked packets from one transmitted window.
+				// A lost retransmission is the RFC 8985 exception: it is a new
+				// congestion indication even while the original recovery is active.
+				if lostRetransmission || lostCWR || tcpECNStartsRecovery(ecnRecoveryActive, sendUnacknowledged, ecnRecoveryPoint) {
+					slowStartThreshold = controller.onCongestion(congestionWindow, flight, peerMSS)
+					ecnRecoveryPoint = sendNext
+					ecnRecoveryActive = true
+					if c.peerECN {
+						c.sendCWR = true
+					}
+				}
+				if controller.algorithm == CongestionControlBBR {
+					congestionWindow = flight
+					if minimum := uint32(bbrMinimumCongestionMSS * peerMSS); congestionWindow < minimum {
+						congestionWindow = minimum
+					}
+				} else if peerSACK {
+					// RFC 6675 uses the SACK scoreboard's pipe estimate rather
+					// than NewReno duplicate-ACK window inflation.
+					congestionWindow = slowStartThreshold
+				} else {
+					congestionWindow = slowStartThreshold + uint32(3*peerMSS)
+				}
 				fastRecovery = true
 				recoveryPoint = sendNext
+				if peerSACK {
+					prrPriorFlight = flight
+					prrDelivered = 0
+					prrOut = uint64(sentSize)
+					// Linux PRR admits exactly the forced recovery-entry
+					// retransmission before delivery feedback grants more.
+					congestionWindow = sackRecoveryPipe(outstanding, peerMSS)
+				}
+			} else if peerSACK {
+				prrOut += uint64(sentSize)
 			}
 		}
 		if len(outstanding) != 0 {
 			armRetransmission()
 		}
+		controller.onRetransmit(len(oldest.payload), peerMSS, oldest.sentAt, congestionWindow, tcpCongestionFlight(outstanding, peerSACK, fastRecovery, peerMSS), rtt.srtt, slowStartThreshold)
 		return nil
 	}
-	recoverSACKHoles := func(highest uint32, allSACKHoles bool) error {
-		retransmitted := false
+	retransmitRTORecovery := func() error {
+		if len(outstanding) == 0 {
+			return nil
+		}
+		segment := &outstanding[firstUnsackedSegment(outstanding)]
+		window := advertisedReceiveWindow()
+		if err := c.sendSegment(segment.sequence, receiveNext, segment.flags, window, segment.payload); err != nil {
+			return err
+		}
+		sentAt := time.Now()
+		lastACKSent = receiveNext
+		lastAdvertisedWindow = window
+		if segment.cwr && c.peerECN {
+			c.sendCWR = true
+		}
+		segment.cwr = false
+		segment.sentAt = sentAt
+		segment.transmissions++
+		segment.sackRetried = false
+		segment.rackLost = false
+		tailProbeActive = false
+		tailProbeRetransmit = false
+		c.stack.stats.tcpRetransmissions.Add(1)
+		controller.onRetransmit(len(segment.payload), peerMSS, segment.sentAt, congestionWindow, outstandingBytes(outstanding, false), rtt.srtt, slowStartThreshold)
+		armRetransmission()
+		return nil
+	}
+	recoverSACKHoles := func(highest uint32, allowSpeculative bool) error {
 		for {
-			index := firstUnretriedLoss(outstanding, highest, allSACKHoles)
+			index := firstUnretriedLoss(outstanding, peerMSS)
+			if index < 0 && allowSpeculative {
+				index = firstUnretriedSACKHole(outstanding, highest)
+			}
 			if index < 0 {
 				return nil
 			}
 			size := outstanding[index].end - outstanding[index].sequence
-			pipe := sackRecoveryPipe(outstanding, highest, allSACKHoles)
-			if retransmitted && pipe+size > congestionWindow {
+			pipe := sackRecoveryPipe(outstanding, peerMSS)
+			// RFC 6675 permits the recovery-entry retransmission before
+			// SetPipe, but every later transmission requires cwnd-Pipe space.
+			if !sackRecoveryCanSend(fastRecovery, pipe, size, congestionWindow) {
 				return nil
+			}
+			if fastRecovery {
+				now := time.Now()
+				if delay := controller.pacingDelay(now, congestionWindow, pipe, peerMSS, rtt.srtt, slowStartThreshold); delay > 0 {
+					armPacing(delay)
+					return nil
+				}
 			}
 			if err := retransmitSegment(index, false); err != nil {
 				return err
 			}
-			retransmitted = true
 		}
 	}
-	applyPathMTU := func(retransmit bool) error {
+	applyPathMTU := func(mtu int, retransmit bool) error {
 		configured := c.stack.network.Load().congestionControl
 		if configured != controller.algorithm {
 			controller = newTCPCongestionController(configured)
@@ -2281,14 +2996,14 @@ func (c *TCPConn) established(sendNext uint32) error {
 			}
 			pacing = nil
 		}
-		mtu := c.stack.mtuFor(c.key.remote.Addr())
 		c.mtu = mtu
-		armPathMTUProbe()
-		localMaximum := tcpMSSForMTU(mtu, c.key.local.Addr())
+		pathMSS = tcpMSSForMTU(mtu, c.key.local.Addr())
 		if c.peerTimestamp {
-			localMaximum -= 12
+			pathMSS -= 12
 		}
-		newMSS := clampMSS(c.peerMSS, localMaximum)
+		receiveMSS = pathMSS
+		armPathMTUProbe()
+		newMSS := clampMSS(c.peerMSS, pathMSS)
 		if newMSS == peerMSS {
 			return nil
 		}
@@ -2309,24 +3024,52 @@ func (c *TCPConn) established(sendNext uint32) error {
 		if retransmit && len(outstanding) != 0 {
 			index := firstUnsackedSegment(outstanding)
 			segment := &outstanding[index]
-			if segment.transmissions >= tcpMaximumRetransmits {
-				return tcpTimeoutError(lastSoftError)
-			}
-			if err := c.sendSegment(segment.sequence, receiveNext, segment.flags, outOfOrderBytes, segment.payload); err != nil {
+			window := advertisedReceiveWindow()
+			if err := c.sendSegment(segment.sequence, receiveNext, segment.flags, window, segment.payload); err != nil {
 				return err
 			}
-			segment.sentAt = time.Now()
+			sentAt := time.Now()
+			lastACKSent = receiveNext
+			lastAdvertisedWindow = window
+			if segment.cwr && c.peerECN {
+				c.sendCWR = true
+			}
+			segment.cwr = false
+			segment.sentAt = sentAt
 			segment.transmissions++
 			c.stack.stats.tcpRetransmissions.Add(1)
+			controller.onRetransmit(len(segment.payload), peerMSS, segment.sentAt, congestionWindow, tcpCongestionFlight(outstanding, peerSACK, fastRecovery, peerMSS), rtt.srtt, slowStartThreshold)
 			armRetransmission()
 		}
 		return nil
 	}
 	armPathMTUProbe()
 	armLiveness()
+	timerDeferrals := 0
 	for {
+		activeRetransmit, activePersist, activeDelayedACK := retransmit, persist, delayedACK
+		activeLiveness, activePathMTUProbe, activePacing := liveness, pathMTUProbe, pacing
+		queued := len(c.inbound)
+		if queued == 0 {
+			timerDeferrals = 0
+		} else if timerDeferrals < tcpMaximumTimerDeferrals {
+			// Protocol timers are derived from packet-arrival deadlines. If a
+			// segment is already queued, it arrived before the actor reached
+			// this select and must update those deadlines first. Leaving the
+			// timer cases enabled would let select randomly report loss,
+			// liveness failure, or a delayed ACK solely because the host
+			// scheduled this actor late.
+			activeRetransmit, activePersist, activeDelayedACK = nil, nil, nil
+			activeLiveness, activePathMTUProbe, activePacing = nil, nil, nil
+		}
 		select {
 		case segment := <-c.inbound:
+			if timerDeferrals < tcpMaximumTimerDeferrals {
+				timerDeferrals++
+			}
+			segment = c.consumeInbound(segment)
+			processedAt := time.Now()
+			receivedAt := tcpSegmentEventTime(segment, processedAt)
 			segmentLength := uint32(len(segment.payload))
 			if segment.flags&tcpFlagSYN != 0 {
 				segmentLength++
@@ -2334,13 +3077,26 @@ func (c *TCPConn) established(sendNext uint32) error {
 			if segment.flags&tcpFlagFIN != 0 {
 				segmentLength++
 			}
-			receiveWindow := uint32(c.receiveWindow(outOfOrderBytes, c.peerWindowScaling))
-			if c.peerWindowScaling {
-				receiveWindow <<= tcpReceiveWindowScale
-			}
+			receiveWindow := receiveWindowState.size(receiveNext)
+			retransmittedTimeWaitFIN := timeWaitArmed && segment.flags&(tcpFlagRST|tcpFlagSYN|tcpFlagACK|tcpFlagFIN) == tcpFlagACK|tcpFlagFIN &&
+				segment.sequence+uint32(len(segment.payload))+1 == receiveNext
 			if !tcpSegmentAcceptable(segment.sequence, segmentLength, receiveNext, receiveWindow) {
+				if retransmittedTimeWaitFIN {
+					if err := sendACK(); err != nil {
+						return err
+					}
+					armClose(time.Now(), tcpTimeWaitDuration)
+					continue
+				}
 				if segment.flags&tcpFlagRST == 0 {
-					if err := sendChallengeACK(); err != nil {
+					var err error
+					if tcpKeepAliveOrWindowProbe(segment, segmentLength, receiveNext, receiveWindow) {
+						err = sendACK()
+					} else {
+						sequence := tcpChallengeACKSequence(segment, sendUnacknowledged, sendNext, peerWindow, peerScale)
+						err = sendChallengeACKAt(sequence)
+					}
+					if err != nil {
 						return err
 					}
 				}
@@ -2353,22 +3109,18 @@ func (c *TCPConn) established(sendNext uint32) error {
 					continue
 				}
 				timestampEcho = echo
-				if time.Since(lastTimestampUpdate) < 24*24*time.Hour && tcpSequenceLess(timestampValue, c.recentTimestamp) {
+				if receivedAt.Sub(lastTimestampUpdate) < 24*24*time.Hour && tcpSequenceLess(timestampValue, c.recentTimestamp) {
 					if err := sendChallengeACK(); err != nil {
 						return err
 					}
 					continue
 				}
-				segmentEnd := segment.sequence + uint32(len(segment.payload))
-				if segment.flags&tcpFlagSYN != 0 || segment.flags&tcpFlagFIN != 0 {
-					segmentEnd++
-				}
-				if tcpSequenceLessEqual(segment.sequence, receiveNext) && tcpSequenceGreaterEqual(segmentEnd, receiveNext) {
+				if tcpSequenceLessEqual(segment.sequence, lastACKSent) {
 					c.recentTimestamp = timestampValue
-					lastTimestampUpdate = time.Now()
+					lastTimestampUpdate = receivedAt
 				}
 			}
-			lastActivity = time.Now()
+			lastActivity = receivedAt
 			lastKeepAlive = time.Time{}
 			keepAliveProbes = 0
 			armLiveness()
@@ -2398,118 +3150,279 @@ func (c *TCPConn) established(sendNext uint32) error {
 			if segment.flags&tcpFlagACK == 0 {
 				continue
 			}
-			previousWindow := peerWindow
 			ack := segment.acknowledgement
-			if tcpSequenceGreater(ack, sendNext) || tcpSequenceLess(ack, sendUnacknowledged) {
+			if tcpSequenceGreater(ack, sendNext) {
 				if err := sendChallengeACK(); err != nil {
 					return err
 				}
 				continue
 			}
-			if tcpWindowUpdateAllowed(segment.sequence, ack, peerWindowSequence, peerWindowACK) {
-				peerWindow = uint32(segment.window) << peerScale
-				peerWindowSequence = segment.sequence
-				peerWindowACK = ack
-			}
-			ackAdvanced := tcpSequenceGreater(ack, sendUnacknowledged)
-			if c.peerECN && segment.flags&tcpFlagECE != 0 && len(outstanding) != 0 && (ecnRecoveryPoint == 0 || tcpSequenceGreaterEqual(ack, ecnRecoveryPoint)) {
-				slowStartThreshold = controller.onCongestion(congestionWindow, peerMSS)
-				congestionWindow = slowStartThreshold
-				ecnRecoveryPoint = sendNext
-				c.sendCWR = true
-			}
-			if tcpSequenceGreater(ack, sendUnacknowledged) {
-				acknowledged := ack - sendUnacknowledged
-				flightBeforeACK := outstandingBytes(outstanding, false)
-				c.acknowledgeSend(int(acknowledged))
-				sendUnacknowledged = ack
-				c.publishICMPSequenceRange(sendUnacknowledged, sendNext)
-				duplicateACKs = 0
-				tailProbeSent = false
-				consecutiveRTOs = 0
-				lastSoftError = nil
-				sampledRTT := false
-				rttSample := time.Duration(0)
-				if c.peerTimestamp && timestampEcho != 0 {
-					delta := c.stack.tcpTimestamp() - timestampEcho
-					if delta != 0 && time.Duration(delta)*time.Millisecond <= tcpMaximumRTO {
-						rttSample = time.Duration(delta) * time.Millisecond
-						rtt.observe(rttSample)
-						sampledRTT = true
+			if tcpSequenceLess(ack, sendUnacknowledged) {
+				oldestAcceptable := maximumPeerWindow
+				if uint64(oldestAcceptable) > bytesAcknowledged {
+					oldestAcceptable = uint32(bytesAcknowledged)
+				}
+				// RFC 5961 section 5.2 and Linux reject an ACK older than both
+				// the largest observed send window and all bytes ever acknowledged.
+				// A merely reordered ACK may still carry valid receive data below.
+				if tcpSequenceLess(ack, sendUnacknowledged-oldestAcceptable) {
+					if err := sendChallengeACK(); err != nil {
+						return err
+					}
+					continue
+				}
+			} else {
+				previousWindow := peerWindow
+				if tcpWindowUpdateAllowed(segment.sequence, ack, peerWindowSequence, peerWindowACK) {
+					peerWindow = uint32(segment.window) << peerScale
+					if peerWindow > maximumPeerWindow {
+						maximumPeerWindow = peerWindow
+					}
+					peerWindowSequence = segment.sequence
+					peerWindowACK = ack
+				}
+				ackAdvanced := tcpSequenceGreater(ack, sendUnacknowledged)
+				recoveryAtACK := fastRecovery
+				newlyDelivered := uint32(0)
+				rtoPartialACK := false
+				ecnCongestion := false
+				if c.peerECN && segment.flags&tcpFlagECE != 0 && len(outstanding) != 0 && tcpECNStartsRecovery(ecnRecoveryActive, ack, ecnRecoveryPoint) {
+					minimumWindow := congestionWindow <= uint32(peerMSS)
+					flight := tcpCongestionFlight(outstanding, peerSACK, fastRecovery, peerMSS)
+					slowStartThreshold = controller.onECN(congestionWindow, flight, peerMSS)
+					congestionWindow = slowStartThreshold
+					ecnRecoveryPoint = sendNext
+					ecnRecoveryActive = true
+					ecnCongestion = true
+					c.sendCWR = true
+					if minimumWindow {
+						// RFC 3168 section 6.1.2 uses the retransmission interval
+						// to reduce an already one-segment sending rate further.
+						ecnHoldUntil = receivedAt.Add(rtt.rto)
+						armPacing(ecnHoldUntil.Sub(time.Now()))
 					}
 				}
-				for len(outstanding) != 0 && tcpSequenceGreaterEqual(ack, outstanding[0].end) {
-					oldest := outstanding[0]
-					if oldest.sentAt.After(rackLatestSent) {
-						rackLatestSent = oldest.sentAt
+				if tcpSequenceGreater(ack, sendUnacknowledged) {
+					acknowledged := ack - sendUnacknowledged
+					newlyDelivered = tcpNewlyAcknowledgedBytes(outstanding, ack)
+					bytesAcknowledged += uint64(acknowledged)
+					flightBeforeACK := tcpCongestionFlight(outstanding, peerSACK, fastRecovery, peerMSS)
+					c.acknowledgeSend(int(acknowledged))
+					sendUnacknowledged = ack
+					c.publishICMPSequenceRange(sendUnacknowledged, sendNext)
+					duplicateACKs = 0
+					rtoAttempts = 0
+					if rtoRecovery {
+						if tcpSequenceGreaterEqual(ack, rtoRecoveryPoint) {
+							rtoRecovery = false
+							rtoRecoveryPoint = 0
+							ageRACKReordering()
+						} else {
+							rtoPartialACK = true
+						}
 					}
-					if !sampledRTT && oldest.transmissions == 1 {
-						rttSample = time.Since(oldest.sentAt)
-						rtt.observe(rttSample)
-						sampledRTT = true
+					blackHoleRTOs = 0
+					lastSoftError = nil
+					sampledRTT := false
+					rttSample := time.Duration(0)
+					if c.peerTimestamp && timestampEcho != 0 {
+						delta := c.stack.tcpTimestampAt(receivedAt) - timestampEcho
+						if delta != 0 && time.Duration(delta)*time.Millisecond <= tcpMaximumRTO {
+							rttSample = time.Duration(delta) * time.Millisecond
+							rtt.observe(rttSample)
+							sampledRTT = true
+						}
 					}
-					if oldest.flags&tcpFlagFIN != 0 {
-						localFINAcked = true
-						c.notifyLingerDone()
+					// A negotiated timestamp only removes Karn ambiguity when this
+					// ACK actually produced a valid timestamp sample. If it did not,
+					// the sent-time fallback must still reject a cumulative ACK that
+					// covers any retransmitted range.
+					ambiguousRTT := tcpACKRTTAmbiguous(outstanding, ack)
+					for len(outstanding) != 0 && tcpSequenceGreaterEqual(ack, outstanding[0].end) {
+						oldest := outstanding[0]
+						if !oldest.sacked {
+							observeRACKReordering(oldest.end, oldest.transmissions > 1)
+						}
+						candidate := tcpRACKSample{sentAt: oldest.sentAt, end: oldest.end, rtt: elapsedRTTSampleAt(oldest.sentAt, receivedAt), retransmitted: oldest.transmissions > 1}
+						rackLatestDelivered = newerRACKSample(rackLatestDelivered, validRACKSample(candidate, rtt.minimum))
+						if !sampledRTT && !ambiguousRTT && oldest.transmissions == 1 {
+							rttSample = elapsedRTTSampleAt(oldest.sentAt, receivedAt)
+							rtt.observe(rttSample)
+							sampledRTT = true
+						}
+						if oldest.flags&tcpFlagFIN != 0 {
+							localFINAcked = true
+							c.notifyLingerDone()
+						}
+						outstanding = outstanding[1:]
 					}
-					outstanding = outstanding[1:]
+					if len(outstanding) == 0 {
+						outstanding = nil
+					}
+					if len(outstanding) != 0 && tcpSequenceGreater(ack, outstanding[0].sequence) {
+						if !outstanding[0].sacked {
+							observeRACKReordering(ack, outstanding[0].transmissions > 1)
+						}
+						candidate := tcpRACKSample{sentAt: outstanding[0].sentAt, end: ack, rtt: elapsedRTTSampleAt(outstanding[0].sentAt, receivedAt), retransmitted: outstanding[0].transmissions > 1}
+						rackLatestDelivered = newerRACKSample(rackLatestDelivered, validRACKSample(candidate, rtt.minimum))
+						trimAcknowledgedTCPSegment(&outstanding[0], ack)
+					}
+					// RFC 3042 excludes Limited Transmit data only when the
+					// duplicate-ACK episode that sent it enters recovery. Once a
+					// cumulative ACK advances without doing so, every remaining
+					// range is ordinary flight for any later loss episode.
+					if !fastRecovery {
+						for index := range outstanding {
+							outstanding[index].limited = false
+						}
+					}
+					if tailProbeActive && tcpSequenceGreaterEqual(ack, tailProbeEnd) {
+						if !tailProbeRetransmit {
+							tailProbeActive = false
+						} else if tcpSequenceGreater(ack, tailProbeEnd) {
+							if !fastRecovery {
+								if tcpECNStartsRecovery(ecnRecoveryActive, sendUnacknowledged, ecnRecoveryPoint) {
+									slowStartThreshold = controller.onCongestion(congestionWindow, flightBeforeACK, peerMSS)
+									congestionWindow = slowStartThreshold
+									ecnRecoveryPoint = sendNext
+									ecnRecoveryActive = true
+									if c.peerECN {
+										c.sendCWR = true
+									}
+								}
+							}
+							tailProbeActive = false
+							tailProbeRetransmit = false
+						}
+					}
+					now := receivedAt
+					if fastRecovery {
+						// BBR continues delivery-rate and min-RTT sampling during
+						// recovery, but PRR/NewReno retains ownership of cwnd.
+						controller.observeRecoveryACK(congestionWindow, acknowledged, peerMSS, now, rtt.srtt, normalizedRTTSample(rttSample), flightBeforeACK)
+						if tcpSequenceGreaterEqual(ack, recoveryPoint) {
+							ageRACKReordering()
+							fastRecovery = false
+							prrPriorFlight = 0
+							prrDelivered = 0
+							prrOut = 0
+							congestionWindow = slowStartThreshold
+						} else if !peerSACK {
+							// RFC 6582 NewReno: a partial ACK confirms one loss
+							// but not the recovery point. Deflate by newly ACKed
+							// data, add one SMSS, and retransmit the next hole.
+							congestionWindow = newRenoPartialACKWindow(congestionWindow, acknowledged, peerMSS)
+							if err := retransmitSegment(firstUnsackedSegment(outstanding), false); err != nil {
+								return err
+							}
+						}
+					} else if !ecnCongestion {
+						congestionWindow = controller.onACKWithThreshold(congestionWindow, acknowledged, peerMSS, now, rtt.srtt, normalizedRTTSample(rttSample), flightBeforeACK, slowStartThreshold)
+					}
+					armRetransmissionAfterACK(receivedAt)
 				}
-				if len(outstanding) == 0 {
-					outstanding = nil
+				history := uint32(bytesAcknowledged)
+				if bytesAcknowledged > uint64(tcpMaximumScaledWindow) {
+					history = tcpMaximumScaledWindow
 				}
-				if len(outstanding) != 0 && tcpSequenceGreater(ack, outstanding[0].sequence) {
-					skip := ack - outstanding[0].sequence
-					if skip < uint32(len(outstanding[0].payload)) {
-						outstanding[0].payload = outstanding[0].payload[skip:]
-						outstanding[0].sequence = ack
+				dsack, hasDSACK := tcpSACKBlock{}, false
+				if peerSACK {
+					dsack, hasDSACK = parseTCPDSACKOption(segment.options, ack, sendNext, history)
+				}
+				if hasDSACK {
+					rackReorderingSeen = true
+					rackReorderPersist = 16
+					if !rackDSACKRoundSet || tcpSequenceGreater(ack, rackDSACKRound) {
+						if rackReorderingScale != ^uint32(0) {
+							rackReorderingScale++
+						}
+						rackDSACKRound = sendNext
+						rackDSACKRoundSet = true
+					}
+					if tailProbeActive && tailProbeRetransmit && tcpSequenceLess(dsack.left, tailProbeEnd) && tcpSequenceGreaterEqual(dsack.right, tailProbeEnd) {
+						tailProbeActive = false
+						tailProbeRetransmit = false
 					}
 				}
-				if fastRecovery {
-					if tcpSequenceGreaterEqual(ack, recoveryPoint) {
-						fastRecovery = false
-						congestionWindow = slowStartThreshold
-					} else {
-						congestionWindow = slowStartThreshold + uint32(3*peerMSS)
+				var highestSACK uint32
+				hasSACK := false
+				newSACKInfo := false
+				trackPRRLoss := recoveryAtACK && fastRecovery && peerSACK
+				lostBefore := 0
+				if trackPRRLoss {
+					lostBefore = sackLostRangeCount(outstanding, peerMSS)
+				}
+				if peerSACK && len(outstanding) != 0 {
+					blocks := parseTCPSACKOptions(segment.options, sendUnacknowledged, sendNext)
+					var latestSACK tcpRACKSample
+					var newlySACKed []sentTCPSegment
+					outstanding, highestSACK, hasSACK, newSACKInfo, latestSACK, newlySACKed = applyTCPSACK(outstanding, blocks)
+					for _, candidate := range newlySACKed {
+						newlyDelivered = growCongestionWindow(newlyDelivered, candidate.end-candidate.sequence)
+						observeRACKReordering(candidate.end, candidate.transmissions > 1)
 					}
-				} else {
-					congestionWindow = controller.onACK(congestionWindow, acknowledged, peerMSS, time.Now(), rtt.srtt, rttSample, flightBeforeACK, congestionWindow < slowStartThreshold)
+					latestSACK.rtt = elapsedRTTSampleAt(latestSACK.sentAt, receivedAt)
+					rackLatestDelivered = newerRACKSample(rackLatestDelivered, validRACKSample(latestSACK, rtt.minimum))
+					reorderingWindow := rackReorderingWindow(rtt.minimum, rtt.srtt, rackReorderingScale)
+					if !rackReorderingSeen && (fastRecovery || sackedSegmentCount(outstanding) >= tcpDuplicateACKThreshold) {
+						reorderingWindow = 0
+					}
+					if rackLatestDelivered.retransmitted || hasSACKedSegment(outstanding) {
+						markRACKLoss(outstanding, rackLatestDelivered, receivedAt, reorderingWindow)
+					}
 				}
-				armRetransmission()
-			}
-			var highestSACK uint32
-			hasSACK := false
-			if peerSACK && len(outstanding) != 0 {
-				blocks := parseTCPSACKOptions(segment.options, sendUnacknowledged, sendNext)
-				var latestSACK time.Time
-				highestSACK, hasSACK, latestSACK = applyTCPSACK(outstanding, blocks)
-				if latestSACK.After(rackLatestSent) {
-					rackLatestSent = latestSACK
+				newlyLost := trackPRRLoss && sackLostRangeCount(outstanding, peerMSS) > lostBefore
+				if recoveryAtACK && fastRecovery && peerSACK && newlyDelivered != 0 {
+					prrDelivered += uint64(newlyDelivered)
+					pipe := sackRecoveryPipe(outstanding, peerMSS)
+					congestionWindow = prrCongestionWindow(pipe, slowStartThreshold, prrPriorFlight, prrDelivered, prrOut, newlyDelivered, ackAdvanced, newlyLost, peerMSS)
 				}
-				markRACKLoss(outstanding, rackLatestSent, rackReorderingWindow(rtt.srtt))
-			}
-			if hasRACKLoss(outstanding) {
-				if err := recoverSACKHoles(highestSACK, false); err != nil {
-					return err
+				if tailProbeActive && tailProbeRetransmit && !ackAdvanced && ack == tailProbeEnd && previousWindow == peerWindow && !hasSACK && len(segment.payload) == 0 && segment.flags&tcpFlagFIN == 0 {
+					tailProbeActive = false
+					tailProbeRetransmit = false
 				}
-			}
-			if !ackAdvanced && ack == sendUnacknowledged && previousWindow == peerWindow && len(segment.payload) == 0 && segment.flags&tcpFlagFIN == 0 && len(outstanding) != 0 {
-				duplicateACKs++
-				if duplicateACKs == 3 {
-					if hasSACK {
+				if rtoPartialACK {
+					if err := retransmitRTORecovery(); err != nil {
+						return err
+					}
+				}
+				if !rtoRecovery && hasRACKLoss(outstanding) {
+					if err := recoverSACKHoles(highestSACK, false); err != nil {
+						return err
+					}
+				}
+				if !rtoRecovery && !ackAdvanced && ack == sendUnacknowledged && previousWindow == peerWindow && len(segment.payload) == 0 && segment.flags&tcpFlagFIN == 0 && len(outstanding) != 0 && (!hasSACK || newSACKInfo) {
+					duplicateACKs++
+					if duplicateACKs < tcpDuplicateACKThreshold && !fastRecovery {
+						// RFC 3042 Limited Transmit permits one new segment for each
+						// of the first two duplicate ACKs without inflating cwnd.
+						// sendNextData still enforces the receive window and the
+						// cumulative cwnd+2*SMSS allowance.
+						if _, err := sendNextData(uint32(duplicateACKs*peerMSS), true); err != nil {
+							return err
+						}
+					} else if duplicateACKs == tcpDuplicateACKThreshold {
+						if hasSACK {
+							// RFC 6675 enters recovery by retransmitting HighACK+1
+							// even if IsLost has not accumulated enough SACK evidence.
+							if err := retransmitSegment(firstUnsackedSegment(outstanding), false); err != nil {
+								return err
+							}
+							if err := recoverSACKHoles(highestSACK, false); err != nil {
+								return err
+							}
+						} else if err := retransmitSegment(firstUnsackedSegment(outstanding), false); err != nil {
+							return err
+						}
+					} else if duplicateACKs > tcpDuplicateACKThreshold && !peerSACK {
+						congestionWindow = growCongestionWindow(congestionWindow, uint32(peerMSS))
+					}
+				}
+				if fastRecovery && hasSACK {
+					if ackAdvanced || duplicateACKs >= tcpDuplicateACKThreshold {
 						if err := recoverSACKHoles(highestSACK, true); err != nil {
 							return err
 						}
-					} else if err := retransmitSegment(firstUnsackedSegment(outstanding), false); err != nil {
-						return err
-					}
-				} else if duplicateACKs > 3 {
-					congestionWindow = growCongestionWindow(congestionWindow, uint32(peerMSS))
-				}
-			}
-			if fastRecovery && hasSACK {
-				if ackAdvanced || duplicateACKs >= 3 {
-					if err := recoverSACKHoles(highestSACK, true); err != nil {
-						return err
 					}
 				}
 			}
@@ -2517,23 +3430,49 @@ func (c *TCPConn) established(sendNext uint32) error {
 			fin := segment.flags&tcpFlagFIN != 0
 			if len(segment.payload) != 0 || fin {
 				previousReceiveNext := receiveNext
+				newApplicationData := len(segment.payload) != 0 && tcpSequenceGreater(segment.sequence+uint32(len(segment.payload)), previousReceiveNext)
+				hadOutOfOrder := len(outOfOrder) != 0
 				recentSACK = segment.sequence
+				if peerSACK {
+					if block, duplicate := tcpDuplicateSACKBlock(segment.sequence, len(segment.payload), fin, receiveNext, outOfOrder); duplicate {
+						recentDSACK, haveRecentDSACK = block, true
+					}
+				}
 				if !remoteFINReceived {
-					_, closed := c.receiveTCPData(segment.sequence, segment.payload, fin, &receiveNext, &outOfOrder, &outOfOrderBytes)
+					_, closed := c.receiveTCPData(segment.sequence, segment.payload, fin, receiveWindow, &receiveNext, &outOfOrder, &outOfOrderBytes)
 					if closed {
 						remoteFINReceived = true
 						c.setReadEOF()
 					}
 				}
-				immediateACK := fin || segment.sequence != previousReceiveNext || len(outOfOrder) != 0
-				if err := scheduleACK(immediateACK, len(segment.payload) != 0); err != nil {
+				if newApplicationData && c.applicationReceiveClosed() {
+					sequence := tcpAcceptableSendSequence(sendUnacknowledged, sendNext, peerWindow, peerScale)
+					_ = c.sendSegment(sequence, receiveNext, tcpFlagRST|tcpFlagACK, advertisedReceiveWindow(), nil)
+					return net.ErrClosed
+				}
+				immediateACK := fin || segment.sequence != previousReceiveNext || hadOutOfOrder || len(outOfOrder) != 0
+				if err := scheduleACK(immediateACK, len(segment.payload) != 0, receivedAt); err != nil {
 					return err
 				}
 			}
 			if localFINAcked && remoteFINReceived {
-				armClose(tcpTimeWaitDuration)
-			} else if localFINAcked {
-				armClose(tcpFINWaitDuration)
+				if !timeWaitRequired {
+					return nil
+				}
+				// RFC 9293 restarts 2MSL for a retransmitted FIN, not for
+				// every acceptable ACK received while the tuple is retained.
+				if !timeWaitArmed || fin {
+					startedAt := receivedAt
+					if fin {
+						// TIME-WAIT starts after acknowledging the peer's FIN.
+						startedAt = time.Now()
+					}
+					armClose(startedAt, tcpTimeWaitDuration)
+					timeWaitArmed = true
+				}
+			} else if localFINAcked && !finWaitArmed && c.applicationReceiveClosed() {
+				armClose(receivedAt, tcpFINWaitDuration)
+				finWaitArmed = true
 			}
 			armLiveness()
 			if err := fillWindow(); err != nil {
@@ -2544,15 +3483,33 @@ func (c *TCPConn) established(sendNext uint32) error {
 			if err := fillWindow(); err != nil {
 				return err
 			}
+			if localFINAcked && !remoteFINReceived && !finWaitArmed && c.applicationReceiveClosed() {
+				armClose(time.Now(), tcpFINWaitDuration)
+				finWaitArmed = true
+			}
 
 		case <-c.windowUpdate:
 			if c.discardingReads() {
 				outOfOrder = nil
 				outOfOrderBytes = 0
+				c.outOfOrderUnread.Store(0)
+			} else if len(outOfOrder) != 0 {
+				previousReceiveNext := receiveNext
+				_, closed := c.promoteTCPReceived(&receiveNext, &outOfOrder, &outOfOrderBytes)
+				if closed {
+					remoteFINReceived = true
+					c.setReadEOF()
+				}
+				if receiveNext != previousReceiveNext {
+					if err := scheduleACK(true, false, time.Now()); err != nil {
+						return err
+					}
+				}
 			}
-			window := c.receiveWindow(outOfOrderBytes, c.peerWindowScaling)
+			available, capacity := c.receiveSpace(outOfOrderBytes)
+			window, _ := receiveWindowState.next(receiveNext, available, tcpReceiveWindowIncrease(capacity, receiveMSS))
 			if window > lastAdvertisedWindow {
-				if err := scheduleACK(lastAdvertisedWindow == 0, false); err != nil {
+				if err := scheduleACK(lastAdvertisedWindow == 0, false, time.Now()); err != nil {
 					return err
 				}
 			}
@@ -2560,103 +3517,138 @@ func (c *TCPConn) established(sendNext uint32) error {
 				return err
 			}
 
-		case <-retransmit:
+		case <-activeRetransmit:
 			if retransmissionClose {
 				return net.ErrClosed
 			}
-			if retransmissionProbe {
-				index := lastUnsackedSegment(outstanding)
-				segment := &outstanding[index]
-				if segment.transmissions >= tcpMaximumRetransmits {
-					return tcpTimeoutError(lastSoftError)
+			if retransmissionRACK {
+				reorderingWindow := rackReorderingWindow(rtt.minimum, rtt.srtt, rackReorderingScale)
+				if !rackReorderingSeen && (fastRecovery || sackedSegmentCount(outstanding) >= tcpDuplicateACKThreshold) {
+					reorderingWindow = 0
 				}
-				if err := c.sendSegment(segment.sequence, receiveNext, segment.flags, outOfOrderBytes, segment.payload); err != nil {
-					return err
-				}
-				segment.sentAt = time.Now()
-				segment.transmissions++
-				tailProbeSent = true
-				c.stack.stats.tcpRetransmissions.Add(1)
-				c.stack.stats.tcpTailLossProbes.Add(1)
-				armRetransmission()
-				continue
-			}
-			consecutiveRTOs++
-			if consecutiveRTOs >= tcpBlackHoleTimeouts {
-				if mtu := nextBlackHoleMTU(c.mtu, c.key.remote.Addr().Is6()); mtu < c.mtu {
-					if c.stack.observePathMTU(c.key.remote.Addr(), uint32(mtu)) {
-						c.stack.stats.pathMTUBlackHoleReductions.Add(1)
-						c.stack.notifyTCPPathMTU(c.key.remote.Addr(), c)
-					}
-					if err := applyPathMTU(false); err != nil {
+				markRACKLoss(outstanding, rackLatestDelivered, time.Now(), reorderingWindow)
+				if hasRACKLoss(outstanding) {
+					if err := recoverSACKHoles(0, false); err != nil {
 						return err
 					}
 				}
-				consecutiveRTOs = 0
+				armRetransmission()
+				continue
+			}
+			if retransmissionProbe {
+				sent, err := sendNextData(uint32(peerMSS), false)
+				if err != nil {
+					return err
+				}
+				probeSentAt := time.Time{}
+				if sent {
+					probeSentAt = outstanding[len(outstanding)-1].sentAt
+				}
+				tailProbeRetransmit = !sent
+				if !sent {
+					index := lastUnsackedSegment(outstanding)
+					segment := &outstanding[index]
+					window := advertisedReceiveWindow()
+					if err := c.sendSegment(segment.sequence, receiveNext, segment.flags, window, segment.payload); err != nil {
+						return err
+					}
+					sentAt := time.Now()
+					lastACKSent = receiveNext
+					lastAdvertisedWindow = window
+					segment.sentAt = sentAt
+					probeSentAt = sentAt
+					segment.transmissions++
+					c.stack.stats.tcpRetransmissions.Add(1)
+					controller.onRetransmit(len(segment.payload), peerMSS, segment.sentAt, congestionWindow, tcpCongestionFlight(outstanding, peerSACK, fastRecovery, peerMSS), rtt.srtt, slowStartThreshold)
+				}
+				tailProbeActive = true
+				tailProbeEnd = sendNext
+				tailProbeRTTSamples = rtt.samples
+				c.stack.stats.tcpTailLossProbes.Add(1)
+				// RFC 8985 requires a full RTO from the probe transmission;
+				// retaining the oldest segment's prior deadline can otherwise
+				// turn a useful new-data probe into an immediate timeout.
+				armRetransmissionAfterACK(probeSentAt)
+				continue
+			}
+			rtoAttempts++
+			if rtoAttempts > tcpMaximumRTOs {
+				return tcpTimeoutError(lastSoftError)
+			}
+			blackHoleRTOs++
+			if blackHoleRTOs >= tcpBlackHoleTimeouts {
+				if len(outstanding) != 0 {
+					segment := outstanding[firstUnsackedSegment(outstanding)]
+					mtu := nextBlackHoleProbeMTU(c.mtu, c.key.remote.Addr().Is6(), len(segment.payload), c.peerTimestamp)
+					if mtu < c.mtu {
+						c.stack.stats.pathMTUBlackHoleReductions.Add(1)
+						blackHoleMTU = mtu
+						blackHoleExpiry = time.Now().Add(pathMTULifetime)
+						if err := applyPathMTU(effectivePathMTU(), false); err != nil {
+							return err
+						}
+					}
+				}
 			}
 			if err := retransmitSegment(firstUnsackedSegment(outstanding), true); err != nil {
 				return err
 			}
 
-		case <-persist:
+		case <-activePersist:
 			persist = nil
-			sequence, flags := sendNext, byte(tcpFlagACK)
-			var payload []byte
-			if len(outstanding) != 0 {
-				segment := &outstanding[firstUnsackedSegment(outstanding)]
-				sequence, flags = segment.sequence, segment.flags
-				if len(segment.payload) != 0 {
-					payload = segment.payload[:1]
-				}
-			} else {
-				offset := int(sendNext - sendUnacknowledged)
-				payload, _, _ = c.sendSnapshot(offset, 1)
-				if len(payload) != 0 {
-					c.publishICMPSequenceRange(sendUnacknowledged, sendNext+1)
-					outstanding = append(outstanding, sentTCPSegment{
-						sequence: sendNext, end: sendNext + 1, flags: flags,
-						payload: payload, sentAt: time.Now(), transmissions: 1,
-					})
-					sendNext++
-				} else {
-					sequence--
-					if sequence-sendUnacknowledged > sendNext-sendUnacknowledged {
-						c.publishICMPSequenceRange(sequence, sendNext)
-					}
+			if c.applicationReceiveClosed() {
+				persistAttempts++
+				if persistAttempts > tcpMaximumRTOs {
+					return os.ErrDeadlineExceeded
 				}
 			}
-			if err := c.sendSegment(sequence, receiveNext, flags, outOfOrderBytes, payload); err != nil {
+			// Like Linux and gVisor, probe with an already acknowledged byte.
+			// Consuming new sequence space here would move pure ACKs beyond the
+			// peer's zero window and can deadlock a full-duplex connection.
+			sequence, flags := sendUnacknowledged-1, byte(tcpFlagACK)
+			payload := tcpZeroWindowProbe[:]
+			window := advertisedReceiveWindow()
+			if err := c.sendSegment(sequence, receiveNext, flags, window, payload); err != nil {
 				return err
 			}
+			probeSentAt := time.Now()
+			lastACKSent = receiveNext
+			lastAdvertisedWindow = window
 			c.stack.stats.tcpZeroWindowProbes.Add(1)
-			if len(outstanding) != 0 {
-				armRetransmission()
-			}
 			persistRTO *= 2
 			if persistRTO > tcpMaximumRTO {
 				persistRTO = tcpMaximumRTO
 			}
-			armPersist()
+			armPersist(probeSentAt)
 
-		case <-delayedACK:
+		case <-activeDelayedACK:
 			if err := sendACK(); err != nil {
 				return err
 			}
 
 		case <-c.pathMTUUpdate:
-			if err := applyPathMTU(true); err != nil {
+			if err := applyPathMTU(effectivePathMTU(), true); err != nil {
 				return err
 			}
-		case <-pathMTUProbe:
+		case <-activePathMTUProbe:
 			pathMTUProbe = nil
-			if err := applyPathMTU(false); err != nil {
+			if !blackHoleExpiry.IsZero() && !time.Now().Before(blackHoleExpiry) {
+				blackHoleMTU = 0
+				blackHoleExpiry = time.Time{}
+			}
+			if err := applyPathMTU(effectivePathMTU(), false); err != nil {
 				return err
 			}
 			if err := fillWindow(); err != nil {
 				return err
 			}
-		case <-pacing:
+		case <-activePacing:
 			pacing = nil
+			if fastRecovery && peerSACK && len(outstanding) != 0 {
+				if err := recoverSACKHoles(highestSACKedSequence(outstanding), true); err != nil {
+					return err
+				}
+			}
 			if err := fillWindow(); err != nil {
 				return err
 			}
@@ -2667,13 +3659,13 @@ func (c *TCPConn) established(sendNext uint32) error {
 			if err := fillWindow(); err != nil {
 				return err
 			}
-		case <-liveness:
+		case <-activeLiveness:
 			options := c.socketOptions()
 			now := time.Now()
 			if options.idleTimeout > 0 && !now.Before(lastActivity.Add(options.idleTimeout)) {
 				return os.ErrDeadlineExceeded
 			}
-			if options.keepAlive {
+			if options.keepAlive && keepAliveEligible() {
 				deadline := lastActivity.Add(options.keepAliveConfig.Idle)
 				if keepAliveProbes != 0 {
 					deadline = lastKeepAlive.Add(options.keepAliveConfig.Interval)
@@ -2686,9 +3678,12 @@ func (c *TCPConn) established(sendNext uint32) error {
 					if probeSequence-sendUnacknowledged > sendNext-sendUnacknowledged {
 						c.publishICMPSequenceRange(probeSequence, sendNext)
 					}
-					if err := c.sendSegment(probeSequence, receiveNext, tcpFlagACK, outOfOrderBytes, nil); err != nil {
+					window := advertisedReceiveWindow()
+					if err := c.sendSegment(probeSequence, receiveNext, tcpFlagACK, window, nil); err != nil {
 						return err
 					}
+					lastACKSent = receiveNext
+					lastAdvertisedWindow = window
 					keepAliveProbes++
 					lastKeepAlive = now
 					c.stack.stats.tcpKeepAliveProbes.Add(1)
@@ -2704,7 +3699,8 @@ func (c *TCPConn) established(sendNext uint32) error {
 		case <-c.abortCh:
 			err := c.abortedError()
 			if c.resetAfterAbort() {
-				_ = c.sendSegment(sendNext, receiveNext, tcpFlagRST|tcpFlagACK, outOfOrderBytes, nil)
+				sequence := tcpAcceptableSendSequence(sendUnacknowledged, sendNext, peerWindow, peerScale)
+				_ = c.sendSegment(sequence, receiveNext, tcpFlagRST|tcpFlagACK, advertisedReceiveWindow(), nil)
 			}
 			return err
 		case <-c.stack.closeCh:
@@ -2713,27 +3709,20 @@ func (c *TCPConn) established(sendNext uint32) error {
 	}
 }
 
-// sendSegment emits a segment with the actor's current advertised window.
-func (c *TCPConn) sendSegment(sequence, acknowledgement uint32, flags byte, outOfOrderBytes int, payload []byte) error {
-	return c.sendSegmentWithOptions(sequence, acknowledgement, flags, outOfOrderBytes, nil, payload)
-}
-
-// sendNewDataSegment emits a first transmission with ECT when ECN was
-// negotiated. Retransmissions and window probes use sendSegment and remain
-// Not-ECT as required by RFC 3168.
-func (c *TCPConn) sendNewDataSegment(sequence, acknowledgement uint32, flags byte, outOfOrderBytes int, payload []byte) error {
-	return c.sendSegmentWithOptionsECN(sequence, acknowledgement, flags, outOfOrderBytes, nil, payload, true)
+// sendSegment emits a segment with the supplied advertised window.
+func (c *TCPConn) sendSegment(sequence, acknowledgement uint32, flags byte, window uint16, payload []byte) error {
+	return c.sendSegmentWithOptions(sequence, acknowledgement, flags, window, nil, payload)
 }
 
 // sendSegmentWithOptions emits a segment with TCP options and the actor's
 // current advertised window.
-func (c *TCPConn) sendSegmentWithOptions(sequence, acknowledgement uint32, flags byte, outOfOrderBytes int, options, payload []byte) error {
-	return c.sendSegmentWithOptionsECN(sequence, acknowledgement, flags, outOfOrderBytes, options, payload, false)
+func (c *TCPConn) sendSegmentWithOptions(sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte) error {
+	return c.sendSegmentWithOptionsECN(sequence, acknowledgement, flags, window, options, payload, false)
 }
 
 // sendSegmentWithOptionsECN emits a segment and marks only first-transmission
 // data as ECN-capable.
-func (c *TCPConn) sendSegmentWithOptionsECN(sequence, acknowledgement uint32, flags byte, outOfOrderBytes int, options, payload []byte, ecnCapable bool) error {
+func (c *TCPConn) sendSegmentWithOptionsECN(sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, ecnCapable bool) error {
 	if c.peerTimestamp {
 		combined := make([]byte, 0, 12+len(options))
 		combined = append(combined, tcpTimestampOptions(c.stack.tcpTimestamp(), c.recentTimestamp)...)
@@ -2751,7 +3740,7 @@ func (c *TCPConn) sendSegmentWithOptionsECN(sequence, acknowledgement uint32, fl
 	if c.peerECN && ecnCapable && len(payload) != 0 {
 		ecn = 2
 	}
-	err := c.stack.writeTCPWithECN(c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(), sequence, acknowledgement, flags, c.receiveWindow(outOfOrderBytes, c.peerWindowScaling), options, payload, c.mtu, ecn)
+	err := c.stack.writeTCPWithECN(c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(), sequence, acknowledgement, flags, window, options, payload, c.mtu, ecn)
 	if err == nil && includeCWR {
 		c.sendCWR = false
 	}
@@ -2761,6 +3750,8 @@ func (c *TCPConn) sendSegmentWithOptionsECN(sequence, acknowledgement uint32, fl
 // rttEstimator implements the RFC 6298 smoothed RTT and variance calculation.
 type rttEstimator struct {
 	initialized bool
+	samples     uint64
+	minimum     time.Duration
 	srtt        time.Duration
 	variation   time.Duration
 	rto         time.Duration
@@ -2770,6 +3761,11 @@ type rttEstimator struct {
 func (r *rttEstimator) observe(sample time.Duration) {
 	if sample <= 0 {
 		return
+	}
+	r.samples++
+	sample = normalizedRTTSample(sample)
+	if r.minimum == 0 || sample < r.minimum {
+		r.minimum = sample
 	}
 	if !r.initialized {
 		r.srtt = sample
@@ -2789,6 +3785,38 @@ func (r *rttEstimator) observe(sample time.Duration) {
 	} else if r.rto > tcpMaximumRTO {
 		r.rto = tcpMaximumRTO
 	}
+}
+
+// normalizedRTTSample keeps estimator arithmetic and model-based pacing
+// bounded after a process suspension or other multi-minute scheduling gap.
+func normalizedRTTSample(sample time.Duration) time.Duration {
+	if sample > tcpMaximumRTO {
+		return tcpMaximumRTO
+	}
+	return sample
+}
+
+// elapsedRTTSampleAt measures delivery at packet arrival rather than when a
+// connection actor was eventually scheduled to process the acknowledgement.
+func elapsedRTTSampleAt(sentAt, receivedAt time.Time) time.Duration {
+	if sentAt.IsZero() {
+		return 0
+	}
+	sample := receivedAt.Sub(sentAt)
+	if sample < time.Microsecond {
+		return time.Microsecond
+	}
+	return sample
+}
+
+// tcpSegmentEventTime returns the monotonic stack-arrival time attached by
+// handleTCP. Directly constructed test segments retain the historical current
+// time fallback, and a future value cannot move protocol clocks forward.
+func tcpSegmentEventTime(segment tcpSegment, now time.Time) time.Time {
+	if segment.receivedAt.IsZero() || segment.receivedAt.After(now) {
+		return now
+	}
+	return segment.receivedAt
 }
 
 // backoff doubles RTO after a retransmission timeout.
@@ -2827,12 +3855,38 @@ func nextBlackHoleMTU(current int, ipv6 bool) int {
 		}
 		return current
 	}
-	for _, candidate := range [...]int{1500, 1280, 1006, 576, 296, 68} {
+	for _, candidate := range [...]int{1500, 1280, 1006, 576, 508, 296, 68} {
 		if candidate < current {
 			return candidate
 		}
 	}
 	return current
+}
+
+// nextBlackHoleProbeMTU skips nominal plateaus that would emit the same wire
+// payload. A black-hole probe must make the retransmission smaller to provide
+// new path information; repeatedly recording a larger MTU that already fits
+// the current segment cannot recover the connection.
+func nextBlackHoleProbeMTU(current int, ipv6 bool, payloadSize int, timestamp bool) int {
+	address := netip.IPv4Unspecified()
+	if ipv6 {
+		address = netip.IPv6Unspecified()
+	}
+	probe := current
+	for {
+		next := nextBlackHoleMTU(probe, ipv6)
+		if next >= probe {
+			return current
+		}
+		maximumPayload := tcpMSSForMTU(next, address)
+		if timestamp {
+			maximumPayload -= 12
+		}
+		if payloadSize > maximumPayload {
+			return next
+		}
+		probe = next
+	}
 }
 
 // tcpTimeoutError preserves the last validated asynchronous network failure
@@ -2842,6 +3896,20 @@ func tcpTimeoutError(softError error) error {
 		return softError
 	}
 	return os.ErrDeadlineExceeded
+}
+
+// tcpActiveOpenHardError applies RFC 1122's protocol/port-unreachable split.
+// IPv6 has no protocol-unreachable destination code, but its port-unreachable
+// code carries the same definitive active-open meaning.
+func tcpActiveOpenHardError(err error) bool {
+	var networkError ICMPError
+	if !errors.As(err, &networkError) {
+		return false
+	}
+	if networkError.QuotedSource.Is6() {
+		return networkError.Type == 1 && networkError.Code == 4
+	}
+	return networkError.Type == 3 && (networkError.Code == 2 || networkError.Code == 3)
 }
 
 // tcpSYNOptions advertises MSS, SACK, receive window scaling, and timestamps.
@@ -2958,21 +4026,60 @@ type tcpSACKBlock struct {
 	right uint32
 }
 
-// tcpSACKOptions reports up to four retained out-of-order ranges. The range
-// containing the segment that triggered the ACK is placed first as required by
-// RFC 2018.
-func tcpSACKOptions(pieces []tcpReceivedPiece, recent uint32, maximumBlocks int) []byte {
+// tcpSACKBlockLimit returns the largest SACK option fitting both TCP's
+// 40-byte option space and the current PMTU. reservePayload keeps room for a
+// data byte when the option is piggybacked instead of sent on a pure ACK.
+func tcpSACKBlockLimit(mtu int, address netip.Addr, timestamp bool, reservePayload int) int {
+	ipHeader := 40
+	if address.Is4() {
+		ipHeader = 20
+	}
+	budget := mtu - ipHeader - tcpHeaderSize - reservePayload
+	if budget > 40 {
+		budget = 40
+	}
+	if budget < 0 {
+		return 0
+	}
+	timestampSize := 0
+	maximum := 4
+	if timestamp {
+		timestampSize = 12
+		maximum = 3
+	}
+	for blocks := maximum; blocks > 0; blocks-- {
+		optionSize := timestampSize + 2 + 8*blocks
+		optionSize = (optionSize + 3) &^ 3
+		if optionSize <= budget {
+			return blocks
+		}
+	}
+	return 0
+}
+
+// tcpSACKOptions reports retained out-of-order ranges and an optional RFC 2883
+// duplicate range. DSACK occupies the first block; otherwise the range
+// containing the segment that triggered the ACK is first as required by RFC
+// 2018.
+func tcpSACKOptions(pieces []tcpReceivedPiece, recent uint32, maximumBlocks int, dsack tcpSACKBlock, haveDSACK bool) []byte {
 	blocks := make([]tcpSACKBlock, 0, len(pieces))
 	for _, piece := range pieces {
 		right := piece.sequence + uint32(len(piece.payload))
 		if piece.fin {
 			right++
 		}
-		if right != piece.sequence {
+		if right == piece.sequence {
+			continue
+		}
+		if len(blocks) != 0 && !tcpSequenceGreater(piece.sequence, blocks[len(blocks)-1].right) {
+			if tcpSequenceGreater(right, blocks[len(blocks)-1].right) {
+				blocks[len(blocks)-1].right = right
+			}
+		} else {
 			blocks = append(blocks, tcpSACKBlock{left: piece.sequence, right: right})
 		}
 	}
-	if len(blocks) == 0 {
+	if len(blocks) == 0 && !haveDSACK {
 		return nil
 	}
 	recentIndex := -1
@@ -2989,8 +4096,13 @@ func tcpSACKOptions(pieces []tcpReceivedPiece, recent uint32, maximumBlocks int)
 		maximumBlocks = 4
 	}
 	ordered := make([]tcpSACKBlock, 0, maximumBlocks)
+	if haveDSACK {
+		ordered = append(ordered, dsack)
+	}
 	if recentIndex >= 0 {
-		ordered = append(ordered, blocks[recentIndex])
+		if len(ordered) < maximumBlocks {
+			ordered = append(ordered, blocks[recentIndex])
+		}
 	}
 	for index := len(blocks) - 1; index >= 0 && len(ordered) < maximumBlocks; index-- {
 		if index != recentIndex {
@@ -3007,8 +4119,100 @@ func tcpSACKOptions(pieces []tcpReceivedPiece, recent uint32, maximumBlocks int)
 	return options
 }
 
-// parseTCPSACKOptions validates and merges SACK ranges within the current send
-// window. DSACK ranges below the cumulative ACK are intentionally ignored.
+// tcpDuplicateSACKBlock finds the first duplicate sequence range in an
+// incoming segment. Ranges below RCV.NXT and overlaps with retained
+// out-of-order data use the two DSACK forms defined by RFC 2883.
+func tcpDuplicateSACKBlock(sequence uint32, payloadLength int, fin bool, receiveNext uint32, pieces []tcpReceivedPiece) (tcpSACKBlock, bool) {
+	length := uint32(payloadLength)
+	if fin {
+		length++
+	}
+	if length == 0 {
+		return tcpSACKBlock{}, false
+	}
+	end := sequence + length
+	if tcpSequenceLess(sequence, receiveNext) {
+		right := end
+		if tcpSequenceGreater(right, receiveNext) {
+			right = receiveNext
+		}
+		if tcpSequenceGreater(right, sequence) {
+			return tcpSACKBlock{left: sequence, right: right}, true
+		}
+		sequence = receiveNext
+	}
+	incomingStart := sequence - receiveNext
+	incomingEnd := end - receiveNext
+	if incomingStart >= incomingEnd {
+		return tcpSACKBlock{}, false
+	}
+	for _, piece := range pieces {
+		pieceStart := piece.sequence - receiveNext
+		pieceEnd := pieceStart + uint32(len(piece.payload))
+		if piece.fin {
+			pieceEnd++
+		}
+		left := incomingStart
+		if pieceStart > left {
+			left = pieceStart
+		}
+		right := incomingEnd
+		if pieceEnd < right {
+			right = pieceEnd
+		}
+		if left < right {
+			return tcpSACKBlock{left: receiveNext + left, right: receiveNext + right}, true
+		}
+	}
+	return tcpSACKBlock{}, false
+}
+
+// parseTCPDSACKOption returns RFC 2883's distinguished first SACK block when
+// it describes already cumulatively acknowledged data or is contained in the
+// following ordinary SACK block. history bounds below-ACK reports to sequence
+// space this connection actually acknowledged recently.
+func parseTCPDSACKOption(options []byte, acknowledged, sendNext, history uint32) (tcpSACKBlock, bool) {
+	for offset := 0; offset < len(options); {
+		kind := options[offset]
+		if kind == 0 {
+			break
+		}
+		if kind == 1 {
+			offset++
+			continue
+		}
+		if len(options)-offset < 2 {
+			break
+		}
+		length := int(options[offset+1])
+		if length < 2 || length > len(options)-offset {
+			break
+		}
+		if kind == 5 && length >= 10 && (length-2)%8 == 0 {
+			left := binary.BigEndian.Uint32(options[offset+2 : offset+6])
+			right := binary.BigEndian.Uint32(options[offset+6 : offset+10])
+			block := tcpSACKBlock{left: left, right: right}
+			if tcpSequenceLess(left, right) && tcpSequenceLessEqual(right, acknowledged) && acknowledged-left <= history {
+				return block, true
+			}
+			if length >= 18 {
+				secondLeft := binary.BigEndian.Uint32(options[offset+10 : offset+14])
+				secondRight := binary.BigEndian.Uint32(options[offset+14 : offset+18])
+				secondLength := secondRight - secondLeft
+				if secondLength != 0 && secondLength <= sendNext-acknowledged &&
+					left-secondLeft < secondLength && right-secondLeft <= secondLength && left != right {
+					return block, true
+				}
+			}
+			return tcpSACKBlock{}, false
+		}
+		offset += length
+	}
+	return tcpSACKBlock{}, false
+}
+
+// parseTCPSACKOptions validates and merges ordinary SACK ranges within the
+// current send window. The distinguished DSACK block is handled separately.
 func parseTCPSACKOptions(options []byte, acknowledged, sendNext uint32) []tcpSACKBlock {
 	window := sendNext - acknowledged
 	var blocks []tcpSACKBlock
@@ -3054,26 +4258,72 @@ func parseTCPSACKOptions(options []byte, acknowledged, sendNext uint32) []tcpSAC
 	return merged
 }
 
-// applyTCPSACK marks fully covered transmissions and returns the highest
-// selectively acknowledged sequence plus the newest delivered send time.
-func applyTCPSACK(outstanding []sentTCPSegment, blocks []tcpSACKBlock) (uint32, bool, time.Time) {
+// applyTCPSACK splits transmissions at SACK boundaries, marks exact covered
+// ranges, and returns the newest delivery information used by RACK.
+func applyTCPSACK(outstanding []sentTCPSegment, blocks []tcpSACKBlock) ([]sentTCPSegment, uint32, bool, bool, tcpRACKSample, []sentTCPSegment) {
 	var highest uint32
-	var latest time.Time
+	var newInformation bool
+	var latest tcpRACKSample
+	var newlySACKed []sentTCPSegment
 	for blockIndex, block := range blocks {
 		if blockIndex == 0 || tcpSequenceGreater(block.right, highest) {
 			highest = block.right
 		}
+		outstanding = splitTCPSegmentAt(outstanding, block.left)
+		outstanding = splitTCPSegmentAt(outstanding, block.right)
 		for index := range outstanding {
 			segment := &outstanding[index]
 			if tcpSequenceGreaterEqual(segment.sequence, block.left) && tcpSequenceGreaterEqual(block.right, segment.end) {
-				segment.sacked = true
-				if segment.sentAt.After(latest) {
-					latest = segment.sentAt
+				if !segment.sacked {
+					newInformation = true
+					newlySACKed = append(newlySACKed, *segment)
 				}
+				segment.sacked = true
+				latest = newerRACKSample(latest, tcpRACKSample{sentAt: segment.sentAt, end: segment.end, retransmitted: segment.transmissions > 1})
 			}
 		}
 	}
-	return highest, len(blocks) != 0, latest
+	return outstanding, highest, len(blocks) != 0, newInformation, latest, newlySACKed
+}
+
+// splitTCPSegmentAt makes the SACK scoreboard byte-accurate when a peer's
+// block edge falls inside one transmitted segment.
+func splitTCPSegmentAt(outstanding []sentTCPSegment, boundary uint32) []sentTCPSegment {
+	splitRanges := 0
+	for index := range outstanding {
+		if outstanding[index].sackSplit {
+			splitRanges++
+		}
+	}
+	for index := range outstanding {
+		segment := outstanding[index]
+		if !tcpSequenceGreater(boundary, segment.sequence) || !tcpSequenceLess(boundary, segment.end) {
+			continue
+		}
+		increase := 1
+		if !segment.sackSplit {
+			increase = 2
+		}
+		if splitRanges+increase > tcpMaximumSACKSplitRanges {
+			return outstanding
+		}
+		left, right := segment, segment
+		left.sackSplit, right.sackSplit = true, true
+		left.end = boundary
+		left.flags &^= tcpFlagPSH | tcpFlagFIN
+		right.sequence = boundary
+		payloadOffset := int(boundary - segment.sequence)
+		if payloadOffset > len(segment.payload) {
+			payloadOffset = len(segment.payload)
+		}
+		left.payload = segment.payload[:payloadOffset]
+		right.payload = segment.payload[payloadOffset:]
+		outstanding = append(outstanding, sentTCPSegment{})
+		copy(outstanding[index+2:], outstanding[index+1:])
+		outstanding[index], outstanding[index+1] = left, right
+		return outstanding
+	}
+	return outstanding
 }
 
 // firstUnsackedSegment returns the oldest known hole, falling back to the
@@ -3102,10 +4352,12 @@ func lastUnsackedSegment(outstanding []sentTCPSegment) int {
 
 // tailLossProbeDelay schedules one probe before the normal RTO after an RTT
 // sample is available.
-func tailLossProbeDelay(smoothedRTT, rto time.Duration) time.Duration {
+func tailLossProbeDelay(smoothedRTT, rto time.Duration, singleSegment bool) time.Duration {
 	delay := 2 * smoothedRTT
 	if smoothedRTT == 0 {
-		delay = rto / 2
+		delay = rto
+	} else if singleSegment {
+		delay += tcpDelayedACKTimeout
 	}
 	if delay < 10*time.Millisecond {
 		delay = 10 * time.Millisecond
@@ -3116,16 +4368,127 @@ func tailLossProbeDelay(smoothedRTT, rto time.Duration) time.Duration {
 	return delay
 }
 
-// firstUnretriedLoss returns the next RACK loss or, in full SACK recovery, the
-// next hole below the highest selectively acknowledged sequence.
-func firstUnretriedLoss(outstanding []sentTCPSegment, highest uint32, allSACKHoles bool) int {
+// unsackedSegmentCount returns the number of sequence ranges still eligible
+// for cumulative acknowledgement or retransmission.
+func unsackedSegmentCount(outstanding []sentTCPSegment) int {
+	count := 0
+	for _, segment := range outstanding {
+		if !segment.sacked {
+			count++
+		}
+	}
+	return count
+}
+
+// sackedSegmentCount returns the packet-count evidence used by Linux to make
+// RACK's reordering window aggressive at the traditional DupThresh.
+func sackedSegmentCount(outstanding []sentTCPSegment) int {
+	count := 0
+	for _, segment := range outstanding {
+		if segment.sacked {
+			count++
+		}
+	}
+	return count
+}
+
+// hasSACKedSegment reports whether selective feedback already owns recovery;
+// RFC 8985 does not schedule a TLP while such evidence is outstanding.
+func hasSACKedSegment(outstanding []sentTCPSegment) bool {
+	for _, segment := range outstanding {
+		if segment.sacked {
+			return true
+		}
+	}
+	return false
+}
+
+// highestSACKedSequence returns HighSACK for RFC 6675 NextSeg processing.
+func highestSACKedSequence(outstanding []sentTCPSegment) uint32 {
+	var highest uint32
+	var found bool
+	for _, segment := range outstanding {
+		if segment.sacked && (!found || tcpSequenceGreater(segment.end, highest)) {
+			highest = segment.end
+			found = true
+		}
+	}
+	return highest
+}
+
+// firstUnretriedLoss returns the first range satisfying RACK or RFC 6675's
+// IsLost test and not already retransmitted in this recovery round.
+func firstUnretriedLoss(outstanding []sentTCPSegment, mss int) int {
+	index := -1
+	var sackedRanges, sackedBytes int
+	for next := len(outstanding) - 1; next >= 0; next-- {
+		segment := outstanding[next]
+		if segment.sacked {
+			sackedRanges++
+			sackedBytes += int(segment.end - segment.sequence)
+			continue
+		}
+		lost := segment.rackLost || sackedRanges >= tcpDuplicateACKThreshold || mss > 0 && sackedBytes > (tcpDuplicateACKThreshold-1)*mss
+		if !segment.sackRetried && lost {
+			index = next
+		}
+	}
+	return index
+}
+
+// firstUnretriedSACKHole implements RFC 6675 NextSeg rule 3 after all ranges
+// with sufficient loss evidence have been retransmitted.
+func firstUnretriedSACKHole(outstanding []sentTCPSegment, highest uint32) int {
 	for index := range outstanding {
 		segment := &outstanding[index]
-		if !segment.sacked && !segment.sackRetried && (segment.rackLost || allSACKHoles && tcpSequenceLess(segment.sequence, highest)) {
+		if !segment.sacked && !segment.sackRetried && tcpSequenceLess(segment.sequence, highest) {
 			return index
 		}
 	}
 	return -1
+}
+
+// sackLostRangeCount counts ranges satisfying RFC 6675 IsLost, including
+// RACK declarations, for PRR's newly-lost suppression of slow-start reduction.
+func sackLostRangeCount(outstanding []sentTCPSegment, mss int) int {
+	count := 0
+	var sackedRanges, sackedBytes int
+	for index := len(outstanding) - 1; index >= 0; index-- {
+		segment := outstanding[index]
+		if segment.sacked {
+			sackedRanges++
+			sackedBytes += int(segment.end - segment.sequence)
+			continue
+		}
+		if segment.rackLost || sackedRanges >= tcpDuplicateACKThreshold || mss > 0 && sackedBytes > (tcpDuplicateACKThreshold-1)*mss {
+			count++
+		}
+	}
+	return count
+}
+
+// sackSegmentLost implements RFC 6675 IsLost: either DupThresh transmitted
+// ranges or more than (DupThresh-1)*SMSS bytes have been SACKed above it.
+func sackSegmentLost(outstanding []sentTCPSegment, index, mss int) bool {
+	if index < 0 || index >= len(outstanding) || outstanding[index].sacked {
+		return false
+	}
+	if outstanding[index].rackLost {
+		return true
+	}
+	var ranges, bytes int
+	for next := index + 1; next < len(outstanding); next++ {
+		segment := outstanding[next]
+		if !segment.sacked {
+			continue
+		}
+		ranges++
+		bytes += int(segment.end - segment.sequence)
+		if ranges >= tcpDuplicateACKThreshold || mss > 0 && bytes > (tcpDuplicateACKThreshold-1)*mss {
+			return true
+		}
+	}
+	return false
 }
 
 // outstandingBytes returns bytes currently counted in the congestion pipe.
@@ -3139,46 +4502,224 @@ func outstandingBytes(outstanding []sentTCPSegment, includeSACKed bool) uint32 {
 	return bytes
 }
 
-// sackRecoveryPipe estimates bytes still consuming the congestion window.
-// Confirmed RACK losses and, during full recovery, holes below the highest
-// SACK edge leave the pipe until retransmitted.
-func sackRecoveryPipe(outstanding []sentTCPSegment, highest uint32, allSACKHoles bool) uint32 {
+// lossRecoveryFlightSize applies RFC 3042's exception: data sent by Limited
+// Transmit is not included when DupThresh establishes the new ssthresh.
+func lossRecoveryFlightSize(outstanding []sentTCPSegment) uint32 {
 	var bytes uint32
 	for _, segment := range outstanding {
-		if segment.sacked {
-			continue
+		if !segment.sacked && !segment.limited {
+			bytes += segment.end - segment.sequence
 		}
-		if (segment.rackLost || allSACKHoles && tcpSequenceLess(segment.sequence, highest)) && !segment.sackRetried {
-			continue
-		}
-		bytes += segment.end - segment.sequence
 	}
 	return bytes
 }
 
-// rackReorderingWindow returns a conservative time allowance for legitimate
-// packet reordering before RACK declares an older transmission lost.
-func rackReorderingWindow(smoothedRTT time.Duration) time.Duration {
-	window := smoothedRTT / 4
-	if window < 10*time.Millisecond {
-		window = 10 * time.Millisecond
+// tcpACKRTTAmbiguous implements Karn's algorithm for one cumulative ACK. If
+// any newly acknowledged sequence range was retransmitted, the ACK cannot
+// identify which transmission produced it, including untouched later ranges
+// covered by the same cumulative acknowledgement.
+func tcpACKRTTAmbiguous(outstanding []sentTCPSegment, acknowledgement uint32) bool {
+	for _, segment := range outstanding {
+		if !tcpSequenceLess(segment.sequence, acknowledgement) {
+			break
+		}
+		if segment.transmissions > 1 {
+			return true
+		}
 	}
-	if window > 200*time.Millisecond {
-		window = 200 * time.Millisecond
+	return false
+}
+
+// sackRecoveryPipe implements RFC 6675 SetPipe. An unSACKed range not yet
+// considered lost counts its original transmission, while every retransmitted
+// range counts its replacement as well. A speculative retransmission can
+// therefore count twice, exactly as required by SetPipe.
+func sackRecoveryPipe(outstanding []sentTCPSegment, mss int) uint32 {
+	var bytes uint32
+	var sackedRanges, sackedBytes int
+	for index := len(outstanding) - 1; index >= 0; index-- {
+		segment := outstanding[index]
+		if segment.sacked {
+			sackedRanges++
+			sackedBytes += int(segment.end - segment.sequence)
+			continue
+		}
+		size := segment.end - segment.sequence
+		lost := segment.rackLost || sackedRanges >= tcpDuplicateACKThreshold || mss > 0 && sackedBytes > (tcpDuplicateACKThreshold-1)*mss
+		if !lost {
+			bytes = growCongestionWindow(bytes, size)
+		}
+		if segment.sackRetried {
+			bytes = growCongestionWindow(bytes, size)
+		}
+	}
+	return bytes
+}
+
+// sackRecoveryCanSend applies RFC 6675's cwnd-Pipe gate. The one
+// retransmission that enters recovery precedes SetPipe and is exempt.
+func sackRecoveryCanSend(recovery bool, pipe, size, window uint32) bool {
+	return !recovery || uint64(pipe)+uint64(size) <= uint64(window)
+}
+
+// tcpNewlyAcknowledgedBytes counts cumulative delivery not previously
+// reported by SACK, avoiding double accounting in RFC 6937 PRR.
+func tcpNewlyAcknowledgedBytes(outstanding []sentTCPSegment, acknowledgement uint32) uint32 {
+	var delivered uint32
+	for _, segment := range outstanding {
+		if !tcpSequenceGreater(acknowledgement, segment.sequence) {
+			break
+		}
+		if segment.sacked {
+			continue
+		}
+		end := segment.end
+		if tcpSequenceLess(acknowledgement, end) {
+			end = acknowledgement
+		}
+		delivered = growCongestionWindow(delivered, end-segment.sequence)
+	}
+	return delivered
+}
+
+// prrCongestionWindow implements Linux's byte-scaled RFC 6937 send-count
+// calculation. Returning Pipe+sndcnt lets the existing RFC 6675 sender apply
+// the allowance to retransmissions and new data with one common gate.
+func prrCongestionWindow(pipe, threshold, priorFlight uint32, delivered, sent uint64, newlyDelivered uint32, cumulativeACK, newlyLost bool, mss int) uint32 {
+	if newlyDelivered == 0 || priorFlight == 0 || mss < 1 {
+		return pipe
+	}
+	var allowance uint64
+	if pipe > threshold {
+		target := (uint64(threshold)*delivered + uint64(priorFlight) - 1) / uint64(priorFlight)
+		if target > sent {
+			allowance = target - sent
+		}
+	} else {
+		if delivered > sent {
+			allowance = delivered - sent
+		}
+		if allowance < uint64(newlyDelivered) {
+			allowance = uint64(newlyDelivered)
+		}
+		if cumulativeACK && !newlyLost {
+			allowance += uint64(mss)
+		}
+		if available := uint64(threshold - pipe); allowance > available {
+			allowance = available
+		}
+	}
+	if allowance > uint64(tcpMaximumScaledWindow) {
+		allowance = uint64(tcpMaximumScaledWindow)
+	}
+	return growCongestionWindow(pipe, uint32(allowance))
+}
+
+// tcpCongestionFlight selects RFC 6675 SetPipe while SACK recovery is active.
+// Outside recovery, one copy of each unSACKed range is ordinary flight.
+func tcpCongestionFlight(outstanding []sentTCPSegment, sack, recovery bool, mss int) uint32 {
+	if sack && recovery {
+		return sackRecoveryPipe(outstanding, mss)
+	}
+	return outstandingBytes(outstanding, false)
+}
+
+// rackReorderingWindow returns RFC 8985's initial min_RTT/4 settling
+// allowance, bounded by SRTT as required for every adapted RACK window.
+func rackReorderingWindow(minimumRTT, smoothedRTT time.Duration, scale uint32) time.Duration {
+	if minimumRTT <= 0 || smoothedRTT <= 0 {
+		return 0
+	}
+	if scale == 0 {
+		scale = 1
+	}
+	window := minimumRTT / 4
+	if window <= 0 {
+		return 0
+	}
+	if scale > uint32(smoothedRTT/window) {
+		return smoothedRTT
+	}
+	window *= time.Duration(scale)
+	if window > smoothedRTT {
+		window = smoothedRTT
 	}
 	return window
 }
 
-// markRACKLoss records transmissions sufficiently older than a newly
-// delivered segment. SACKed and already retransmitted ranges are ignored.
-func markRACKLoss(outstanding []sentTCPSegment, latest time.Time, reorderingWindow time.Duration) {
-	if latest.IsZero() {
-		return
+// newerRACKSample returns the later transmission under RFC 8985's transmit
+// time ordering. Sequence order disambiguates timestamps with equal clock
+// granularity.
+func newerRACKSample(current, candidate tcpRACKSample) tcpRACKSample {
+	if candidate.sentAt.IsZero() {
+		return current
 	}
+	if candidate.sentAt.After(current.sentAt) || candidate.sentAt.Equal(current.sentAt) && tcpSequenceGreater(candidate.end, current.end) {
+		return candidate
+	}
+	return current
+}
+
+// validRACKSample applies RFC 8985's fallback ambiguity check for a
+// retransmitted segment. Without proof from a timestamp echo, an RTT below
+// min_RTT can belong to the original transmission and must not advance RACK.
+func validRACKSample(sample tcpRACKSample, minimumRTT time.Duration) tcpRACKSample {
+	if sample.retransmitted && minimumRTT > 0 && sample.rtt < minimumRTT {
+		return tcpRACKSample{}
+	}
+	return sample
+}
+
+// rackDeliveredAfter reports whether delivered was transmitted after segment.
+// A later ACK alone is insufficient: RACK compares transmit order so reordered
+// acknowledgements cannot declare a newer transmission lost.
+func rackDeliveredAfter(delivered tcpRACKSample, segment sentTCPSegment) bool {
+	return delivered.sentAt.After(segment.sentAt) || delivered.sentAt.Equal(segment.sentAt) && tcpSequenceGreater(delivered.end, segment.end)
+}
+
+// rackAdvanceForwardACK updates RFC 8985's highest newly delivered sequence
+// and reports original data delivered out of order below that edge.
+func rackAdvanceForwardACK(forward *uint32, set *bool, end uint32, retransmitted bool) bool {
+	if !*set || tcpSequenceGreater(end, *forward) {
+		*forward, *set = end, true
+		return false
+	}
+	return tcpSequenceLess(end, *forward) && !retransmitted
+}
+
+// rackLossDelay returns RFC 8985's maximum remaining reordering wait across
+// eligible transmissions. Linux measures each threshold as the latest
+// delivered transmission's RTT plus reo_wnd minus the candidate's current age.
+func rackLossDelay(outstanding []sentTCPSegment, delivered tcpRACKSample, now time.Time, reorderingWindow time.Duration) (time.Duration, bool) {
+	var maximum time.Duration
+	found := false
+	for _, segment := range outstanding {
+		// A range already declared lost waits for cwnd-Pipe space or the
+		// ordinary RTO. Re-arming its expired reordering deadline would spin
+		// the actor while recovery is congestion-window limited.
+		if segment.sacked || segment.rackLost || !rackDeliveredAfter(delivered, segment) {
+			continue
+		}
+		remaining := segment.sentAt.Add(delivered.rtt + reorderingWindow).Sub(now)
+		if remaining < 0 {
+			remaining = 0
+		}
+		if !found || remaining > maximum {
+			maximum, found = remaining, true
+		}
+	}
+	return maximum, found
+}
+
+// markRACKLoss records eligible transmissions whose reordering wait expired.
+// A retransmission can itself be lost; clearing sackRetried makes that range
+// eligible for another recovery transmission instead of deferring it to RTO.
+func markRACKLoss(outstanding []sentTCPSegment, delivered tcpRACKSample, now time.Time, reorderingWindow time.Duration) {
 	for index := range outstanding {
 		segment := &outstanding[index]
-		if !segment.sacked && !segment.sackRetried && segment.sentAt.Add(reorderingWindow).Before(latest) {
+		if !segment.sacked && rackDeliveredAfter(delivered, *segment) && !now.Before(segment.sentAt.Add(delivered.rtt+reorderingWindow)) {
 			segment.rackLost = true
+			segment.sackRetried = false
 		}
 	}
 }
@@ -3210,8 +4751,11 @@ func splitTCPSegments(outstanding []sentTCPSegment, mss int) []sentTCPSegment {
 			part.sequence = segment.sequence + uint32(offset)
 			part.end = segment.sequence + uint32(end)
 			part.payload = segment.payload[offset:end]
+			part.cwr = offset == 0 && segment.cwr
 			if end != len(segment.payload) {
 				part.flags &^= tcpFlagPSH | tcpFlagFIN
+			} else if part.flags&tcpFlagFIN != 0 {
+				part.end++
 			}
 			result = append(result, part)
 		}
@@ -3219,15 +4763,45 @@ func splitTCPSegments(outstanding []sentTCPSegment, mss int) []sentTCPSegment {
 	return result
 }
 
+// trimAcknowledgedTCPSegment removes a cumulatively acknowledged prefix from
+// a partially acknowledged range. A data-plus-FIN segment can be acknowledged
+// exactly through its data, leaving a FIN-only range in sequence space.
+func trimAcknowledgedTCPSegment(segment *sentTCPSegment, acknowledgement uint32) {
+	if segment == nil || !tcpSequenceGreater(acknowledgement, segment.sequence) || !tcpSequenceLess(acknowledgement, segment.end) {
+		return
+	}
+	skip := acknowledgement - segment.sequence
+	if skip < uint32(len(segment.payload)) {
+		segment.payload = segment.payload[skip:]
+	} else {
+		segment.payload = nil
+		segment.flags &^= tcpFlagPSH
+	}
+	segment.sequence = acknowledgement
+	// Any ACK inside this transmitted packet proves that its CWR header was
+	// delivered even if a control flag remains outstanding.
+	segment.cwr = false
+}
+
 // clampMSS applies local packet-size bounds to a peer MSS.
 func clampMSS(value, maximum int) int {
-	if value < 1 {
-		value = 1
+	if value < tcpMinimumPeerMSS {
+		value = tcpMinimumPeerMSS
 	}
 	if value > maximum {
 		value = maximum
 	}
 	return value
+}
+
+// tcpSegmentPayloadLimit applies peer MSS to data only, while charging extra
+// TCP options exclusively to the current path's header budget.
+func tcpSegmentPayloadLimit(peerMSS, pathMSS, optionSize int) int {
+	pathLimit := pathMSS - optionSize
+	if pathLimit < peerMSS {
+		return pathLimit
+	}
+	return peerMSS
 }
 
 // defaultTCPPeerMSS returns the RFC default for a SYN without an MSS option.
@@ -3251,6 +4825,16 @@ func initialTCPWindow(mss int) uint32 {
 	return uint32(window)
 }
 
+// tcpRestartWindow applies RFC 5681's restart window after an idle interval
+// longer than the current RTO.
+func tcpRestartWindow(window uint32, mss int) uint32 {
+	restart := initialTCPWindow(mss)
+	if window < restart {
+		return window
+	}
+	return restart
+}
+
 // growCongestionWindow adds delta without wrapping beyond TCP's maximum
 // representable scaled receive window.
 func growCongestionWindow(window, delta uint32) uint32 {
@@ -3260,8 +4844,27 @@ func growCongestionWindow(window, delta uint32) uint32 {
 	return window + delta
 }
 
+// newRenoPartialACKWindow applies RFC 6582 partial-window deflation. One
+// SMSS is restored only when at least one complete SMSS left the network, and
+// the result retains TCP's one-segment congestion-window floor.
+func newRenoPartialACKWindow(window, acknowledged uint32, mss int) uint32 {
+	if acknowledged >= window {
+		window = 0
+	} else {
+		window -= acknowledged
+	}
+	minimum := uint32(mss)
+	if acknowledged >= minimum {
+		window = growCongestionWindow(window, minimum)
+	}
+	if window < minimum {
+		window = minimum
+	}
+	return window
+}
+
 // receiveTCPData inserts one range and exposes all newly contiguous bytes.
-func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, receiveNext *uint32, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) (bool, bool) {
+func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, receiveWindow uint32, receiveNext *uint32, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) (bool, bool) {
 	finSequence := sequence + uint32(len(payload))
 	if tcpSequenceLess(sequence, *receiveNext) {
 		skip := *receiveNext - sequence
@@ -3274,9 +4877,32 @@ func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, rece
 			fin = fin && finSequence == *receiveNext
 		}
 	}
-	if !c.storeTCPOutOfOrder(*receiveNext, sequence, payload, fin, outOfOrder, outOfOrderBytes) && tcpSequenceGreater(sequence, *receiveNext) {
+	if sequence == *receiveNext && len(*outOfOrder) == 0 {
+		// The overwhelmingly common in-order path does not need an
+		// allocation, sort, or a second payload copy through the
+		// out-of-order scoreboard.
+		originalPayloadSize := len(payload)
+		if uint64(len(payload)) > uint64(receiveWindow) {
+			payload = payload[:receiveWindow]
+		}
+		accepted := c.appendReadBuffer(payload, 0)
+		*receiveNext += uint32(accepted)
+		closed := fin && accepted == originalPayloadSize && uint64(originalPayloadSize) < uint64(receiveWindow)
+		if closed {
+			*receiveNext++
+		}
+		c.outOfOrderUnread.Store(0)
+		return accepted != 0 || closed, closed
+	}
+	if !c.storeTCPOutOfOrder(*receiveNext, receiveWindow, sequence, payload, fin, outOfOrder, outOfOrderBytes) && tcpSequenceGreater(sequence, *receiveNext) {
 		return false, false
 	}
+	return c.promoteTCPReceived(receiveNext, outOfOrder, outOfOrderBytes)
+}
+
+// promoteTCPReceived exposes queued bytes that became deliverable after either
+// a segment filled a sequence gap or the application reopened its window.
+func (c *TCPConn) promoteTCPReceived(receiveNext *uint32, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) (bool, bool) {
 	delivered, remoteClosed := false, false
 	for len(*outOfOrder) != 0 && !remoteClosed {
 		piece := (*outOfOrder)[0]
@@ -3315,6 +4941,7 @@ func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, rece
 		*outOfOrder = nil
 		*outOfOrderBytes = 0
 	}
+	c.outOfOrderUnread.Store(int64(*outOfOrderBytes))
 	return delivered || remoteClosed, remoteClosed
 }
 
@@ -3325,26 +4952,20 @@ type tcpDataFragment struct {
 }
 
 // storeTCPOutOfOrder retains only uncovered bytes within the receive window.
-func (c *TCPConn) storeTCPOutOfOrder(receiveNext, sequence uint32, payload []byte, fin bool, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) bool {
+func (c *TCPConn) storeTCPOutOfOrder(receiveNext, receiveWindow, sequence uint32, payload []byte, fin bool, outOfOrder *[]tcpReceivedPiece, outOfOrderBytes *int) bool {
 	distance := sequence - receiveNext
-	c.mu.Lock()
-	available := c.receiveCapacity - len(c.readBuffer) - *outOfOrderBytes
-	if c.userClosed || c.readClosed {
-		available = c.receiveCapacity - *outOfOrderBytes
-	}
-	c.mu.Unlock()
+	available := c.receiveAvailable(*outOfOrderBytes)
 	if available < 0 {
 		available = 0
 	}
-	window := uint32(available)
-	if distance >= window && !(distance == 0 && len(payload) == 0 && fin) {
+	if distance >= receiveWindow && !(distance == 0 && len(payload) == 0 && fin) {
 		return false
 	}
 	originalPayloadSize := len(payload)
-	if maximumPayload := int(window - distance); len(payload) > maximumPayload {
+	if maximumPayload := int(receiveWindow - distance); len(payload) > maximumPayload {
 		payload = payload[:maximumPayload]
 	}
-	fin = fin && (distance == 0 && len(payload) == 0 || uint64(distance)+uint64(originalPayloadSize) < uint64(window))
+	fin = fin && (distance == 0 && len(payload) == 0 || uint64(distance)+uint64(originalPayloadSize) < uint64(receiveWindow))
 	incomingFINSequence := sequence + uint32(originalPayloadSize)
 	var existingFINSequence uint32
 	hasExistingFIN := false
@@ -3356,7 +4977,9 @@ func (c *TCPConn) storeTCPOutOfOrder(receiveNext, sequence uint32, payload []byt
 		}
 	}
 	if hasExistingFIN {
-		fin = fin && incomingFINSequence == existingFINSequence
+		// An earlier FIN terminates the stream before a previously queued FIN.
+		// Retain it and let normalization discard all later sequence space.
+		fin = fin && !tcpSequenceGreater(incomingFINSequence, existingFINSequence)
 		payloadEnd := sequence + uint32(len(payload))
 		if tcpSequenceGreater(payloadEnd, existingFINSequence) {
 			if !tcpSequenceLess(sequence, existingFINSequence) {
@@ -3368,37 +4991,43 @@ func (c *TCPConn) storeTCPOutOfOrder(receiveNext, sequence uint32, payload []byt
 	}
 	fragments := make([]tcpDataFragment, 0, 2)
 	if len(payload) != 0 {
-		fragments = append(fragments, tcpDataFragment{offset: distance, payload: payload})
-	}
-	for _, existing := range *outOfOrder {
-		existingStart := existing.sequence - receiveNext
-		existingEnd := existingStart + uint32(len(existing.payload))
-		if existingStart == existingEnd {
-			continue
-		}
-		next := make([]tcpDataFragment, 0, len(fragments)+1)
-		for _, fragment := range fragments {
-			fragmentEnd := fragment.offset + uint32(len(fragment.payload))
-			if fragmentEnd <= existingStart || fragment.offset >= existingEnd {
-				next = append(next, fragment)
+		start, end := distance, distance+uint32(len(payload))
+		cursor := start
+		for _, existing := range *outOfOrder {
+			existingStart := existing.sequence - receiveNext
+			existingEnd := existingStart + uint32(len(existing.payload))
+			if existingEnd <= cursor {
 				continue
 			}
-			if fragment.offset < existingStart {
-				leftSize := existingStart - fragment.offset
-				next = append(next, tcpDataFragment{offset: fragment.offset, payload: fragment.payload[:leftSize]})
+			if existingStart >= end {
+				break
 			}
-			if fragmentEnd > existingEnd {
-				rightOffset := existingEnd - fragment.offset
-				next = append(next, tcpDataFragment{offset: existingEnd, payload: fragment.payload[rightOffset:]})
+			if cursor < existingStart {
+				fragmentEnd := existingStart
+				if fragmentEnd > end {
+					fragmentEnd = end
+				}
+				fragments = append(fragments, tcpDataFragment{
+					offset:  cursor,
+					payload: payload[cursor-start : fragmentEnd-start],
+				})
+			}
+			if existingEnd > cursor {
+				cursor = existingEnd
+			}
+			if cursor >= end {
+				break
 			}
 		}
-		fragments = next
+		if cursor < end {
+			fragments = append(fragments, tcpDataFragment{offset: cursor, payload: payload[cursor-start:]})
+		}
 	}
 	candidate := append([]tcpReceivedPiece(nil), (*outOfOrder)...)
 	for _, fragment := range fragments {
 		candidate = append(candidate, tcpReceivedPiece{sequence: receiveNext + fragment.offset, payload: append([]byte(nil), fragment.payload...)})
 	}
-	if fin && !hasExistingFIN {
+	if fin {
 		candidate = append(candidate, tcpReceivedPiece{sequence: incomingFINSequence, fin: true})
 	}
 	candidate = normalizeTCPReceivedPieces(receiveNext, candidate)
@@ -3406,10 +5035,11 @@ func (c *TCPConn) storeTCPOutOfOrder(receiveNext, sequence uint32, payload []byt
 	for _, piece := range candidate {
 		bytes += len(piece.payload)
 	}
-	if bytes > c.receiveCapacity || len(candidate) > tcpMaximumOutOfOrder {
+	if bytes > *outOfOrderBytes+available || len(candidate) > tcpMaximumOutOfOrder {
 		return false
 	}
 	*outOfOrder, *outOfOrderBytes = candidate, bytes
+	c.outOfOrderUnread.Store(int64(bytes))
 	return len(fragments) != 0 || fin
 }
 
@@ -3454,12 +5084,12 @@ func normalizeTCPReceivedPieces(receiveNext uint32, pieces []tcpReceivedPiece) [
 		}
 		previous := &result[len(result)-1]
 		previousEnd := previous.sequence + uint32(len(previous.payload))
-		if previousEnd == piece.sequence {
-			previous.payload = append(previous.payload, piece.payload...)
-		} else if tcpSequenceGreater(previousEnd, piece.sequence) {
+		if tcpSequenceGreater(previousEnd, piece.sequence) {
 			skip := previousEnd - piece.sequence
 			if skip < uint32(len(piece.payload)) {
-				previous.payload = append(previous.payload, piece.payload[skip:]...)
+				piece.sequence += skip
+				piece.payload = piece.payload[skip:]
+				result = append(result, piece)
 			}
 		} else {
 			result = append(result, piece)
@@ -3491,6 +5121,44 @@ func tcpSequenceLessEqual(left, right uint32) bool { return !tcpSequenceGreater(
 // tcpSequenceGreaterEqual compares sequence numbers modulo 2^32.
 func tcpSequenceGreaterEqual(left, right uint32) bool { return !tcpSequenceLess(left, right) }
 
+// tcpAcceptableSendSequence follows Linux's tcp_acceptable_seq rule for an
+// empty ACK or active reset after the peer shrinks its receive window. SND.NXT
+// is normally correct, but a sequence beyond the shrunken right edge would be
+// rejected before its ACK field can be processed.
+func tcpAcceptableSendSequence(sendUnacknowledged, sendNext, sendWindow uint32, sendWindowScale uint8) uint32 {
+	// A zero window has no scaling ambiguity: RFC 9293 accepts only an empty
+	// segment exactly at RCV.NXT. Applying the scale quantum here can create an
+	// ACK loop when a small amount of data remains unacknowledged.
+	if sendWindow == 0 {
+		return sendUnacknowledged
+	}
+	windowEnd := sendUnacknowledged + sendWindow
+	if !tcpSequenceLess(windowEnd, sendNext) || sendNext-windowEnd < uint32(1)<<sendWindowScale {
+		return sendNext
+	}
+	return windowEnd
+}
+
+// tcpChallengeACKSequence selects a response that a legitimate peer can
+// accept after sending an out-of-window pure ACK during a window shrink. The
+// segment is still dropped without changing the TCB; only an ACK already
+// within the current send range may inform the response sequence.
+func tcpChallengeACKSequence(segment tcpSegment, sendUnacknowledged, sendNext, currentSendWindow uint32, sendWindowScale uint8) uint32 {
+	fallback := tcpAcceptableSendSequence(sendUnacknowledged, sendNext, currentSendWindow, sendWindowScale)
+	if segment.flags != tcpFlagACK || len(segment.payload) != 0 || segment.acknowledgement-sendUnacknowledged > sendNext-sendUnacknowledged {
+		return fallback
+	}
+	sendWindow := uint32(segment.window) << sendWindowScale
+	return tcpAcceptableSendSequence(segment.acknowledgement, sendNext, sendWindow, sendWindowScale)
+}
+
+// tcpECNStartsRecovery permits one congestion response per transmitted window.
+// Equality still belongs to the current recovery epoch; only an ACK beyond the
+// saved boundary proves that later data encountered another CE mark.
+func tcpECNStartsRecovery(active bool, acknowledgement, recoveryPoint uint32) bool {
+	return !active || tcpSequenceGreater(acknowledgement, recoveryPoint)
+}
+
 // tcpSegmentAcceptable implements the RFC 9293 receive-window tests for a
 // segment's first and last sequence numbers.
 func tcpSegmentAcceptable(sequence, length, receiveNext, receiveWindow uint32) bool {
@@ -3501,6 +5169,19 @@ func tcpSegmentAcceptable(sequence, length, receiveNext, receiveWindow uint32) b
 		return true
 	}
 	return length != 0 && sequence+length-1-receiveNext < receiveWindow
+}
+
+// tcpKeepAliveOrWindowProbe recognizes the two RFC 9293 probe forms that use
+// RCV.NXT-1 deliberately. They require an ordinary ACK and must not consume
+// the RFC 5961 challenge-ACK rate limit.
+func tcpKeepAliveOrWindowProbe(segment tcpSegment, length, receiveNext, receiveWindow uint32) bool {
+	if segment.flags&(tcpFlagRST|tcpFlagSYN|tcpFlagFIN) != 0 || segment.flags&tcpFlagACK == 0 || segment.sequence != receiveNext-1 {
+		return false
+	}
+	// RFC 1122 permits a keepalive to contain either no payload or one
+	// garbage octet. The latter remains a keepalive when the receive window
+	// is open; its sequence is deliberately just below the left edge.
+	return length <= 1
 }
 
 // tcpWindowUpdateAllowed implements the RFC 9293 SND.WL1/SND.WL2 ordering

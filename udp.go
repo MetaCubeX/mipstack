@@ -330,6 +330,14 @@ func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, tar
 		}
 		deadline, changed, notified := c.readDeadline, c.readChanged, c.receiveNotify
 		c.mu.Unlock()
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			select {
+			case <-changed:
+				continue
+			default:
+				return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
+			}
+		}
 		timer, timeout := deadlineTimer(deadline)
 		select {
 		case <-notified:
@@ -490,7 +498,11 @@ func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, address net
 		return 0, err
 	}
 	source = source.Unmap()
-	if len(payload) > 65535-udpHeaderSize {
+	maximumPayload := 65535 - udpHeaderSize
+	if target.Addr().Is4() {
+		maximumPayload -= 20
+	}
+	if len(payload) > maximumPayload {
 		return 0, messageTooLong(c.network(), c.LocalAddr(), address)
 	}
 	udp := make([]byte, udpHeaderSize+len(payload))
@@ -503,13 +515,13 @@ func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, address net
 		value = 0xffff
 	}
 	binary.BigEndian.PutUint16(udp[6:8], value)
-	c.rememberTarget(target)
 	if err := c.stack.writeIPPayloadUntilOptions(source, target.Addr(), protocolUDP, udp, true, options, c.writeState); err != nil {
 		if errors.Is(err, syscall.EMSGSIZE) {
 			return 0, messageTooLong(c.network(), c.LocalAddr(), address)
 		}
 		return 0, err
 	}
+	c.rememberTarget(target)
 	return len(payload), nil
 }
 
@@ -517,8 +529,8 @@ func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, address net
 // validation. The oldest entries are discarded when the bound is reached.
 func (c *UDPConn) rememberTarget(target netip.AddrPort) {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
-	now := time.Now()
 	c.mu.Lock()
+	now := time.Now()
 	if _, exists := c.recentTargets[target]; exists {
 		c.recentTargets[target] = now
 		c.mu.Unlock()
@@ -548,8 +560,8 @@ func (c *UDPConn) rememberTarget(target netip.AddrPort) {
 // unconnected socket to the exact remote endpoint.
 func (c *UDPConn) acceptsError(target netip.AddrPort) bool {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
-	now := time.Now()
 	c.mu.Lock()
+	now := time.Now()
 	updated, exists := c.recentTargets[target]
 	if exists && now.Sub(updated) >= udpRecentTargetLifetime {
 		delete(c.recentTargets, target)

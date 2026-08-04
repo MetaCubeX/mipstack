@@ -37,6 +37,19 @@ func TestMTUAndRouteFamilyValidation(t *testing.T) {
 	if _, err = withoutRoutes.RouteFor(netip.MustParseAddr("198.51.100.1")); !errors.Is(err, syscall.ENETUNREACH) {
 		t.Fatalf("explicit empty route table = %v, want ENETUNREACH", err)
 	}
+	broadcastStack, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.15/24")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, address := range []string{"192.0.2.255", "255.255.255.255"} {
+		destination := netip.MustParseAddr(address)
+		if _, routeErr := broadcastStack.RouteFor(destination); !errors.Is(routeErr, syscall.EACCES) {
+			t.Fatalf("broadcast route %s = %v, want EACCES", destination, routeErr)
+		}
+		if _, sourceErr := broadcastStack.sourceFor(destination); !errors.Is(sourceErr, syscall.EACCES) {
+			t.Fatalf("broadcast source %s = %v, want EACCES", destination, sourceErr)
+		}
+	}
 }
 
 func TestTCPConnectionLimitConfiguration(t *testing.T) {

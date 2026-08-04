@@ -23,6 +23,7 @@ type networkState struct {
 	congestionControl CongestionControl
 	local             map[netip.Addr]struct{}
 	sources           []netip.Addr
+	localPrefixes     []netip.Prefix
 	routes            []Route
 }
 
@@ -69,6 +70,7 @@ func buildNetworkState(config Config) (*networkState, error) {
 			state.local[address] = struct{}{}
 			state.sources = append(state.sources, address)
 		}
+		state.localPrefixes = append(state.localPrefixes, netip.PrefixFrom(address, bits).Masked())
 	}
 	if len(state.local) == 0 {
 		return nil, errors.New("mipstack: at least one local address is required")
@@ -130,6 +132,55 @@ func buildNetworkState(config Config) (*networkState, error) {
 	return state, nil
 }
 
+// invalidInboundSource reports source addresses that RFC 1122 forbids on an
+// incoming datagram. Generic multicast, unspecified, and limited-broadcast
+// checks are performed by the caller; this method recognizes a directed
+// broadcast on one of the stack's configured IPv4 subnets.
+func (state *networkState) invalidInboundSource(address netip.Addr) bool {
+	address = address.Unmap()
+	if !address.Is4() {
+		return false
+	}
+	value := binary.BigEndian.Uint32(address.AsSlice())
+	for _, prefix := range state.localPrefixes {
+		if !prefix.Addr().Is4() || prefix.Bits() >= 31 || !prefix.Contains(address) {
+			continue
+		}
+		network := binary.BigEndian.Uint32(prefix.Addr().AsSlice())
+		hostMask := uint32((uint64(1) << (32 - prefix.Bits())) - 1)
+		if value == network|hostMask {
+			return true
+		}
+	}
+	return false
+}
+
+// broadcastDestination reports limited broadcast and directed broadcast for
+// one of the configured IPv4 prefixes. Mipstack exposes unicast sockets and
+// has no SO_BROADCAST option, so these addresses cannot be used as ordinary
+// transport destinations.
+func (state *networkState) broadcastDestination(address netip.Addr) bool {
+	address = address.Unmap()
+	if !address.Is4() {
+		return false
+	}
+	value := binary.BigEndian.Uint32(address.AsSlice())
+	if value == ^uint32(0) {
+		return true
+	}
+	for _, prefix := range state.localPrefixes {
+		if !prefix.Addr().Is4() || prefix.Bits() >= 31 || !prefix.Contains(address) {
+			continue
+		}
+		network := binary.BigEndian.Uint32(prefix.Addr().AsSlice())
+		hostMask := uint32((uint64(1) << (32 - prefix.Bits())) - 1)
+		if value == network|hostMask {
+			return true
+		}
+	}
+	return false
+}
+
 // isIPv4Broadcast reports limited broadcast and subnet broadcast addresses.
 // Prefixes /31 and /32 do not reserve a subnet broadcast address.
 func isIPv4Broadcast(prefix netip.Prefix, address netip.Addr, bits int) bool {
@@ -188,6 +239,9 @@ func (state *networkState) sourceFor(destination, requested netip.Addr) (netip.A
 	destination = destination.Unmap()
 	if !destination.IsValid() || destination.IsUnspecified() || destination.IsMulticast() || destination.Zone() != "" {
 		return netip.Addr{}, syscall.EINVAL
+	}
+	if state.broadcastDestination(destination) {
+		return netip.Addr{}, syscall.EACCES
 	}
 	route, exists := state.routeFor(destination)
 	if !exists {

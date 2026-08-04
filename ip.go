@@ -472,6 +472,14 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 		}
 		deadline, changed, notified := c.readDeadline, c.readChanged, c.receiveNotify
 		c.mu.Unlock()
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			select {
+			case <-changed:
+				continue
+			default:
+				return 0, ipDatagram{}, false, os.ErrDeadlineExceeded
+			}
+		}
 		timer, timeout := deadlineTimer(deadline)
 		select {
 		case <-notified:

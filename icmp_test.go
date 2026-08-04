@@ -47,8 +47,9 @@ func TestICMPErrorCodeValidation(t *testing.T) {
 		{protocolICMPv6, 2, 1, false},
 		{protocolICMPv6, 3, 1, true},
 		{protocolICMPv6, 3, 2, false},
-		{protocolICMPv6, 4, 2, true},
-		{protocolICMPv6, 4, 3, false},
+		{protocolICMPv6, 4, 3, true},
+		{protocolICMPv6, 4, 4, true},
+		{protocolICMPv6, 4, 5, false},
 		{protocolICMPv4, 8, 0, false},
 	} {
 		if got := validICMPErrorCode(test.protocol, test.messageType, test.code); got != test.valid {
@@ -62,6 +63,46 @@ func TestICMPErrorCodeValidation(t *testing.T) {
 func TestTruncatedICMPv6ErrorIsRejected(t *testing.T) {
 	if _, ok := parseICMPError(ipPacket{protocol: protocolICMPv6, payload: []byte{1}}); ok {
 		t.Fatal("truncated ICMPv6 error was accepted")
+	}
+}
+
+func TestICMPErrorRejectsCrossFamilyQuote(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		protocol byte
+		typeCode [2]byte
+		quoted   []byte
+	}{
+		{
+			name: "ICMPv4 quoting IPv6", protocol: protocolICMPv4, typeCode: [2]byte{3, 1},
+			quoted: buildIPPacket(netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2"), protocolUDP, make([]byte, 8), 0, true),
+		},
+		{
+			name: "ICMPv6 quoting IPv4", protocol: protocolICMPv6, typeCode: [2]byte{1, 0},
+			quoted: buildIPPacket(netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"), protocolUDP, make([]byte, 8), 1, true),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message := make([]byte, 8+len(test.quoted))
+			message[0], message[1] = test.typeCode[0], test.typeCode[1]
+			copy(message[8:], test.quoted)
+			if _, ok := parseICMPError(ipPacket{protocol: test.protocol, payload: message}); ok {
+				t.Fatal("cross-family quoted packet was accepted")
+			}
+		})
+	}
+}
+
+func TestQuotedIPv6FirstFragmentIgnoresReservedBits(t *testing.T) {
+	source := netip.MustParseAddr("2001:db8::1")
+	target := netip.MustParseAddr("2001:db8::2")
+	fragment := make([]byte, 8+udpHeaderSize)
+	fragment[0], fragment[1] = protocolUDP, 0xff
+	binary.BigEndian.PutUint16(fragment[2:4], 0x0007) // Reserved bits and M.
+	packet := buildIPPacket(source, target, 44, fragment, 0, false)
+	quotedSource, quotedTarget, protocol, payload, ok := quotedIPPayload(packet)
+	if !ok || quotedSource != source || quotedTarget != target || protocol != protocolUDP || len(payload) != udpHeaderSize {
+		t.Fatalf("quoted reserved-bit first fragment = %v %v %d %d, parsed = %v", quotedSource, quotedTarget, protocol, len(payload), ok)
 	}
 }
 
