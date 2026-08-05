@@ -78,7 +78,7 @@ func TestIPConnFanoutAndLinuxControl(t *testing.T) {
 			if stats := stack.Stats(); stats.ActiveIPSockets != 2 {
 				t.Fatalf("active IP sockets = %d, want 2", stats.ActiveIPSockets)
 			}
-			if len(stack.outbound) != 0 {
+			if len(stack.outbound.packets) != 0 {
 				t.Fatal("raw-consumed protocol generated Protocol Unreachable")
 			}
 		})
@@ -631,6 +631,60 @@ func TestIPConnReceiveCapacity(t *testing.T) {
 		if readErr != nil || n != 1 || buffer[0] != byte(index) {
 			t.Fatalf("raw ReadFrom %d = %x, %v", index, buffer[:n], readErr)
 		}
+	}
+}
+
+func TestIPConcurrentReadersReuseBoundedTimers(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.121")
+	remote := netip.MustParseAddr("198.51.100.121")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := newIPConn(stack, "ip4:99", 99, local, remote)
+	defer connection.closeFromStack()
+	if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	const readers = 8
+	start := make(chan struct{})
+	results := make(chan byte, readers)
+	for index := 0; index < readers; index++ {
+		go func() {
+			<-start
+			buffer := make([]byte, 1)
+			n, readErr := connection.Read(buffer)
+			if readErr != nil || n != 1 {
+				results <- 0xff
+				return
+			}
+			results <- buffer[0]
+		}()
+	}
+	close(start)
+	for value := byte(0); value < readers; value++ {
+		connection.enqueue([]byte{value}, remote, local, ipPacketOptions{})
+	}
+	seen := make(map[byte]struct{}, readers)
+	for index := 0; index < readers; index++ {
+		select {
+		case value := <-results:
+			if value == 0xff {
+				t.Fatal("concurrent IP read failed")
+			}
+			seen[value] = struct{}{}
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent IP readers did not make progress")
+		}
+	}
+	if len(seen) != readers {
+		t.Fatalf("concurrent IP reads received %d distinct datagrams", len(seen))
+	}
+	connection.readTimers.mu.Lock()
+	cached := len(connection.readTimers.timers)
+	connection.readTimers.mu.Unlock()
+	if cached > deadlineTimerCacheLimit {
+		t.Fatalf("cached IP read timers = %d, limit %d", cached, deadlineTimerCacheLimit)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -77,6 +78,35 @@ func TestPathMTUMinimumPolicy(t *testing.T) {
 	}
 	if mtu := stack4.mtuFor(remote4); mtu != 68 {
 		t.Fatalf("IPv4 PMTU after subminimum hint = %d, want 68", mtu)
+	}
+}
+
+func TestPathMTUUsesOneConfigurationSnapshot(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.3")
+	remote := netip.MustParseAddr("198.51.100.3")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := buildNetworkState(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1200})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// UpdateConfig publishes the network and clears the cache while holding
+	// pathMTUMu. Force mtuFor to wait at that boundary: it must load both the
+	// network ceiling and cache contents on the same side of the update.
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+	stack.pathMTUMu.Lock()
+	result := make(chan int, 1)
+	go func() { result <- stack.mtuFor(remote) }()
+	runtime.Gosched()
+	stack.network.Store(updated)
+	stack.pathMTU = make(map[netip.Addr]pathMTUEntry)
+	stack.pathMTUMu.Unlock()
+	if mtu := <-result; mtu != 1200 {
+		t.Fatalf("PMTU spanning a configuration update = %d, want 1200", mtu)
 	}
 }
 

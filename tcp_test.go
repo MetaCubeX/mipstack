@@ -1838,9 +1838,7 @@ func TestTCPDialCancellationUnblocksFullPacketQueue(t *testing.T) {
 	if err = stack.Start(); err != nil {
 		t.Fatal(err)
 	}
-	for len(stack.outbound) < cap(stack.outbound) {
-		stack.outbound <- []byte{0x45}
-	}
+	fillTestPacketQueue(t, &stack.outbound, []byte{0x45})
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 	if _, err = stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, remote); !errors.Is(err, context.DeadlineExceeded) {
@@ -3248,6 +3246,55 @@ func TestTCPInboundQueuePrependHonorsByteCapacity(t *testing.T) {
 	}
 }
 
+func TestTCPInboundQueueRetainsOnlySmallBacking(t *testing.T) {
+	queue := newTCPSegmentQueue()
+	for index := 0; index < tcpMetadataQueueRetain; index++ {
+		if !queue.enqueue(tcpSegment{sequence: uint32(index)}) {
+			t.Fatal("small inbound queue rejected a segment")
+		}
+	}
+	for index := 0; index < tcpMetadataQueueRetain; index++ {
+		segment, ok := queue.dequeue()
+		if !ok || segment.sequence != uint32(index) {
+			t.Fatalf("small inbound queue dequeue = %d, %v, want %d, true", segment.sequence, ok, index)
+		}
+	}
+	if len(queue.segments) != 0 || cap(queue.segments) == 0 || cap(queue.segments) > tcpMetadataQueueRetain {
+		t.Fatalf("small drained inbound queue = len %d cap %d", len(queue.segments), cap(queue.segments))
+	}
+	for index := 0; index < tcpMetadataQueueRetain+1; index++ {
+		if !queue.enqueue(tcpSegment{sequence: uint32(index)}) {
+			t.Fatal("large inbound queue rejected a segment")
+		}
+	}
+	for index := 0; index < tcpMetadataQueueRetain+1; index++ {
+		if _, ok := queue.dequeue(); !ok {
+			t.Fatal("large inbound queue lost a segment")
+		}
+	}
+	if queue.segments != nil || queue.head != 0 {
+		t.Fatalf("large drained inbound queue retained len %d cap %d head %d", len(queue.segments), cap(queue.segments), queue.head)
+	}
+}
+
+func BenchmarkTCPInboundQueueSmallBurst(b *testing.B) {
+	queue := newTCPSegmentQueue()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		for index := 0; index < tcpMetadataQueueRetain; index++ {
+			if !queue.enqueue(tcpSegment{sequence: uint32(index)}) {
+				b.Fatal("small inbound queue rejected a segment")
+			}
+		}
+		for index := 0; index < tcpMetadataQueueRetain; index++ {
+			if _, ok := queue.dequeue(); !ok {
+				b.Fatal("small inbound queue lost a segment")
+			}
+		}
+	}
+}
+
 // TestTCPTimerOrderingDrainsPreDeadlineBacklog verifies that scheduler delay
 // cannot turn a large, already-arrived packet backlog into synthetic loss.
 // The backlog deliberately exceeds the former 1024-event deferral limit.
@@ -3854,7 +3901,8 @@ func TestTCPReservedHeaderBitsAreIgnored(t *testing.T) {
 		t.Fatalf("reserved TCP header bits dropped packets = %d, want 0", dropped)
 	}
 	select {
-	case response := <-stack.outbound:
+	case entry := <-stack.outbound.packets:
+		response := stack.outbound.consume(entry)
 		parsed, ok := parseIPPacket(response)
 		if !ok || len(parsed.payload) < tcpHeaderSize || parsed.payload[13] != tcpFlagRST|tcpFlagACK {
 			t.Fatalf("reserved TCP header response = %x", response)
@@ -3980,7 +4028,8 @@ func TestExplicitTCPSourceAndLocalLoopback(t *testing.T) {
 		t.Fatal("local traffic did not use the loopback path")
 	}
 	select {
-	case packet := <-stack.outbound:
+	case entry := <-stack.outbound.packets:
+		packet := stack.outbound.consume(entry)
 		t.Fatalf("local traffic escaped to the link: %x", packet)
 	default:
 	}

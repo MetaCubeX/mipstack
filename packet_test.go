@@ -184,7 +184,8 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case response = <-stack.outbound:
+	case entry := <-stack.outbound.packets:
+		response = stack.outbound.consume(entry)
 		t.Fatalf("non-initial malformed fragment produced Parameter Problem: %x", response)
 	case <-time.After(25 * time.Millisecond):
 	}
@@ -212,7 +213,8 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case response = <-stack.outbound:
+	case entry := <-stack.outbound.packets:
+		response = stack.outbound.consume(entry)
 		t.Fatalf("ICMPv6 error produced recursive Parameter Problem: %x", response)
 	case <-time.After(25 * time.Millisecond):
 	}
@@ -236,7 +238,8 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case response = <-stack.outbound:
+	case entry := <-stack.outbound.packets:
+		response = stack.outbound.consume(entry)
 		t.Fatalf("IPv6 No Next Header produced a response: %x", response)
 	default:
 	}
@@ -305,7 +308,8 @@ func TestIPv4MappedIPv6WireSourceIsDropped(t *testing.T) {
 		t.Fatalf("mapped IPv6 source drop count = %d, want %d", after, before+1)
 	}
 	select {
-	case response := <-stack.outbound:
+	case entry := <-stack.outbound.packets:
+		response := stack.outbound.consume(entry)
 		t.Fatalf("mapped IPv6 source produced response: %x", response)
 	default:
 	}
@@ -326,7 +330,8 @@ func TestIPv4DirectedBroadcastSourceIsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case response := <-stack.outbound:
+	case entry := <-stack.outbound.packets:
+		response := stack.outbound.consume(entry)
 		t.Fatalf("directed-broadcast source produced a response: %x", response)
 	case <-time.After(25 * time.Millisecond):
 	}

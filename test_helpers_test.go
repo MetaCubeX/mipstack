@@ -739,11 +739,20 @@ func wildcardUDP(address netip.Addr) netip.AddrPort {
 func readOutboundPacket(t *testing.T, stack *Stack) []byte {
 	t.Helper()
 	select {
-	case packet := <-stack.outbound:
-		return packet
+	case entry := <-stack.outbound.packets:
+		return stack.outbound.consume(entry)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for outbound packet")
 		return nil
+	}
+}
+
+func fillTestPacketQueue(t *testing.T, queue *packetQueue, packet []byte) {
+	t.Helper()
+	for len(queue.packets) < cap(queue.packets) {
+		if _, queued := queue.tryEnqueue(packet); !queued {
+			t.Fatal("packet queue became full before its channel capacity")
+		}
 	}
 }
 

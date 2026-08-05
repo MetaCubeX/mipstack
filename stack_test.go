@@ -275,9 +275,7 @@ func TestFullLoopbackQueueDoesNotBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	for len(stack.loopback) < cap(stack.loopback) {
-		stack.loopback <- []byte{0}
-	}
+	fillTestPacketQueue(t, &stack.loopback, []byte{0})
 	packet := buildIPPacket(local, local, protocolUDP, make([]byte, udpHeaderSize), 1, false)
 	if err = stack.writePacket(packet); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("writePacket to full loopback queue = %v, want ErrResourceLimit", err)
@@ -316,6 +314,147 @@ func TestPacketQueueTicketTracksDeviceDequeue(t *testing.T) {
 	}
 	if ticket.pending() {
 		t.Fatal("packet queue ticket remained pending after device Read")
+	}
+}
+
+func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
+	queue := newPacketQueue(1)
+	first, queued := queue.tryEnqueue([]byte{1})
+	if !queued || !first.pending() {
+		t.Fatal("first queue ticket was not pending")
+	}
+	entry := <-queue.packets
+	queue.consume(entry)
+	if first.pending() {
+		t.Fatal("consumed queue ticket remained pending")
+	}
+	second, queued := queue.tryEnqueue([]byte{2})
+	if !queued || !second.pending() {
+		t.Fatal("reused queue slot was not pending")
+	}
+	if first.pending() || first.generation == second.generation {
+		t.Fatalf("slot reuse revived generation %d as %d", first.generation, second.generation)
+	}
+	entry = <-queue.packets
+	queue.consume(entry)
+	if second.pending() {
+		t.Fatal("second queue ticket remained pending")
+	}
+}
+
+func TestPacketQueueConcurrentWritersMakeBoundedProgress(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.15")
+	remote := netip.MustParseAddr("192.0.2.16")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	packet := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	const writers = 1024
+	errorsCh := make(chan error, writers)
+	start := make(chan struct{})
+	for index := 0; index < writers; index++ {
+		go func() {
+			<-start
+			errorsCh <- stack.writePacket(packet)
+		}()
+	}
+	close(start)
+	buffer := make([]byte, 1500)
+	for received := 0; received < writers; {
+		count, readErr := stack.Read([][]byte{buffer}, []int{0}, 0)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		received += count
+	}
+	for index := 0; index < writers; index++ {
+		if writeErr := <-errorsCh; writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+	if len(stack.outbound.packets) != 0 || len(stack.outbound.free) != cap(stack.outbound.free) {
+		t.Fatalf("queue did not release every slot: packets=%d free=%d", len(stack.outbound.packets), len(stack.outbound.free))
+	}
+}
+
+func TestDatagramQueueRetainsOnlySmallBacking(t *testing.T) {
+	var queue datagramQueue[int]
+	for value := 0; value < datagramQueueRetain; value++ {
+		queue.push(value)
+	}
+	for value := 0; value < datagramQueueRetain; value++ {
+		got, ok := queue.pop()
+		if !ok || got != value {
+			t.Fatalf("small queue pop = %d, %v, want %d, true", got, ok, value)
+		}
+	}
+	if queue.len() != 0 || cap(queue.values) == 0 || cap(queue.values) > datagramQueueRetain {
+		t.Fatalf("small drained queue = len %d cap %d", queue.len(), cap(queue.values))
+	}
+	for value := 0; value < datagramQueueRetain+1; value++ {
+		queue.push(value)
+	}
+	for value := 0; value < datagramQueueRetain+1; value++ {
+		got, ok := queue.pop()
+		if !ok || got != value {
+			t.Fatalf("large queue pop = %d, %v, want %d, true", got, ok, value)
+		}
+	}
+	if queue.values != nil || queue.head != 0 {
+		t.Fatalf("large drained queue retained len %d cap %d head %d", len(queue.values), cap(queue.values), queue.head)
+	}
+}
+
+func TestDeadlineTimerCacheIsConcurrentAndBounded(t *testing.T) {
+	var cache deadlineTimerCache
+	timers := make([]*time.Timer, 2*deadlineTimerCacheLimit)
+	for index := range timers {
+		timer, _ := cache.timer(time.Now().Add(time.Hour))
+		timers[index] = timer
+	}
+	var wait sync.WaitGroup
+	wait.Add(len(timers))
+	for _, timer := range timers {
+		go func(timer *time.Timer) {
+			defer wait.Done()
+			cache.release(timer, false)
+		}(timer)
+	}
+	wait.Wait()
+	cache.mu.Lock()
+	cached := len(cache.timers)
+	cache.mu.Unlock()
+	if cached != deadlineTimerCacheLimit {
+		t.Fatalf("cached deadline timers = %d, want %d", cached, deadlineTimerCacheLimit)
+	}
+}
+
+func TestDeadlineTimerCacheResetHasNoStaleTick(t *testing.T) {
+	var cache deadlineTimerCache
+	for _, consume := range []bool{false, true} {
+		timer, timeout := cache.timer(time.Now().Add(time.Millisecond))
+		if consume {
+			<-timeout
+		} else {
+			time.Sleep(10 * time.Millisecond)
+		}
+		cache.release(timer, consume)
+
+		reused, next := cache.timer(time.Now().Add(time.Hour))
+		if reused != timer {
+			t.Fatal("deadline timer cache did not reuse the released timer")
+		}
+		select {
+		case <-next:
+			t.Fatalf("deadline timer cache exposed a stale tick after consumed=%v", consume)
+		default:
+		}
+		cache.release(reused, false)
 	}
 }
 

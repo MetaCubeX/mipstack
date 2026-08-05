@@ -48,6 +48,9 @@ const (
 	// operations without pinning an automatically tuned multi-megabyte window
 	// on every idle connection.
 	tcpReusableBufferLimit = 64 * 1024
+	// tcpMetadataQueueRetain keeps common short actor bursts from reallocating
+	// metadata while releasing larger arrays after they drain.
+	tcpMetadataQueueRetain = 4
 	// tcpMaximumOutOfOrder bounds retained receive-range metadata. The limit
 	// accommodates a full default window split near IPv6's minimum MTU while
 	// still bounding adversarial sparse one-byte ranges.
@@ -376,7 +379,11 @@ func (q *tcpSegmentQueue) dequeue() (tcpSegment, bool) {
 	q.bytes -= segment.retainedBytes
 	segment.retainedBytes = 0
 	if q.head == len(q.segments) {
-		q.segments = nil
+		if cap(q.segments) <= tcpMetadataQueueRetain {
+			q.segments = q.segments[:0]
+		} else {
+			q.segments = nil
+		}
 		q.head = 0
 	} else {
 		if q.head >= 1024 && q.head*2 >= len(q.segments) {
@@ -4823,6 +4830,7 @@ func (c *TCPConn) established(sendNext uint32) error {
 							localFINAcked = true
 							c.notifyLingerDone()
 						}
+						outstanding[0] = sentTCPSegment{}
 						outstanding = outstanding[1:]
 					}
 					if len(outstanding) == 0 {

@@ -158,7 +158,15 @@ func benchmarkTCPControllerConnections(b *testing.B, algorithm CongestionControl
 	if err != nil {
 		b.Fatal(err)
 	}
-	server, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(serverAddress, 32)}, TCP: TCPSocketDefaults{CongestionControl: algorithm}})
+	server, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(serverAddress, 32)},
+		TCP: TCPSocketDefaults{
+			CongestionControl: algorithm,
+			// This benchmark measures established-flow concurrency rather than
+			// the independently tested accept-queue overload policy.
+			AcceptQueue: count,
+		},
+	})
 	if err != nil {
 		b.Fatal(err)
 	}

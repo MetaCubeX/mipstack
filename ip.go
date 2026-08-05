@@ -91,7 +91,7 @@ type IPConn struct {
 	once   sync.Once
 
 	mu              sync.Mutex
-	receive         []ipDatagram
+	receive         datagramQueue[ipDatagram]
 	receiveNotify   chan struct{}
 	receiveCapacity int
 	queuedBytes     int
@@ -99,6 +99,7 @@ type IPConn struct {
 	writeDeadline   time.Time
 	readChanged     chan struct{}
 	writeChanged    chan struct{}
+	readTimers      deadlineTimerCache
 	errors          chan error
 	recentTargets   recentDestinationCache[netip.Addr]
 	defaultOptions  ipPacketOptions
@@ -273,16 +274,20 @@ func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.
 	if stack != nil {
 		defaults = stack.network.Load().ipDefaults
 	}
-	return &IPConn{
+	connection := &IPConn{
 		stack: stack, net: network, protocol: protocol, v6: local.Is6(), local: local, remote: remote,
-		closed: make(chan struct{}), receiveNotify: make(chan struct{}), receiveCapacity: defaults.ReceiveBuffer,
+		closed: make(chan struct{}), receiveNotify: make(chan struct{}, 1), receiveCapacity: defaults.ReceiveBuffer,
 		readChanged: make(chan struct{}), writeChanged: make(chan struct{}),
-		errors: make(chan error, 8), recentTargets: make(recentDestinationCache[netip.Addr]),
+		errors: make(chan error, 8),
 		defaultOptions: ipPacketOptions{
 			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
 			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
 		},
 	}
+	if !remote.IsValid() {
+		connection.recentTargets = make(recentDestinationCache[netip.Addr])
+	}
+	return connection
 }
 
 // ipEndpointStateLocked returns the lazily allocated raw dispatcher while
@@ -459,17 +464,28 @@ func (c *IPConn) enqueue(payload []byte, source, target netip.Addr, options ipPa
 		return
 	}
 	datagram := ipDatagram{payload: append([]byte(nil), payload...), source: source, target: target, options: options}
-	wasEmpty := len(c.receive) == 0
-	c.receive = append(c.receive, datagram)
+	c.receive.push(datagram)
 	c.queuedBytes += size
 	c.packetsReceived.Add(1)
 	c.bytesReceived.Add(uint64(len(payload)))
-	if wasEmpty {
-		notified := c.receiveNotify
-		c.receiveNotify = make(chan struct{})
-		close(notified)
-	}
+	c.notifyReceiveLocked()
 	c.mu.Unlock()
+}
+
+// notifyReceiveLocked keeps one edge notification armed while queued data
+// remains and removes a stale token when the queue becomes empty.
+func (c *IPConn) notifyReceiveLocked() {
+	if c.receive.len() != 0 {
+		select {
+		case c.receiveNotify <- struct{}{}:
+		default:
+		}
+		return
+	}
+	select {
+	case <-c.receiveNotify:
+	default:
+	}
 }
 
 // ReadFrom implements net.PacketConn.
@@ -537,14 +553,10 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 			return 0, ipDatagram{}, false, net.ErrClosed
 		default:
 		}
-		if len(c.receive) != 0 {
-			datagram = c.receive[0]
-			c.receive[0] = ipDatagram{}
-			c.receive = c.receive[1:]
-			if len(c.receive) == 0 {
-				c.receive = nil
-			}
+		if queued, ok := c.receive.pop(); ok {
+			datagram = queued
 			c.queuedBytes -= ipDatagramMetadataSize + len(datagram.payload)
+			c.notifyReceiveLocked()
 			c.mu.Unlock()
 			n = copy(buffer, datagram.payload)
 			return n, datagram, n < len(datagram.payload), nil
@@ -559,19 +571,20 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 				return 0, ipDatagram{}, false, os.ErrDeadlineExceeded
 			}
 		}
-		timer, timeout := deadlineTimer(deadline)
+		timer, timeout := c.readTimers.timer(deadline)
 		select {
 		case <-notified:
-			stopTimer(timer)
+			c.readTimers.release(timer, false)
 		case err = <-c.errors:
-			stopTimer(timer)
+			c.readTimers.release(timer, false)
 			return 0, ipDatagram{}, false, err
 		case <-timeout:
+			c.readTimers.release(timer, true)
 			return 0, ipDatagram{}, false, os.ErrDeadlineExceeded
 		case <-changed:
-			stopTimer(timer)
+			c.readTimers.release(timer, false)
 		case <-c.closed:
-			stopTimer(timer)
+			c.readTimers.release(timer, false)
 			return 0, ipDatagram{}, false, net.ErrClosed
 		}
 	}
@@ -595,7 +608,7 @@ func (c *IPConn) WriteToIP(payload []byte, address *net.IPAddr) (int, error) {
 	if c.remote.IsValid() {
 		return 0, c.operationErrorTo("write", address, net.ErrWriteToConnected)
 	}
-	n, err := c.writeTo(payload, target, address, netip.Addr{}, ipPacketOptions{})
+	n, err := c.writeTo(payload, target, netip.Addr{}, ipPacketOptions{})
 	if err != nil {
 		return n, c.operationErrorTo("write", address, err)
 	}
@@ -607,7 +620,7 @@ func (c *IPConn) Write(payload []byte) (int, error) {
 	if !c.remote.IsValid() {
 		return 0, c.operationError("write", errors.New("mipstack: IP socket is not connected"))
 	}
-	n, err := c.writeTo(payload, c.remote, c.remoteAddr(), netip.Addr{}, ipPacketOptions{})
+	n, err := c.writeTo(payload, c.remote, netip.Addr{}, ipPacketOptions{})
 	if err != nil {
 		return n, c.operationError("write", err)
 	}
@@ -621,7 +634,7 @@ func (c *IPConn) WritePathMTUProbe(payload []byte) (int, error) {
 	if !c.remote.IsValid() {
 		return 0, c.operationError("write", errors.New("mipstack: IP socket is not connected"))
 	}
-	n, err := c.writeToWith(payload, c.remote, c.remoteAddr(), netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
+	n, err := c.writeToWith(payload, c.remote, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
 	if err != nil {
 		return n, c.operationError("write", err)
 	}
@@ -633,7 +646,7 @@ func (c *IPConn) WritePathMTUProbeTo(payload []byte, target netip.Addr) (int, er
 	if c.remote.IsValid() {
 		return 0, c.operationErrorTo("write", ipNetAddr(target), net.ErrWriteToConnected)
 	}
-	n, err := c.writeToWith(payload, target, ipNetAddr(target), netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
+	n, err := c.writeToWith(payload, target, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
 	if err != nil {
 		return n, c.operationErrorTo("write", ipNetAddr(target), err)
 	}
@@ -684,7 +697,7 @@ func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn i
 	if err != nil {
 		return 0, 0, c.operationErrorTo("write", netAddress, err)
 	}
-	n, err = c.writeTo(payload, target, netAddress, source, options)
+	n, err = c.writeTo(payload, target, source, options)
 	if err != nil {
 		return n, 0, c.operationErrorTo("write", netAddress, err)
 	}
@@ -693,18 +706,18 @@ func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn i
 
 // writeTo selects a source, repairs ICMPv6 checksum, and emits one ordinary
 // fragmentable payload.
-func (c *IPConn) writeTo(payload []byte, target netip.Addr, address net.Addr, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
-	return c.writeToWith(payload, target, address, packetInfoSource, options, c.writePayload)
+func (c *IPConn) writeTo(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
+	return c.writeToWith(payload, target, packetInfoSource, options, c.writePayload)
 }
 
 // writeToWith keeps routing, checksums, deadlines, accounting, and ICMP
 // correlation shared between ordinary writes and PLPMTUD probes.
-func (c *IPConn) writeToWith(payload []byte, target netip.Addr, address net.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, []byte, ipPacketOptions) error) (int, error) {
+func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, []byte, ipPacketOptions) error) (int, error) {
 	target = target.Unmap()
 	if !target.IsValid() || target.IsUnspecified() || target.IsMulticast() || !c.dual && target.Is6() != c.v6 || target.Zone() != "" {
 		return 0, syscall.EINVAL
 	}
-	deadline, _, closed := c.writeState()
+	deadline, _, closed, options := c.writeStateAndOptions(options)
 	if closed {
 		return 0, net.ErrClosed
 	}
@@ -728,10 +741,9 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, address net.Addr
 		payload[2], payload[3] = 0, 0
 		binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, protocolICMPv6, payload))
 	}
-	options = c.outputOptions(options)
 	if err = write(source, target, payload, options); err != nil {
 		if errors.Is(err, syscall.EMSGSIZE) {
-			return 0, messageTooLong(c.net, c.LocalAddr(), address)
+			return 0, syscall.EMSGSIZE
 		}
 		return 0, err
 	}
@@ -765,7 +777,7 @@ func (c *IPConn) Close() error {
 func (c *IPConn) closeFromStack() {
 	c.once.Do(func() {
 		c.mu.Lock()
-		c.receive = nil
+		c.receive.clear()
 		c.queuedBytes = 0
 		close(c.closed)
 		c.mu.Unlock()
@@ -788,7 +800,7 @@ func (c *IPConn) Info() IPInfo {
 	}
 	info := IPInfo{
 		LocalAddress: c.local, RemoteAddress: c.remote, Protocol: c.protocol,
-		ReceiveQueuePackets: len(c.receive), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
+		ReceiveQueuePackets: c.receive.len(), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
 		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass,
 		FlowLabel: flowLabel,
 		LastError: c.lastError,
@@ -965,6 +977,9 @@ func (c *IPConn) SetFlowLabel(label uint32) error {
 // rememberTarget records a successful write for later ICMP quote validation.
 func (c *IPConn) rememberTarget(target netip.Addr) {
 	target = target.Unmap()
+	if c.remote.IsValid() {
+		return
+	}
 	c.mu.Lock()
 	c.recentTargets.remember(target, time.Now())
 	c.mu.Unlock()
@@ -973,6 +988,9 @@ func (c *IPConn) rememberTarget(target netip.Addr) {
 // acceptsError reports whether ICMP quoted a recent write to target.
 func (c *IPConn) acceptsError(target netip.Addr) bool {
 	target = target.Unmap()
+	if c.remote.IsValid() {
+		return target == c.remote
+	}
 	c.mu.Lock()
 	exists := c.recentTargets.contains(target, time.Now())
 	c.mu.Unlock()
@@ -994,14 +1012,6 @@ func (c *IPConn) deliverError(target netip.Addr, err error) {
 	}
 }
 
-// outputOptions merges one per-packet override with socket defaults.
-func (c *IPConn) outputOptions(options ipPacketOptions) ipPacketOptions {
-	c.mu.Lock()
-	defaults := c.defaultOptions
-	c.mu.Unlock()
-	return options.withDefaults(defaults)
-}
-
 // writeState snapshots the write deadline and closure notification.
 func (c *IPConn) writeState() (time.Time, <-chan struct{}, bool) {
 	c.mu.Lock()
@@ -1011,6 +1021,20 @@ func (c *IPConn) writeState() (time.Time, <-chan struct{}, bool) {
 		return c.writeDeadline, c.writeChanged, true
 	default:
 		return c.writeDeadline, c.writeChanged, false
+	}
+}
+
+// writeStateAndOptions reads the initial deadline and output defaults under
+// one socket lock. A blocked host-queue write still rechecks writeState.
+func (c *IPConn) writeStateAndOptions(options ipPacketOptions) (time.Time, <-chan struct{}, bool, ipPacketOptions) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	options = options.withDefaults(c.defaultOptions)
+	select {
+	case <-c.closed:
+		return c.writeDeadline, c.writeChanged, true, options
+	default:
+		return c.writeDeadline, c.writeChanged, false, options
 	}
 }
 

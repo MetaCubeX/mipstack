@@ -223,6 +223,54 @@ func BenchmarkUDPDatagramRoundTrip(b *testing.B) {
 	}
 }
 
+func TestUDPConcurrentReadersReuseBoundedTimers(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.242")
+	remote := netip.MustParseAddrPort("198.51.100.242:5353")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := newUDPConn(stack, "udp4", 5300, false, local, remote)
+	defer connection.closeFromStack()
+	if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	const readers = 8
+	start := make(chan struct{})
+	results := make(chan byte, readers)
+	for index := 0; index < readers; index++ {
+		go func() {
+			<-start
+			buffer := make([]byte, 1)
+			n, readErr := connection.Read(buffer)
+			if readErr != nil || n != 1 {
+				results <- 0xff
+				return
+			}
+			results <- buffer[0]
+		}()
+	}
+	close(start)
+	for value := byte(0); value < readers; value++ {
+		connection.enqueue([]byte{value}, remote, local, ipPacketOptions{})
+	}
+	seen := make(map[byte]struct{}, readers)
+	for index := 0; index < readers; index++ {
+		select {
+		case value := <-results:
+			if value == 0xff {
+				t.Fatal("concurrent UDP read failed")
+			}
+			seen[value] = struct{}{}
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent UDP readers did not make progress")
+		}
+	}
+	if len(seen) != readers {
+		t.Fatalf("concurrent UDP reads received %d distinct datagrams", len(seen))
+	}
+}
+
 func TestUDPDialNetworkValidation(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.121")
 	remote := netip.MustParseAddrPort("198.51.100.121:53")
@@ -336,9 +384,7 @@ func TestUDPWriteDeadlineInterruptsFullQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	for len(stack.outbound) < cap(stack.outbound) {
-		stack.outbound <- []byte{0}
-	}
+	fillTestPacketQueue(t, &stack.outbound, []byte{0})
 	if err = connection.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}

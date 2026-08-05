@@ -90,7 +90,7 @@ type UDPConn struct {
 	once   sync.Once
 
 	mu              sync.Mutex
-	receive         []udpDatagram
+	receive         datagramQueue[udpDatagram]
 	receiveNotify   chan struct{}
 	receiveCapacity int
 	queuedBytes     int
@@ -98,8 +98,10 @@ type UDPConn struct {
 	writeDeadline   time.Time
 	readChanged     chan struct{}
 	writeChanged    chan struct{}
+	readTimers      deadlineTimerCache
 	recentTargets   recentDestinationCache[netip.AddrPort]
 	defaultOptions  ipPacketOptions
+	automaticLabel  uint32
 	lastError       error
 	packetsSent     atomic.Uint64
 	bytesSent       atomic.Uint64
@@ -115,16 +117,21 @@ func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.
 	if stack != nil {
 		defaults = stack.network.Load().udpDefaults
 	}
-	return &UDPConn{
+	connection := &UDPConn{
 		stack: stack, net: network, port: port, v6: v6, local: local, remote: remote,
-		errors: make(chan error, 8), closed: make(chan struct{}), receiveNotify: make(chan struct{}), receiveCapacity: defaults.ReceiveBuffer,
+		errors: make(chan error, 8), closed: make(chan struct{}), receiveNotify: make(chan struct{}, 1), receiveCapacity: defaults.ReceiveBuffer,
 		readChanged: make(chan struct{}), writeChanged: make(chan struct{}),
-		recentTargets: make(recentDestinationCache[netip.AddrPort]),
 		defaultOptions: ipPacketOptions{
 			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
 			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
 		},
 	}
+	if !remote.IsValid() {
+		connection.recentTargets = make(recentDestinationCache[netip.AddrPort])
+	} else if stack != nil && local.Is6() && remote.Addr().Is6() && defaults.FlowLabel == 0 {
+		connection.automaticLabel = stack.automaticTransportFlowLabel(local, remote.Addr(), protocolUDP, port, remote.Port())
+	}
+	return connection
 }
 
 // available implements exclusive UDP binding.
@@ -239,17 +246,28 @@ func (c *UDPConn) enqueue(payload []byte, source netip.AddrPort, target netip.Ad
 		return
 	}
 	datagram := udpDatagram{payload: append([]byte(nil), payload...), source: source, target: target, options: options}
-	wasEmpty := len(c.receive) == 0
-	c.receive = append(c.receive, datagram)
+	c.receive.push(datagram)
 	c.queuedBytes += size
 	c.packetsReceived.Add(1)
 	c.bytesReceived.Add(uint64(len(payload)))
-	if wasEmpty {
-		notified := c.receiveNotify
-		c.receiveNotify = make(chan struct{})
-		close(notified)
-	}
+	c.notifyReceiveLocked()
 	c.mu.Unlock()
+}
+
+// notifyReceiveLocked keeps one edge notification armed while queued data
+// remains and removes a stale token when the queue becomes empty.
+func (c *UDPConn) notifyReceiveLocked() {
+	if c.receive.len() != 0 {
+		select {
+		case c.receiveNotify <- struct{}{}:
+		default:
+		}
+		return
+	}
+	select {
+	case <-c.receiveNotify:
+	default:
+	}
 }
 
 // udpDatagramSize returns the approximate retained-memory cost of a payload.
@@ -354,14 +372,9 @@ func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, tar
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, net.ErrClosed
 		default:
 		}
-		if len(c.receive) != 0 {
-			datagram := c.receive[0]
-			c.receive[0] = udpDatagram{}
-			c.receive = c.receive[1:]
-			if len(c.receive) == 0 {
-				c.receive = nil
-			}
+		if datagram, ok := c.receive.pop(); ok {
 			c.queuedBytes -= udpDatagramSize(datagram.payload)
+			c.notifyReceiveLocked()
 			c.mu.Unlock()
 			n = copy(buffer, datagram.payload)
 			return n, datagram.source, datagram.target, datagram.options, n < len(datagram.payload), nil
@@ -376,20 +389,21 @@ func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, tar
 				return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
 			}
 		}
-		timer, timeout := deadlineTimer(deadline)
+		timer, timeout := c.readTimers.timer(deadline)
 		select {
 		case <-notified:
-			stopTimer(timer)
+			c.readTimers.release(timer, false)
 		case err := <-c.errors:
-			stopTimer(timer)
+			c.readTimers.release(timer, false)
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, err
 		case <-timeout:
+			c.readTimers.release(timer, true)
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
 		case <-changed:
-			stopTimer(timer)
+			c.readTimers.release(timer, false)
 			continue
 		case <-c.closed:
-			stopTimer(timer)
+			c.readTimers.release(timer, false)
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, net.ErrClosed
 		}
 	}
@@ -404,7 +418,7 @@ func (c *UDPConn) WriteTo(payload []byte, address net.Addr) (int, error) {
 	if c.remote.IsValid() {
 		return 0, c.operationError("write", address, net.ErrWriteToConnected)
 	}
-	n, err := c.writeTo(payload, target, address)
+	n, err := c.writeTo(payload, target)
 	if err != nil {
 		return n, c.operationError("write", address, err)
 	}
@@ -432,7 +446,7 @@ func (c *UDPConn) writeToUDPAddrPort(payload []byte, target netip.AddrPort, addr
 		return 0, c.operationError("write", address, net.ErrWriteToConnected)
 	}
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
-	n, err := c.writeTo(payload, target, address)
+	n, err := c.writeTo(payload, target)
 	if err != nil {
 		return n, c.operationError("write", address, err)
 	}
@@ -444,10 +458,9 @@ func (c *UDPConn) Write(payload []byte) (int, error) {
 	if !c.remote.IsValid() {
 		return 0, c.operationError("write", nil, errors.New("mipstack: UDP socket is not connected"))
 	}
-	address := c.remoteAddr()
-	n, err := c.writeTo(payload, c.remote, address)
+	n, err := c.writeTo(payload, c.remote)
 	if err != nil {
-		return n, c.operationError("write", address, err)
+		return n, c.operationError("write", c.remoteAddr(), err)
 	}
 	return n, nil
 }
@@ -459,10 +472,9 @@ func (c *UDPConn) WritePathMTUProbe(payload []byte) (int, error) {
 	if !c.remote.IsValid() {
 		return 0, c.operationError("write", nil, errors.New("mipstack: UDP socket is not connected"))
 	}
-	address := c.remoteAddr()
-	n, err := c.writeToFromWith(payload, c.remote, address, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram)
+	n, err := c.writeToFromWith(payload, c.remote, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram)
 	if err != nil {
-		return n, c.operationError("write", address, err)
+		return n, c.operationError("write", c.remoteAddr(), err)
 	}
 	return n, nil
 }
@@ -473,7 +485,7 @@ func (c *UDPConn) WritePathMTUProbeTo(payload []byte, target netip.AddrPort) (in
 	if c.remote.IsValid() {
 		return 0, c.operationError("write", address, net.ErrWriteToConnected)
 	}
-	n, err := c.writeToFromWith(payload, target, address, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram)
+	n, err := c.writeToFromWith(payload, target, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram)
 	if err != nil {
 		return n, c.operationError("write", address, err)
 	}
@@ -549,7 +561,7 @@ func (c *UDPConn) writeMsgUDPAddrPort(payload, oob []byte, target netip.AddrPort
 	if err != nil {
 		return 0, 0, c.operationError("write", address, err)
 	}
-	n, err = c.writeToFrom(payload, target, address, source, options)
+	n, err = c.writeToFrom(payload, target, source, options)
 	if err != nil {
 		return n, 0, c.operationError("write", address, err)
 	}
@@ -557,24 +569,24 @@ func (c *UDPConn) writeMsgUDPAddrPort(payload, oob []byte, target netip.AddrPort
 }
 
 // writeTo sends one datagram without adding the public net.OpError wrapper.
-func (c *UDPConn) writeTo(payload []byte, target netip.AddrPort, address net.Addr) (int, error) {
-	return c.writeToFrom(payload, target, address, netip.Addr{}, ipPacketOptions{})
+func (c *UDPConn) writeTo(payload []byte, target netip.AddrPort) (int, error) {
+	return c.writeToFrom(payload, target, netip.Addr{}, ipPacketOptions{})
 }
 
 // writeToFrom sends one datagram with an optional packet-info source address.
-func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, address net.Addr, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
-	return c.writeToFromWith(payload, target, address, packetInfoSource, options, c.writeDatagram)
+func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
+	return c.writeToFromWith(payload, target, packetInfoSource, options, c.writeDatagram)
 }
 
 // writeToFromWith keeps source selection, checksums, deadlines, accounting,
 // and ICMP correlation shared while leaving optional output policies
 // independently reachable by the linker.
-func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, address net.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, uint16, uint16, []byte, ipPacketOptions) error) (int, error) {
+func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, uint16, uint16, []byte, ipPacketOptions) error) (int, error) {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
 	if target.Addr().Is6() != c.v6 && !c.dual || target.Port() == 0 || target.Addr().IsUnspecified() {
 		return 0, errors.New("mipstack: invalid UDP destination")
 	}
-	deadline, _, closed := c.writeState()
+	deadline, _, closed, options := c.writeStateAndOptions(options)
 	if closed {
 		return 0, net.ErrClosed
 	}
@@ -594,18 +606,17 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, address
 		return 0, err
 	}
 	source = source.Unmap()
-	options = c.outputOptions(options)
 	maximumPayload := 65535 - udpHeaderSize
 	if target.Addr().Is4() {
 		maximumPayload -= 20
 	}
 	if len(payload) > maximumPayload {
-		return 0, messageTooLong(c.net, c.LocalAddr(), address)
+		return 0, syscall.EMSGSIZE
 	}
 	writeErr := write(source, target.Addr(), c.port, target.Port(), payload, options)
 	if writeErr != nil {
 		if errors.Is(writeErr, syscall.EMSGSIZE) {
-			return 0, messageTooLong(c.net, c.LocalAddr(), address)
+			return 0, syscall.EMSGSIZE
 		}
 		return 0, writeErr
 	}
@@ -637,7 +648,10 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 		return syscall.EMSGSIZE
 	}
 	if source.Is6() && !options.flowLabelSet {
-		options.flowLabel = c.stack.automaticTransportFlowLabel(source, target, protocolUDP, sourcePort, targetPort)
+		options.flowLabel = c.automaticLabel
+		if options.flowLabel == 0 || !c.remote.IsValid() || target != c.remote.Addr() || sourcePort != c.port || targetPort != c.remote.Port() {
+			options.flowLabel = c.stack.automaticTransportFlowLabel(source, target, protocolUDP, sourcePort, targetPort)
+		}
 		options.flowLabelSet = true
 	}
 	if ipSize+udpSize <= mtu {
@@ -678,6 +692,9 @@ func marshalUDPDatagram(dst []byte, source, target netip.Addr, sourcePort, targe
 // validation. The oldest entries are discarded when the bound is reached.
 func (c *UDPConn) rememberTarget(target netip.AddrPort) {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
+	if c.remote.IsValid() {
+		return
+	}
 	c.mu.Lock()
 	c.recentTargets.remember(target, time.Now())
 	c.mu.Unlock()
@@ -687,6 +704,9 @@ func (c *UDPConn) rememberTarget(target netip.AddrPort) {
 // unconnected socket to the exact remote endpoint.
 func (c *UDPConn) acceptsError(target netip.AddrPort) bool {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
+	if c.remote.IsValid() {
+		return target == c.remote
+	}
 	c.mu.Lock()
 	exists := c.recentTargets.contains(target, time.Now())
 	c.mu.Unlock()
@@ -736,7 +756,7 @@ func (c *UDPConn) Close() error {
 func (c *UDPConn) closeFromStack() {
 	c.once.Do(func() {
 		c.mu.Lock()
-		c.receive = nil
+		c.receive.clear()
 		c.queuedBytes = 0
 		close(c.closed)
 		c.mu.Unlock()
@@ -762,7 +782,7 @@ func (c *UDPConn) Info() UDPInfo {
 	}
 	info := UDPInfo{
 		LocalAddress: netip.AddrPortFrom(c.local, c.port), RemoteAddress: c.remote,
-		ReceiveQueuePackets: len(c.receive), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
+		ReceiveQueuePackets: c.receive.len(), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
 		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass,
 		FlowLabel: flowLabel, LastError: c.lastError,
 	}
@@ -940,14 +960,6 @@ func (c *UDPConn) SetFlowLabel(label uint32) error {
 	}
 }
 
-// outputOptions merges one per-packet override with socket defaults.
-func (c *UDPConn) outputOptions(options ipPacketOptions) ipPacketOptions {
-	c.mu.Lock()
-	defaults := c.defaultOptions
-	c.mu.Unlock()
-	return options.withDefaults(defaults)
-}
-
 // writeState snapshots the write deadline, notification, and closure state.
 func (c *UDPConn) writeState() (time.Time, <-chan struct{}, bool) {
 	c.mu.Lock()
@@ -960,9 +972,18 @@ func (c *UDPConn) writeState() (time.Time, <-chan struct{}, bool) {
 	}
 }
 
-// messageTooLong constructs the standard net.OpError form for EMSGSIZE.
-func messageTooLong(network string, source, target net.Addr) error {
-	return &net.OpError{Op: "write", Net: network, Source: source, Addr: target, Err: syscall.EMSGSIZE}
+// writeStateAndOptions reads the initial deadline and output defaults under
+// one socket lock. A blocked host-queue write still rechecks writeState.
+func (c *UDPConn) writeStateAndOptions(options ipPacketOptions) (time.Time, <-chan struct{}, bool, ipPacketOptions) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	options = options.withDefaults(c.defaultOptions)
+	select {
+	case <-c.closed:
+		return c.writeDeadline, c.writeChanged, true, options
+	default:
+		return c.writeDeadline, c.writeChanged, false, options
+	}
 }
 
 // operationError wraps a UDP socket failure in the same public shape used by
