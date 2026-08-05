@@ -7,6 +7,32 @@ import (
 	"time"
 )
 
+func TestChecksumMatchesReference(t *testing.T) {
+	reference := func(data []byte) uint16 {
+		var sum uint32
+		for len(data) >= 2 {
+			sum += uint32(data[0])<<8 | uint32(data[1])
+			data = data[2:]
+		}
+		if len(data) != 0 {
+			sum += uint32(data[0]) << 8
+		}
+		for sum>>16 != 0 {
+			sum = sum&0xffff + sum>>16
+		}
+		return ^uint16(sum)
+	}
+	data := make([]byte, 65535)
+	for index := range data {
+		data[index] = byte(index*37 + 11)
+	}
+	for _, size := range []int{0, 1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 1500, 65534, 65535} {
+		if got, want := checksum(data[:size]), reference(data[:size]); got != want {
+			t.Fatalf("checksum at length %d = %#x, want %#x", size, got, want)
+		}
+	}
+}
+
 // FuzzInboundPacket verifies that arbitrary L3 input cannot panic the stack.
 func FuzzInboundPacket(f *testing.F) {
 	f.Add([]byte(nil))
@@ -17,6 +43,41 @@ func FuzzInboundPacket(f *testing.F) {
 		defer stack.Close()
 		_ = writeTestPacket(stack, packet)
 	})
+}
+
+func TestIPv6FlowLabelEncodingAndFragmentation(t *testing.T) {
+	source := netip.MustParseAddr("2001:db8::10")
+	target := netip.MustParseAddr("2001:db8::20")
+	const label = uint32(0xabcde)
+	packet := buildIPPacketWithOptions(source, target, protocolUDP, make([]byte, udpHeaderSize), 0, true, ipPacketOptions{
+		trafficClass: 0x2e, flowLabel: label, flowLabelSet: true,
+	})
+	parsed, ok := parseIPPacket(packet)
+	if !ok || parsed.trafficClass != 0x2e || parsed.flowLabel != label {
+		t.Fatalf("IPv6 flow header = class %#x label %#x, parsed=%v", parsed.trafficClass, parsed.flowLabel, ok)
+	}
+	setPacketECN(packet, 3)
+	parsed, ok = parseIPPacket(packet)
+	if !ok || parsed.ecn != 3 || parsed.flowLabel != label {
+		t.Fatalf("IPv6 ECN update changed flow label: ECN %d label %#x", parsed.ecn, parsed.flowLabel)
+	}
+
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(source, 128)}, MTU: 1280})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragments, err := stack.ipPayloadPackets(source, target, protocolUDP, make([]byte, 2000), true)
+	if err != nil || len(fragments) < 2 {
+		t.Fatalf("IPv6 flow fragmentation = %d packets, %v", len(fragments), err)
+	}
+	var automatic uint32
+	for index, fragment := range fragments {
+		current := uint32(fragment[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(fragment[2:4]))
+		if current == 0 || index != 0 && current != automatic {
+			t.Fatalf("IPv6 fragment %d flow label = %#x, first %#x", index, current, automatic)
+		}
+		automatic = current
+	}
 }
 
 func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {

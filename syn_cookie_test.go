@@ -26,14 +26,16 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	listener.mu.Lock()
 	for index := 0; index < tcpSYNBacklog; index++ {
-		listener.pending[&TCPConn{}] = struct{}{}
+		connection := &TCPConn{}
+		if !listener.trackHandshake(connection) {
+			t.Fatalf("failed to fill SYN backlog at %d", index)
+		}
 	}
-	listener.mu.Unlock()
 	defer func() {
 		listener.mu.Lock()
 		listener.pending = make(map[*TCPConn]struct{})
+		listener.handshaking = make(map[*TCPConn]struct{})
 		listener.mu.Unlock()
 	}()
 
@@ -71,9 +73,6 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 		t.Fatalf("SYN cookie retained %d connections before final ACK", connectionsBeforeACK)
 	}
 
-	listener.mu.Lock()
-	listener.pending = make(map[*TCPConn]struct{})
-	listener.mu.Unlock()
 	if err = stack.UpdateConfig(Config{
 		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
 		TCP:            TCPSocketDefaults{ReceiveBuffer: 64 * 1024, MaximumReceiveBuffer: 128 * 1024},
@@ -81,6 +80,14 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	ackOptions := tcpTimestampOptions(clientTimestamp+1, serverTimestamp)
+	forgedACK := buildTestTCP(remote, local, 43001, 47002, clientSequence+1, serverSequence+2, tcpFlagACK, 1234, ackOptions, nil)
+	if err = writeTestPacket(stack, forgedACK); err != nil {
+		t.Fatal(err)
+	}
+	reset := readOutboundPacket(t, stack)
+	if parsedReset, parsedResetOK := parseIPPacket(reset); !parsedResetOK || len(parsedReset.payload) < tcpHeaderSize || parsedReset.payload[13]&tcpFlagRST == 0 {
+		t.Fatalf("forged cookie ACK response = %x", reset)
+	}
 	ack := buildTestTCP(remote, local, 43001, 47002, clientSequence+1, serverSequence+1, tcpFlagACK, 1234, ackOptions, nil)
 	if err = writeTestPacket(stack, ack); err != nil {
 		t.Fatal(err)
@@ -107,6 +114,16 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	}
 	if connection.RemoteAddr().(*net.TCPAddr).AddrPort() != netip.AddrPortFrom(remote, 43001) {
 		t.Fatalf("cookie connection remote = %v", connection.RemoteAddr())
+	}
+	info := listener.Info()
+	if info.SYNsReceived != 1 || info.SYNCookiesSent != 1 || info.SYNCookiesRejected != 1 || info.SYNCookiesAccepted != 1 ||
+		info.HandshakeCompletions != 1 || info.AcceptedConnections != 1 || info.AcceptQueuePeak > 1 ||
+		info.SYNBacklogConnections != tcpSYNBacklog || info.SYNBacklogPeak != tcpSYNBacklog {
+		t.Fatalf("SYN cookie listener diagnostics = %+v", info)
+	}
+	stats := stack.Stats()
+	if stats.TCPSYNCookiesSent != 1 || stats.TCPSYNCookiesRejected != 1 || stats.TCPSYNCookiesAccepted != 1 {
+		t.Fatalf("SYN cookie stack diagnostics = %+v", stats)
 	}
 }
 
@@ -135,7 +152,7 @@ func TestSYNCookieListenerCloseResetsPendingConnection(t *testing.T) {
 	connection := newTCPConn(stack, "tcp4", key, 1500)
 	connection.passive = true
 	connection.receiveNext = 0x12345679
-	if !listener.track(connection) {
+	if !listener.trackCompleted(connection) {
 		t.Fatal("failed to track pending cookie connection")
 	}
 	if err = listener.Close(); err != nil {

@@ -44,6 +44,10 @@ const (
 	// every mostly idle proxy connection up front.
 	tcpMaximumReceiveCapacity = 16 * 1024 * 1024
 	tcpMaximumSendCapacity    = 16 * 1024 * 1024
+	// tcpReusableBufferLimit retains modest empty application buffers between
+	// operations without pinning an automatically tuned multi-megabyte window
+	// on every idle connection.
+	tcpReusableBufferLimit = 64 * 1024
 	// tcpMaximumOutOfOrder bounds retained receive-range metadata. The limit
 	// accommodates a full default window split near IPv6's minimum MTU while
 	// still bounding adversarial sparse one-byte ranges.
@@ -57,8 +61,7 @@ const (
 	tcpInboundSegmentMetadata = 128
 	// tcpAcceptQueue bounds completed passive handshakes waiting for Accept.
 	tcpAcceptQueue = 128
-	// tcpSYNBacklog bounds half-open and completed but unaccepted connections
-	// owned by one listener.
+	// tcpSYNBacklog bounds half-open connections owned by one listener.
 	tcpSYNBacklog = 256
 	// tcpMaximumRTOs matches Linux's default tcp_retries2 budget for
 	// consecutive retransmission timeouts without cumulative acknowledgement
@@ -257,6 +260,7 @@ type TCPInfo struct {
 	UserTimeout            time.Duration
 	NoDelay                bool
 	TrafficClass           uint8
+	FlowLabel              uint32
 	SpuriousRecoveryUndos  uint64
 	PathMTUProbes          uint64
 	PathMTUProbeSuccesses  uint64
@@ -1006,28 +1010,30 @@ type TCPConn struct {
 	// used by the standard library.
 	passive bool
 
-	inbound           tcpSegmentQueue
-	networkError      chan error
-	pathMTUUpdate     chan struct{}
-	sendNotify        chan struct{}
-	windowUpdate      chan struct{}
-	abortCh           chan struct{}
-	done              chan struct{}
-	connected         chan error
-	lingerDone        chan struct{}
-	infoRequest       chan chan TCPInfo
-	abortOnce         sync.Once
-	closeOnce         sync.Once
-	lingerOnce        sync.Once
-	readCallMu        sync.Mutex
-	writeCallMu       sync.Mutex
-	icmpSequence      atomic.Uint64
-	applicationReads  atomic.Uint64
-	outOfOrderUnread  atomic.Int64
-	retransmissions   atomic.Uint64
-	inboundQueueDrops atomic.Uint64
-	lastInfo          atomic.Pointer[TCPInfo]
-	sendCapacityHint  atomic.Int64
+	inbound            tcpSegmentQueue
+	networkError       chan error
+	pathMTUUpdate      chan struct{}
+	sendNotify         chan struct{}
+	windowUpdate       chan struct{}
+	abortCh            chan struct{}
+	done               chan struct{}
+	connected          chan error
+	lingerDone         chan struct{}
+	infoRequest        chan chan TCPInfo
+	abortOnce          sync.Once
+	closeOnce          sync.Once
+	lingerOnce         sync.Once
+	readCallMu         sync.Mutex
+	writeCallMu        sync.Mutex
+	readDeadlineTimer  *ownedTimer
+	writeDeadlineTimer *ownedTimer
+	icmpSequence       atomic.Uint64
+	applicationReads   atomic.Uint64
+	outOfOrderUnread   atomic.Int64
+	retransmissions    atomic.Uint64
+	inboundQueueDrops  atomic.Uint64
+	lastInfo           atomic.Pointer[TCPInfo]
+	sendCapacityHint   atomic.Int64
 
 	abortMu  sync.Mutex
 	abortErr error
@@ -1035,6 +1041,7 @@ type TCPConn struct {
 
 	mu                 sync.Mutex
 	readBuffer         []byte
+	readBufferBase     []byte
 	readErr            error
 	terminalErr        error
 	userClosed         bool
@@ -1047,6 +1054,7 @@ type TCPConn struct {
 	readNotify         chan struct{}
 	sendChanged        chan struct{}
 	sendBuffer         []byte
+	sendBufferBase     []byte
 	optionsChanged     chan struct{}
 	receiveCapacity    int
 	sendCapacity       int
@@ -1063,6 +1071,7 @@ type TCPConn struct {
 	congestionUser     bool
 	receiveWindowScale uint8
 	trafficClass       atomic.Uint32
+	flowLabel          uint32
 	linger             int
 
 	// Handshake results are passed to established by the same actor goroutine.
@@ -1142,6 +1151,29 @@ type tcpListenerBinding interface {
 // exclusiveTCPListenerBinding is the default one-owner bind policy.
 type exclusiveTCPListenerBinding struct{}
 
+// TCPListenerInfo is a point-in-time diagnostic snapshot of one passive TCP
+// endpoint. Queue peaks and counters cover the listener's complete lifetime.
+type TCPListenerInfo struct {
+	LocalAddress           netip.AddrPort
+	Closed                 bool
+	AcceptQueueConnections int
+	AcceptQueueCapacity    int
+	AcceptQueuePeak        int
+	SYNBacklogConnections  int
+	SYNBacklogCapacity     int
+	SYNBacklogPeak         int
+	SYNsReceived           uint64
+	StatefulHandshakes     uint64
+	HandshakeCompletions   uint64
+	HandshakeFailures      uint64
+	HandshakeTimeouts      uint64
+	SYNCookiesSent         uint64
+	SYNCookiesAccepted     uint64
+	SYNCookiesRejected     uint64
+	AcceptQueueDrops       uint64
+	AcceptedConnections    uint64
+}
+
 // TCPListener is a passive userspace TCP endpoint.
 type TCPListener struct {
 	stack *Stack
@@ -1155,10 +1187,24 @@ type TCPListener struct {
 	once    sync.Once
 	backlog int
 
-	mu       sync.Mutex
-	deadline time.Time
-	changed  chan struct{}
-	pending  map[*TCPConn]struct{}
+	mu          sync.Mutex
+	deadline    time.Time
+	changed     chan struct{}
+	pending     map[*TCPConn]struct{}
+	handshaking map[*TCPConn]struct{}
+	acceptPeak  int
+	backlogPeak int
+
+	synsReceived         atomic.Uint64
+	statefulHandshakes   atomic.Uint64
+	handshakeCompletions atomic.Uint64
+	handshakeFailures    atomic.Uint64
+	handshakeTimeouts    atomic.Uint64
+	synCookiesSent       atomic.Uint64
+	synCookiesAccepted   atomic.Uint64
+	synCookiesRejected   atomic.Uint64
+	acceptQueueDrops     atomic.Uint64
+	acceptedConnections  atomic.Uint64
 }
 
 // ListenTCP creates a passive TCP endpoint. Network must be tcp, tcp4, or
@@ -1225,7 +1271,7 @@ func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrP
 	key := tcpListenKey{address: address, port: port}
 	listener := &TCPListener{
 		stack: s, key: key, local: local, dual: dual, net: network, accept: make(chan *TCPConn, state.tcpDefaults.AcceptQueue), backlog: state.tcpDefaults.SYNBacklog,
-		closed: make(chan struct{}), changed: make(chan struct{}), pending: make(map[*TCPConn]struct{}),
+		closed: make(chan struct{}), changed: make(chan struct{}), pending: make(map[*TCPConn]struct{}), handshaking: make(map[*TCPConn]struct{}),
 	}
 	if err = binding.register(passive, listener); err != nil {
 		return wrap(err)
@@ -1428,6 +1474,7 @@ func (l *TCPListener) AcceptTCP() (*TCPConn, error) {
 			}
 			delete(l.pending, connection)
 			l.mu.Unlock()
+			l.acceptedConnections.Add(1)
 			return connection, nil
 		case <-changed:
 			stopTimer(timer)
@@ -1452,6 +1499,34 @@ func (l *TCPListener) Close() error {
 // Addr returns the bound TCP endpoint.
 func (l *TCPListener) Addr() net.Addr { return net.TCPAddrFromAddrPort(l.local) }
 
+// Info returns queue pressure, handshake outcomes, and SYN-cookie activity for
+// this listener. The final snapshot remains available after Close.
+func (l *TCPListener) Info() TCPListenerInfo {
+	l.mu.Lock()
+	info := TCPListenerInfo{
+		LocalAddress:           l.local,
+		AcceptQueueConnections: len(l.accept), AcceptQueueCapacity: cap(l.accept), AcceptQueuePeak: l.acceptPeak,
+		SYNBacklogConnections: len(l.handshaking), SYNBacklogCapacity: l.backlog, SYNBacklogPeak: l.backlogPeak,
+	}
+	select {
+	case <-l.closed:
+		info.Closed = true
+	default:
+	}
+	l.mu.Unlock()
+	info.SYNsReceived = l.synsReceived.Load()
+	info.StatefulHandshakes = l.statefulHandshakes.Load()
+	info.HandshakeCompletions = l.handshakeCompletions.Load()
+	info.HandshakeFailures = l.handshakeFailures.Load()
+	info.HandshakeTimeouts = l.handshakeTimeouts.Load()
+	info.SYNCookiesSent = l.synCookiesSent.Load()
+	info.SYNCookiesAccepted = l.synCookiesAccepted.Load()
+	info.SYNCookiesRejected = l.synCookiesRejected.Load()
+	info.AcceptQueueDrops = l.acceptQueueDrops.Load()
+	info.AcceptedConnections = l.acceptedConnections.Load()
+	return info
+}
+
 // SetDeadline sets the deadline for subsequent Accept calls.
 func (l *TCPListener) SetDeadline(deadline time.Time) error {
 	l.mu.Lock()
@@ -1473,8 +1548,8 @@ func (l *TCPListener) operationError(operation string, err error) error {
 	return socketOperationError(operation, l.net, nil, l.Addr(), err)
 }
 
-// track reserves one listener backlog entry for connection.
-func (l *TCPListener) track(connection *TCPConn) bool {
+// trackHandshake reserves one listener SYN-backlog entry for connection.
+func (l *TCPListener) trackHandshake(connection *TCPConn) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	select {
@@ -1482,17 +1557,36 @@ func (l *TCPListener) track(connection *TCPConn) bool {
 		return false
 	default:
 	}
-	if len(l.pending) >= l.backlog {
+	if len(l.handshaking) >= l.backlog {
 		return false
 	}
 	l.pending[connection] = struct{}{}
+	l.handshaking[connection] = struct{}{}
+	if len(l.handshaking) > l.backlogPeak {
+		l.backlogPeak = len(l.handshaking)
+	}
 	return true
+}
+
+// trackCompleted retains a completed SYN-cookie connection until Accept
+// returns it. It deliberately does not consult or occupy the SYN backlog.
+func (l *TCPListener) trackCompleted(connection *TCPConn) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	select {
+	case <-l.closed:
+		return false
+	default:
+		l.pending[connection] = struct{}{}
+		return true
+	}
 }
 
 // removePending releases a failed handshake from the listener backlog.
 func (l *TCPListener) removePending(connection *TCPConn) {
 	l.mu.Lock()
 	delete(l.pending, connection)
+	delete(l.handshaking, connection)
 	l.mu.Unlock()
 }
 
@@ -1500,6 +1594,7 @@ func (l *TCPListener) removePending(connection *TCPConn) {
 func (l *TCPListener) enqueue(connection *TCPConn) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	delete(l.handshaking, connection)
 	select {
 	case <-l.closed:
 		return false
@@ -1507,9 +1602,24 @@ func (l *TCPListener) enqueue(connection *TCPConn) bool {
 	}
 	select {
 	case l.accept <- connection:
+		l.handshakeCompletions.Add(1)
+		if len(l.accept) > l.acceptPeak {
+			l.acceptPeak = len(l.accept)
+		}
 		return true
 	default:
+		l.acceptQueueDrops.Add(1)
+		l.stack.stats.tcpAcceptQueueDrops.Add(1)
 		return false
+	}
+}
+
+// noteHandshakeFailure classifies a failed stateful passive open.
+func (l *TCPListener) noteHandshakeFailure(err error) {
+	l.handshakeFailures.Add(1)
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		l.handshakeTimeouts.Add(1)
+		l.stack.stats.tcpHandshakeTimeouts.Add(1)
 	}
 }
 
@@ -1524,6 +1634,7 @@ func (l *TCPListener) closeFromStack() {
 			pending = append(pending, connection)
 		}
 		l.pending = make(map[*TCPConn]struct{})
+		l.handshaking = make(map[*TCPConn]struct{})
 		l.mu.Unlock()
 		for _, connection := range pending {
 			connection.abort(net.ErrClosed)
@@ -1623,7 +1734,7 @@ func newTCPConn(stack *Stack, network string, key tcpKey, mtu int) *TCPConn {
 		sendNotify: make(chan struct{}, 1), windowUpdate: make(chan struct{}, 1),
 		abortCh: make(chan struct{}), done: make(chan struct{}), connected: make(chan error, 1), lingerDone: make(chan struct{}),
 		infoRequest: make(chan chan TCPInfo),
-		readChanged: make(chan struct{}), writeChanged: make(chan struct{}), readNotify: make(chan struct{}), sendChanged: make(chan struct{}),
+		readChanged: make(chan struct{}), writeChanged: make(chan struct{}), readNotify: make(chan struct{}, 1), sendChanged: make(chan struct{}, 1),
 		optionsChanged: make(chan struct{}, 1), noDelay: !defaults.DisableNoDelay, linger: -1,
 		receiveCapacity: defaults.ReceiveBuffer, sendCapacity: defaults.SendBuffer,
 		receiveMaximum: defaults.MaximumReceiveBuffer, sendMaximum: defaults.MaximumSendBuffer,
@@ -1632,6 +1743,12 @@ func newTCPConn(stack *Stack, network string, key tcpKey, mtu int) *TCPConn {
 		keepAlive:       defaults.KeepAlive, keepAliveConfig: defaults.KeepAliveConfig,
 		idleTimeout: defaults.IdleTimeout, userTimeout: defaults.UserTimeout, congestion: defaults.CongestionControl,
 		receiveWindowScale: tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer),
+	}
+	if key.local.Addr().Is6() {
+		connection.flowLabel = defaults.FlowLabel
+		if connection.flowLabel == 0 && stack != nil {
+			connection.flowLabel = stack.automaticTransportFlowLabel(key.local.Addr(), key.remote.Addr(), protocolTCP, key.local.Port(), key.remote.Port())
+		}
 	}
 	connection.trafficClass.Store(uint32(defaults.TrafficClass))
 	connection.sendCapacityHint.Store(int64(defaults.SendBuffer))
@@ -1770,6 +1887,7 @@ func (state *tcpPassiveState) handleSYN(stack *Stack, packet ipPacket, segment t
 	if listener == nil {
 		return false, nil
 	}
+	listener.synsReceived.Add(1)
 	stack.mu.Lock()
 	if connection := stack.tcp[key]; connection != nil {
 		stack.mu.Unlock()
@@ -1788,7 +1906,8 @@ func (state *tcpPassiveState) handleSYN(stack *Stack, packet ipPacket, segment t
 		connection := newTCPConn(stack, listener.net, key, stack.mtuFor(packet.source))
 		connection.passive = true
 		connection.publishICMPSequenceRange(initialSequence, initialSequence+1)
-		if listener.track(connection) {
+		if listener.trackHandshake(connection) {
+			listener.statefulHandshakes.Add(1)
 			stack.tcp[key] = connection
 			stack.stats.activeTCPConnections.Add(1)
 			stack.mu.Unlock()
@@ -1800,7 +1919,12 @@ func (state *tcpPassiveState) handleSYN(stack *Stack, packet ipPacket, segment t
 	if listener == nil {
 		return false, nil
 	}
-	return true, state.sendSYNCookie(stack, key, segment, tcpSegmentEventTime(segment, time.Now(), time.Time{}))
+	err := state.sendSYNCookie(stack, key, segment, tcpSegmentEventTime(segment, time.Now(), time.Time{}))
+	if err == nil {
+		listener.synCookiesSent.Add(1)
+		stack.stats.tcpSYNCookiesSent.Add(1)
+	}
+	return true, err
 }
 
 // handleSYNCookieACK allocates connection state only after authenticating a
@@ -1812,8 +1936,12 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 	if listener == nil {
 		return false, nil
 	}
-	initialSequence, options, valid := state.validateSYNCookie(key, segment, tcpSegmentEventTime(segment, time.Now(), time.Time{}))
+	initialSequence, options, valid, attempted := state.validateSYNCookieCandidate(key, segment, tcpSegmentEventTime(segment, time.Now(), time.Time{}))
 	if !valid {
+		if attempted {
+			listener.synCookiesRejected.Add(1)
+			stack.stats.tcpSYNCookiesRejected.Add(1)
+		}
 		return false, nil
 	}
 	stack.mu.Lock()
@@ -1855,10 +1983,12 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 	connection.peerWindowSeq = segment.sequence
 	connection.peerWindowACK = segment.acknowledgement
 	connection.receiveWindowScale = options.localWindowScale
-	if !listener.track(connection) {
+	if !listener.trackCompleted(connection) {
 		stack.mu.Unlock()
 		return true, nil
 	}
+	listener.synCookiesAccepted.Add(1)
+	stack.stats.tcpSYNCookiesAccepted.Add(1)
 	stack.tcp[key] = connection
 	stack.stats.activeTCPConnections.Add(1)
 	stack.mu.Unlock()
@@ -1868,12 +1998,25 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 
 // buildTCPPacket constructs one non-fragmented TCP segment using explicit path
 // and IP-header policy.
-func buildTCPPacket(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte) ([]byte, error) {
+func buildTCPPacket(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte, flowLabel uint32) ([]byte, error) {
 	headerSize := tcpHeaderSize + (len(options)+3)&^3
 	if len(options) > 40 || headerSize > 60 {
 		return nil, errors.New("mipstack: invalid TCP options")
 	}
-	tcp := make([]byte, headerSize+len(payload))
+	ipSize := ipHeaderSize(source, target, headerSize+len(payload))
+	if ipSize == 0 || ipSize+headerSize+len(payload) > mtu {
+		return nil, syscall.EMSGSIZE
+	}
+	packet := make([]byte, ipSize+headerSize+len(payload))
+	// RFC 6864 makes Identification meaningless on this DF atomic datagram;
+	// Linux likewise emits zero instead of consuming the ID sequence reserved
+	// for datagrams that routers may actually fragment.
+	if !marshalIPHeader(packet, source, target, protocolTCP, 0, true, ipPacketOptions{
+		trafficClass: trafficClass&0xfc | ecn&3, flowLabel: flowLabel, flowLabelSet: true,
+	}) {
+		return nil, syscall.EMSGSIZE
+	}
+	tcp := packet[ipSize:]
 	binary.BigEndian.PutUint16(tcp[0:2], sourcePort)
 	binary.BigEndian.PutUint16(tcp[2:4], targetPort)
 	binary.BigEndian.PutUint32(tcp[4:8], sequence)
@@ -1883,13 +2026,6 @@ func buildTCPPacket(source, target netip.Addr, sourcePort, targetPort uint16, se
 	copy(tcp[tcpHeaderSize:headerSize], options)
 	copy(tcp[headerSize:], payload)
 	binary.BigEndian.PutUint16(tcp[16:18], transportChecksum(source, target, protocolTCP, tcp))
-	// RFC 6864 makes Identification meaningless on this DF atomic datagram;
-	// Linux likewise emits zero instead of consuming the fragmentation ID
-	// sequence used by datagrams that routers may actually fragment.
-	packet := buildIPPacketWithOptions(source, target, protocolTCP, tcp, 0, true, ipPacketOptions{trafficClass: trafficClass&0xfc | ecn&3})
-	if len(packet) == 0 || len(packet) > mtu {
-		return nil, syscall.EMSGSIZE
-	}
 	return packet, nil
 }
 
@@ -1897,7 +2033,14 @@ func buildTCPPacket(source, target netip.Addr, sourcePort, targetPort uint16, se
 // cancellation-aware writer below so a stalled embedding link cannot retain a
 // terminated connection indefinitely.
 func (s *Stack) writeTCP(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte) error {
-	packet, err := buildTCPPacket(source, target, sourcePort, targetPort, sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn)
+	flowLabel := uint32(0)
+	if source.Is6() {
+		flowLabel = s.network.Load().tcpDefaults.FlowLabel
+		if flowLabel == 0 {
+			flowLabel = s.automaticTransportFlowLabel(source, target, protocolTCP, sourcePort, targetPort)
+		}
+	}
+	packet, err := buildTCPPacket(source, target, sourcePort, targetPort, sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, flowLabel)
 	if err != nil {
 		return err
 	}
@@ -1970,9 +2113,10 @@ func (c *TCPConn) read(buffer []byte) (int, error) {
 		}
 		if len(c.readBuffer) != 0 {
 			n := copy(buffer, c.readBuffer)
-			c.readBuffer = c.readBuffer[n:]
-			if len(c.readBuffer) == 0 {
-				c.readBuffer = nil
+			if n == len(c.readBuffer) {
+				c.readBuffer, c.readBufferBase = emptyReusableTCPBuffer(c.readBufferBase)
+			} else {
+				c.readBuffer = c.readBuffer[n:]
 			}
 			c.mu.Unlock()
 			c.applicationReads.Add(uint64(n))
@@ -1997,16 +2141,24 @@ func (c *TCPConn) read(buffer []byte) (int, error) {
 				return 0, os.ErrDeadlineExceeded
 			}
 		}
-		timer, timeout := deadlineTimer(deadline)
+		var timeout <-chan time.Time
+		if !deadline.IsZero() {
+			if c.readDeadlineTimer == nil {
+				c.readDeadlineTimer = newOwnedTimer()
+			}
+			timeout = c.readDeadlineTimer.reset(time.Until(deadline))
+		}
 		select {
 		case <-notified:
 		case <-changed:
 		case <-timeout:
-			stopTimer(timer)
+			c.readDeadlineTimer.consumed()
 			return 0, os.ErrDeadlineExceeded
 		case <-c.done:
 		}
-		stopTimer(timer)
+		if c.readDeadlineTimer != nil {
+			c.readDeadlineTimer.stop()
+		}
 	}
 }
 
@@ -2077,7 +2229,7 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 			available = len(payload) - written
 		}
 		if available > 0 {
-			c.sendBuffer = append(c.sendBuffer, payload[written:written+available]...)
+			c.sendBuffer, c.sendBufferBase = appendTCPBuffer(c.sendBuffer, c.sendBufferBase, payload[written:written+available])
 			written += available
 		}
 		deadline, deadlineChanged, sendChanged := c.writeDeadline, c.writeChanged, c.sendChanged
@@ -2088,18 +2240,27 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 		if written == len(payload) {
 			return written, nil
 		}
-		timer, timeout := deadlineTimer(deadline)
+		var timeout <-chan time.Time
+		if !deadline.IsZero() {
+			if c.writeDeadlineTimer == nil {
+				c.writeDeadlineTimer = newOwnedTimer()
+			}
+			timeout = c.writeDeadlineTimer.reset(time.Until(deadline))
+		}
 		select {
 		case <-sendChanged:
-			stopTimer(timer)
 		case <-deadlineChanged:
-			stopTimer(timer)
 		case <-timeout:
-			stopTimer(timer)
+			c.writeDeadlineTimer.consumed()
 			return written, os.ErrDeadlineExceeded
 		case <-c.done:
-			stopTimer(timer)
+			if c.writeDeadlineTimer != nil {
+				c.writeDeadlineTimer.stop()
+			}
 			return written, c.connectionError()
+		}
+		if c.writeDeadlineTimer != nil {
+			c.writeDeadlineTimer.stop()
 		}
 	}
 	return written, nil
@@ -2175,6 +2336,7 @@ func (c *TCPConn) CloseRead() error {
 	if !c.readClosed {
 		c.readClosed = true
 		c.readBuffer = nil
+		c.readBufferBase = nil
 		c.readErr = net.ErrClosed
 		c.notifyReadLocked()
 	}
@@ -2205,8 +2367,10 @@ func (c *TCPConn) Close() error {
 		c.userClosed = true
 		c.readErr = net.ErrClosed
 		c.readBuffer = nil
+		c.readBufferBase = nil
 		if abortive {
 			c.sendBuffer = nil
+			c.sendBufferBase = nil
 			c.notifySendChangedLocked()
 		}
 		c.notifyReadLocked()
@@ -2283,8 +2447,8 @@ func (c *TCPConn) tcpInfoBaseLocked(state TCPState) TCPInfo {
 		PeerWindowScale: c.peerWindowScale, ReceiveWindowScale: c.receiveWindowScale,
 		SACK: c.peerSACK, Timestamps: c.peerTimestamp, ECN: c.peerECN,
 		KeepAlive: c.keepAlive, KeepAliveConfig: c.keepAliveConfig, IdleTimeout: c.idleTimeout, UserTimeout: c.userTimeout, NoDelay: c.noDelay,
-		TrafficClass: uint8(c.trafficClass.Load()),
-		LastError:    c.terminalErr,
+		TrafficClass: uint8(c.trafficClass.Load()), FlowLabel: c.flowLabel,
+		LastError: c.terminalErr,
 	}
 	return info
 }
@@ -2675,11 +2839,13 @@ func (c *TCPConn) connectionErrorLocked() error {
 	return net.ErrClosed
 }
 
-// notifyReadLocked broadcasts a receive-state change while c.mu is held.
+// notifyReadLocked wakes the serialized application reader. Repeated state
+// changes coalesce while it is running.
 func (c *TCPConn) notifyReadLocked() {
-	notified := c.readNotify
-	c.readNotify = make(chan struct{})
-	close(notified)
+	select {
+	case c.readNotify <- struct{}{}:
+	default:
+	}
 }
 
 // notifySend wakes the connection actor after buffered data or CloseWrite.
@@ -2693,9 +2859,10 @@ func (c *TCPConn) notifySend() {
 // notifySendChangedLocked wakes Writes waiting for send-buffer space while
 // c.mu is held.
 func (c *TCPConn) notifySendChangedLocked() {
-	changed := c.sendChanged
-	c.sendChanged = make(chan struct{})
-	close(changed)
+	select {
+	case c.sendChanged <- struct{}{}:
+	default:
+	}
 }
 
 // notifyLingerDone publishes that every accepted byte and the local FIN have
@@ -2732,9 +2899,10 @@ func (c *TCPConn) acknowledgeSend(size int) {
 		size = len(c.sendBuffer)
 	}
 	if size != 0 {
-		c.sendBuffer = c.sendBuffer[size:]
-		if len(c.sendBuffer) == 0 {
-			c.sendBuffer = nil
+		if size == len(c.sendBuffer) {
+			c.sendBuffer, c.sendBufferBase = emptyReusableTCPBuffer(c.sendBufferBase)
+		} else {
+			c.sendBuffer = c.sendBuffer[size:]
 		}
 		c.notifySendChangedLocked()
 	}
@@ -2772,12 +2940,33 @@ func (c *TCPConn) appendReadBuffer(payload []byte, outOfOrderBytes int) int {
 	if len(payload) > available {
 		payload = payload[:available]
 	}
-	c.readBuffer = append(c.readBuffer, payload...)
+	c.readBuffer, c.readBufferBase = appendTCPBuffer(c.readBuffer, c.readBufferBase, payload)
 	if len(payload) != 0 {
 		c.notifyReadLocked()
 	}
 	c.mu.Unlock()
 	return len(payload)
+}
+
+// appendTCPBuffer tracks the start of the current allocation so a completely
+// drained modest buffer can be reused even after its live slice moved forward.
+func appendTCPBuffer(buffer, base, payload []byte) ([]byte, []byte) {
+	if len(payload) > cap(buffer)-len(buffer) {
+		buffer = append(buffer, payload...)
+		base = buffer[:0]
+		return buffer, base
+	}
+	return append(buffer, payload...), base
+}
+
+// emptyReusableTCPBuffer releases large tuned buffers and resets smaller
+// allocations to their true beginning.
+func emptyReusableTCPBuffer(base []byte) ([]byte, []byte) {
+	if cap(base) == 0 || cap(base) > tcpReusableBufferLimit {
+		return nil, nil
+	}
+	base = base[:0]
+	return base, base
 }
 
 // receiveAvailable returns storage not occupied by delivered or out-of-order
@@ -2890,6 +3079,7 @@ func (c *TCPConn) runPassive(listener *TCPListener, syn tcpSegment, initialSeque
 	defer c.stack.removeTCP(c)
 	defer close(c.done)
 	if err := c.passiveHandshake(syn, initialSequence); err != nil {
+		listener.noteHandshakeFailure(err)
 		if errors.Is(err, net.ErrClosed) {
 			_ = c.sendAbortReset(initialSequence+1, c.receiveNext, c.receiveWindow(0, false))
 		}
@@ -4446,7 +4636,8 @@ func (c *TCPConn) established(sendNext uint32) error {
 				segmentLength++
 			}
 			receiveWindow := receiveWindowState.size(receiveNext)
-			retransmittedTimeWaitFIN := timeWaitArmed && segment.flags&(tcpFlagRST|tcpFlagSYN|tcpFlagACK|tcpFlagFIN) == tcpFlagACK|tcpFlagFIN &&
+			retransmittedTimeWaitFIN := timeWaitArmed && segment.flags&(tcpFlagRST|tcpFlagSYN) == 0 &&
+				segment.flags&(tcpFlagACK|tcpFlagFIN) == tcpFlagACK|tcpFlagFIN &&
 				segment.sequence+uint32(len(segment.payload))+1 == receiveNext
 			if !tcpSegmentAcceptable(segment.sequence, segmentLength, receiveNext, receiveWindow) {
 				if retransmittedTimeWaitFIN {
@@ -5276,7 +5467,7 @@ func (c *TCPConn) sendAbortReset(sequence, acknowledgement uint32, window uint16
 	}
 	packet, err := buildTCPPacket(
 		c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(),
-		sequence, acknowledgement, flags, window, options, nil, c.mtu, uint8(c.trafficClass.Load()), 0,
+		sequence, acknowledgement, flags, window, options, nil, c.mtu, uint8(c.trafficClass.Load()), 0, c.flowLabel,
 	)
 	if err != nil {
 		return err
@@ -5340,7 +5531,7 @@ func (c *TCPConn) sendSegmentForMTU(sequence, acknowledgement uint32, flags byte
 func (c *TCPConn) writeTCP(sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte) (packetQueueTicket, error) {
 	packet, err := buildTCPPacket(
 		c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(),
-		sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn,
+		sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, c.flowLabel,
 	)
 	if err != nil {
 		return packetQueueTicket{}, err

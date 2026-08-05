@@ -1,6 +1,7 @@
 package mipstack
 
 import (
+	"encoding/binary"
 	"net/netip"
 	"testing"
 )
@@ -34,13 +35,13 @@ func TestIPv4ControlMessageMarshalAndParse(t *testing.T) {
 
 func TestIPv6ControlMessageMarshalAndParse(t *testing.T) {
 	source := netip.MustParseAddr("2001:db8::123")
-	outgoing := &IPv6ControlMessage{TrafficClass: 0x2e, HopLimit: 29, Src: source}
+	outgoing := &IPv6ControlMessage{TrafficClass: 0x2e, HopLimit: 29, FlowLabel: 0xabcde, Src: source}
 	control, err := outgoing.Marshal()
 	if err != nil {
 		t.Fatal(err)
 	}
 	parsedSource, options, err := parseControlMessageForWrite(control, true)
-	if err != nil || parsedSource != source || options != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e, hopLimitSet: true, trafficClassSet: true}) {
+	if err != nil || parsedSource != source || options != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e, flowLabel: 0xabcde, hopLimitSet: true, trafficClassSet: true, flowLabelSet: true}) {
 		t.Fatalf("marshaled IPv6 control = source %v options %+v, %v", parsedSource, options, err)
 	}
 	var incoming IPv6ControlMessage
@@ -51,11 +52,27 @@ func TestIPv6ControlMessageMarshalAndParse(t *testing.T) {
 	if err = incoming.Parse(receivedControl); err != nil {
 		t.Fatal(err)
 	}
-	if incoming != (IPv6ControlMessage{TrafficClass: 0x2e, HopLimit: 29, Dst: source}) {
+	if incoming != (IPv6ControlMessage{TrafficClass: 0x2e, HopLimit: 29, FlowLabel: 0xabcde, Dst: source}) {
 		t.Fatalf("parsed IPv6 control = %+v", incoming)
 	}
 	if control, err = (*IPv6ControlMessage)(nil).Marshal(); err != nil || control != nil {
 		t.Fatalf("nil IPv6 control marshal = %x, %v", control, err)
+	}
+}
+
+func TestIPv6ZeroFlowInfoIsOmittedOnRead(t *testing.T) {
+	control, err := (&IPv6ControlMessage{HopLimit: 64, Dst: netip.MustParseAddr("2001:db8::124")}).marshalForRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for remaining := control; len(remaining) != 0; {
+		length := int(binary.LittleEndian.Uint64(remaining[:8]))
+		if binary.LittleEndian.Uint32(remaining[8:12]) == linuxLevelIPv6 &&
+			binary.LittleEndian.Uint32(remaining[12:16]) == linuxIPv6FlowInfo {
+			t.Fatal("zero IPv6 flow info was emitted on receive")
+		}
+		aligned := (length + linuxControlAlignment - 1) &^ (linuxControlAlignment - 1)
+		remaining = remaining[aligned:]
 	}
 }
 
@@ -72,6 +89,7 @@ func TestControlMessageValidation(t *testing.T) {
 		{name: "IPv6 source", marshal: func() ([]byte, error) { return (&IPv6ControlMessage{Src: netip.IPv4Unspecified()}).Marshal() }},
 		{name: "IPv6 hop limit", marshal: func() ([]byte, error) { return (&IPv6ControlMessage{HopLimit: 256}).Marshal() }},
 		{name: "IPv6 traffic class", marshal: func() ([]byte, error) { return (&IPv6ControlMessage{TrafficClass: -1}).Marshal() }},
+		{name: "IPv6 flow label", marshal: func() ([]byte, error) { return (&IPv6ControlMessage{FlowLabel: ipv6MaximumFlowLabel + 1}).Marshal() }},
 	}
 	for _, test := range invalid {
 		t.Run(test.name, func(t *testing.T) {
@@ -110,13 +128,25 @@ func TestControlMessageValidation(t *testing.T) {
 	if _, _, err = parseLinuxIPControlValues(zeroTTL, false, false); err == nil {
 		t.Fatal("IPv4 zero TTL control message parsed successfully")
 	}
+	var zeroFlowInfo [4]byte
+	zeroFlowControl := appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6FlowInfo, zeroFlowInfo[:])
+	_, options, err = parseLinuxIPControlValues(zeroFlowControl, true, false)
+	if err != nil || options.flowLabel != 0 || !options.flowLabelSet {
+		t.Fatalf("IPv6 explicit zero flow label = %+v, %v", options, err)
+	}
+	conflicting := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6TrafficClass, 1)
+	flowInfo := [4]byte{0x02, 0, 0, 1}
+	conflicting = appendLinuxControl(conflicting, linuxLevelIPv6, linuxIPv6FlowInfo, flowInfo[:])
+	if _, _, err = parseLinuxIPControlValues(conflicting, true, false); err == nil {
+		t.Fatal("conflicting IPv6 flow-info traffic class parsed successfully")
+	}
 }
 
 // FuzzControlMessageParsing keeps the public read semantics and internal write
 // semantics on the same panic-free ancillary decoder.
 func FuzzControlMessageParsing(f *testing.F) {
 	control4, _ := (&IPv4ControlMessage{TTL: 31, TOS: 0xb8, Src: netip.MustParseAddr("192.0.2.1")}).Marshal()
-	control6, _ := (&IPv6ControlMessage{HopLimit: 29, TrafficClass: 0x2e, Src: netip.MustParseAddr("2001:db8::1")}).Marshal()
+	control6, _ := (&IPv6ControlMessage{HopLimit: 29, TrafficClass: 0x2e, FlowLabel: 0x12345, Src: netip.MustParseAddr("2001:db8::1")}).Marshal()
 	f.Add([]byte(nil))
 	f.Add(control4)
 	f.Add(control6)

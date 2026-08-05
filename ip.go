@@ -46,9 +46,12 @@ type IPInfo struct {
 	PacketsReceived      uint64
 	BytesReceived        uint64
 	PacketsDropped       uint64
+	ICMPErrors           uint64
 	PathMTU              int
 	HopLimit             int
 	TrafficClass         uint8
+	FlowLabel            uint32
+	LastError            error
 }
 
 // ipKey identifies one specific or wildcard raw protocol binding.
@@ -63,6 +66,7 @@ type ipKey struct {
 // binaries.
 type ipEndpoints interface {
 	deliver(stack *Stack, packet ipPacket) bool
+	deliverError(stack *Stack, networkError ICMPError) bool
 	updateConfig(stack *Stack, network *networkState)
 	closeAll()
 }
@@ -95,12 +99,16 @@ type IPConn struct {
 	writeDeadline   time.Time
 	readChanged     chan struct{}
 	writeChanged    chan struct{}
+	errors          chan error
+	recentTargets   recentDestinationCache[netip.Addr]
 	defaultOptions  ipPacketOptions
+	lastError       error
 	packetsSent     atomic.Uint64
 	bytesSent       atomic.Uint64
 	packetsReceived atomic.Uint64
 	bytesReceived   atomic.Uint64
 	packetsDropped  atomic.Uint64
+	icmpErrors      atomic.Uint64
 }
 
 // ListenIP creates an unconnected IPv4 or IPv6 protocol socket. Network must
@@ -269,7 +277,11 @@ func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.
 		stack: stack, net: network, protocol: protocol, v6: local.Is6(), local: local, remote: remote,
 		closed: make(chan struct{}), receiveNotify: make(chan struct{}), receiveCapacity: defaults.ReceiveBuffer,
 		readChanged: make(chan struct{}), writeChanged: make(chan struct{}),
-		defaultOptions: ipPacketOptions{hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass},
+		errors: make(chan error, 8), recentTargets: make(recentDestinationCache[netip.Addr]),
+		defaultOptions: ipPacketOptions{
+			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
+			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
+		},
 	}
 }
 
@@ -303,33 +315,65 @@ func (state *ipEndpointState) deliver(stack *Stack, packet ipPacket) bool {
 		stack.mu.RUnlock()
 		return false
 	}
-	connections := make([]*IPConn, 0)
-	for connection := range state.bindings[ipKey{address: packet.target, protocol: packet.protocol}] {
-		connections = append(connections, connection)
-	}
-	wildcard := netip.IPv4Unspecified()
-	if packet.target.Is6() {
-		wildcard = netip.IPv6Unspecified()
-	}
-	for connection := range state.bindings[ipKey{address: wildcard, protocol: packet.protocol}] {
-		connections = append(connections, connection)
-	}
-	if packet.target.Is4() {
-		for connection := range state.bindings[ipKey{address: netip.IPv6Unspecified(), protocol: packet.protocol}] {
-			if connection.dual {
-				connections = append(connections, connection)
-			}
-		}
-	}
+	connections := state.connectionsForLocked(packet.target, packet.protocol)
 	stack.mu.RUnlock()
 	accepted := false
-	options := ipPacketOptions{hopLimit: packet.hopLimit, trafficClass: packet.trafficClass}
+	options := ipPacketOptions{hopLimit: packet.hopLimit, trafficClass: packet.trafficClass, flowLabel: packet.flowLabel}
 	for _, connection := range connections {
 		if connection.remote.IsValid() && connection.remote != packet.source {
 			continue
 		}
 		accepted = true
 		connection.enqueue(packet.payload, packet.source, packet.target, options)
+	}
+	return accepted
+}
+
+// connectionsForLocked returns exact, family-wildcard, and dual-stack raw
+// bindings while Stack.mu is held.
+func (state *ipEndpointState) connectionsForLocked(address netip.Addr, protocol byte) []*IPConn {
+	connections := make([]*IPConn, 0)
+	for connection := range state.bindings[ipKey{address: address, protocol: protocol}] {
+		connections = append(connections, connection)
+	}
+	wildcard := netip.IPv4Unspecified()
+	if address.Is6() {
+		wildcard = netip.IPv6Unspecified()
+	}
+	for connection := range state.bindings[ipKey{address: wildcard, protocol: protocol}] {
+		connections = append(connections, connection)
+	}
+	if address.Is4() {
+		for connection := range state.bindings[ipKey{address: netip.IPv6Unspecified(), protocol: protocol}] {
+			if connection.dual {
+				connections = append(connections, connection)
+			}
+		}
+	}
+	return connections
+}
+
+// deliverError correlates an ICMP quote with recent writes by matching raw
+// protocol sockets before it changes shared path state.
+func (state *ipEndpointState) deliverError(stack *Stack, networkError ICMPError) bool {
+	stack.mu.RLock()
+	if stack.ip != state {
+		stack.mu.RUnlock()
+		return false
+	}
+	connections := state.connectionsForLocked(networkError.QuotedSource, networkError.QuotedProtocol)
+	stack.mu.RUnlock()
+	accepted := false
+	networkError.QuotedPayload = append([]byte(nil), networkError.QuotedPayload...)
+	for _, connection := range connections {
+		if !connection.acceptsError(networkError.QuotedTarget) {
+			continue
+		}
+		accepted = true
+		connection.deliverError(networkError.QuotedTarget, networkError)
+	}
+	if accepted && networkError.MTU != 0 && stack.observePathMTU(networkError.QuotedTarget, networkError.MTU) {
+		stack.notifyTCPPathMTU(networkError.QuotedTarget, nil)
 	}
 	return accepted
 }
@@ -519,6 +563,9 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 		select {
 		case <-notified:
 			stopTimer(timer)
+		case err = <-c.errors:
+			stopTimer(timer)
+			return 0, ipDatagram{}, false, err
 		case <-timeout:
 			return 0, ipDatagram{}, false, os.ErrDeadlineExceeded
 		case <-changed:
@@ -567,6 +614,55 @@ func (c *IPConn) Write(payload []byte) (int, error) {
 	return n, nil
 }
 
+// WritePathMTUProbe sends one connected protocol payload without IPv4 or
+// IPv6 source fragmentation. The complete packet may exceed the confirmed
+// PMTU but cannot exceed the first-hop MTU.
+func (c *IPConn) WritePathMTUProbe(payload []byte) (int, error) {
+	if !c.remote.IsValid() {
+		return 0, c.operationError("write", errors.New("mipstack: IP socket is not connected"))
+	}
+	n, err := c.writeToWith(payload, c.remote, c.remoteAddr(), netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
+	if err != nil {
+		return n, c.operationError("write", err)
+	}
+	return n, nil
+}
+
+// WritePathMTUProbeTo is the unconnected netip form of WritePathMTUProbe.
+func (c *IPConn) WritePathMTUProbeTo(payload []byte, target netip.Addr) (int, error) {
+	if c.remote.IsValid() {
+		return 0, c.operationErrorTo("write", ipNetAddr(target), net.ErrWriteToConnected)
+	}
+	n, err := c.writeToWith(payload, target, ipNetAddr(target), netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
+	if err != nil {
+		return n, c.operationErrorTo("write", ipNetAddr(target), err)
+	}
+	return n, nil
+}
+
+// ConfirmPathMTU records application-level acknowledgement of a connected
+// protocol probe. mtu is the complete IP packet size, not the payload size.
+func (c *IPConn) ConfirmPathMTU(mtu int) error {
+	if !c.remote.IsValid() {
+		return c.operationError("set", errors.New("mipstack: IP socket is not connected"))
+	}
+	if err := c.stack.ConfirmPathMTU(c.remote, mtu); err != nil {
+		return c.setOperationError(err)
+	}
+	return nil
+}
+
+// ConfirmPathMTUFor is the unconnected form of ConfirmPathMTU.
+func (c *IPConn) ConfirmPathMTUFor(target netip.Addr, mtu int) error {
+	if c.remote.IsValid() {
+		return c.setOperationError(net.ErrWriteToConnected)
+	}
+	if err := c.stack.ConfirmPathMTU(target, mtu); err != nil {
+		return c.setOperationError(err)
+	}
+	return nil
+}
+
 // WriteMsgIP writes one payload with Linux-compatible source, hop-limit, and
 // traffic-class ancillary data. A connected socket requires a nil address.
 func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn int, err error) {
@@ -595,8 +691,15 @@ func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn i
 	return n, len(oob), nil
 }
 
-// writeTo selects a source, repairs ICMPv6 checksum, and emits one payload.
+// writeTo selects a source, repairs ICMPv6 checksum, and emits one ordinary
+// fragmentable payload.
 func (c *IPConn) writeTo(payload []byte, target netip.Addr, address net.Addr, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
+	return c.writeToWith(payload, target, address, packetInfoSource, options, c.writePayload)
+}
+
+// writeToWith keeps routing, checksums, deadlines, accounting, and ICMP
+// correlation shared between ordinary writes and PLPMTUD probes.
+func (c *IPConn) writeToWith(payload []byte, target netip.Addr, address net.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, []byte, ipPacketOptions) error) (int, error) {
 	target = target.Unmap()
 	if !target.IsValid() || target.IsUnspecified() || target.IsMulticast() || !c.dual && target.Is6() != c.v6 || target.Zone() != "" {
 		return 0, syscall.EINVAL
@@ -626,15 +729,28 @@ func (c *IPConn) writeTo(payload []byte, target netip.Addr, address net.Addr, pa
 		binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, protocolICMPv6, payload))
 	}
 	options = c.outputOptions(options)
-	if err = c.stack.writeIPPayloadUntilOptions(source, target, c.protocol, payload, true, options, c.writeState); err != nil {
+	if err = write(source, target, payload, options); err != nil {
 		if errors.Is(err, syscall.EMSGSIZE) {
 			return 0, messageTooLong(c.net, c.LocalAddr(), address)
 		}
 		return 0, err
 	}
+	c.rememberTarget(target)
 	c.packetsSent.Add(1)
 	c.bytesSent.Add(uint64(len(payload)))
 	return len(payload), nil
+}
+
+// writePayload emits ordinary output against the confirmed path MTU and
+// permits source fragmentation.
+func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
+	return c.stack.writeIPPayloadUntilOptions(source, target, c.protocol, payload, true, options, c.writeState)
+}
+
+// writePathMTUProbePayload emits explicitly unfragmented output against the
+// first-hop MTU.
+func (c *IPConn) writePathMTUProbePayload(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
+	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, false, options, c.stack.network.Load().mtu, c.writeState)
 }
 
 // Close unregisters the protocol socket and wakes blocked operations.
@@ -666,10 +782,16 @@ func (c *IPConn) RemoteAddr() net.Addr { return c.remoteAddr() }
 // queue.
 func (c *IPConn) Info() IPInfo {
 	c.mu.Lock()
+	flowLabel := c.defaultOptions.flowLabel
+	if !c.v6 && !c.dual {
+		flowLabel = 0
+	}
 	info := IPInfo{
 		LocalAddress: c.local, RemoteAddress: c.remote, Protocol: c.protocol,
 		ReceiveQueuePackets: len(c.receive), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
 		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass,
+		FlowLabel: flowLabel,
+		LastError: c.lastError,
 	}
 	select {
 	case <-c.closed:
@@ -679,7 +801,7 @@ func (c *IPConn) Info() IPInfo {
 	c.mu.Unlock()
 	info.PacketsSent, info.BytesSent = c.packetsSent.Load(), c.bytesSent.Load()
 	info.PacketsReceived, info.BytesReceived = c.packetsReceived.Load(), c.bytesReceived.Load()
-	info.PacketsDropped = c.packetsDropped.Load()
+	info.PacketsDropped, info.ICMPErrors = c.packetsDropped.Load(), c.icmpErrors.Load()
 	if c.remote.IsValid() {
 		info.PathMTU = c.stack.mtuFor(c.remote)
 	}
@@ -816,6 +938,59 @@ func (c *IPConn) SetTrafficClass(value int) error {
 		c.defaultOptions.trafficClass = byte(value)
 		c.mu.Unlock()
 		return nil
+	}
+}
+
+// SetFlowLabel changes the default IPv6 Flow Label. Zero explicitly disables
+// automatic labeling for this socket.
+func (c *IPConn) SetFlowLabel(label uint32) error {
+	if label > ipv6MaximumFlowLabel {
+		return c.setOperationError(syscall.EINVAL)
+	}
+	if !c.v6 && !c.dual {
+		return c.setOperationError(syscall.EAFNOSUPPORT)
+	}
+	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return c.setOperationError(net.ErrClosed)
+	default:
+		c.defaultOptions.flowLabel, c.defaultOptions.flowLabelSet = label, true
+		c.mu.Unlock()
+		return nil
+	}
+}
+
+// rememberTarget records a successful write for later ICMP quote validation.
+func (c *IPConn) rememberTarget(target netip.Addr) {
+	target = target.Unmap()
+	c.mu.Lock()
+	c.recentTargets.remember(target, time.Now())
+	c.mu.Unlock()
+}
+
+// acceptsError reports whether ICMP quoted a recent write to target.
+func (c *IPConn) acceptsError(target netip.Addr) bool {
+	target = target.Unmap()
+	c.mu.Lock()
+	exists := c.recentTargets.contains(target, time.Now())
+	c.mu.Unlock()
+	return exists
+}
+
+// deliverError queues one correlated asynchronous network error.
+func (c *IPConn) deliverError(target netip.Addr, err error) {
+	operationError := &net.OpError{
+		Op: "read", Net: c.net, Source: c.LocalAddr(), Addr: ipNetAddr(target), Err: err,
+	}
+	c.mu.Lock()
+	c.lastError = operationError
+	c.mu.Unlock()
+	c.icmpErrors.Add(1)
+	select {
+	case c.errors <- operationError:
+	default:
 	}
 }
 

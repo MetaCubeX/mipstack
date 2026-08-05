@@ -439,6 +439,7 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 	}
 	source := netip.AddrFrom16([16]byte(packet[8:24]))
 	target := netip.AddrFrom16([16]byte(packet[24:40]))
+	flowLabel := uint32(packet[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(packet[2:4]))
 	next, nextHeader, offset := packet[6], 6, 40
 	seenHop := false
 	for offset <= end {
@@ -514,7 +515,7 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 				protocol: protocol,
 				offset:   fragmentOffset, more: more,
 				payload: payload, identifier: identifier, ecn: packet[1] >> 4 & 3,
-				options: ipPacketOptions{hopLimit: packet[7], trafficClass: (packet[0]&0x0f)<<4 | packet[1]>>4},
+				options: ipPacketOptions{hopLimit: packet[7], trafficClass: (packet[0]&0x0f)<<4 | packet[1]>>4, flowLabel: flowLabel},
 				header:  packet[:offset], nextHeader: nextHeader,
 				maximum:   maximum,
 				original:  packet[:end],
@@ -704,17 +705,22 @@ func (s *Stack) ipPayloadPacketsWithOptions(source, target netip.Addr, protocol 
 // traffic passes the confirmed PMTU; packetization-layer probes pass the
 // first-hop MTU and disable fragmentation.
 func (s *Stack) ipPayloadPacketsForMTU(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, mtu int) ([][]byte, error) {
+	if source.Is6() && !options.flowLabelSet {
+		options.flowLabel = s.automaticFlowLabel(source, target, protocol, payload)
+		options.flowLabelSet = true
+	}
 	var identification uint16
 	if source.Is4() && allowFragment {
 		// A router may fragment any IPv4 datagram without DF, so reserve its
 		// ID even when it currently fits the managed link MTU.
 		identification = uint16(s.ipv4ID.Add(1))
 	}
-	packet := buildIPPacketWithOptions(source, target, protocol, payload, identification, !allowFragment, options)
-	if len(packet) == 0 {
+	headerSize := ipHeaderSize(source, target, len(payload))
+	if headerSize == 0 {
 		return nil, syscall.EMSGSIZE
 	}
-	if len(packet) <= mtu {
+	if headerSize+len(payload) <= mtu {
+		packet := buildIPPacketWithOptions(source, target, protocol, payload, identification, !allowFragment, options)
 		return [][]byte{packet}, nil
 	}
 	if !allowFragment {

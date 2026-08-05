@@ -645,7 +645,7 @@ func TestUDPMessagePacketInfoRoundTrip(t *testing.T) {
 				t.Fatal(err)
 			}
 			buffer := make([]byte, 3)
-			oob := make([]byte, 96)
+			oob := make([]byte, 128)
 			n, oobn, flags, source, err := connection.ReadMsgUDPAddrPort(buffer, oob)
 			if err != nil || n != 3 || string(buffer) != "req" || source != netip.AddrPortFrom(test.remote, 50014) {
 				t.Fatalf("ReadMsgUDPAddrPort = %q, %d oob, flags %#x, source %v, %v", buffer[:n], oobn, flags, source, err)
@@ -720,6 +720,69 @@ func TestUDPMessageControlValidationAndWriteBuffer(t *testing.T) {
 	}
 	if err = connection.SetWriteBuffer(1024); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("SetWriteBuffer after Close = %v, want net.ErrClosed", err)
+	}
+}
+
+func TestUDPIPv6FlowLabelPolicy(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::190")
+	remote := netip.MustParseAddr("2001:db8::191")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	packetConnection, err := stack.ListenUDP(context.Background(), "udp6", netip.AddrPortFrom(netip.IPv6Unspecified(), 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := packetConnection.(*UDPConn)
+	defer connection.Close()
+	target := netip.AddrPortFrom(remote, 5353)
+	writeAndLabel := func(oob []byte) uint32 {
+		t.Helper()
+		if oob == nil {
+			_, err = connection.WriteToUDPAddrPort([]byte("flow"), target)
+		} else {
+			_, _, err = connection.WriteMsgUDPAddrPort([]byte("flow"), oob, target)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+		if !ok {
+			t.Fatal("failed to parse IPv6 UDP output")
+		}
+		return packet.flowLabel
+	}
+	automatic := writeAndLabel(nil)
+	second := writeAndLabel(nil)
+	if automatic == 0 || second != automatic {
+		t.Fatalf("automatic UDP flow labels = %#x then %#x", automatic, second)
+	}
+	if err = connection.SetFlowLabel(0x12345); err != nil {
+		t.Fatal(err)
+	}
+	if label := writeAndLabel(nil); label != 0x12345 {
+		t.Fatalf("socket UDP flow label = %#x, want 0x12345", label)
+	}
+	oob, err := (&IPv6ControlMessage{FlowLabel: 0x54321}).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if label := writeAndLabel(oob); label != 0x54321 {
+		t.Fatalf("per-packet UDP flow label = %#x, want 0x54321", label)
+	}
+	if err = connection.SetFlowLabel(0); err != nil {
+		t.Fatal(err)
+	}
+	if label := writeAndLabel(nil); label != 0 {
+		t.Fatalf("explicit zero UDP flow label = %#x", label)
+	}
+	if info := connection.Info(); info.FlowLabel != 0 {
+		t.Fatalf("UDP flow-label diagnostics = %+v", info)
 	}
 }
 

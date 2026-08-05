@@ -6,6 +6,8 @@ import (
 )
 
 const (
+	// ipv6MaximumFlowLabel is the 20-bit RFC 8200 Flow Label ceiling.
+	ipv6MaximumFlowLabel = 1<<20 - 1
 	// protocolICMPv4 is the IPv4 ICMP protocol number.
 	protocolICMPv4 = byte(1)
 	// protocolTCP is the TCP protocol number.
@@ -27,6 +29,7 @@ type ipPacket struct {
 	ecn            byte
 	hopLimit       byte
 	trafficClass   byte
+	flowLabel      uint32
 	payload        []byte
 	original       []byte
 }
@@ -36,8 +39,10 @@ type ipPacket struct {
 type ipPacketOptions struct {
 	hopLimit        byte
 	trafficClass    byte
+	flowLabel       uint32
 	hopLimitSet     bool
 	trafficClassSet bool
+	flowLabelSet    bool
 }
 
 // withDefaults fills output fields omitted by per-packet control data.
@@ -48,6 +53,9 @@ func (o ipPacketOptions) withDefaults(defaults ipPacketOptions) ipPacketOptions 
 	if !o.trafficClassSet && o.trafficClass == 0 {
 		o.trafficClass, o.trafficClassSet = defaults.trafficClass, defaults.trafficClassSet
 	}
+	if !o.flowLabelSet {
+		o.flowLabel, o.flowLabelSet = defaults.flowLabel, defaults.flowLabelSet
+	}
 	return o
 }
 
@@ -56,12 +64,36 @@ func (o ipPacketOptions) normalized() ipPacketOptions {
 	if !o.hopLimitSet && o.hopLimit == 0 {
 		o.hopLimit = 64
 	}
+	o.flowLabel &= ipv6MaximumFlowLabel
 	return o
 }
 
 // checksum computes the Internet checksum over data.
 func checksum(data []byte) uint16 {
+	sum := checksumSum(data)
+	for sum>>16 != 0 {
+		sum = sum&0xffff + sum>>16
+	}
+	return ^uint16(sum)
+}
+
+// checksumSum accumulates one contiguous Internet-checksum region. A maximum
+// IP packet contains fewer than 32768 words, so a uint32 cannot overflow
+// before the caller folds it. Unrolling the common packet-sized loop avoids
+// making checksum traversal dominate TCP throughput.
+func checksumSum(data []byte) uint32 {
 	var sum uint32
+	for len(data) >= 16 {
+		sum += uint32(binary.BigEndian.Uint16(data[0:2]))
+		sum += uint32(binary.BigEndian.Uint16(data[2:4]))
+		sum += uint32(binary.BigEndian.Uint16(data[4:6]))
+		sum += uint32(binary.BigEndian.Uint16(data[6:8]))
+		sum += uint32(binary.BigEndian.Uint16(data[8:10]))
+		sum += uint32(binary.BigEndian.Uint16(data[10:12]))
+		sum += uint32(binary.BigEndian.Uint16(data[12:14]))
+		sum += uint32(binary.BigEndian.Uint16(data[14:16]))
+		data = data[16:]
+	}
 	for len(data) >= 2 {
 		sum += uint32(binary.BigEndian.Uint16(data[:2]))
 		data = data[2:]
@@ -69,40 +101,28 @@ func checksum(data []byte) uint16 {
 	if len(data) != 0 {
 		sum += uint32(data[0]) << 8
 	}
-	for sum>>16 != 0 {
-		sum = sum&0xffff + sum>>16
-	}
-	return ^uint16(sum)
+	return sum
 }
 
 // transportChecksum computes an IPv4 or IPv6 pseudo-header checksum.
 func transportChecksum(source, target netip.Addr, protocol byte, payload []byte) uint16 {
 	source, target = source.Unmap(), target.Unmap()
 	var sum uint32
-	add := func(data []byte) {
-		for len(data) >= 2 {
-			sum += uint32(binary.BigEndian.Uint16(data[:2]))
-			data = data[2:]
-		}
-		if len(data) != 0 {
-			sum += uint32(data[0]) << 8
-		}
-	}
 	if source.Is4() && target.Is4() {
-		add(source.AsSlice())
-		add(target.AsSlice())
+		sum += checksumSum(source.AsSlice())
+		sum += checksumSum(target.AsSlice())
 		sum += uint32(protocol)
 		sum += uint32(len(payload))
 	} else if source.Is6() && target.Is6() {
-		add(source.AsSlice())
-		add(target.AsSlice())
+		sum += checksumSum(source.AsSlice())
+		sum += checksumSum(target.AsSlice())
 		sum += uint32(len(payload) >> 16)
 		sum += uint32(len(payload) & 0xffff)
 		sum += uint32(protocol)
 	} else {
 		return 0
 	}
-	add(payload)
+	sum += checksumSum(payload)
 	for sum>>16 != 0 {
 		sum = sum&0xffff + sum>>16
 	}
@@ -183,6 +203,7 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 		}
 		source := netip.AddrFrom16([16]byte(packet[8:24]))
 		target := netip.AddrFrom16([16]byte(packet[24:40]))
+		flowLabel := uint32(packet[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(packet[2:4]))
 		next, nextOffset, offset := packet[6], 6, 40
 		seenHop := false
 		for offset <= end {
@@ -194,7 +215,7 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 					// unrecognized Next Header, not another extension header.
 					return ipPacket{
 						source: source, target: target, original: packet[:end], ecn: packet[1] >> 4 & 3,
-						hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4,
+						hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4, flowLabel: flowLabel,
 						parameterError: true, parameterCode: 1, parameterAt: uint32(nextOffset),
 					}, true
 				}
@@ -210,7 +231,7 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 					if action >= 2 && (action == 2 || !target.IsMulticast()) {
 						return ipPacket{
 							source: source, target: target, original: packet[:end], ecn: packet[1] >> 4 & 3,
-							hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4,
+							hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4, flowLabel: flowLabel,
 							parameterError: true, parameterCode: 2, parameterAt: uint32(offset + optionOffset),
 						}, true
 					}
@@ -231,7 +252,7 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 				if packet[offset+3] != 0 {
 					return ipPacket{
 						source: source, target: target, original: packet[:end], ecn: packet[1] >> 4 & 3,
-						hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4,
+						hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4, flowLabel: flowLabel,
 						parameterError: true, parameterCode: 0, parameterAt: uint32(offset + 2),
 					}, true
 				}
@@ -247,7 +268,7 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 			default:
 				return ipPacket{
 					source: source, target: target, protocol: next, protocolOffset: nextOffset,
-					ecn: packet[1] >> 4 & 3, hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4,
+					ecn: packet[1] >> 4 & 3, hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4, flowLabel: flowLabel,
 					payload: packet[offset:end], original: packet[:end],
 				}, true
 			}
@@ -420,18 +441,39 @@ func setPacketECN(packet []byte, ecn byte) {
 	}
 }
 
-// buildIPPacketWithOptions wraps payload and applies raw IP output fields.
-func buildIPPacketWithOptions(source, target netip.Addr, protocol byte, payload []byte, identification uint16, dontFragment bool, options ipPacketOptions) []byte {
+// ipHeaderSize validates an address pair and payload length and returns the
+// fixed header size for the selected IP version.
+func ipHeaderSize(source, target netip.Addr, payloadSize int) int {
 	source, target = source.Unmap(), target.Unmap()
-	options = options.normalized()
 	if !source.IsValid() || !target.IsValid() || source.Is4() != target.Is4() {
-		return nil
+		return 0
 	}
 	if source.Is4() {
-		if len(payload) > 65515 {
-			return nil
+		if payloadSize < 0 || payloadSize > 65515 {
+			return 0
 		}
-		packet := make([]byte, 20+len(payload))
+		return 20
+	}
+	if payloadSize < 0 || payloadSize > 65535 {
+		return 0
+	}
+	return 40
+}
+
+// marshalIPHeader writes an IPv4 or IPv6 header into a complete, already
+// sized packet. Callers can fill the transport payload in the remaining
+// bytes without an intermediate allocation.
+func marshalIPHeader(packet []byte, source, target netip.Addr, protocol byte, identification uint16, dontFragment bool, options ipPacketOptions) bool {
+	source, target = source.Unmap(), target.Unmap()
+	headerSize := 20
+	if source.Is6() {
+		headerSize = 40
+	}
+	if len(packet) < headerSize || ipHeaderSize(source, target, len(packet)-headerSize) != headerSize {
+		return false
+	}
+	options = options.normalized()
+	if source.Is4() {
 		packet[0] = 0x45
 		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
 		binary.BigEndian.PutUint16(packet[4:6], identification)
@@ -442,19 +484,28 @@ func buildIPPacketWithOptions(source, target netip.Addr, protocol byte, payload 
 		copy(packet[12:16], source.AsSlice())
 		copy(packet[16:20], target.AsSlice())
 		binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:20]))
-		copy(packet[20:], payload)
-		return packet
+		return true
 	}
-	if len(payload) > 65535 {
-		return nil
-	}
-	packet := make([]byte, 40+len(payload))
 	packet[0] = 0x60 | options.trafficClass>>4
-	packet[1] = options.trafficClass << 4
+	packet[1] = options.trafficClass<<4 | byte(options.flowLabel>>16)
+	binary.BigEndian.PutUint16(packet[2:4], uint16(options.flowLabel))
 	packet[6], packet[7] = protocol, options.hopLimit
-	binary.BigEndian.PutUint16(packet[4:6], uint16(len(payload)))
+	binary.BigEndian.PutUint16(packet[4:6], uint16(len(packet)-40))
 	copy(packet[8:24], source.AsSlice())
 	copy(packet[24:40], target.AsSlice())
-	copy(packet[40:], payload)
+	return true
+}
+
+// buildIPPacketWithOptions wraps payload and applies raw IP output fields.
+func buildIPPacketWithOptions(source, target netip.Addr, protocol byte, payload []byte, identification uint16, dontFragment bool, options ipPacketOptions) []byte {
+	headerSize := ipHeaderSize(source, target, len(payload))
+	if headerSize == 0 {
+		return nil
+	}
+	packet := make([]byte, headerSize+len(payload))
+	if !marshalIPHeader(packet, source, target, protocol, identification, dontFragment, options) {
+		return nil
+	}
+	copy(packet[headerSize:], payload)
 	return packet
 }

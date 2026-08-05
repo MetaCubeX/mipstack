@@ -315,6 +315,107 @@ func TestUDPPathMTUAndICMPCorrelation(t *testing.T) {
 	}
 }
 
+func TestIPConnPathMTUAndICMPCorrelation(t *testing.T) {
+	for _, test := range []struct {
+		name                   string
+		local, remote, unknown netip.Addr
+		mtu                    uint32
+	}{
+		{name: "IPv4", local: netip.MustParseAddr("192.0.2.180"), remote: netip.MustParseAddr("192.0.2.181"), unknown: netip.MustParseAddr("192.0.2.182"), mtu: 1200},
+		{name: "IPv6", local: netip.MustParseAddr("2001:db8::180"), remote: netip.MustParseAddr("2001:db8::181"), unknown: netip.MustParseAddr("2001:db8::182"), mtu: 1280},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bits := 32
+			if test.local.Is6() {
+				bits = 128
+			}
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.local, bits)}, MTU: 1400})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			connection, err := stack.ListenIP(context.Background(), "ip:99", netip.Addr{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			payload := bytes.Repeat([]byte{0x5a}, 256)
+			if _, err = connection.WriteToIP(payload, ipNetAddr(test.remote)); err != nil {
+				t.Fatal(err)
+			}
+			original := readOutboundPacket(t, stack)
+			unknownQuote := buildIPPacket(test.local, test.unknown, 99, payload, 1, true)
+			if err = writeTestPacket(stack, buildTestPacketTooBig(test.unknown, test.local, unknownQuote, test.mtu)); err != nil {
+				t.Fatal(err)
+			}
+			if err = writeTestPacket(stack, buildTestPacketTooBig(test.remote, test.local, original, test.mtu)); err != nil {
+				t.Fatal(err)
+			}
+			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+			_, _, err = connection.ReadFrom(make([]byte, 1))
+			var operationError *net.OpError
+			if !errors.As(err, &operationError) {
+				t.Fatalf("ReadFrom error = %#v, want IP socket network error", err)
+			}
+			errorAddress, ok := operationError.Addr.(*net.IPAddr)
+			if !ok || errorAddress.String() != test.remote.String() {
+				t.Fatalf("ReadFrom error address = %#v, want %s", operationError.Addr, test.remote)
+			}
+			var icmpError ICMPError
+			if !errors.As(err, &icmpError) || icmpError.MTU != test.mtu || icmpError.QuotedProtocol != 99 {
+				t.Fatalf("ReadFrom error does not expose matching ICMP error: %#v", err)
+			}
+			if learned := stack.mtuFor(test.remote); learned != int(test.mtu) {
+				t.Fatalf("learned PMTU = %d, want %d", learned, test.mtu)
+			}
+			if unknown := stack.mtuFor(test.unknown); unknown != 1400 {
+				t.Fatalf("unmatched target PMTU = %d, want 1400", unknown)
+			}
+			info := connection.Info()
+			if info.ICMPErrors != 1 || info.LastError == nil || info.PathMTU != 0 {
+				t.Fatalf("IP socket diagnostics = %+v", info)
+			}
+		})
+	}
+}
+
+func TestIPConnICMPErrorDoesNotRequireTransportHeader(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.183")
+	remote := netip.MustParseAddr("192.0.2.184")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := stack.ListenIP(context.Background(), "ip4:17", netip.IPv4Unspecified())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err = connection.WriteToIP([]byte{1, 2, 3, 4}, ipNetAddr(remote)); err != nil {
+		t.Fatal(err)
+	}
+	original := readOutboundPacket(t, stack)
+	if err = writeTestPacket(stack, buildTestPacketTooBig(remote, local, original, 1200)); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err = connection.ReadFrom(make([]byte, 1)); err == nil {
+		t.Fatal("raw UDP-protocol socket did not receive the correlated ICMP error")
+	} else {
+		var icmpError ICMPError
+		if !errors.As(err, &icmpError) || icmpError.QuotedProtocol != protocolUDP || len(icmpError.QuotedPayload) != 4 {
+			t.Fatalf("short quoted transport error = %#v", err)
+		}
+	}
+}
+
 // TestControlResponseRateLimitAndStats verifies independent token accounting
 // and the public read-only statistics snapshot.
 func TestControlResponseRateLimitAndStats(t *testing.T) {

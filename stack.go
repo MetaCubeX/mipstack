@@ -52,6 +52,12 @@ const (
 	// controlResponseBurst permits short diagnostic bursts without allowing a
 	// packet flood to monopolize the outbound queue.
 	controlResponseBurst = 200
+	// recentDestinationMaximum bounds ICMP correlation state for one
+	// connectionless socket.
+	recentDestinationMaximum = 256
+	// recentDestinationLifetime accepts delayed network errors without
+	// retaining every destination used by a long-running socket.
+	recentDestinationLifetime = 2 * time.Minute
 )
 
 var (
@@ -102,6 +108,9 @@ type TCPSocketDefaults struct {
 	// TrafficClass supplies IPv4 TOS or IPv6 Traffic Class DSCP bits. TCP
 	// controls the two ECN bits independently.
 	TrafficClass uint8
+	// FlowLabel fixes the IPv6 Flow Label on new connections. Zero selects a
+	// stable RFC 6437-style label derived from the connection tuple.
+	FlowLabel uint32
 }
 
 // DatagramSocketDefaults configures policies inherited by newly created UDP
@@ -113,6 +122,9 @@ type DatagramSocketDefaults struct {
 	HopLimit int
 	// TrafficClass is the default IPv4 TOS or IPv6 Traffic Class byte.
 	TrafficClass uint8
+	// FlowLabel is the default IPv6 Flow Label. Zero selects a stable automatic
+	// label for each destination flow.
+	FlowLabel uint32
 }
 
 // Config configures a Stack.
@@ -160,11 +172,12 @@ type Stack struct {
 	pathMTUMu sync.RWMutex
 	pathMTU   map[netip.Addr]pathMTUEntry
 
-	ipv4ID         atomic.Uint32
-	ipv6FragmentID atomic.Uint32
-	closeCh        chan struct{}
-	timestampEpoch time.Time
-	tcpISNSecret   [16]byte
+	ipv4ID          atomic.Uint32
+	ipv6FragmentID  atomic.Uint32
+	closeCh         chan struct{}
+	timestampEpoch  time.Time
+	tcpISNSecret    [16]byte
+	flowLabelSecret [16]byte
 
 	fragmentMu    sync.Mutex
 	fragments     map[fragmentKey]*fragmentSet
@@ -229,6 +242,21 @@ type StackStats struct {
 	TCPZeroWindowProbes uint64
 	// TCPKeepAliveProbes counts probes sent after configured receive inactivity.
 	TCPKeepAliveProbes uint64
+	// TCPSYNCookiesSent counts stateless SYN-ACKs emitted under listener or
+	// stack connection pressure.
+	TCPSYNCookiesSent uint64
+	// TCPSYNCookiesAccepted counts final ACKs that authenticated a recent SYN
+	// cookie and entered a listener backlog.
+	TCPSYNCookiesAccepted uint64
+	// TCPSYNCookiesRejected counts candidate final ACKs that failed cookie
+	// authentication while cookie validation was active.
+	TCPSYNCookiesRejected uint64
+	// TCPHandshakeTimeouts counts passive stateful handshakes that exhausted
+	// their SYN-ACK retry budget.
+	TCPHandshakeTimeouts uint64
+	// TCPAcceptQueueDrops counts completed handshakes aborted because their
+	// listener's accept queue was full.
+	TCPAcceptQueueDrops uint64
 	// PathMTUUpdates counts accepted destination PMTU reductions.
 	PathMTUUpdates uint64
 	// PathMTUProbes counts TCP packets sent above the confirmed effective MTU.
@@ -273,6 +301,11 @@ type stackCounters struct {
 	tcpSpuriousRecoveryUndos    atomic.Uint64
 	tcpZeroWindowProbes         atomic.Uint64
 	tcpKeepAliveProbes          atomic.Uint64
+	tcpSYNCookiesSent           atomic.Uint64
+	tcpSYNCookiesAccepted       atomic.Uint64
+	tcpSYNCookiesRejected       atomic.Uint64
+	tcpHandshakeTimeouts        atomic.Uint64
+	tcpAcceptQueueDrops         atomic.Uint64
 	pathMTUUpdates              atomic.Uint64
 	pathMTUProbes               atomic.Uint64
 	pathMTUProbeSuccesses       atomic.Uint64
@@ -317,6 +350,48 @@ type pathMTUEntry struct {
 	updated time.Time
 }
 
+// recentDestinationCache retains bounded evidence that a connectionless
+// socket actually sent to a destination quoted by an ICMP error. Callers own
+// synchronization so the cache can share their existing socket mutex.
+type recentDestinationCache[T comparable] map[T]time.Time
+
+// remember records a successful transmission and evicts expired or oldest
+// evidence when the bound is full.
+func (c recentDestinationCache[T]) remember(destination T, now time.Time) {
+	if _, exists := c[destination]; exists {
+		c[destination] = now
+		return
+	}
+	if len(c) >= recentDestinationMaximum {
+		var oldest T
+		var oldestTime time.Time
+		haveOldest := false
+		for candidate, updated := range c {
+			if now.Sub(updated) >= recentDestinationLifetime {
+				delete(c, candidate)
+				continue
+			}
+			if !haveOldest || updated.Before(oldestTime) {
+				oldest, oldestTime, haveOldest = candidate, updated, true
+			}
+		}
+		if len(c) >= recentDestinationMaximum && haveOldest {
+			delete(c, oldest)
+		}
+	}
+	c[destination] = now
+}
+
+// contains reports recent transmission evidence and removes it after expiry.
+func (c recentDestinationCache[T]) contains(destination T, now time.Time) bool {
+	updated, exists := c[destination]
+	if exists && now.Sub(updated) >= recentDestinationLifetime {
+		delete(c, destination)
+		return false
+	}
+	return exists
+}
+
 // udpKey identifies one specific or wildcard local UDP endpoint.
 type udpKey struct {
 	address netip.Addr
@@ -332,10 +407,11 @@ type tcpKey struct {
 // automaticPortCursor remembers the next randomized position in the primary
 // IANA range and its lower, non-privileged fallback range.
 type automaticPortCursor struct {
-	dynamic  uint16
-	fallback uint16
-	secret   [16]byte
-	sequence uint64
+	dynamic      uint16
+	fallback     uint16
+	dynamicStep  uint16
+	fallbackStep uint16
+	secret       [16]byte
 }
 
 // packetQueueState assigns FIFO-order tickets to packets handed to one host
@@ -420,7 +496,7 @@ func New(config Config) (*Stack, error) {
 	}
 	// One OS-random read seeds independent port, fragment-ID, and RFC 6528
 	// sequence spaces. Per-connection ISNs are derived from tcpISNSecret.
-	var seed [72]byte
+	var seed [88]byte
 	if _, err = rand.Read(seed[:]); err != nil {
 		return nil, err
 	}
@@ -443,6 +519,7 @@ func New(config Config) (*Stack, error) {
 		closeCh: make(chan struct{}), timestampEpoch: time.Now(), fragments: make(map[fragmentKey]*fragmentSet), fragmentWake: make(chan struct{}, 1),
 	}
 	copy(stack.tcpISNSecret[:], seed[24:40])
+	copy(stack.flowLabelSecret[:], seed[72:88])
 	stack.ipv4ID.Store(ipv4ID)
 	stack.ipv6FragmentID.Store(ipv6FragmentID)
 	stack.network.Store(state)
@@ -747,24 +824,38 @@ func (s *Stack) observePathMTU(destination netip.Addr, mtu uint32) bool {
 	defer s.pathMTUMu.Unlock()
 	now := time.Now()
 	current, exists := s.pathMTU[destination]
-	if exists && current.mtu <= int(mtu) && now.Sub(current.updated) < pathMTULifetime {
-		current.updated = now
-		s.pathMTU[destination] = current
-		return false
+	if exists && now.Sub(current.updated) < pathMTULifetime {
+		if current.mtu < int(mtu) {
+			// A Packet Too Big message can only lower the confirmed PMTU.
+			// A larger value neither proves the smaller path constraint still
+			// exists nor authorizes an upward change.
+			return false
+		}
+		if current.mtu == int(mtu) {
+			current.updated = now
+			s.pathMTU[destination] = current
+			return false
+		}
 	}
-	if !exists && len(s.pathMTU) >= pathMTUMaximumEntries {
+	s.storePathMTULocked(destination, pathMTUEntry{mtu: int(mtu), updated: now})
+	s.stats.pathMTUUpdates.Add(1)
+	return true
+}
+
+// storePathMTULocked installs one entry while preserving the global cache
+// bound. Callers hold pathMTUMu for writing.
+func (s *Stack) storePathMTULocked(destination netip.Addr, entry pathMTUEntry) {
+	if _, exists := s.pathMTU[destination]; !exists && len(s.pathMTU) >= pathMTUMaximumEntries {
 		var oldestAddress netip.Addr
 		var oldest pathMTUEntry
-		for address, entry := range s.pathMTU {
-			if !oldestAddress.IsValid() || entry.updated.Before(oldest.updated) {
-				oldestAddress, oldest = address, entry
+		for address, candidate := range s.pathMTU {
+			if !oldestAddress.IsValid() || candidate.updated.Before(oldest.updated) {
+				oldestAddress, oldest = address, candidate
 			}
 		}
 		delete(s.pathMTU, oldestAddress)
 	}
-	s.pathMTU[destination] = pathMTUEntry{mtu: int(mtu), updated: now}
-	s.stats.pathMTUUpdates.Add(1)
-	return true
+	s.pathMTU[destination] = entry
 }
 
 // confirmPathMTU raises a shared destination PMTU after packetization-layer
@@ -777,16 +868,24 @@ func (s *Stack) confirmPathMTU(destination netip.Addr, mtu int, except *TCPConn)
 	}
 	s.pathMTUMu.Lock()
 	current, exists := s.pathMTU[destination]
-	if exists && current.mtu >= mtu && time.Since(current.updated) < pathMTULifetime {
-		current.updated = time.Now()
-		s.pathMTU[destination] = current
-		s.pathMTUMu.Unlock()
-		return false
+	if exists && time.Since(current.updated) < pathMTULifetime {
+		if current.mtu > mtu {
+			// Delivery of a smaller probe does not reconfirm the larger packet
+			// size established by another flow.
+			s.pathMTUMu.Unlock()
+			return false
+		}
+		if current.mtu == mtu {
+			current.updated = time.Now()
+			s.pathMTU[destination] = current
+			s.pathMTUMu.Unlock()
+			return false
+		}
 	}
 	if mtu >= linkMTU {
 		delete(s.pathMTU, destination)
 	} else {
-		s.pathMTU[destination] = pathMTUEntry{mtu: mtu, updated: time.Now()}
+		s.storePathMTULocked(destination, pathMTUEntry{mtu: mtu, updated: time.Now()})
 	}
 	s.pathMTUMu.Unlock()
 	s.notifyTCPPathMTU(destination, except)
@@ -819,6 +918,11 @@ func (s *Stack) Stats() StackStats {
 		TCPSpuriousRecoveryUndos:    s.stats.tcpSpuriousRecoveryUndos.Load(),
 		TCPZeroWindowProbes:         s.stats.tcpZeroWindowProbes.Load(),
 		TCPKeepAliveProbes:          s.stats.tcpKeepAliveProbes.Load(),
+		TCPSYNCookiesSent:           s.stats.tcpSYNCookiesSent.Load(),
+		TCPSYNCookiesAccepted:       s.stats.tcpSYNCookiesAccepted.Load(),
+		TCPSYNCookiesRejected:       s.stats.tcpSYNCookiesRejected.Load(),
+		TCPHandshakeTimeouts:        s.stats.tcpHandshakeTimeouts.Load(),
+		TCPAcceptQueueDrops:         s.stats.tcpAcceptQueueDrops.Load(),
 		PathMTUUpdates:              s.stats.pathMTUUpdates.Load(),
 		PathMTUProbes:               s.stats.pathMTUProbes.Load(),
 		PathMTUProbeSuccesses:       s.stats.pathMTUProbeSuccesses.Load(),
@@ -905,39 +1009,108 @@ func (s *Stack) sourceForRequested(destination, requested netip.Addr) (netip.Add
 	return s.network.Load().sourceFor(destination, requested)
 }
 
+// automaticFlowLabel derives one nonzero RFC 6437-style label from a stable
+// per-stack secret and the fields available to identify an IPv6 flow.
+func (s *Stack) automaticFlowLabel(source, target netip.Addr, protocol byte, payload []byte) uint32 {
+	var selector [4]byte
+	switch protocol {
+	case protocolTCP, protocolUDP:
+		if len(payload) >= 4 {
+			copy(selector[:], payload[:4])
+		}
+	case protocolICMPv6:
+		if len(payload) >= 6 {
+			selector[0], selector[1] = payload[0], payload[1]
+			copy(selector[2:4], payload[4:6])
+		}
+	}
+	return s.flowLabel(source, target, protocol, selector)
+}
+
+// automaticTransportFlowLabel is automaticFlowLabel without requiring a
+// serialized TCP or UDP header.
+func (s *Stack) automaticTransportFlowLabel(source, target netip.Addr, protocol byte, sourcePort, targetPort uint16) uint32 {
+	var selector [4]byte
+	binary.BigEndian.PutUint16(selector[0:2], sourcePort)
+	binary.BigEndian.PutUint16(selector[2:4], targetPort)
+	return s.flowLabel(source, target, protocol, selector)
+}
+
+// flowLabel hashes one directional flow identity into IPv6's 20-bit field.
+func (s *Stack) flowLabel(source, target netip.Addr, protocol byte, selector [4]byte) uint32 {
+	var input [37]byte
+	sourceValue, targetValue := source.As16(), target.As16()
+	copy(input[0:16], sourceValue[:])
+	copy(input[16:32], targetValue[:])
+	input[32] = protocol
+	copy(input[33:37], selector[:])
+	label := uint32(sipHash24(s.flowLabelSecret, input[:])) & ipv6MaximumFlowLabel
+	if label == 0 {
+		label = 1
+	}
+	return label
+}
+
 // allocateAutomaticPort selects an available IANA dynamic port first, then
 // falls back to the lower non-privileged range only after a complete scan.
 func allocateAutomaticPort(cursor *automaticPortCursor, available func(uint16) bool) (uint16, error) {
+	return allocateAutomaticPortWithOffsets(cursor, [2]uint32{}, available)
+}
+
+// allocateAutomaticPortWithOffsets combines a moving full-period cursor with
+// keyed per-destination offsets, following RFC 6056's hash-based selection
+// model without retaining a table for every remote endpoint.
+func allocateAutomaticPortWithOffsets(cursor *automaticPortCursor, offsets [2]uint32, available func(uint16) bool) (uint16, error) {
 	ranges := [...]struct {
 		id     byte
 		first  uint32
 		count  uint32
 		cursor *uint16
+		step   *uint16
 	}{
-		{0, dynamicPortFirst, dynamicPortCount, &cursor.dynamic},
-		{1, fallbackPortFirst, fallbackPortCount, &cursor.fallback},
+		{0, dynamicPortFirst, dynamicPortCount, &cursor.dynamic, &cursor.dynamicStep},
+		{1, fallbackPortFirst, fallbackPortCount, &cursor.fallback, &cursor.fallbackStep},
 	}
 	for _, portRange := range ranges {
-		start := uint32(*portRange.cursor)
-		for offset := uint32(0); offset < portRange.count; offset++ {
-			position := (start + offset) % portRange.count
+		if *portRange.step == 0 {
+			*portRange.step = automaticPortStep(cursor.secret, portRange.id, portRange.count)
+		}
+		base := uint32(*portRange.cursor)
+		start := (base + offsets[portRange.id]%portRange.count) % portRange.count
+		for probe := uint32(0); probe < portRange.count; probe++ {
+			position := (start + probe*uint32(*portRange.step)) % portRange.count
 			port := uint16(portRange.first + position)
 			if !available(port) {
 				continue
 			}
-			// RFC 6056-style keyed increments prevent one observed automatic
-			// port from revealing the next selection while preserving a complete
-			// linear collision scan from each unpredictable starting point.
-			var input [9]byte
-			input[0] = portRange.id
-			binary.BigEndian.PutUint64(input[1:9], cursor.sequence)
-			cursor.sequence++
-			step := uint32(1) + uint32(sipHash24(cursor.secret, input[:])%uint64(portRange.count-1))
-			*portRange.cursor = uint16((position + step) % portRange.count)
+			// Advance the shared cursor independently of the destination offset.
+			// For one destination this visits the complete range before returning
+			// to a recently closed four-tuple retained by its peer in TIME_WAIT.
+			*portRange.cursor = uint16((base + (probe+1)*uint32(*portRange.step)) % portRange.count)
 			return port, nil
 		}
 	}
 	return 0, ErrNoPorts
+}
+
+// automaticPortStep derives an unpredictable full-period traversal step.
+func automaticPortStep(secret [16]byte, id byte, count uint32) uint16 {
+	step := uint32(1) + uint32(sipHash24(secret, []byte{id})%uint64(count-1))
+	for greatestCommonDivisor(step, count) != 1 {
+		step++
+		if step == count {
+			step = 1
+		}
+	}
+	return uint16(step)
+}
+
+// greatestCommonDivisor supports full-period automatic-port traversal.
+func greatestCommonDivisor(left, right uint32) uint32 {
+	for right != 0 {
+		left, right = right, left%right
+	}
+	return left
 }
 
 // isLocal reports whether address belongs to this stack.
@@ -992,7 +1165,9 @@ func (s *Stack) allocateTCPPortLocked(local netip.Addr, remote netip.AddrPort) (
 	if remote.Addr().Is6() {
 		index = 1
 	}
-	return allocateAutomaticPort(&s.nextPort[index], func(port uint16) bool {
+	cursor := &s.nextPort[index]
+	offsets := automaticTCPPortOffsets(cursor.secret, local, remote)
+	return allocateAutomaticPortWithOffsets(cursor, offsets, func(port uint16) bool {
 		if s.tcpPortListenedLocked(local, port) {
 			return false
 		}
@@ -1002,6 +1177,23 @@ func (s *Stack) allocateTCPPortLocked(local netip.Addr, remote netip.AddrPort) (
 		}
 		return true
 	})
+}
+
+// automaticTCPPortOffsets separate the ephemeral sequence observed by each
+// remote endpoint using the same tuple inputs recommended by RFC 6056.
+func automaticTCPPortOffsets(secret [16]byte, local netip.Addr, remote netip.AddrPort) [2]uint32 {
+	var input [35]byte
+	if local.Is6() {
+		input[0] = 6
+	} else {
+		input[0] = 4
+	}
+	localValue, remoteValue := local.As16(), remote.Addr().As16()
+	copy(input[1:17], localValue[:])
+	copy(input[17:33], remoteValue[:])
+	binary.BigEndian.PutUint16(input[33:35], remote.Port())
+	hash := sipHash24(secret, input[:])
+	return [2]uint32{uint32(hash), uint32(hash >> 32)}
 }
 
 // tcpPortListenedLocked reports whether a wildcard or exact listener owns a

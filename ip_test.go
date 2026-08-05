@@ -19,7 +19,7 @@ func TestIPConnFanoutAndLinuxControl(t *testing.T) {
 		controlSize   int
 	}{
 		{name: "IPv4", local: netip.MustParseAddr("192.0.2.110"), remote: netip.MustParseAddr("198.51.100.110"), controlSize: 80},
-		{name: "IPv6", local: netip.MustParseAddr("2001:db8::110"), remote: netip.MustParseAddr("2001:db8:1::110"), controlSize: 88},
+		{name: "IPv6", local: netip.MustParseAddr("2001:db8::110"), remote: netip.MustParseAddr("2001:db8:1::110"), controlSize: 112},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.local, test.local.BitLen())}})
@@ -59,7 +59,7 @@ func TestIPConnFanoutAndLinuxControl(t *testing.T) {
 				t.Fatalf("ReadFromIP = %q from %v, %v", buffer[:n], source, err)
 			}
 			short := make([]byte, 3)
-			oob := make([]byte, 96)
+			oob := make([]byte, 128)
 			n, oobn, flags, source, err := all.ReadMsgIP(short, oob)
 			if err != nil || n != len(short) || string(short) != "raw" || flags != linuxMessageTruncated || oobn != test.controlSize {
 				t.Fatalf("ReadMsgIP = %q/%d flags %#x from %v, %v", short[:n], oobn, flags, source, err)
@@ -357,6 +357,139 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 	}
 }
 
+func TestIPPathMTUProbing(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		local     netip.Addr
+		remote    netip.Addr
+		baseMTU   uint32
+		connected bool
+	}{
+		{name: "IPv4 connected", local: netip.MustParseAddr("192.0.2.170"), remote: netip.MustParseAddr("192.0.2.171"), baseMTU: 1000, connected: true},
+		{name: "IPv4 unconnected", local: netip.MustParseAddr("192.0.2.172"), remote: netip.MustParseAddr("192.0.2.173"), baseMTU: 1000},
+		{name: "IPv6 connected", local: netip.MustParseAddr("2001:db8::170"), remote: netip.MustParseAddr("2001:db8::171"), baseMTU: 1280, connected: true},
+		{name: "IPv6 unconnected", local: netip.MustParseAddr("2001:db8::172"), remote: netip.MustParseAddr("2001:db8::173"), baseMTU: 1280},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bits := 32
+			if test.local.Is6() {
+				bits = 128
+			}
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.local, bits)}, MTU: 1500})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stack.Close() })
+			if !stack.observePathMTU(test.remote, test.baseMTU) {
+				t.Fatal("failed to install base PMTU")
+			}
+			var connection *IPConn
+			if test.connected {
+				var netConnection net.Conn
+				netConnection, err = stack.DialIP(context.Background(), "ip:99", netip.Addr{}, test.remote)
+				if err == nil {
+					connection = netConnection.(*IPConn)
+				}
+			} else {
+				connection, err = stack.ListenIP(context.Background(), "ip:99", netip.Addr{})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			payload := bytes.Repeat([]byte{0x5a}, 1300)
+			if test.connected {
+				_, err = connection.Write(payload)
+			} else {
+				_, err = connection.WriteToIP(payload, ipNetAddr(test.remote))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for fragment := 0; fragment < 2; fragment++ {
+				if packet := readOutboundPacket(t, stack); len(packet) > int(test.baseMTU) {
+					t.Fatalf("ordinary IP fragment size = %d, want <= %d", len(packet), test.baseMTU)
+				}
+			}
+			if test.connected {
+				_, err = connection.WritePathMTUProbe(payload)
+			} else {
+				_, err = connection.WritePathMTUProbeTo(payload, test.remote)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			probe := readOutboundPacket(t, stack)
+			wantSize := len(payload) + 20
+			if test.remote.Is6() {
+				wantSize = len(payload) + 40
+			}
+			if len(probe) != wantSize {
+				t.Fatalf("IP path probe size = %d, want %d", len(probe), wantSize)
+			}
+			if test.connected {
+				err = connection.ConfirmPathMTU(wantSize)
+			} else {
+				err = connection.ConfirmPathMTUFor(test.remote, wantSize)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mtu, pathErr := stack.PathMTU(test.remote); pathErr != nil || mtu != wantSize {
+				t.Fatalf("confirmed IP PMTU = %d, %v, want %d", mtu, pathErr, wantSize)
+			}
+		})
+	}
+}
+
+func TestIPIPv6FlowLabelPolicy(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::192")
+	remote := netip.MustParseAddr("2001:db8::193")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection, err := stack.ListenIP(context.Background(), "ip6:99", netip.IPv6Unspecified())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	writeAndLabel := func() uint32 {
+		t.Helper()
+		if _, writeErr := connection.WriteToIP([]byte("flow"), ipNetAddr(remote)); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+		if !ok {
+			t.Fatal("failed to parse IPv6 IP output")
+		}
+		return packet.flowLabel
+	}
+	first := writeAndLabel()
+	if first == 0 || writeAndLabel() != first {
+		t.Fatalf("unstable automatic IP flow label %#x", first)
+	}
+	if info := connection.Info(); info.FlowLabel != 0 {
+		t.Fatalf("automatic IP flow-label diagnostics = %+v", info)
+	}
+	if err = connection.SetFlowLabel(0x34567); err != nil {
+		t.Fatal(err)
+	}
+	if label := writeAndLabel(); label != 0x34567 {
+		t.Fatalf("IP socket flow label = %#x, want 0x34567", label)
+	}
+	if info := connection.Info(); info.FlowLabel != 0x34567 {
+		t.Fatalf("fixed IP flow-label diagnostics = %+v", info)
+	}
+}
+
 func TestIPConnFragmentReassembly(t *testing.T) {
 	for _, test := range []struct {
 		name          string
@@ -398,7 +531,7 @@ func TestIPConnFragmentReassembly(t *testing.T) {
 				t.Fatalf("fragmented WriteMsgIP = %d, %v", n, writeErr)
 			}
 			buffer := make([]byte, len(payload))
-			control := make([]byte, 96)
+			control := make([]byte, 128)
 			n, oobn, flags, source, readErr := listener.ReadMsgIP(buffer, control)
 			if readErr != nil || n != len(payload) || flags != 0 || !bytes.Equal(buffer, payload) || source.String() != test.local.String() {
 				t.Fatalf("reassembled ReadMsgIP = %d flags %#x from %v, %v", n, flags, source, readErr)
@@ -410,7 +543,7 @@ func TestIPConnFragmentReassembly(t *testing.T) {
 				}
 			} else {
 				var message IPv6ControlMessage
-				if controlErr := message.Parse(control[:oobn]); controlErr != nil || message != (IPv6ControlMessage{HopLimit: 29, TrafficClass: 0x2e, Dst: test.remote}) {
+				if controlErr := message.Parse(control[:oobn]); controlErr != nil || message.HopLimit != 29 || message.TrafficClass != 0x2e || message.FlowLabel == 0 || message.Dst != test.remote {
 					t.Fatalf("reassembled IPv6 control = %+v, %v", message, controlErr)
 				}
 			}

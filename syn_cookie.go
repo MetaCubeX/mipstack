@@ -131,12 +131,19 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, key tcpKey, syn tcpSeg
 // validateSYNCookie authenticates a final ACK against the current or previous
 // time period and reconstructs its negotiated options.
 func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now time.Time) (uint32, synCookieOptions, bool) {
+	sequence, options, valid, _ := state.validateSYNCookieCandidate(key, ack, now)
+	return sequence, options, valid
+}
+
+// validateSYNCookieCandidate additionally reports whether a recent cookie
+// made this ACK eligible for authentication diagnostics.
+func (state *tcpPassiveState) validateSYNCookieCandidate(key tcpKey, ack tcpSegment, now time.Time) (uint32, synCookieOptions, bool, bool) {
 	if ack.flags&tcpFlagACK == 0 || ack.flags&(tcpFlagSYN|tcpFlagRST) != 0 {
-		return 0, synCookieOptions{}, false
+		return 0, synCookieOptions{}, false, false
 	}
 	secret, period, scalePeriods, windowScales, scalesSet, active := state.recentSYNCookieState(now)
 	if !active {
-		return 0, synCookieOptions{}, false
+		return 0, synCookieOptions{}, false, false
 	}
 	serverSequence := ack.acknowledgement - 1
 	clientSequence := ack.sequence - 1
@@ -168,17 +175,17 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 		}
 	}
 	if !valid {
-		return 0, synCookieOptions{}, false
+		return 0, synCookieOptions{}, false, true
 	}
 	options, ok := decodeSYNCookieOptions(data)
 	if !ok {
-		return 0, synCookieOptions{}, false
+		return 0, synCookieOptions{}, false, true
 	}
 	options.timestamp = timestamp
 	options.timestampNow = timestampValue
 	options.ecn = ecn
 	options.localWindowScale = localWindowScale
-	return serverSequence, options, true
+	return serverSequence, options, true, true
 }
 
 // encodeSYNCookieOptions converts a SYN's offered options into eight sequence

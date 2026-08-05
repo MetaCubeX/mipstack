@@ -120,8 +120,12 @@ Active sockets allocate from the IANA dynamic range (`49152..65535`) first.
 Only when that range is unavailable for the requested binding or TCP tuple do
 they fall back to non-privileged ports `1024..49151`. Ports below 1024 are
 never selected automatically but remain available for explicit bindings.
-RFC 6056-style keyed increments make the next scan origin unpredictable
-without performing a system-random read for every socket.
+TCP combines an RFC 6056-style SipHash offset of the local and remote
+endpoints with a keyed full-period scan step. Different destinations therefore
+observe separated sequences, and a collision-free sequence does not revisit a
+recently closed tuple until it has traversed the complete range. The keys and
+initial cursors are read from system randomness once when the Stack is created;
+socket creation does not perform another system-random read.
 `Config.MaxTCPConnections` may impose an application-selected resource bound;
 its zero value does not impose an artificial connection limit. Listener count
 is controlled only by available memory and explicit application creation.
@@ -133,7 +137,9 @@ containing IPv6 require the IPv6 minimum MTU of 1280.
 `Config.TCP` defines policies inherited by newly created connections and
 listeners: initial and maximum automatic receive/send buffers, completed and
 half-open listener queues, congestion control, keepalive, receive-idle timeout,
-Nagle behavior, TCP user timeout, and DSCP bits. Congestion control accepts
+Nagle behavior, TCP user timeout, DSCP bits, and IPv6 Flow Label policy. A zero
+TCP Flow Label selects a stable keyed label for the connection tuple; a
+nonzero value fixes the label for new connections. Congestion control accepts
 `CongestionControlCUBIC`, `CongestionControlReno`, or `CongestionControlBBR`;
 its zero value selects CUBIC. `UpdateConfig` applies a changed congestion
 controller to established connections without an explicit per-connection
@@ -149,11 +155,13 @@ not inflate buffers. `SetCongestionControl` and `SetTrafficClass` provide
 per-connection overrides.
 
 `Config.UDP` and `Config.IP` define the receive-buffer capacity, default
-TTL/Hop Limit, and default TOS/Traffic Class inherited by new datagram sockets.
-`SetReadBuffer`, `SetHopLimit`, and `SetTrafficClass` provide per-socket
-overrides. Nonzero message control fields override the socket defaults; an
-explicit zero TOS/Traffic Class encoded in raw OOB data remains distinguishable
-from an omitted field.
+TTL/Hop Limit, default TOS/Traffic Class, and IPv6 Flow Label policy inherited
+by new datagram sockets. `SetReadBuffer`, `SetHopLimit`, `SetTrafficClass`, and
+`SetFlowLabel` provide per-socket overrides. A zero configured Flow Label uses
+a stable keyed label for each flow; explicitly setting a socket label to zero
+disables automatic labeling. Nonzero message control fields override the
+socket defaults; an explicit zero TOS/Traffic Class or Flow Label encoded in
+raw OOB data remains distinguishable from an omitted field.
 
 Socket operation failures use `*net.OpError`. `errors.Is` continues to identify
 `os.ErrDeadlineExceeded`, `net.ErrClosed`, and syscall errors. Orderly TCP EOF
@@ -172,28 +180,33 @@ connection actor and retains the final snapshot after close. It includes RFC
 9293 state, endpoints, negotiated extensions, RTT/RTO, congestion controller,
 cwnd and ssthresh, peer/receive windows, bytes in flight, path MTU and active
 probe state, buffer occupancy and automatic limits, byte counters, recovery
-state, inherited keepalive/Nagle/DSCP policies, window-scale values, and
-connection-local retransmission, PMTU-probe, and spurious-recovery counters.
+state, inherited keepalive/Nagle/DSCP/Flow Label policies, window-scale values,
+and connection-local retransmission, PMTU-probe, and spurious-recovery counters.
 It also reports the current and peak byte-bounded actor queue occupancy and
 queue drops, making scheduler or embedding-link backpressure distinguishable
 from network loss.
-`UDPConn.Info` and `IPConn.Info` expose endpoint identity, queue occupancy,
-socket defaults, path MTU for connected sockets, and cumulative accepted,
-dropped, and transmitted datagram counters. UDP diagnostics also retain the
-latest correlated ICMP error.
+`TCPListener.Info` reports current, capacity, and lifetime peak occupancy for
+the accept and SYN backlogs, along with handshake, SYN-cookie, accept, timeout,
+and queue-drop counters. `UDPConn.Info` and `IPConn.Info` expose endpoint
+identity, queue occupancy, socket defaults, path MTU for connected sockets,
+and cumulative accepted, dropped, and transmitted datagram counters. Both
+retain the latest correlated ICMP error. An automatic `IPConn` Flow Label is
+reported as zero because raw payload fields may select a different flow on
+each write; fixed socket labels are reported directly.
 
 UDP message methods use the Linux 64-bit little-endian control-message layout
 on every host. `ReadMsgUDP` emits `IP_PKTINFO` or `IPV6_PKTINFO` for the local
 destination plus TTL/Hop Limit and TOS/Traffic Class, with Linux
 `MSG_TRUNC`/`MSG_CTRUNC` flags. Passing that data to `WriteMsgUDP` selects the
-corresponding managed source and output header fields. `IPConn` uses the same
-ancillary representation.
+corresponding managed source and output header fields. IPv6 messages also
+carry Linux `IPV6_FLOWINFO`. `IPConn` uses the same ancillary representation.
 
 `IPv4ControlMessage` and `IPv6ControlMessage` make that ancillary data
 structured rather than opaque. Their `Parse` methods decode OOB returned by a
 message read; their `Marshal` methods encode `Src`, TTL/Hop Limit, and
-TOS/Traffic Class for a message write. `Dst` is populated while parsing.
-`IfIndex` is always zero because MIPS has one embedding link.
+TOS/Traffic Class for a message write. `IPv6ControlMessage` also exposes the
+20-bit Flow Label. `Dst` is populated while parsing. `IfIndex` is always zero
+because MIPS has one embedding link.
 
 ## Protocol behavior
 
@@ -273,6 +286,12 @@ Connected UDP sockets select a stable local address and filter inbound remote
 tuples; unconnected sockets can use arbitrary destinations in one IP family.
 Both correlate asynchronous ICMP errors with recently used remote endpoints.
 
+`IPConn` applies the same recent-destination correlation to protocol payload
+writes. Validated errors are returned by a subsequent read and retained in
+`IPInfo`; Packet Too Big also updates the shared destination PMTU. Its explicit
+probe and confirmation methods follow the same application-acknowledgement
+contract as UDP.
+
 ICMP echo, unreachable, packet-too-big, IPv4 fragmentation, IPv6 source
 fragmentation, and bounded IPv4 and IPv6 reassembly are handled internally.
 Fragment overlap drops the complete datagram. Incomplete sets have count, byte,
@@ -287,8 +306,9 @@ copies. A listener for an otherwise unknown protocol suppresses Protocol
 Unreachable while its receive queue accepts or drops matching traffic.
 
 `Stack.Stats` returns a lock-free snapshot of active socket counts, categorized
-IP/TCP packet and actor-queue drops, retransmission modes, PMTU changes,
-fragment cleanup, and rate limiting.
+IP/TCP packet and actor-queue drops, passive handshake, SYN-cookie and accept
+queue outcomes, retransmission modes, PMTU changes, fragment cleanup, and rate
+limiting.
 
 Optional surfaces are arranged for ordinary Go linker reachability rather than
 build tags. A consumer that only dials TCP and listens for UDP does not retain

@@ -175,6 +175,7 @@ func TestTCPSocketDefaultConfiguration(t *testing.T) {
 		{MaximumReceiveBuffer: int(tcpMaximumScaledWindow) + 1},
 		{KeepAliveConfig: KeepAliveConfig{Count: -1}},
 		{UserTimeout: -time.Second},
+		{FlowLabel: ipv6MaximumFlowLabel + 1},
 	}
 	for _, defaults := range invalid {
 		if _, err := New(Config{LocalAddresses: []netip.Prefix{local}, TCP: defaults}); err == nil {
@@ -236,7 +237,9 @@ func TestDatagramSocketDefaultConfiguration(t *testing.T) {
 	for _, config := range []Config{
 		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{ReceiveBuffer: -1}},
 		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{HopLimit: 256}},
+		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{FlowLabel: ipv6MaximumFlowLabel + 1}},
 		{LocalAddresses: []netip.Prefix{local}, IP: DatagramSocketDefaults{HopLimit: -1}},
+		{LocalAddresses: []netip.Prefix{local}, IP: DatagramSocketDefaults{FlowLabel: ipv6MaximumFlowLabel + 1}},
 	} {
 		if _, err := New(config); err == nil {
 			t.Fatalf("invalid datagram defaults were accepted: %+v", config)
@@ -276,6 +279,49 @@ func TestExpiredPathMTURemainsActionable(t *testing.T) {
 	}
 	if _, exists := stack.pathMTU[remote]; exists {
 		t.Fatal("expired PMTU cache entry was not removed")
+	}
+}
+
+func TestPathMTUCacheBoundAndICMPRefreshPolicy(t *testing.T) {
+	local := netip.MustParsePrefix("192.0.2.16/32")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{local}, MTU: 1500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := netip.MustParseAddr("198.51.100.16")
+	updated := time.Now().Add(-time.Minute)
+	stack.pathMTU[remote] = pathMTUEntry{mtu: 1000, updated: updated}
+	if stack.observePathMTU(remote, 1200) {
+		t.Fatal("larger ICMP Packet Too Big value raised the PMTU")
+	}
+	if entry := stack.pathMTU[remote]; entry.mtu != 1000 || !entry.updated.Equal(updated) {
+		t.Fatalf("larger ICMP value refreshed PMTU entry = %+v", entry)
+	}
+	for index := 0; index <= pathMTUMaximumEntries; index++ {
+		address := netip.AddrFrom4([4]byte{10, byte(index >> 8), byte(index), 1})
+		if !stack.confirmPathMTU(address, 1400, nil) {
+			t.Fatalf("PMTU confirmation %d was not recorded", index)
+		}
+	}
+	if count := len(stack.pathMTU); count != pathMTUMaximumEntries {
+		t.Fatalf("PMTU cache entries = %d, want %d", count, pathMTUMaximumEntries)
+	}
+}
+
+func TestSmallerConfirmationDoesNotRefreshLargerPathMTU(t *testing.T) {
+	local := netip.MustParsePrefix("192.0.2.17/32")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{local}, MTU: 1500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := netip.MustParseAddr("198.51.100.17")
+	updated := time.Now().Add(-time.Minute)
+	stack.pathMTU[remote] = pathMTUEntry{mtu: 1400, updated: updated}
+	if stack.confirmPathMTU(remote, 1200, nil) {
+		t.Fatal("smaller confirmation changed the shared PMTU")
+	}
+	if entry := stack.pathMTU[remote]; entry.mtu != 1400 || !entry.updated.Equal(updated) {
+		t.Fatalf("smaller confirmation refreshed larger PMTU entry = %+v", entry)
 	}
 }
 

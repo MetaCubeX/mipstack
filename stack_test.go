@@ -389,7 +389,7 @@ func TestAutomaticPortRangeFallback(t *testing.T) {
 	}
 }
 
-func TestAutomaticPortCursorUsesKeyedIncrements(t *testing.T) {
+func TestAutomaticPortCursorUsesKeyedFullPeriodSteps(t *testing.T) {
 	first := automaticPortCursor{secret: [16]byte{1}}
 	second := automaticPortCursor{secret: [16]byte{2}}
 	firstPort, err := allocateAutomaticPort(&first, func(uint16) bool { return true })
@@ -405,5 +405,32 @@ func TestAutomaticPortCursorUsesKeyedIncrements(t *testing.T) {
 	}
 	if first.dynamic == 1 || second.dynamic == 1 {
 		t.Fatal("automatic port cursor retained a sequential increment")
+	}
+	if first.dynamic == second.dynamic {
+		t.Fatal("automatic port cursors with different keys selected the same increment")
+	}
+
+	seen := make(map[uint16]struct{}, dynamicPortCount)
+	cursor := automaticPortCursor{secret: [16]byte{3}}
+	offsets := [2]uint32{12345, 6789}
+	for index := uint32(0); index < dynamicPortCount; index++ {
+		port, allocateErr := allocateAutomaticPortWithOffsets(&cursor, offsets, func(uint16) bool { return true })
+		if allocateErr != nil {
+			t.Fatal(allocateErr)
+		}
+		if _, exists := seen[port]; exists {
+			t.Fatalf("automatic port %d repeated after %d allocations", port, index)
+		}
+		seen[port] = struct{}{}
+	}
+}
+
+func TestAutomaticTCPPortOffsetsSeparateDestinations(t *testing.T) {
+	secret := [16]byte{4}
+	local := netip.MustParseAddr("192.0.2.1")
+	first := automaticTCPPortOffsets(secret, local, netip.MustParseAddrPort("198.51.100.1:443"))
+	second := automaticTCPPortOffsets(secret, local, netip.MustParseAddrPort("198.51.100.2:443"))
+	if first == second {
+		t.Fatal("different TCP destinations received the same automatic-port offsets")
 	}
 }

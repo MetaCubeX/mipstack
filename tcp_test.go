@@ -39,6 +39,13 @@ func TestTCPListenerAcceptAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer serverConnection.Close()
+	listenerInfo := listener.Info()
+	if listenerInfo.LocalAddress != serverEndpoint || listenerInfo.Closed || listenerInfo.AcceptQueueConnections != 0 ||
+		listenerInfo.SYNBacklogConnections != 0 || listenerInfo.AcceptQueueCapacity == 0 || listenerInfo.SYNBacklogCapacity == 0 ||
+		listenerInfo.AcceptQueuePeak > 1 || listenerInfo.SYNBacklogPeak != 1 || listenerInfo.SYNsReceived != 1 ||
+		listenerInfo.StatefulHandshakes != 1 || listenerInfo.HandshakeCompletions != 1 || listenerInfo.AcceptedConnections != 1 {
+		t.Fatalf("listener diagnostics after Accept = %+v", listenerInfo)
+	}
 	_ = clientConnection.SetDeadline(time.Now().Add(2 * time.Second))
 	_ = serverConnection.SetDeadline(time.Now().Add(2 * time.Second))
 	if _, err = clientConnection.Write([]byte("request")); err != nil {
@@ -50,6 +57,9 @@ func TestTCPListenerAcceptAndClose(t *testing.T) {
 	}
 	if err = listener.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if closedInfo := listener.Info(); !closedInfo.Closed || closedInfo.AcceptedConnections != 1 {
+		t.Fatalf("closed listener diagnostics = %+v", closedInfo)
 	}
 	if _, err = serverConnection.Write([]byte("response")); err != nil {
 		t.Fatal(err)
@@ -75,6 +85,24 @@ func TestTCPListenerAcceptAndClose(t *testing.T) {
 		t.Fatalf("Accept error = %v, want deadline", err)
 	} else {
 		checkNetOpError(t, err, "accept", "tcp")
+	}
+}
+
+func TestTCPListenerCompletedConnectionsLeaveSYNBacklog(t *testing.T) {
+	listener := &TCPListener{
+		accept: make(chan *TCPConn, 2), closed: make(chan struct{}), changed: make(chan struct{}), backlog: 1,
+		pending: make(map[*TCPConn]struct{}), handshaking: make(map[*TCPConn]struct{}),
+	}
+	first, second := &TCPConn{}, &TCPConn{}
+	if !listener.trackHandshake(first) || !listener.enqueue(first) {
+		t.Fatal("first handshake did not enter the accept queue")
+	}
+	info := listener.Info()
+	if info.SYNBacklogConnections != 0 || info.AcceptQueueConnections != 1 {
+		t.Fatalf("completed handshake queue accounting = %+v", info)
+	}
+	if !listener.trackHandshake(second) {
+		t.Fatal("completed connection continued to consume the SYN backlog")
 	}
 }
 
@@ -132,6 +160,33 @@ func TestTCPConnectionInfo(t *testing.T) {
 	closed := clientConnection.Info()
 	if closed.State != TCPStateClosed || closed.LastError == nil || closed.BytesAcknowledged < uint64(len(payload)) {
 		t.Fatalf("final TCP diagnostics = %+v", closed)
+	}
+}
+
+func TestTCPIPv6FlowLabelPolicy(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::194")
+	remote := netip.MustParseAddr("2001:db8::195")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := tcpKey{local: netip.AddrPortFrom(local, 40000), remote: netip.AddrPortFrom(remote, 443)}
+	connection := newTCPConn(stack, "tcp6", key, 1500)
+	if connection.flowLabel == 0 {
+		t.Fatal("automatic TCP flow label is zero")
+	}
+	if second := newTCPConn(stack, "tcp6", key, 1500); second.flowLabel != connection.flowLabel {
+		t.Fatalf("automatic TCP flow labels = %#x and %#x", connection.flowLabel, second.flowLabel)
+	}
+	explicit, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)},
+		TCP:            TCPSocketDefaults{FlowLabel: 0x45678},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if label := newTCPConn(explicit, "tcp6", key, 1500).flowLabel; label != 0x45678 {
+		t.Fatalf("configured TCP flow label = %#x, want 0x45678", label)
 	}
 }
 
@@ -458,6 +513,46 @@ func TestTCPPassiveCloserSkipsTimeWait(t *testing.T) {
 	if active := server.Stats().ActiveTCPConnections; active != 1 {
 		t.Fatalf("active closer connections = %d, want TIME-WAIT actor", active)
 	}
+}
+
+func TestTCPTimeWaitAcceptsRetransmittedFINWithAdditionalFlags(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.183"), netip.MustParseAddr("192.0.2.184"))
+	link.echoTCP = true
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8080))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConnection := connection.(*TCPConn)
+	defer connection.Close()
+	if err = tcpConnection.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := connection.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("peer FIN read = %d, %v", n, readErr)
+	}
+	waitFor(t, time.Second, func() bool { return stack.Stats().ActiveTCPConnections == 1 })
+	link.mu.Lock()
+	peer := link.tcp[tcpConnection.key.local.Port()]
+	if peer == nil || !peer.finSent {
+		link.mu.Unlock()
+		t.Fatal("test peer did not complete the active close")
+	}
+	sequence := peer.serverNext - 1
+	acknowledgement := peer.clientNext
+	ackCount := link.clientACKs
+	link.mu.Unlock()
+	stack.controlMu.Lock()
+	stack.controlLimiters[controlResponseTCPChallengeACK] = tokenBucket{updated: time.Now().Add(time.Hour)}
+	stack.controlMu.Unlock()
+	if err = link.deliverTCP(8080, tcpConnection.key.local.Port(), sequence, acknowledgement, tcpFlagACK|tcpFlagFIN|tcpFlagPSH, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		defer link.mu.Unlock()
+		return link.clientACKs > ackCount
+	})
 }
 
 func TestTCPPassiveHandshakeChallengeAndResetResponses(t *testing.T) {
@@ -3280,10 +3375,14 @@ func TestTCPPortReuseByFourTuple(t *testing.T) {
 	}
 	defer first.Close()
 	firstPort := first.LocalAddr().(*net.TCPAddr).Port
+	secondRemote := netip.AddrPortFrom(link.remote, 9101)
 	stack.mu.Lock()
-	stack.nextPort[0].dynamic = uint16(firstPort - dynamicPortFirst)
+	cursor := &stack.nextPort[0]
+	offset := automaticTCPPortOffsets(cursor.secret, link.local, secondRemote)[0] % dynamicPortCount
+	position := uint32(firstPort - dynamicPortFirst)
+	cursor.dynamic = uint16((position + dynamicPortCount - offset) % dynamicPortCount)
 	stack.mu.Unlock()
-	second, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 9101))
+	second, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, secondRemote)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -153,6 +153,9 @@ func normalizeTCPSocketDefaults(value TCPSocketDefaults) (TCPSocketDefaults, err
 		value.AcceptQueue < 0 || value.SYNBacklog < 0 || value.IdleTimeout < 0 || value.UserTimeout < 0 {
 		return TCPSocketDefaults{}, errors.New("mipstack: TCP socket defaults cannot be negative")
 	}
+	if value.FlowLabel > ipv6MaximumFlowLabel {
+		return TCPSocketDefaults{}, errors.New("mipstack: TCP flow label exceeds 20 bits")
+	}
 	if value.ReceiveBuffer == 0 {
 		value.ReceiveBuffer = tcpReceiveCapacity
 	}
@@ -197,6 +200,9 @@ func normalizeTCPSocketDefaults(value TCPSocketDefaults) (TCPSocketDefaults, err
 func normalizeDatagramSocketDefaults(value DatagramSocketDefaults, defaultReceiveBuffer, minimumReceiveBuffer int) (DatagramSocketDefaults, error) {
 	if value.ReceiveBuffer < 0 || value.HopLimit < 0 || value.HopLimit > 255 {
 		return DatagramSocketDefaults{}, errors.New("receive buffer and hop limit must be valid")
+	}
+	if value.FlowLabel > ipv6MaximumFlowLabel {
+		return DatagramSocketDefaults{}, errors.New("flow label exceeds 20 bits")
 	}
 	if value.ReceiveBuffer == 0 {
 		value.ReceiveBuffer = defaultReceiveBuffer

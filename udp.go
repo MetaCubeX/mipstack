@@ -22,12 +22,6 @@ const (
 	// address retained alongside each payload. In particular, empty datagrams
 	// must consume capacity so they cannot grow the queue without bound.
 	udpDatagramMetadataSize = 96
-	// udpMaximumRecentTargets bounds ICMP correlation state for one
-	// unconnected proxy socket.
-	udpMaximumRecentTargets = 256
-	// udpRecentTargetLifetime accepts delayed network errors without retaining
-	// every destination used by a long-running association.
-	udpRecentTargetLifetime = 2 * time.Minute
 )
 
 // udpDatagram is one validated inbound payload and its source endpoint.
@@ -55,6 +49,7 @@ type UDPInfo struct {
 	PathMTU              int
 	HopLimit             int
 	TrafficClass         uint8
+	FlowLabel            uint32
 	LastError            error
 }
 
@@ -103,7 +98,7 @@ type UDPConn struct {
 	writeDeadline   time.Time
 	readChanged     chan struct{}
 	writeChanged    chan struct{}
-	recentTargets   map[netip.AddrPort]time.Time
+	recentTargets   recentDestinationCache[netip.AddrPort]
 	defaultOptions  ipPacketOptions
 	lastError       error
 	packetsSent     atomic.Uint64
@@ -124,8 +119,11 @@ func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.
 		stack: stack, net: network, port: port, v6: v6, local: local, remote: remote,
 		errors: make(chan error, 8), closed: make(chan struct{}), receiveNotify: make(chan struct{}), receiveCapacity: defaults.ReceiveBuffer,
 		readChanged: make(chan struct{}), writeChanged: make(chan struct{}),
-		recentTargets:  make(map[netip.AddrPort]time.Time),
-		defaultOptions: ipPacketOptions{hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass},
+		recentTargets: make(recentDestinationCache[netip.AddrPort]),
+		defaultOptions: ipPacketOptions{
+			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
+			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
+		},
 	}
 }
 
@@ -171,7 +169,9 @@ func (s *Stack) handleUDP(packet ipPacket) error {
 		s.stats.inboundDroppedPackets.Add(1)
 		return nil
 	}
-	connection.enqueue(udp[udpHeaderSize:length], source, packet.target, ipPacketOptions{hopLimit: packet.hopLimit, trafficClass: packet.trafficClass})
+	connection.enqueue(udp[udpHeaderSize:length], source, packet.target, ipPacketOptions{
+		hopLimit: packet.hopLimit, trafficClass: packet.trafficClass, flowLabel: packet.flowLabel,
+	})
 	return nil
 }
 
@@ -569,7 +569,7 @@ func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, address net
 // writeToFromWith keeps source selection, checksums, deadlines, accounting,
 // and ICMP correlation shared while leaving optional output policies
 // independently reachable by the linker.
-func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, address net.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, []byte, ipPacketOptions) error) (int, error) {
+func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, address net.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, uint16, uint16, []byte, ipPacketOptions) error) (int, error) {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
 	if target.Addr().Is6() != c.v6 && !c.dual || target.Port() == 0 || target.Addr().IsUnspecified() {
 		return 0, errors.New("mipstack: invalid UDP destination")
@@ -602,17 +602,7 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, address
 	if len(payload) > maximumPayload {
 		return 0, messageTooLong(c.net, c.LocalAddr(), address)
 	}
-	udp := make([]byte, udpHeaderSize+len(payload))
-	binary.BigEndian.PutUint16(udp[0:2], c.port)
-	binary.BigEndian.PutUint16(udp[2:4], target.Port())
-	binary.BigEndian.PutUint16(udp[4:6], uint16(len(udp)))
-	copy(udp[udpHeaderSize:], payload)
-	value := transportChecksum(source, target.Addr(), protocolUDP, udp)
-	if value == 0 {
-		value = 0xffff
-	}
-	binary.BigEndian.PutUint16(udp[6:8], value)
-	writeErr := write(source, target.Addr(), udp, options)
+	writeErr := write(source, target.Addr(), c.port, target.Port(), payload, options)
 	if writeErr != nil {
 		if errors.Is(writeErr, syscall.EMSGSIZE) {
 			return 0, messageTooLong(c.net, c.LocalAddr(), address)
@@ -627,14 +617,61 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, address
 
 // writeDatagram emits ordinary UDP output against the confirmed path MTU and
 // permits source fragmentation.
-func (c *UDPConn) writeDatagram(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
-	return c.stack.writeIPPayloadUntilOptions(source, target, protocolUDP, payload, true, options, c.writeState)
+func (c *UDPConn) writeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions) error {
+	return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, true, c.stack.mtuFor(target))
 }
 
 // writePathMTUProbeDatagram is retained only when an application references
 // the UDP packetization-layer probing API.
-func (c *UDPConn) writePathMTUProbeDatagram(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
-	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, protocolUDP, payload, false, options, c.stack.network.Load().mtu, c.writeState)
+func (c *UDPConn) writePathMTUProbeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions) error {
+	return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, false, c.stack.network.Load().mtu)
+}
+
+// writeDatagramForMTU serializes the common unfragmented case directly into
+// its final IP packet. Only datagrams that actually require source
+// fragmentation need a separate contiguous UDP segment.
+func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, allowFragment bool, mtu int) error {
+	udpSize := udpHeaderSize + len(payload)
+	ipSize := ipHeaderSize(source, target, udpSize)
+	if ipSize == 0 {
+		return syscall.EMSGSIZE
+	}
+	if source.Is6() && !options.flowLabelSet {
+		options.flowLabel = c.stack.automaticTransportFlowLabel(source, target, protocolUDP, sourcePort, targetPort)
+		options.flowLabelSet = true
+	}
+	if ipSize+udpSize <= mtu {
+		identification := uint16(0)
+		if source.Is4() && allowFragment {
+			identification = uint16(c.stack.ipv4ID.Add(1))
+		}
+		packet := make([]byte, ipSize+udpSize)
+		if !marshalIPHeader(packet, source, target, protocolUDP, identification, !allowFragment, options) {
+			return syscall.EMSGSIZE
+		}
+		udp := packet[ipSize:]
+		marshalUDPDatagram(udp, source, target, sourcePort, targetPort, payload)
+		return c.stack.writePacketUntil(packet, c.writeState)
+	}
+	if !allowFragment {
+		return syscall.EMSGSIZE
+	}
+	udp := make([]byte, udpSize)
+	marshalUDPDatagram(udp, source, target, sourcePort, targetPort, payload)
+	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, protocolUDP, udp, true, options, mtu, c.writeState)
+}
+
+// marshalUDPDatagram writes one UDP header, payload, and checksum into dst.
+func marshalUDPDatagram(dst []byte, source, target netip.Addr, sourcePort, targetPort uint16, payload []byte) {
+	binary.BigEndian.PutUint16(dst[0:2], sourcePort)
+	binary.BigEndian.PutUint16(dst[2:4], targetPort)
+	binary.BigEndian.PutUint16(dst[4:6], uint16(len(dst)))
+	copy(dst[udpHeaderSize:], payload)
+	value := transportChecksum(source, target, protocolUDP, dst)
+	if value == 0 {
+		value = 0xffff
+	}
+	binary.BigEndian.PutUint16(dst[6:8], value)
 }
 
 // rememberTarget records an actual WriteTo destination for ICMP tuple
@@ -642,29 +679,7 @@ func (c *UDPConn) writePathMTUProbeDatagram(source, target netip.Addr, payload [
 func (c *UDPConn) rememberTarget(target netip.AddrPort) {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
 	c.mu.Lock()
-	now := time.Now()
-	if _, exists := c.recentTargets[target]; exists {
-		c.recentTargets[target] = now
-		c.mu.Unlock()
-		return
-	}
-	if len(c.recentTargets) >= udpMaximumRecentTargets {
-		var oldestTarget netip.AddrPort
-		var oldestTime time.Time
-		for destination, updated := range c.recentTargets {
-			if now.Sub(updated) >= udpRecentTargetLifetime {
-				delete(c.recentTargets, destination)
-				continue
-			}
-			if !oldestTarget.IsValid() || updated.Before(oldestTime) {
-				oldestTarget, oldestTime = destination, updated
-			}
-		}
-		if len(c.recentTargets) >= udpMaximumRecentTargets {
-			delete(c.recentTargets, oldestTarget)
-		}
-	}
-	c.recentTargets[target] = now
+	c.recentTargets.remember(target, time.Now())
 	c.mu.Unlock()
 }
 
@@ -673,12 +688,7 @@ func (c *UDPConn) rememberTarget(target netip.AddrPort) {
 func (c *UDPConn) acceptsError(target netip.AddrPort) bool {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
 	c.mu.Lock()
-	now := time.Now()
-	updated, exists := c.recentTargets[target]
-	if exists && now.Sub(updated) >= udpRecentTargetLifetime {
-		delete(c.recentTargets, target)
-		exists = false
-	}
+	exists := c.recentTargets.contains(target, time.Now())
 	c.mu.Unlock()
 	return exists
 }
@@ -745,10 +755,16 @@ func (c *UDPConn) RemoteAddr() net.Addr { return c.remoteAddr() }
 // Info returns a diagnostic snapshot of the socket and its receive queue.
 func (c *UDPConn) Info() UDPInfo {
 	c.mu.Lock()
+	automaticFlowLabel := !c.defaultOptions.flowLabelSet
+	flowLabel := c.defaultOptions.flowLabel
+	if !c.v6 && !c.dual {
+		flowLabel = 0
+	}
 	info := UDPInfo{
 		LocalAddress: netip.AddrPortFrom(c.local, c.port), RemoteAddress: c.remote,
 		ReceiveQueuePackets: len(c.receive), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
-		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass, LastError: c.lastError,
+		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass,
+		FlowLabel: flowLabel, LastError: c.lastError,
 	}
 	select {
 	case <-c.closed:
@@ -761,6 +777,9 @@ func (c *UDPConn) Info() UDPInfo {
 	info.PacketsDropped, info.ICMPErrors = c.packetsDropped.Load(), c.icmpErrors.Load()
 	if c.remote.IsValid() {
 		info.PathMTU = c.stack.mtuFor(c.remote.Addr())
+		if c.remote.Addr().Is6() && automaticFlowLabel {
+			info.FlowLabel = c.stack.automaticTransportFlowLabel(c.local, c.remote.Addr(), protocolUDP, c.port, c.remote.Port())
+		}
 	}
 	return info
 }
@@ -895,6 +914,27 @@ func (c *UDPConn) SetTrafficClass(value int) error {
 		return c.setOperationError(net.ErrClosed)
 	default:
 		c.defaultOptions.trafficClass = byte(value)
+		c.mu.Unlock()
+		return nil
+	}
+}
+
+// SetFlowLabel changes the default IPv6 Flow Label. Zero explicitly disables
+// automatic labeling for this socket.
+func (c *UDPConn) SetFlowLabel(label uint32) error {
+	if label > ipv6MaximumFlowLabel {
+		return c.setOperationError(syscall.EINVAL)
+	}
+	if !c.v6 && !c.dual {
+		return c.setOperationError(syscall.EAFNOSUPPORT)
+	}
+	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return c.setOperationError(net.ErrClosed)
+	default:
+		c.defaultOptions.flowLabel, c.defaultOptions.flowLabelSet = label, true
 		c.mu.Unlock()
 		return nil
 	}

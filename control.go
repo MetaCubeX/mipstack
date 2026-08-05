@@ -18,6 +18,7 @@ const (
 	linuxIPTimeToLive            = 2
 	linuxIPPacketInfo            = 8
 	linuxLevelIPv6               = 41
+	linuxIPv6FlowInfo            = 11
 	linuxIPv6PacketInfo          = 50
 	linuxIPv6HopLimit            = 52
 	linuxIPv6TrafficClass        = 67
@@ -135,6 +136,9 @@ type IPv6ControlMessage struct {
 	// HopLimit is the received or requested hop limit. A received value may be
 	// zero; zero selects the output default when marshaling.
 	HopLimit int
+	// FlowLabel is the received or requested 20-bit IPv6 Flow Label. Zero
+	// selects automatic labeling when marshaling through this structured API.
+	FlowLabel uint32
 	// Src selects a managed source address when marshaling.
 	Src netip.Addr
 	// Dst is the local destination populated by Parse and is not marshaled.
@@ -189,6 +193,18 @@ func (message *IPv6ControlMessage) marshal(address netip.Addr, receiving bool) (
 	if receiving || message.TrafficClass != 0 {
 		control = appendLinuxControlInt32(control, linuxLevelIPv6, linuxIPv6TrafficClass, int32(message.TrafficClass))
 	}
+	if message.FlowLabel > ipv6MaximumFlowLabel {
+		return nil, errors.New("mipstack: IPv6 control-message flow label exceeds 20 bits")
+	}
+	// Linux emits IPV6_FLOWINFO on receive only when the combined traffic
+	// class and flow label are nonzero. Structured sends omit a zero label so
+	// it retains the public API's automatic-labeling meaning; raw OOB can still
+	// carry an explicit all-zero flowinfo value.
+	if message.FlowLabel != 0 || receiving && message.TrafficClass != 0 {
+		var flowInfo [4]byte
+		binary.BigEndian.PutUint32(flowInfo[:], uint32(message.TrafficClass)<<20|message.FlowLabel)
+		control = appendLinuxControl(control, linuxLevelIPv6, linuxIPv6FlowInfo, flowInfo[:])
+	}
 	return control, nil
 }
 
@@ -203,7 +219,7 @@ func (message *IPv6ControlMessage) Parse(control []byte) error {
 		return err
 	}
 	*message = IPv6ControlMessage{
-		TrafficClass: int(options.trafficClass), HopLimit: int(options.hopLimit), Dst: address,
+		TrafficClass: int(options.trafficClass), HopLimit: int(options.hopLimit), FlowLabel: options.flowLabel, Dst: address,
 	}
 	return nil
 }
@@ -216,7 +232,7 @@ func (message *IPv6ControlMessage) parseForWrite(control []byte) (ipPacketOption
 		return ipPacketOptions{}, err
 	}
 	*message = IPv6ControlMessage{
-		TrafficClass: int(options.trafficClass), HopLimit: int(options.hopLimit), Src: address,
+		TrafficClass: int(options.trafficClass), HopLimit: int(options.hopLimit), FlowLabel: options.flowLabel, Src: address,
 	}
 	return options, nil
 }
@@ -244,7 +260,7 @@ func controlMessageForRead(address netip.Addr, options ipPacketOptions) ([]byte,
 		message := IPv4ControlMessage{TTL: int(options.hopLimit), TOS: int(options.trafficClass), Dst: address}
 		return message.marshalForRead()
 	}
-	message := IPv6ControlMessage{TrafficClass: int(options.trafficClass), HopLimit: int(options.hopLimit), Dst: address}
+	message := IPv6ControlMessage{TrafficClass: int(options.trafficClass), HopLimit: int(options.hopLimit), FlowLabel: options.flowLabel, Dst: address}
 	return message.marshalForRead()
 }
 
@@ -293,7 +309,7 @@ func parseControlMessageForWrite(control []byte, v6 bool) (netip.Addr, ipPacketO
 func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPacketOptions, error) {
 	var address netip.Addr
 	var options ipPacketOptions
-	var haveHopLimit, haveTrafficClass bool
+	var haveHopLimit, haveTrafficClass, haveTrafficClassControl, haveFlowLabel bool
 	for len(oob) != 0 {
 		if len(oob) < linuxControlHeaderSize {
 			return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: truncated Linux IP control header")
@@ -339,10 +355,10 @@ func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPa
 			options.hopLimit, options.hopLimitSet, haveHopLimit = byte(value), true, true
 		case level == linuxLevelIP && kind == linuxIPTypeOfService:
 			value, err := linuxControlByteOrInt32(data)
-			if v6 || err != nil || value < 0 || value > 255 || haveTrafficClass {
+			if v6 || err != nil || value < 0 || value > 255 || haveTrafficClassControl {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv4 TOS control message")
 			}
-			options.trafficClass, options.trafficClassSet, haveTrafficClass = byte(value), true, true
+			options.trafficClass, options.trafficClassSet, haveTrafficClass, haveTrafficClassControl = byte(value), true, true, true
 		case level == linuxLevelIPv6 && kind == linuxIPv6HopLimit:
 			value, err := linuxControlInt32(data)
 			if !v6 || err != nil || value < 0 || value > 255 || haveHopLimit {
@@ -351,10 +367,26 @@ func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPa
 			options.hopLimit, options.hopLimitSet, haveHopLimit = byte(value), true, true
 		case level == linuxLevelIPv6 && kind == linuxIPv6TrafficClass:
 			value, err := linuxControlInt32(data)
-			if !v6 || err != nil || value < 0 || value > 255 || haveTrafficClass {
+			if !v6 || err != nil || value < 0 || value > 255 || haveTrafficClassControl || haveTrafficClass && options.trafficClass != byte(value) {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 traffic-class control message")
 			}
-			options.trafficClass, options.trafficClassSet, haveTrafficClass = byte(value), true, true
+			options.trafficClass, options.trafficClassSet, haveTrafficClass, haveTrafficClassControl = byte(value), true, true, true
+		case level == linuxLevelIPv6 && kind == linuxIPv6FlowInfo:
+			if !v6 || len(data) != 4 || haveFlowLabel {
+				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 flow-info control message")
+			}
+			flowInfo := binary.BigEndian.Uint32(data)
+			if flowInfo>>28 != 0 {
+				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 flow-info control message")
+			}
+			flowTrafficClass := byte(flowInfo >> 20)
+			if flowTrafficClass != 0 {
+				if haveTrafficClass && options.trafficClass != flowTrafficClass {
+					return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: conflicting IPv6 flow-info traffic class")
+				}
+				options.trafficClass, options.trafficClassSet, haveTrafficClass = flowTrafficClass, true, true
+			}
+			options.flowLabel, options.flowLabelSet, haveFlowLabel = flowInfo&ipv6MaximumFlowLabel, true, true
 		default:
 			return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: unsupported Linux IP control message")
 		}

@@ -75,51 +75,55 @@ func (s *Stack) handleICMP(packet ipPacket) error {
 	}
 	switch remoteError.QuotedProtocol {
 	case protocolUDP:
-		if len(remoteError.QuotedPayload) < udpHeaderSize {
-			return nil
-		}
-		sourcePort := binary.BigEndian.Uint16(remoteError.QuotedPayload[0:2])
-		targetPort := binary.BigEndian.Uint16(remoteError.QuotedPayload[2:4])
-		remoteError.QuotedSourcePort = sourcePort
-		remoteError.QuotedTargetPort = targetPort
-		local := netip.AddrPortFrom(remoteError.QuotedSource, sourcePort)
-		target := netip.AddrPortFrom(remoteError.QuotedTarget, targetPort)
-		s.mu.RLock()
-		connection := s.udpConnectionLocked(local, target)
-		s.mu.RUnlock()
-		if connection != nil && connection.acceptsLocal(remoteError.QuotedSource) && connection.acceptsError(target) {
-			if remoteError.MTU != 0 {
-				if s.observePathMTU(remoteError.QuotedTarget, remoteError.MTU) {
-					s.notifyTCPPathMTU(remoteError.QuotedTarget, nil)
+		if len(remoteError.QuotedPayload) >= udpHeaderSize {
+			sourcePort := binary.BigEndian.Uint16(remoteError.QuotedPayload[0:2])
+			targetPort := binary.BigEndian.Uint16(remoteError.QuotedPayload[2:4])
+			remoteError.QuotedSourcePort = sourcePort
+			remoteError.QuotedTargetPort = targetPort
+			local := netip.AddrPortFrom(remoteError.QuotedSource, sourcePort)
+			target := netip.AddrPortFrom(remoteError.QuotedTarget, targetPort)
+			s.mu.RLock()
+			connection := s.udpConnectionLocked(local, target)
+			s.mu.RUnlock()
+			if connection != nil && connection.acceptsLocal(remoteError.QuotedSource) && connection.acceptsError(target) {
+				if remoteError.MTU != 0 {
+					if s.observePathMTU(remoteError.QuotedTarget, remoteError.MTU) {
+						s.notifyTCPPathMTU(remoteError.QuotedTarget, nil)
+					}
 				}
+				remoteError.QuotedPayload = append([]byte(nil), remoteError.QuotedPayload...)
+				connection.deliverError(target, remoteError)
 			}
-			remoteError.QuotedPayload = append([]byte(nil), remoteError.QuotedPayload...)
-			connection.deliverError(target, remoteError)
 		}
 	case protocolTCP:
-		if len(remoteError.QuotedPayload) < 8 {
-			return nil
-		}
-		sourcePort := binary.BigEndian.Uint16(remoteError.QuotedPayload[0:2])
-		targetPort := binary.BigEndian.Uint16(remoteError.QuotedPayload[2:4])
-		remoteError.QuotedSourcePort = sourcePort
-		remoteError.QuotedTargetPort = targetPort
-		key := tcpKey{
-			local:  netip.AddrPortFrom(remoteError.QuotedSource, sourcePort),
-			remote: netip.AddrPortFrom(remoteError.QuotedTarget, targetPort),
-		}
-		s.mu.RLock()
-		connection := s.tcp[key]
-		s.mu.RUnlock()
-		if connection != nil && connection.acceptsICMPQuote(remoteError.QuotedPayload) {
-			if remoteError.MTU != 0 {
-				if s.observePathMTU(remoteError.QuotedTarget, remoteError.MTU) {
-					s.notifyTCPPathMTU(remoteError.QuotedTarget, nil)
-				}
+		if len(remoteError.QuotedPayload) >= 8 {
+			sourcePort := binary.BigEndian.Uint16(remoteError.QuotedPayload[0:2])
+			targetPort := binary.BigEndian.Uint16(remoteError.QuotedPayload[2:4])
+			remoteError.QuotedSourcePort = sourcePort
+			remoteError.QuotedTargetPort = targetPort
+			key := tcpKey{
+				local:  netip.AddrPortFrom(remoteError.QuotedSource, sourcePort),
+				remote: netip.AddrPortFrom(remoteError.QuotedTarget, targetPort),
 			}
-			remoteError.QuotedPayload = append([]byte(nil), remoteError.QuotedPayload...)
-			connection.deliverError(remoteError)
+			s.mu.RLock()
+			connection := s.tcp[key]
+			s.mu.RUnlock()
+			if connection != nil && connection.acceptsICMPQuote(remoteError.QuotedPayload) {
+				if remoteError.MTU != 0 {
+					if s.observePathMTU(remoteError.QuotedTarget, remoteError.MTU) {
+						s.notifyTCPPathMTU(remoteError.QuotedTarget, nil)
+					}
+				}
+				remoteError.QuotedPayload = append([]byte(nil), remoteError.QuotedPayload...)
+				connection.deliverError(remoteError)
+			}
 		}
+	}
+	s.mu.RLock()
+	raw := s.ip
+	s.mu.RUnlock()
+	if raw != nil {
+		raw.deliverError(s, remoteError)
 	}
 	return nil
 }
