@@ -23,9 +23,11 @@ import (
 
 func open(ctx context.Context, local netip.Prefix, destination netip.AddrPort) error {
     stack, err := mipstack.New(mipstack.Config{
-        LocalAddresses:    []netip.Prefix{local},
-        MTU:               1500,
-        CongestionControl: mipstack.CongestionControlCUBIC,
+        LocalAddresses: []netip.Prefix{local},
+        MTU:            1500,
+        TCP: mipstack.TCPSocketDefaults{
+            CongestionControl: mipstack.CongestionControlCUBIC,
+        },
     })
     if err != nil {
         return err
@@ -56,9 +58,16 @@ outboundPacket := buffer[:sizes[0]]
 ```
 
 The packet methods intentionally match the common batched userspace-TUN shape.
-`Read` produces one packet per call and `BatchSize` therefore returns one, while
-`Write` accepts every packet supplied in an inbound batch. `Start` is idempotent,
-while `Close` is terminal and unblocks pending packet and socket operations.
+`Read` blocks for one packet and then drains up to 64 currently queued packets
+into the supplied buffers; `BatchSize` reports that upper bound. `Write`
+accepts every packet supplied in an inbound batch. `Start` is idempotent, while
+`Close` is terminal and unblocks pending packet and socket operations.
+`Read` requires `sizes` to be at least as long as the buffer slice and honors
+the same leading `offset` in every buffer. Both methods report the successfully
+completed packet prefix before any later-buffer error, as expected by wireguard-go's
+packet-device loops. They also accept a buffer slice larger than `BatchSize`
+because a composite WireGuard device may use a larger Bind batch; `Read`
+still returns no more than 64 packets.
 
 For integration with userspace packet-device consumers, `Stack` also provides
 `MTU`, `Name`, and `BatchSize`. `LocalAddresses` returns an independent
@@ -111,6 +120,8 @@ Active sockets allocate from the IANA dynamic range (`49152..65535`) first.
 Only when that range is unavailable for the requested binding or TCP tuple do
 they fall back to non-privileged ports `1024..49151`. Ports below 1024 are
 never selected automatically but remain available for explicit bindings.
+RFC 6056-style keyed increments make the next scan origin unpredictable
+without performing a system-random read for every socket.
 `Config.MaxTCPConnections` may impose an application-selected resource bound;
 its zero value does not impose an artificial connection limit. Listener count
 is controlled only by available memory and explicit application creation.
@@ -119,10 +130,30 @@ is controlled only by available memory and explicit application creation.
 family. A non-nil empty route slice deliberately admits only destinations that
 are themselves local. IPv4-only stacks accept MTUs down to 68; configurations
 containing IPv6 require the IPv6 minimum MTU of 1280.
-`Config.CongestionControl` selects `CongestionControlCUBIC`,
-`CongestionControlReno`, or `CongestionControlBBR`; its zero value selects
-CUBIC. `UpdateConfig` applies a changed selection to established connections
-without closing them.
+`Config.TCP` defines policies inherited by newly created connections and
+listeners: initial and maximum automatic receive/send buffers, completed and
+half-open listener queues, congestion control, keepalive, receive-idle timeout,
+Nagle behavior, TCP user timeout, and DSCP bits. Congestion control accepts
+`CongestionControlCUBIC`, `CongestionControlReno`, or `CongestionControlBBR`;
+its zero value selects CUBIC. `UpdateConfig` applies a changed congestion
+controller to established connections without an explicit per-connection
+override. Existing sockets retain the other inherited policies. Receive window
+scale is selected per connection from the configured receive ceiling,
+so deliberate small-buffer policies retain window precision while large-BDP
+connections can use their full automatic maximum. Calling `SetReadBuffer` or
+`SetWriteBuffer` locks that side to the application value and disables its
+automatic growth, matching the user-locked behavior of operating-system TCP
+stacks. Automatic growth follows application-consumed and acknowledged bytes
+per RTT rather than queue size or cwnd alone, so short-RTT scheduler batches do
+not inflate buffers. `SetCongestionControl` and `SetTrafficClass` provide
+per-connection overrides.
+
+`Config.UDP` and `Config.IP` define the receive-buffer capacity, default
+TTL/Hop Limit, and default TOS/Traffic Class inherited by new datagram sockets.
+`SetReadBuffer`, `SetHopLimit`, and `SetTrafficClass` provide per-socket
+overrides. Nonzero message control fields override the socket defaults; an
+explicit zero TOS/Traffic Class encoded in raw OOB data remains distinguishable
+from an omitted field.
 
 Socket operation failures use `*net.OpError`. `errors.Is` continues to identify
 `os.ErrDeadlineExceeded`, `net.ErrClosed`, and syscall errors. Orderly TCP EOF
@@ -135,6 +166,21 @@ bounded wait for acknowledgement. `UDPConn.SetReadBuffer` changes the receive
 queue's approximate retained-memory capacity; payload and per-datagram
 metadata both count toward the bound. UDP writes are synchronous with packet
 delivery to the embedding device, so `SetWriteBuffer` is a validated no-op.
+
+`TCPConn.Info` returns a consistent live diagnostic snapshot from the
+connection actor and retains the final snapshot after close. It includes RFC
+9293 state, endpoints, negotiated extensions, RTT/RTO, congestion controller,
+cwnd and ssthresh, peer/receive windows, bytes in flight, path MTU and active
+probe state, buffer occupancy and automatic limits, byte counters, recovery
+state, inherited keepalive/Nagle/DSCP policies, window-scale values, and
+connection-local retransmission, PMTU-probe, and spurious-recovery counters.
+It also reports the current and peak byte-bounded actor queue occupancy and
+queue drops, making scheduler or embedding-link backpressure distinguishable
+from network loss.
+`UDPConn.Info` and `IPConn.Info` expose endpoint identity, queue occupancy,
+socket defaults, path MTU for connected sockets, and cumulative accepted,
+dropped, and transmitted datagram counters. UDP diagnostics also retain the
+latest correlated ICMP error.
 
 UDP message methods use the Linux 64-bit little-endian control-message layout
 on every host. `ReadMsgUDP` emits `IP_PKTINFO` or `IPV6_PKTINFO` for the local
@@ -153,13 +199,47 @@ TOS/Traffic Class for a message write. `Dst` is populated while parsing.
 
 TCP implements active and passive open, bounded accept and SYN queues,
 concurrent four-tuple demultiplexing, safe local-port reuse for distinct remote
-tuples, and bounded active and TIME_WAIT state. Its data path includes bounded
+tuples, and bounded active and TIME_WAIT state. Validated inbound segments wait
+in a dynamically allocated, byte-bounded FIFO, so idle connections do not pay
+for a large channel while high-throughput connections are not constrained by
+an arbitrary segment count. Initial sequence numbers follow RFC 6528: a
+four-microsecond monotonic counter is added to a SipHash-derived per-four-tuple
+offset under a 128-bit per-stack secret. Its data path includes bounded
 send and receive buffers, adaptive RTO with exponential backoff, selectable
 CUBIC, Reno, and paced model-based BBR congestion control, window scaling,
-delayed ACKs, SACK multi-hole recovery, RACK time-based loss detection,
-tail-loss probes, timestamp negotiation with PAWS, and classic ECN feedback.
-It also handles overlap-aware receive reassembly, data-bearing zero-window
-probes, reset validation, deadlines, half-close, FIN states, and TIME_WAIT.
+delayed ACKs, SACK multi-hole recovery with Proportional Rate Reduction, RACK
+time-based loss detection, tail-loss probes, timestamp negotiation with PAWS,
+and classic ECN feedback.
+On a SACK-negotiated connection, only newly reported scoreboard information
+counts toward RFC 6675 `DupAcks`; repeated cumulative ACKs and window-probe
+responses without new SACK data cannot manufacture a loss episode.
+Initial Reno and CUBIC slow start uses RFC 9406 HyStart++ and Conservative Slow
+Start; BBR retains its own Startup model. Eifel timestamps and conservative
+DSACK accounting detect spurious fast retransmits and timeouts, while the RFC
+4015 response bounds the restored congestion window and makes the RTO more
+conservative after a spurious timeout. TCP also handles overlap-aware receive
+reassembly, data-bearing zero-window probes, reset validation, deadlines,
+half-close, FIN states, and TIME_WAIT.
+
+RTT sampling uses packet arrival time rather than actor scheduling time. Its
+minimum is the Linux-style three-sample running minimum over a 300-second
+window, so a route change can replace stale path history without retaining an
+unbounded sample set. When receive work and a protocol timer become ready
+together, the actor drains the finite receive snapshot that was already queued
+before servicing the timer. Packets arriving during that turn are excluded, so
+host scheduling delay cannot manufacture loss and a continuous packet stream
+cannot starve retransmission, liveness, pacing, or PMTU timers. Transmission
+timestamps start when packets enter the embedding device queue, and loss
+timers defer while the original packet still occupies that FIFO, so link
+backpressure is not misclassified as network loss.
+
+TCP user timeout follows Linux `TCP_USER_TIMEOUT`: it applies only in
+synchronized states, returns `ETIMEDOUT`, does not change retransmission or
+keepalive probe timing, and bounds data that remains unacknowledged or unsent
+behind a zero window. Retransmission does not restart the absolute deadline.
+When keepalive is enabled, user timeout replaces the probe-count close policy.
+MIPS treats it as a local socket policy and does not advertise the optional
+RFC 5482 UTO option.
 
 When the SYN backlog or configured connection capacity is exhausted, passive
 open uses stateless SYN cookies instead of retaining another half-open
@@ -170,11 +250,25 @@ forged or expired cookies do not allocate a connection.
 
 Validated ICMP Packet Too Big errors maintain a bounded, expiring destination
 PMTU cache. Error type/code combinations and quoted TCP sequence spans are
-checked before they can affect transport state. TCP immediately resegments
-outstanding data, raises the MSS of established connections when a cached
-reduction expires, and uses later data as an upward path probe. A failed probe
-is reduced again by validated ICMP or by IPv4 and IPv6 PMTU black-hole
-inference after repeated RTOs. UDP uses the learned MTU for later datagrams.
+checked before they can affect transport state. `Stack.PathMTU` exposes the
+currently confirmed value, while `Stack.ConfirmPathMTU` records an
+application-proven packetization-layer acknowledgement for protocols that
+manage probing directly. TCP immediately resegments outstanding data and
+implements RFC 4821 binary-search PLPMTUD when a cached reduction expires.
+Upward probes carry real data; cumulative ACK confirms success, while only
+isolated loss proven by SACK suppresses congestion response. Concurrent loss
+and timeouts remain ordinary congestion and use TCP-friendly probe backoff.
+MSS changes preserve the required byte/packet congestion units, and successful
+probes update sibling flows sharing the destination path. A failed path is
+also reduced by validated ICMP or by IPv4 and IPv6 PMTU black-hole inference
+after repeated RTOs.
+
+UDP uses the learned MTU for ordinary fragmentation. `WritePathMTUProbe` and
+`WritePathMTUProbeTo` send an explicitly unfragmented packet above the current
+confirmed PMTU but no larger than the first-hop MTU. Because UDP has no
+generic acknowledgement, sending alone never raises the PMTU; an application
+must use its own protected acknowledgement and then call `ConfirmPathMTU` or
+`ConfirmPathMTUFor`, following RFC 8899's packetization-layer contract.
 Connected UDP sockets select a stable local address and filter inbound remote
 tuples; unconnected sockets can use arbitrary destinations in one IP family.
 Both correlate asynchronous ICMP errors with recently used remote endpoints.
@@ -192,8 +286,9 @@ TCP, UDP, or ICMP handler runs. Multiple matching sockets receive independent
 copies. A listener for an otherwise unknown protocol suppresses Protocol
 Unreachable while its receive queue accepts or drops matching traffic.
 
-`Stack.Stats` returns a lock-free snapshot of active socket counts, packet
-drops, retransmission modes, PMTU changes, fragment cleanup, and rate limiting.
+`Stack.Stats` returns a lock-free snapshot of active socket counts, categorized
+IP/TCP packet and actor-queue drops, retransmission modes, PMTU changes,
+fragment cleanup, and rate limiting.
 
 Optional surfaces are arranged for ordinary Go linker reachability rather than
 build tags. A consumer that only dials TCP and listens for UDP does not retain

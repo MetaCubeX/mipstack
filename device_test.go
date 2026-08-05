@@ -1,9 +1,11 @@
 package mipstack
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -121,8 +123,8 @@ func TestDeviceMetadata(t *testing.T) {
 	if name, nameErr := stack.Name(); nameErr != nil || name != "mihomo IP stack" {
 		t.Fatalf("Name = %q, %v", name, nameErr)
 	}
-	if stack.BatchSize() != 1 {
-		t.Fatalf("BatchSize = %d, want 1", stack.BatchSize())
+	if stack.BatchSize() != deviceBatchSize {
+		t.Fatalf("BatchSize = %d, want %d", stack.BatchSize(), deviceBatchSize)
 	}
 	addresses := stack.LocalAddresses()
 	if len(addresses) != 2 || addresses[0] != first4 || addresses[1] != first6 {
@@ -144,5 +146,102 @@ func TestDeviceMetadata(t *testing.T) {
 	}
 	if mtu, _ := stack.MTU(); mtu != 1300 {
 		t.Fatalf("updated MTU = %d, want 1300", mtu)
+	}
+}
+
+func TestPacketDeviceBatchRead(t *testing.T) {
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.31/24")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+
+	connection, err := stack.ListenUDP(context.Background(), "udp4", netip.MustParseAddrPort("192.0.2.31:5300"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	for index := 0; index < 3; index++ {
+		if _, err = connection.WriteTo([]byte{byte(index)}, net.UDPAddrFromAddrPort(netip.MustParseAddrPort("192.0.2.32:5300"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const wireguardOffset = 16
+	buffers := make([][]byte, 4)
+	for index := range buffers {
+		buffers[index] = make([]byte, wireguardOffset+1500)
+		for prefix := 0; prefix < wireguardOffset; prefix++ {
+			buffers[index][prefix] = 0xa5
+		}
+	}
+	sizes := make([]int, len(buffers))
+	count, err := stack.Read(buffers, sizes, wireguardOffset)
+	if err != nil || count != 3 {
+		t.Fatalf("batch Read = %d, %v, want 3, nil", count, err)
+	}
+	for index := 0; index < count; index++ {
+		if !bytes.Equal(buffers[index][:wireguardOffset], bytes.Repeat([]byte{0xa5}, wireguardOffset)) {
+			t.Fatalf("batch packet %d overwrote offset prefix", index)
+		}
+		packet, ok := parseIPPacket(buffers[index][wireguardOffset : wireguardOffset+sizes[index]])
+		if !ok || len(packet.payload) != udpHeaderSize+1 || packet.payload[udpHeaderSize] != byte(index) {
+			t.Fatalf("batch packet %d = %x", index, buffers[index][wireguardOffset:wireguardOffset+sizes[index]])
+		}
+	}
+	if _, err = stack.Read(make([][]byte, 2), make([]int, 1), 0); err == nil {
+		t.Fatal("Read accepted a sizes slice shorter than buffers")
+	}
+}
+
+func TestPacketDeviceWriteCountsConsumedEmptyPacket(t *testing.T) {
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.41/24")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	const wireguardOffset = 16
+	if count, writeErr := stack.Write([][]byte{make([]byte, wireguardOffset)}, wireguardOffset); writeErr != nil || count != 1 {
+		t.Fatalf("Write empty packet = %d, %v, want 1, nil", count, writeErr)
+	}
+	stats := stack.Stats()
+	if stats.InboundPackets != 1 || stats.InboundDroppedPackets != 1 || stats.InvalidIPPackets != 1 {
+		t.Fatalf("empty packet diagnostics = %+v", stats)
+	}
+	if count, writeErr := stack.Write([][]byte{make([]byte, wireguardOffset), make([]byte, wireguardOffset-1)}, wireguardOffset); writeErr == nil || count != 1 {
+		t.Fatalf("partial Write = %d, %v, want 1 and an offset error", count, writeErr)
+	}
+}
+
+func TestPacketDeviceBatchReadReportsCompletedPrefix(t *testing.T) {
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.51/24")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	connection, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.MustParseAddrPort("192.0.2.52:5300"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	for index := 0; index < 2; index++ {
+		if _, err = connection.Write([]byte{byte(index)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const wireguardOffset = 16
+	buffers := [][]byte{make([]byte, wireguardOffset+1500), make([]byte, wireguardOffset)}
+	sizes := make([]int, len(buffers))
+	count, err := stack.Read(buffers, sizes, wireguardOffset)
+	if !errors.Is(err, io.ErrShortBuffer) || count != 1 || sizes[0] == 0 || sizes[1] != 0 {
+		t.Fatalf("partial Read = %d, %v, sizes %v", count, err, sizes)
 	}
 }

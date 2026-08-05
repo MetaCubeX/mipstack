@@ -89,9 +89,8 @@ type parsedFragment struct {
 // runFragmentCleaner releases incomplete sets even when no later fragments
 // arrive.
 func (s *Stack) runFragmentCleaner() {
-	timer := time.NewTimer(time.Hour)
-	stopTimer(timer)
-	defer timer.Stop()
+	timer := newOwnedTimer()
+	defer timer.close()
 	var timeout <-chan time.Time
 	for {
 		s.fragmentMu.Lock()
@@ -100,30 +99,23 @@ func (s *Stack) runFragmentCleaner() {
 		next, haveNext := s.nextFragmentExpiryLocked()
 		s.fragmentMu.Unlock()
 		s.sendFragmentTimeouts(expired)
-		stopTimer(timer)
+		timer.stop()
 		timeout = nil
 		if haveNext {
 			delay := time.Until(next)
 			if delay < 0 {
 				delay = 0
 			}
-			resetTimer(timer, delay)
-			timeout = timer.C
+			timeout = timer.reset(delay)
 		}
 		select {
 		case <-timeout:
+			timer.consumed()
 		case <-s.fragmentWake:
 		case <-s.closeCh:
 			return
 		}
 	}
-}
-
-// reassemblePacket inserts one fragment and returns a complete minimal IP
-// packet when every byte is present.
-func (s *Stack) reassemblePacket(packet []byte, now time.Time) []byte {
-	result, _ := s.reassemblePacketStatus(packet, now)
-	return result
 }
 
 // reassemblePacketStatus distinguishes a valid fragment waiting for more data
@@ -142,7 +134,7 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, 
 	set := s.fragments[fragment.key]
 	if set == nil {
 		for len(s.fragments) >= fragmentMaximumSets {
-			s.evictOldestFragmentLocked()
+			s.evictOldestFragmentExceptLocked(nil)
 		}
 		set = &fragmentSet{
 			total: -1, created: now, updated: now, protocol: fragment.protocol,
@@ -638,25 +630,11 @@ func (s *Stack) nextFragmentExpiryLocked() (time.Time, bool) {
 	return next, !next.IsZero()
 }
 
-// expireFragments performs timeout responses after releasing fragmentMu so a
-// congested embedding link cannot block reassembly bookkeeping.
-func (s *Stack) expireFragments(now time.Time) {
-	s.fragmentMu.Lock()
-	expired := s.cleanFragmentsLocked(now)
-	s.fragmentMu.Unlock()
-	s.sendFragmentTimeouts(expired)
-}
-
 // sendFragmentTimeouts emits best-effort diagnostics for expired datagrams.
 func (s *Stack) sendFragmentTimeouts(expired []*fragmentSet) {
 	for _, set := range expired {
 		_ = s.sendFragmentReassemblyTimeout(set)
 	}
-}
-
-// evictOldestFragmentLocked makes room for a new set.
-func (s *Stack) evictOldestFragmentLocked() {
-	s.evictOldestFragmentExceptLocked(nil)
 }
 
 // evictOldestFragmentExceptLocked makes byte-capacity room without discarding
@@ -719,17 +697,23 @@ func (s *Stack) ipPayloadPackets(source, target netip.Addr, protocol byte, paylo
 
 // ipPayloadPacketsWithOptions is the raw-output form of ipPayloadPackets.
 func (s *Stack) ipPayloadPacketsWithOptions(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions) ([][]byte, error) {
+	return s.ipPayloadPacketsForMTU(source, target, protocol, payload, allowFragment, options, s.mtuFor(target))
+}
+
+// ipPayloadPacketsForMTU builds output against an explicit ceiling. Ordinary
+// traffic passes the confirmed PMTU; packetization-layer probes pass the
+// first-hop MTU and disable fragmentation.
+func (s *Stack) ipPayloadPacketsForMTU(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, mtu int) ([][]byte, error) {
 	var identification uint16
 	if source.Is4() && allowFragment {
 		// A router may fragment any IPv4 datagram without DF, so reserve its
 		// ID even when it currently fits the managed link MTU.
-		identification = s.nextIPv4ID()
+		identification = uint16(s.ipv4ID.Add(1))
 	}
 	packet := buildIPPacketWithOptions(source, target, protocol, payload, identification, !allowFragment, options)
 	if len(packet) == 0 {
 		return nil, syscall.EMSGSIZE
 	}
-	mtu := s.mtuFor(target)
 	if len(packet) <= mtu {
 		return [][]byte{packet}, nil
 	}
@@ -740,12 +724,27 @@ func (s *Stack) ipPayloadPacketsWithOptions(source, target netip.Addr, protocol 
 	if source.Is4() {
 		fragments = buildIPv4FragmentsWithOptions(source, target, protocol, payload, mtu, identification, options)
 	} else {
-		fragments = buildIPv6FragmentsWithOptions(source, target, protocol, payload, mtu, s.nextIPv6FragmentID(), options)
+		fragments = buildIPv6FragmentsWithOptions(source, target, protocol, payload, mtu, s.ipv6FragmentID.Add(1), options)
 	}
 	if len(fragments) == 0 {
 		return nil, syscall.EMSGSIZE
 	}
 	return fragments, nil
+}
+
+// writeIPPayloadUntilOptionsForMTU emits output against an explicit packet
+// ceiling while preserving socket deadline and closure behavior.
+func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, mtu int, state func() (time.Time, <-chan struct{}, bool)) error {
+	packets, err := s.ipPayloadPacketsForMTU(source, target, protocol, payload, allowFragment, options, mtu)
+	if err != nil {
+		return err
+	}
+	for _, packet := range packets {
+		if err = s.writePacketUntil(packet, state); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // writeIPPayload emits one packet or a complete source-fragmented sequence.
@@ -774,11 +773,6 @@ func (s *Stack) writeIPPayloadUntilOptions(source, target netip.Addr, protocol b
 		}
 	}
 	return nil
-}
-
-// buildIPv4Fragments divides payload on eight-byte boundaries.
-func buildIPv4Fragments(source, target netip.Addr, protocol byte, payload []byte, mtu int, identification uint16) [][]byte {
-	return buildIPv4FragmentsWithOptions(source, target, protocol, payload, mtu, identification, ipPacketOptions{})
 }
 
 // buildIPv4FragmentsWithOptions preserves raw output fields on every fragment.

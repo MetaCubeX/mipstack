@@ -34,13 +34,26 @@ type ipPacket struct {
 // ipPacketOptions controls fields shared by raw IPv4 and IPv6 output. A zero
 // hop limit selects the stack default.
 type ipPacketOptions struct {
-	hopLimit     byte
-	trafficClass byte
+	hopLimit        byte
+	trafficClass    byte
+	hopLimitSet     bool
+	trafficClassSet bool
+}
+
+// withDefaults fills output fields omitted by per-packet control data.
+func (o ipPacketOptions) withDefaults(defaults ipPacketOptions) ipPacketOptions {
+	if !o.hopLimitSet && o.hopLimit == 0 {
+		o.hopLimit, o.hopLimitSet = defaults.hopLimit, defaults.hopLimitSet
+	}
+	if !o.trafficClassSet && o.trafficClass == 0 {
+		o.trafficClass, o.trafficClassSet = defaults.trafficClass, defaults.trafficClassSet
+	}
+	return o
 }
 
 // normalized applies endpoint defaults to optional output fields.
 func (o ipPacketOptions) normalized() ipPacketOptions {
-	if o.hopLimit == 0 {
+	if !o.hopLimitSet && o.hopLimit == 0 {
 		o.hopLimit = 64
 	}
 	return o
@@ -405,11 +418,6 @@ func setPacketECN(packet []byte, ecn byte) {
 	} else if packet[0]>>4 == 6 && len(packet) >= 40 {
 		packet[1] = packet[1]&0xcf | (ecn&3)<<4
 	}
-}
-
-// buildIPPacket wraps payload in a minimal IPv4 or IPv6 header.
-func buildIPPacket(source, target netip.Addr, protocol byte, payload []byte, identification uint16, dontFragment bool) []byte {
-	return buildIPPacketWithOptions(source, target, protocol, payload, identification, dontFragment, ipPacketOptions{})
 }
 
 // buildIPPacketWithOptions wraps payload and applies raw IP output fields.

@@ -46,9 +46,37 @@ func TestMTUAndRouteFamilyValidation(t *testing.T) {
 		if _, routeErr := broadcastStack.RouteFor(destination); !errors.Is(routeErr, syscall.EACCES) {
 			t.Fatalf("broadcast route %s = %v, want EACCES", destination, routeErr)
 		}
-		if _, sourceErr := broadcastStack.sourceFor(destination); !errors.Is(sourceErr, syscall.EACCES) {
+		if _, sourceErr := broadcastStack.sourceForRequested(destination, netip.Addr{}); !errors.Is(sourceErr, syscall.EACCES) {
 			t.Fatalf("broadcast source %s = %v, want EACCES", destination, sourceErr)
 		}
+	}
+}
+
+func TestPathMTUMinimumPolicy(t *testing.T) {
+	local6 := netip.MustParseAddr("2001:db8::1")
+	remote6 := netip.MustParseAddr("2001:db8::2")
+	stack6, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local6, 128)}, MTU: 1500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stack6.observePathMTU(remote6, 1200) {
+		t.Fatal("IPv6 PTB below the RFC 8201 minimum was accepted")
+	}
+	if mtu := stack6.mtuFor(remote6); mtu != 1500 {
+		t.Fatalf("IPv6 PMTU after subminimum PTB = %d, want 1500", mtu)
+	}
+
+	local4 := netip.MustParseAddr("192.0.2.1")
+	remote4 := netip.MustParseAddr("192.0.2.2")
+	stack4, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local4, 32)}, MTU: 1500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stack4.observePathMTU(remote4, 40) {
+		t.Fatal("legacy IPv4 PTB was not clamped to the minimum datagram size")
+	}
+	if mtu := stack4.mtuFor(remote4); mtu != 68 {
+		t.Fatalf("IPv4 PMTU after subminimum hint = %d, want 68", mtu)
 	}
 }
 
@@ -85,19 +113,150 @@ func TestCongestionControlConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := stack.network.Load().congestionControl; got != CongestionControlCUBIC {
+	if got := stack.network.Load().tcpDefaults.CongestionControl; got != CongestionControlCUBIC {
 		t.Fatalf("default congestion control = %q, want %q", got, CongestionControlCUBIC)
 	}
 	for _, algorithm := range []CongestionControl{CongestionControlCUBIC, CongestionControlReno, CongestionControlBBR} {
-		if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{local}, CongestionControl: algorithm}); err != nil {
+		if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{local}, TCP: TCPSocketDefaults{CongestionControl: algorithm}}); err != nil {
 			t.Fatalf("UpdateConfig(%q): %v", algorithm, err)
 		}
-		if got := stack.network.Load().congestionControl; got != algorithm {
+		if got := stack.network.Load().tcpDefaults.CongestionControl; got != algorithm {
 			t.Fatalf("configured congestion control = %q, want %q", got, algorithm)
 		}
 	}
-	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{local}, CongestionControl: "invalid"}); err == nil {
+	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{local}, TCP: TCPSocketDefaults{CongestionControl: "invalid"}}); err == nil {
 		t.Fatal("invalid congestion control was accepted")
+	}
+}
+
+func TestCongestionControlConfigurationUpdatesExistingConnections(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.16")
+	remote := netip.MustParseAddr("198.51.100.16")
+	link, stack := newTestStack(t, local, remote)
+	defer stack.Close()
+	link.mu.Lock()
+	link.echoTCP = true
+	link.mu.Unlock()
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 443))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConnection := connection.(*TCPConn)
+	defer tcpConnection.Close()
+	if err = stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+		TCP:            TCPSocketDefaults{CongestionControl: CongestionControlReno},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := tcpConnection.socketOptions().congestion; got != CongestionControlReno {
+		t.Fatalf("updated connection congestion control = %q, want %q", got, CongestionControlReno)
+	}
+	if err = tcpConnection.SetCongestionControl(CongestionControlBBR); err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+		TCP:            TCPSocketDefaults{CongestionControl: CongestionControlCUBIC},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := tcpConnection.socketOptions().congestion; got != CongestionControlBBR {
+		t.Fatalf("per-connection congestion control changed to %q, want %q", got, CongestionControlBBR)
+	}
+}
+
+func TestTCPSocketDefaultConfiguration(t *testing.T) {
+	local := netip.MustParsePrefix("192.0.2.130/32")
+	invalid := []TCPSocketDefaults{
+		{ReceiveBuffer: -1},
+		{ReceiveBuffer: 4096, MaximumReceiveBuffer: 2048},
+		{SendBuffer: 4096, MaximumSendBuffer: 2048},
+		{MaximumReceiveBuffer: int(tcpMaximumScaledWindow) + 1},
+		{KeepAliveConfig: KeepAliveConfig{Count: -1}},
+		{UserTimeout: -time.Second},
+	}
+	for _, defaults := range invalid {
+		if _, err := New(Config{LocalAddresses: []netip.Prefix{local}, TCP: defaults}); err == nil {
+			t.Fatalf("invalid TCP defaults were accepted: %+v", defaults)
+		}
+	}
+
+	defaults := TCPSocketDefaults{
+		ReceiveBuffer: 128 * 1024, MaximumReceiveBuffer: 2 * 1024 * 1024,
+		SendBuffer: 64 * 1024, MaximumSendBuffer: 4 * 1024 * 1024,
+		AcceptQueue: 17, SYNBacklog: 29, KeepAlive: true,
+		KeepAliveConfig: KeepAliveConfig{Idle: time.Minute, Interval: 3 * time.Second, Count: 4},
+		IdleTimeout:     5 * time.Minute, UserTimeout: 30 * time.Second, DisableNoDelay: true, TrafficClass: 0xab,
+	}
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{local}, TCP: defaults})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := stack.network.Load()
+	if state.tcpDefaults.TrafficClass != 0xa8 {
+		t.Fatalf("normalized traffic class = %#x, want %#x", state.tcpDefaults.TrafficClass, 0xa8)
+	}
+	connection := newTCPConn(stack, "tcp", tcpKey{}, 1500)
+	if connection.receiveCapacity != defaults.ReceiveBuffer || connection.receiveMaximum != defaults.MaximumReceiveBuffer ||
+		connection.sendCapacity != defaults.SendBuffer || connection.sendMaximum != defaults.MaximumSendBuffer ||
+		connection.noDelay || !connection.keepAlive || connection.userTimeout != defaults.UserTimeout || connection.receiveWindowScale != tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer) {
+		t.Fatalf("connection did not inherit TCP defaults: %+v", connection)
+	}
+	if got := uint8(connection.trafficClass.Load()); got != 0xa8 {
+		t.Fatalf("connection traffic class = %#x, want %#x", got, 0xa8)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	listener, err := stack.ListenTCP(context.Background(), "tcp", netip.AddrPort{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(listener.accept) != defaults.AcceptQueue || listener.backlog != defaults.SYNBacklog {
+		t.Fatalf("listener queue/backlog = %d/%d, want %d/%d", cap(listener.accept), listener.backlog, defaults.AcceptQueue, defaults.SYNBacklog)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	dialDone := make(chan struct{})
+	go func() {
+		_, _ = stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, netip.MustParseAddrPort("198.51.100.130:443"))
+		close(dialDone)
+	}()
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.protocol != protocolTCP || packet.trafficClass != 0xa8 {
+		t.Fatalf("default TCP SYN traffic class = %#x, want %#x", packet.trafficClass, 0xa8)
+	}
+	cancel()
+	<-dialDone
+}
+
+func TestDatagramSocketDefaultConfiguration(t *testing.T) {
+	local := netip.MustParsePrefix("192.0.2.131/32")
+	for _, config := range []Config{
+		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{ReceiveBuffer: -1}},
+		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{HopLimit: 256}},
+		{LocalAddresses: []netip.Prefix{local}, IP: DatagramSocketDefaults{HopLimit: -1}},
+	} {
+		if _, err := New(config); err == nil {
+			t.Fatalf("invalid datagram defaults were accepted: %+v", config)
+		}
+	}
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{local},
+		UDP:            DatagramSocketDefaults{ReceiveBuffer: 2048, HopLimit: 31, TrafficClass: 0xb8},
+		IP:             DatagramSocketDefaults{ReceiveBuffer: 4096, HopLimit: 29, TrafficClass: 0x2e},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	udp := newUDPConn(stack, "udp4", 1000, false, local.Addr(), netip.AddrPort{})
+	if udp.receiveCapacity != 2048 || udp.defaultOptions != (ipPacketOptions{hopLimit: 31, trafficClass: 0xb8}) {
+		t.Fatalf("UDP defaults = %d, %+v", udp.receiveCapacity, udp.defaultOptions)
+	}
+	ip := newIPConn(stack, "ip4:99", 99, local.Addr(), netip.Addr{})
+	if ip.receiveCapacity != 4096 || ip.defaultOptions != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e}) {
+		t.Fatalf("IP defaults = %d, %+v", ip.receiveCapacity, ip.defaultOptions)
 	}
 }
 
@@ -151,13 +310,13 @@ func TestRoutesAndRFC6724SourceSelection(t *testing.T) {
 	if _, err = stack.RouteFor(netip.MustParseAddr("203.0.113.1")); !errors.Is(err, syscall.ENETUNREACH) {
 		t.Fatalf("route miss = %v, want ENETUNREACH", err)
 	}
-	if source, err := stack.sourceFor(netip.MustParseAddr("fd12::1")); err != nil || source != ula {
+	if source, err := stack.sourceForRequested(netip.MustParseAddr("fd12::1"), netip.Addr{}); err != nil || source != ula {
 		t.Fatalf("ULA source = %v, %v, want %v", source, err, ula)
 	}
-	if source, err := stack.sourceFor(netip.MustParseAddr("2001:db8:1::99")); err != nil || source != global {
+	if source, err := stack.sourceForRequested(netip.MustParseAddr("2001:db8:1::99"), netip.Addr{}); err != nil || source != global {
 		t.Fatalf("global source = %v, %v, want %v", source, err, global)
 	}
-	if source, err := stack.sourceFor(netip.MustParseAddr("198.51.100.99")); err != nil || source != ipv4 {
+	if source, err := stack.sourceForRequested(netip.MustParseAddr("198.51.100.99"), netip.Addr{}); err != nil || source != ipv4 {
 		t.Fatalf("route-pinned IPv4 source = %v, %v, want %v", source, err, ipv4)
 	}
 }

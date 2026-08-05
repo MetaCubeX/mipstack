@@ -68,6 +68,53 @@ var (
 	ErrResourceLimit = errors.New("mipstack: resource limit reached")
 )
 
+// TCPSocketDefaults configures policies inherited by newly created TCP
+// connections and listeners. Zero fields retain the package defaults.
+type TCPSocketDefaults struct {
+	// CongestionControl selects the algorithm used by new connections. The
+	// zero value selects CUBIC. UpdateConfig also applies a changed value to
+	// established connections without an explicit per-connection override.
+	CongestionControl CongestionControl
+	// ReceiveBuffer is the initial application receive capacity.
+	ReceiveBuffer int
+	// MaximumReceiveBuffer bounds automatic receive tuning.
+	MaximumReceiveBuffer int
+	// SendBuffer is the initial application send capacity.
+	SendBuffer int
+	// MaximumSendBuffer bounds automatic send tuning.
+	MaximumSendBuffer int
+	// AcceptQueue bounds completed connections waiting for Accept.
+	AcceptQueue int
+	// SYNBacklog bounds stateful handshakes before SYN cookies are used.
+	SYNBacklog int
+	// KeepAlive enables keepalive probes on new connections.
+	KeepAlive bool
+	// KeepAliveConfig supplies the default probe timing and retry count.
+	KeepAliveConfig KeepAliveConfig
+	// IdleTimeout closes a connection after receive inactivity. Zero disables it.
+	IdleTimeout time.Duration
+	// UserTimeout bounds how long transmitted data may remain unacknowledged,
+	// or buffered data may remain unsent behind a zero window. Zero disables
+	// this custom bound while retaining the normal TCP retry limits.
+	UserTimeout time.Duration
+	// DisableNoDelay makes new connections start with Nagle coalescing enabled.
+	DisableNoDelay bool
+	// TrafficClass supplies IPv4 TOS or IPv6 Traffic Class DSCP bits. TCP
+	// controls the two ECN bits independently.
+	TrafficClass uint8
+}
+
+// DatagramSocketDefaults configures policies inherited by newly created UDP
+// or IP protocol sockets. Zero fields retain the package defaults.
+type DatagramSocketDefaults struct {
+	// ReceiveBuffer is the approximate retained-memory receive capacity.
+	ReceiveBuffer int
+	// HopLimit is the default IPv4 TTL or IPv6 Hop Limit. Zero selects 64.
+	HopLimit int
+	// TrafficClass is the default IPv4 TOS or IPv6 Traffic Class byte.
+	TrafficClass uint8
+}
+
 // Config configures a Stack.
 type Config struct {
 	// LocalAddresses lists addresses that may receive packets and be selected
@@ -83,17 +130,22 @@ type Config struct {
 	// connections. Zero leaves the number unbounded; per-listener queues and
 	// per-connection buffers remain independently bounded.
 	MaxTCPConnections int
-	// CongestionControl selects the TCP congestion-control algorithm. The zero
-	// value selects CUBIC.
-	CongestionControl CongestionControl
+	// TCP supplies default socket and listener policies.
+	TCP TCPSocketDefaults
+	// UDP supplies defaults inherited by new UDP sockets.
+	UDP DatagramSocketDefaults
+	// IP supplies defaults inherited by new IP protocol sockets.
+	IP DatagramSocketDefaults
 }
 
 // Stack converts raw IPv4/IPv6 packets to application TCP, UDP, and IP
 // protocol sockets.
 type Stack struct {
-	network  atomic.Pointer[networkState]
-	outbound chan []byte
-	loopback chan []byte
+	network       atomic.Pointer[networkState]
+	outbound      chan []byte
+	loopback      chan []byte
+	outboundQueue packetQueueState
+	loopbackQueue packetQueueState
 
 	mu         sync.RWMutex
 	started    bool
@@ -112,6 +164,7 @@ type Stack struct {
 	ipv6FragmentID atomic.Uint32
 	closeCh        chan struct{}
 	timestampEpoch time.Time
+	tcpISNSecret   [16]byte
 
 	fragmentMu    sync.Mutex
 	fragments     map[fragmentKey]*fragmentSet
@@ -131,6 +184,15 @@ type StackStats struct {
 	InboundPackets uint64
 	// InboundDroppedPackets counts invalid packets and bounded-queue drops.
 	InboundDroppedPackets uint64
+	// InvalidIPPackets counts packets rejected by IP parsing or reassembly.
+	InvalidIPPackets uint64
+	// UnacceptedIPPackets counts valid packets whose source or destination is
+	// not admissible for this endpoint stack.
+	UnacceptedIPPackets uint64
+	// NonlocalDestinationPackets is the unaccepted subset addressed elsewhere.
+	NonlocalDestinationPackets uint64
+	// InvalidSourcePackets is the unaccepted subset with a prohibited source.
+	InvalidSourcePackets uint64
 	// OutboundPackets counts complete packets accepted by the device queue.
 	OutboundPackets uint64
 	// LoopbackPackets counts locally routed packets that bypassed the link.
@@ -147,6 +209,11 @@ type StackStats struct {
 	// TCPRetransmissions counts all SYN, data, FIN, SACK, RACK, and tail-probe
 	// retransmissions.
 	TCPRetransmissions uint64
+	// TCPInboundQueueDrops counts validated segments rejected by a connection's
+	// byte-bounded actor queue.
+	TCPInboundQueueDrops uint64
+	// TCPInvalidSegments counts malformed headers and checksum failures.
+	TCPInvalidSegments uint64
 	// TCPSACKRetransmissions counts retransmissions selected by the SACK
 	// scoreboard, including its RACK-confirmed subset.
 	TCPSACKRetransmissions uint64
@@ -154,6 +221,9 @@ type StackStats struct {
 	TCPRACKRetransmissions uint64
 	// TCPTailLossProbes counts probes sent before the ordinary RTO.
 	TCPTailLossProbes uint64
+	// TCPSpuriousRecoveryUndos counts Eifel or DSACK evidence that safely
+	// restored congestion state after an unnecessary retransmission.
+	TCPSpuriousRecoveryUndos uint64
 	// TCPZeroWindowProbes counts persist probes sent while the peer advertises
 	// a closed receive window.
 	TCPZeroWindowProbes uint64
@@ -161,6 +231,13 @@ type StackStats struct {
 	TCPKeepAliveProbes uint64
 	// PathMTUUpdates counts accepted destination PMTU reductions.
 	PathMTUUpdates uint64
+	// PathMTUProbes counts TCP packets sent above the confirmed effective MTU.
+	PathMTUProbes uint64
+	// PathMTUProbeSuccesses counts acknowledged upward TCP probes.
+	PathMTUProbeSuccesses uint64
+	// PathMTUProbeFailures counts isolated upward probes rejected by SACK
+	// evidence without treating them as congestion loss.
+	PathMTUProbeFailures uint64
 	// PathMTUBlackHoleReductions counts PMTU reductions inferred from repeated
 	// TCP timeouts rather than ICMP.
 	PathMTUBlackHoleReductions uint64
@@ -177,6 +254,10 @@ type StackStats struct {
 type stackCounters struct {
 	inboundPackets              atomic.Uint64
 	inboundDroppedPackets       atomic.Uint64
+	invalidIPPackets            atomic.Uint64
+	unacceptedIPPackets         atomic.Uint64
+	nonlocalDestinationPackets  atomic.Uint64
+	invalidSourcePackets        atomic.Uint64
 	outboundPackets             atomic.Uint64
 	loopbackPackets             atomic.Uint64
 	activeTCPConnections        atomic.Uint64
@@ -184,12 +265,18 @@ type stackCounters struct {
 	activeUDPSockets            atomic.Uint64
 	activeIPSockets             atomic.Uint64
 	tcpRetransmissions          atomic.Uint64
+	tcpInboundQueueDrops        atomic.Uint64
+	tcpInvalidSegments          atomic.Uint64
 	tcpSACKRetransmissions      atomic.Uint64
 	tcpRACKRetransmissions      atomic.Uint64
 	tcpTailLossProbes           atomic.Uint64
+	tcpSpuriousRecoveryUndos    atomic.Uint64
 	tcpZeroWindowProbes         atomic.Uint64
 	tcpKeepAliveProbes          atomic.Uint64
 	pathMTUUpdates              atomic.Uint64
+	pathMTUProbes               atomic.Uint64
+	pathMTUProbeSuccesses       atomic.Uint64
+	pathMTUProbeFailures        atomic.Uint64
 	pathMTUBlackHoleReductions  atomic.Uint64
 	fragmentEvictions           atomic.Uint64
 	fragmentTimeouts            atomic.Uint64
@@ -247,6 +334,82 @@ type tcpKey struct {
 type automaticPortCursor struct {
 	dynamic  uint16
 	fallback uint16
+	secret   [16]byte
+	sequence uint64
+}
+
+// packetQueueState assigns FIFO-order tickets to packets handed to one host
+// queue. TCP uses the dequeue watermark to avoid retransmitting a segment that
+// has not yet left mipstack, matching Linux's skb_still_in_host_queue check.
+type packetQueueState struct {
+	mu          sync.Mutex
+	enqueued    atomic.Uint64
+	dequeued    atomic.Uint64
+	synchronize atomic.Bool
+	progress    chan struct{}
+}
+
+// packetQueueTicket identifies a packet's position in one host queue without
+// adding per-packet allocation or metadata to the public device interface.
+type packetQueueTicket struct {
+	queue    *packetQueueState
+	serial   uint64
+	queuedAt time.Time
+}
+
+// pending reports whether Read or local delivery has not consumed the packet.
+func (t packetQueueTicket) pending() bool {
+	return t.queue != nil && t.queue.dequeued.Load() < t.serial
+}
+
+// tryEnqueue couples a queue position and transmission timestamp to a
+// successful channel send. The mutex is never held while waiting for space,
+// so one blocked socket cannot delay another socket's write deadline.
+func (q *packetQueueState) tryEnqueue(queue chan []byte, packet []byte) (packetQueueTicket, bool, <-chan struct{}) {
+	q.mu.Lock()
+	// A consumer that receives during the channel send must wait until the
+	// corresponding serial is published below. This flag also makes dequeue
+	// notification pay for the mutex only while a producer is publishing or
+	// at least one producer is waiting for space.
+	q.synchronize.Store(true)
+	queuedAt := time.Now()
+	select {
+	case queue <- packet:
+		serial := q.enqueued.Add(1)
+		if q.progress == nil {
+			q.synchronize.Store(false)
+		}
+		q.mu.Unlock()
+		return packetQueueTicket{queue: q, serial: serial, queuedAt: queuedAt}, true, nil
+	default:
+		if q.progress == nil {
+			q.progress = make(chan struct{})
+		}
+		progress := q.progress
+		q.mu.Unlock()
+		return packetQueueTicket{}, false, progress
+	}
+}
+
+// noteDequeue advances the FIFO watermark and wakes every producer that
+// observed a full queue. Enqueue and dequeue accounting share the short mutex
+// so a ticket cannot appear consumed before its serial has been published.
+func (q *packetQueueState) noteDequeue(count uint64) {
+	if count == 0 {
+		return
+	}
+	if !q.synchronize.Load() {
+		q.dequeued.Add(count)
+		return
+	}
+	q.mu.Lock()
+	q.dequeued.Add(count)
+	if q.progress != nil {
+		close(q.progress)
+		q.progress = nil
+	}
+	q.synchronize.Store(false)
+	q.mu.Unlock()
 }
 
 // New constructs an inactive-socket stack.
@@ -255,28 +418,31 @@ func New(config Config) (*Stack, error) {
 	if err != nil {
 		return nil, err
 	}
-	ports4, err := randomAutomaticPortCursor()
-	if err != nil {
+	// One OS-random read seeds independent port, fragment-ID, and RFC 6528
+	// sequence spaces. Per-connection ISNs are derived from tcpISNSecret.
+	var seed [72]byte
+	if _, err = rand.Read(seed[:]); err != nil {
 		return nil, err
 	}
-	ports6, err := randomAutomaticPortCursor()
-	if err != nil {
-		return nil, err
+	ports4 := automaticPortCursor{
+		dynamic:  uint16(binary.BigEndian.Uint32(seed[0:4]) % dynamicPortCount),
+		fallback: uint16(binary.BigEndian.Uint32(seed[4:8]) % fallbackPortCount),
 	}
-	ipv4ID, err := randomUint32()
-	if err != nil {
-		return nil, err
+	ports6 := automaticPortCursor{
+		dynamic:  uint16(binary.BigEndian.Uint32(seed[8:12]) % dynamicPortCount),
+		fallback: uint16(binary.BigEndian.Uint32(seed[12:16]) % fallbackPortCount),
 	}
-	ipv6FragmentID, err := randomUint32()
-	if err != nil {
-		return nil, err
-	}
+	copy(ports4.secret[:], seed[40:56])
+	copy(ports6.secret[:], seed[56:72])
+	ipv4ID := binary.BigEndian.Uint32(seed[16:20])
+	ipv6FragmentID := binary.BigEndian.Uint32(seed[20:24])
 	stack := &Stack{
 		outbound: make(chan []byte, outboundPacketQueue), loopback: make(chan []byte, loopbackPacketQueue),
 		tcp: make(map[tcpKey]*TCPConn), udp: make(map[udpKey]*UDPConn),
 		nextPort: [2]automaticPortCursor{ports4, ports6}, pathMTU: make(map[netip.Addr]pathMTUEntry),
 		closeCh: make(chan struct{}), timestampEpoch: time.Now(), fragments: make(map[fragmentKey]*fragmentSet), fragmentWake: make(chan struct{}, 1),
 	}
+	copy(stack.tcpISNSecret[:], seed[24:40])
 	stack.ipv4ID.Store(ipv4ID)
 	stack.ipv6FragmentID.Store(ipv6FragmentID)
 	stack.network.Store(state)
@@ -297,11 +463,14 @@ func (s *Stack) UpdateConfig(config Config) error {
 		s.mu.Unlock()
 		return ErrClosed
 	}
-	previous := s.network.Swap(state)
+	previous := s.network.Load()
 	if previous == nil || previous.mtu != state.mtu {
 		s.pathMTUMu.Lock()
+		s.network.Store(state)
 		s.pathMTU = make(map[netip.Addr]pathMTUEntry)
 		s.pathMTUMu.Unlock()
+	} else {
+		s.network.Store(state)
 	}
 	tcpConnections := make([]*TCPConn, 0, len(s.tcp))
 	for _, connection := range s.tcp {
@@ -315,6 +484,7 @@ func (s *Stack) UpdateConfig(config Config) error {
 		tcpPassive.updateConfig(s, state)
 	}
 	for _, connection := range tcpConnections {
+		connection.updateDefaultCongestionControl(state.tcpDefaults.CongestionControl)
 		_, routed := state.routeFor(connection.key.remote.Addr())
 		if !networkStateHasLocal(state, connection.key.local.Addr()) {
 			connection.abortWithoutReset(syscall.EADDRNOTAVAIL)
@@ -370,6 +540,49 @@ func (s *Stack) RouteFor(destination netip.Addr) (Route, error) {
 		return Route{}, syscall.ENETUNREACH
 	}
 	return route, nil
+}
+
+// PathMTU returns the currently confirmed packet size for one routed unicast
+// destination. The result includes the IP header.
+func (s *Stack) PathMTU(destination netip.Addr) (int, error) {
+	if _, err := s.RouteFor(destination); err != nil {
+		return 0, err
+	}
+	return s.mtuFor(destination), nil
+}
+
+// ConfirmPathMTU records packetization-layer acknowledgement of an
+// unfragmented probe. Connectionless protocols must call this only after their
+// own acknowledgement semantics prove delivery; queueing a packet is not
+// confirmation.
+func (s *Stack) ConfirmPathMTU(destination netip.Addr, mtu int) error {
+	if _, err := s.RouteFor(destination); err != nil {
+		return err
+	}
+	destination = destination.Unmap()
+	minimum := 68
+	if destination.Is6() {
+		minimum = ipv6MinimumMTU
+	}
+	linkMTU := s.network.Load().mtu
+	if mtu < minimum || mtu > linkMTU {
+		return syscall.EINVAL
+	}
+	// An expired lower cache entry is still the most recent packetization-
+	// layer confirmation. Keep it as the lower bound of an application's
+	// binary search instead of requiring the first successful probe to jump
+	// directly to the link MTU.
+	confirmed := linkMTU
+	s.pathMTUMu.RLock()
+	if current, exists := s.pathMTU[destination]; exists && current.mtu < confirmed {
+		confirmed = current.mtu
+	}
+	s.pathMTUMu.RUnlock()
+	if mtu < confirmed {
+		return syscall.EINVAL
+	}
+	s.confirmPathMTU(destination, mtu, nil)
+	return nil
 }
 
 // networkStateHasLocal reports membership in an immutable configuration.
@@ -519,6 +732,11 @@ func (s *Stack) observePathMTU(destination netip.Addr, mtu uint32) bool {
 	if !destination.IsValid() || mtu == 0 {
 		return false
 	}
+	if destination.Is6() && mtu < minimum {
+		// RFC 8201 requires discarding a Packet Too Big value below the
+		// IPv6 minimum link MTU rather than turning it into a 1280-byte hint.
+		return false
+	}
 	if mtu < minimum {
 		mtu = minimum
 	}
@@ -549,6 +767,32 @@ func (s *Stack) observePathMTU(destination netip.Addr, mtu uint32) bool {
 	return true
 }
 
+// confirmPathMTU raises a shared destination PMTU after packetization-layer
+// acknowledgement and wakes sibling TCP flows on the same single-link path.
+func (s *Stack) confirmPathMTU(destination netip.Addr, mtu int, except *TCPConn) bool {
+	destination = destination.Unmap()
+	linkMTU := s.network.Load().mtu
+	if !destination.IsValid() || mtu <= 0 || mtu > linkMTU {
+		return false
+	}
+	s.pathMTUMu.Lock()
+	current, exists := s.pathMTU[destination]
+	if exists && current.mtu >= mtu && time.Since(current.updated) < pathMTULifetime {
+		current.updated = time.Now()
+		s.pathMTU[destination] = current
+		s.pathMTUMu.Unlock()
+		return false
+	}
+	if mtu >= linkMTU {
+		delete(s.pathMTU, destination)
+	} else {
+		s.pathMTU[destination] = pathMTUEntry{mtu: mtu, updated: time.Now()}
+	}
+	s.pathMTUMu.Unlock()
+	s.notifyTCPPathMTU(destination, except)
+	return true
+}
+
 // Stats returns a consistent-enough lock-free snapshot of stack counters.
 // Concurrent activity may become visible across adjacent fields at slightly
 // different instants.
@@ -556,6 +800,10 @@ func (s *Stack) Stats() StackStats {
 	return StackStats{
 		InboundPackets:              s.stats.inboundPackets.Load(),
 		InboundDroppedPackets:       s.stats.inboundDroppedPackets.Load(),
+		InvalidIPPackets:            s.stats.invalidIPPackets.Load(),
+		UnacceptedIPPackets:         s.stats.unacceptedIPPackets.Load(),
+		NonlocalDestinationPackets:  s.stats.nonlocalDestinationPackets.Load(),
+		InvalidSourcePackets:        s.stats.invalidSourcePackets.Load(),
 		OutboundPackets:             s.stats.outboundPackets.Load(),
 		LoopbackPackets:             s.stats.loopbackPackets.Load(),
 		ActiveTCPConnections:        s.stats.activeTCPConnections.Load(),
@@ -563,12 +811,18 @@ func (s *Stack) Stats() StackStats {
 		ActiveUDPSockets:            s.stats.activeUDPSockets.Load(),
 		ActiveIPSockets:             s.stats.activeIPSockets.Load(),
 		TCPRetransmissions:          s.stats.tcpRetransmissions.Load(),
+		TCPInboundQueueDrops:        s.stats.tcpInboundQueueDrops.Load(),
+		TCPInvalidSegments:          s.stats.tcpInvalidSegments.Load(),
 		TCPSACKRetransmissions:      s.stats.tcpSACKRetransmissions.Load(),
 		TCPRACKRetransmissions:      s.stats.tcpRACKRetransmissions.Load(),
 		TCPTailLossProbes:           s.stats.tcpTailLossProbes.Load(),
+		TCPSpuriousRecoveryUndos:    s.stats.tcpSpuriousRecoveryUndos.Load(),
 		TCPZeroWindowProbes:         s.stats.tcpZeroWindowProbes.Load(),
 		TCPKeepAliveProbes:          s.stats.tcpKeepAliveProbes.Load(),
 		PathMTUUpdates:              s.stats.pathMTUUpdates.Load(),
+		PathMTUProbes:               s.stats.pathMTUProbes.Load(),
+		PathMTUProbeSuccesses:       s.stats.pathMTUProbeSuccesses.Load(),
+		PathMTUProbeFailures:        s.stats.pathMTUProbeFailures.Load(),
 		PathMTUBlackHoleReductions:  s.stats.pathMTUBlackHoleReductions.Load(),
 		FragmentEvictions:           s.stats.fragmentEvictions.Load(),
 		FragmentTimeouts:            s.stats.fragmentTimeouts.Load(),
@@ -625,7 +879,8 @@ func (s *Stack) runLoopback() {
 	for {
 		select {
 		case packet := <-s.loopback:
-			_ = s.handlePacket(packet)
+			s.loopbackQueue.noteDequeue(1)
+			_ = s.handleInboundPacket(packet, time.Now())
 		case <-s.closeCh:
 			return
 		}
@@ -645,57 +900,22 @@ func (s *Stack) ready() error {
 	return nil
 }
 
-// sourceFor selects the route-admitted local address preferred for destination.
-func (s *Stack) sourceFor(destination netip.Addr) (netip.Addr, error) {
-	return s.network.Load().sourceFor(destination, netip.Addr{})
-}
-
 // sourceForRequested validates an explicit source or selects one automatically.
 func (s *Stack) sourceForRequested(destination, requested netip.Addr) (netip.Addr, error) {
 	return s.network.Load().sourceFor(destination, requested)
-}
-
-// randomPortOffset randomizes the first candidate in one automatic range.
-func randomPortOffset(count uint32) (uint16, error) {
-	var raw [4]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return 0, err
-	}
-	return uint16(binary.BigEndian.Uint32(raw[:]) % count), nil
-}
-
-// randomUint32 seeds transport sequence and fragment identification spaces.
-func randomUint32() (uint32, error) {
-	var raw [4]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return 0, err
-	}
-	return binary.BigEndian.Uint32(raw[:]), nil
-}
-
-// randomAutomaticPortCursor independently randomizes both allocation ranges.
-func randomAutomaticPortCursor() (automaticPortCursor, error) {
-	dynamic, err := randomPortOffset(dynamicPortCount)
-	if err != nil {
-		return automaticPortCursor{}, err
-	}
-	fallback, err := randomPortOffset(fallbackPortCount)
-	if err != nil {
-		return automaticPortCursor{}, err
-	}
-	return automaticPortCursor{dynamic: dynamic, fallback: fallback}, nil
 }
 
 // allocateAutomaticPort selects an available IANA dynamic port first, then
 // falls back to the lower non-privileged range only after a complete scan.
 func allocateAutomaticPort(cursor *automaticPortCursor, available func(uint16) bool) (uint16, error) {
 	ranges := [...]struct {
+		id     byte
 		first  uint32
 		count  uint32
 		cursor *uint16
 	}{
-		{dynamicPortFirst, dynamicPortCount, &cursor.dynamic},
-		{fallbackPortFirst, fallbackPortCount, &cursor.fallback},
+		{0, dynamicPortFirst, dynamicPortCount, &cursor.dynamic},
+		{1, fallbackPortFirst, fallbackPortCount, &cursor.fallback},
 	}
 	for _, portRange := range ranges {
 		start := uint32(*portRange.cursor)
@@ -705,7 +925,15 @@ func allocateAutomaticPort(cursor *automaticPortCursor, available func(uint16) b
 			if !available(port) {
 				continue
 			}
-			*portRange.cursor = uint16((position + 1) % portRange.count)
+			// RFC 6056-style keyed increments prevent one observed automatic
+			// port from revealing the next selection while preserving a complete
+			// linear collision scan from each unpredictable starting point.
+			var input [9]byte
+			input[0] = portRange.id
+			binary.BigEndian.PutUint64(input[1:9], cursor.sequence)
+			cursor.sequence++
+			step := uint32(1) + uint32(sipHash24(cursor.secret, input[:])%uint64(portRange.count-1))
+			*portRange.cursor = uint16((position + step) % portRange.count)
 			return port, nil
 		}
 	}
@@ -794,7 +1022,7 @@ func (s *Stack) ListenUDP(ctx context.Context, network string, local netip.AddrP
 func (s *Stack) listenUDP(ctx context.Context, network string, local netip.AddrPort, binding udpSocketBinding) (net.PacketConn, error) {
 	address := local.Addr().Unmap()
 	local = netip.AddrPortFrom(address, local.Port())
-	target := udpNetAddr(local)
+	target := net.UDPAddrFromAddrPort(local)
 	wrap := func(err error) (net.PacketConn, error) {
 		return nil, socketOperationError("listen", network, nil, target, err)
 	}
@@ -850,7 +1078,7 @@ func (s *Stack) listenUDP(ctx context.Context, network string, local netip.AddrP
 // port automatically; an unspecified source address selects only the address.
 func (s *Stack) DialUDP(ctx context.Context, network string, source, remote netip.AddrPort) (net.Conn, error) {
 	remote = netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port())
-	target := udpNetAddr(remote)
+	target := net.UDPAddrFromAddrPort(remote)
 	wrap := func(source net.Addr, err error) (net.Conn, error) {
 		return nil, socketOperationError("dial", network, source, target, err)
 	}
@@ -936,14 +1164,9 @@ func (s *Stack) localEndpointFor(network string, remote, requested netip.AddrPor
 	return netip.AddrPortFrom(address, requested.Port()), nil
 }
 
-// udpNetAddr returns a standard UDP address when endpoint is valid.
-func udpNetAddr(endpoint netip.AddrPort) net.Addr {
-	return net.UDPAddrFromAddrPort(endpoint)
-}
-
-// Read copies one complete outbound IP packet into buffers[0] at offset. Its
-// data-plane signature matches tun.Device.Read, but Stack always has batch
-// size one.
+// Read blocks for one complete outbound IP packet, then drains up to
+// BatchSize packets into consecutive buffers at offset. On success it sets
+// the corresponding packet lengths in sizes, matching tun.Device.Read.
 func (s *Stack) Read(buffers [][]byte, sizes []int, offset int) (int, error) {
 	if err := s.ready(); err != nil {
 		if errors.Is(err, ErrClosed) {
@@ -951,27 +1174,58 @@ func (s *Stack) Read(buffers [][]byte, sizes []int, offset int) (int, error) {
 		}
 		return 0, err
 	}
-	if len(buffers) == 0 || len(sizes) == 0 {
+	if len(sizes) < len(buffers) {
+		return 0, errors.New("mipstack: Read sizes shorter than buffers")
+	}
+	limit := len(buffers)
+	if limit > deviceBatchSize {
+		limit = deviceBatchSize
+	}
+	if limit == 0 {
 		return 0, errors.New("mipstack: Read requires one buffer and size")
 	}
-	if offset < 0 || offset > len(buffers[0]) {
-		return 0, errors.New("mipstack: invalid Read offset")
+	for index := 0; index < limit; index++ {
+		if offset < 0 || offset > len(buffers[index]) {
+			return 0, errors.New("mipstack: invalid Read offset")
+		}
 	}
 	select {
 	case <-s.closeCh:
 		return 0, os.ErrClosed
 	default:
 	}
-	select {
-	case packet := <-s.outbound:
-		if len(packet) > len(buffers[0])-offset {
-			return 0, io.ErrShortBuffer
+	var dequeued uint64
+	defer func() { s.outboundQueue.noteDequeue(dequeued) }()
+	readPacket := func(index int, packet []byte) error {
+		dequeued++
+		if len(packet) > len(buffers[index])-offset {
+			return io.ErrShortBuffer
 		}
-		sizes[0] = copy(buffers[0][offset:], packet)
-		return 1, nil
+		sizes[index] = copy(buffers[index][offset:], packet)
+		return nil
+	}
+	var first []byte
+	select {
+	case first = <-s.outbound:
 	case <-s.closeCh:
 		return 0, os.ErrClosed
 	}
+	if err := readPacket(0, first); err != nil {
+		return 0, err
+	}
+	count := 1
+	for count < limit {
+		select {
+		case packet := <-s.outbound:
+			if err := readPacket(count, packet); err != nil {
+				return count, err
+			}
+			count++
+		default:
+			return count, nil
+		}
+	}
+	return count, nil
 }
 
 // Write delivers complete inbound IP packets from buffers at offset. Invalid,
@@ -989,10 +1243,7 @@ func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 		if offset < 0 || offset > len(buffer) {
 			return count, errors.New("mipstack: invalid Write offset")
 		}
-		if len(buffer) == offset {
-			continue
-		}
-		if err := s.handlePacketAt(buffer[offset:], receivedAt); err != nil {
+		if err := s.handleInboundPacket(buffer[offset:], receivedAt); err != nil {
 			return count, err
 		}
 		count++
@@ -1007,12 +1258,13 @@ func (s *Stack) writePacket(packet []byte) error {
 		return ErrClosed
 	default:
 	}
-	queue, loopback := s.outputQueue(packet)
+	queue, queueState, loopback := s.outputQueue(packet)
 	if loopback {
-		select {
-		case queue <- packet:
+		if _, queued, _ := queueState.tryEnqueue(queue, packet); queued {
 			s.recordOutput(true)
 			return nil
+		}
+		select {
 		case <-s.closeCh:
 			return ErrClosed
 		default:
@@ -1022,75 +1274,165 @@ func (s *Stack) writePacket(packet []byte) error {
 			return ErrResourceLimit
 		}
 	}
+	for {
+		if _, queued, progress := queueState.tryEnqueue(queue, packet); queued {
+			s.recordOutput(false)
+			return nil
+		} else {
+			select {
+			case <-progress:
+			case <-s.closeCh:
+				return ErrClosed
+			}
+		}
+	}
+}
+
+// tryWritePacket queues one best-effort control packet without waiting for
+// device space. It is used when an already aborted TCP actor emits its final
+// reset and must not retain connection state behind a stalled embedding link.
+func (s *Stack) tryWritePacket(packet []byte) error {
 	select {
-	case queue <- packet:
-		s.recordOutput(false)
-		return nil
 	case <-s.closeCh:
 		return ErrClosed
+	default:
 	}
+	queue, queueState, loopback := s.outputQueue(packet)
+	if _, queued, _ := queueState.tryEnqueue(queue, packet); !queued {
+		return ErrResourceLimit
+	}
+	s.recordOutput(loopback)
+	return nil
 }
 
 // writePacketUntil queues a packet while observing a socket's mutable write
 // deadline. The fast path allocates no timer when the packet queue has room.
 func (s *Stack) writePacketUntil(packet []byte, state func() (time.Time, <-chan struct{}, bool)) error {
-	queue, loopback := s.outputQueue(packet)
-	if loopback {
-		select {
-		case queue <- packet:
-			s.recordOutput(true)
-			return nil
-		case <-s.closeCh:
-			return ErrClosed
-		default:
-			return ErrResourceLimit
-		}
-	}
+	_, err := s.writePacketUntilTicket(packet, state)
+	return err
+}
+
+// writePacketUntilTicket is writePacketUntil plus the exact FIFO position
+// used by TCP's host-queue-aware loss probing.
+func (s *Stack) writePacketUntilTicket(packet []byte, state func() (time.Time, <-chan struct{}, bool)) (packetQueueTicket, error) {
+	queue, queueState, loopback := s.outputQueue(packet)
 	for {
-		select {
-		case queue <- packet:
-			s.recordOutput(false)
-			return nil
-		case <-s.closeCh:
-			return ErrClosed
-		default:
-		}
 		deadline, changed, closed := state()
 		if closed {
-			return net.ErrClosed
+			return packetQueueTicket{}, net.ErrClosed
 		}
 		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			select {
 			case <-changed:
 				continue
 			default:
-				return os.ErrDeadlineExceeded
+				return packetQueueTicket{}, os.ErrDeadlineExceeded
+			}
+		}
+		ticket, queued, progress := queueState.tryEnqueue(queue, packet)
+		if queued {
+			s.recordOutput(loopback)
+			return ticket, nil
+		}
+		if loopback {
+			select {
+			case <-s.closeCh:
+				return packetQueueTicket{}, ErrClosed
+			default:
+				return packetQueueTicket{}, ErrResourceLimit
 			}
 		}
 		timer, timeout := deadlineTimer(deadline)
 		select {
-		case queue <- packet:
+		case <-progress:
 			stopTimer(timer)
-			s.recordOutput(false)
-			return nil
 		case <-changed:
 			stopTimer(timer)
 		case <-timeout:
-			return os.ErrDeadlineExceeded
+			return packetQueueTicket{}, os.ErrDeadlineExceeded
 		case <-s.closeCh:
 			stopTimer(timer)
-			return ErrClosed
+			return packetQueueTicket{}, ErrClosed
 		}
 	}
 }
 
+// deadlineTimer returns a disabled channel for an unset deadline.
+func deadlineTimer(deadline time.Time) (*time.Timer, <-chan time.Time) {
+	if deadline.IsZero() {
+		return nil, nil
+	}
+	duration := time.Until(deadline)
+	if duration < 0 {
+		duration = 0
+	}
+	timer := time.NewTimer(duration)
+	return timer, timer.C
+}
+
+// stopTimer stops a non-nil timer.
+func stopTimer(timer *time.Timer) {
+	if timer != nil && !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
+// ownedTimer is a reusable timer consumed by exactly one actor goroutine. Its
+// active bit distinguishes a tick already received by select from an expired
+// tick that still has to be drained before Reset under Go 1.20 timer semantics.
+type ownedTimer struct {
+	timer  *time.Timer
+	active bool
+}
+
+func newOwnedTimer() *ownedTimer {
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	return &ownedTimer{timer: timer}
+}
+
+// reset replaces the deadline and returns the stable timer channel.
+func (t *ownedTimer) reset(duration time.Duration) <-chan time.Time {
+	t.stop()
+	if duration < 0 {
+		duration = 0
+	}
+	t.timer.Reset(duration)
+	t.active = true
+	return t.timer.C
+}
+
+// consumed records that select received the current tick.
+func (t *ownedTimer) consumed() { t.active = false }
+
+// stop prevents the current generation and drains an unconsumed expired tick.
+func (t *ownedTimer) stop() {
+	if !t.active {
+		return
+	}
+	t.active = false
+	if !t.timer.Stop() {
+		<-t.timer.C
+	}
+}
+
+func (t *ownedTimer) close() {
+	t.stop()
+	t.timer.Stop()
+}
+
 // outputQueue chooses local delivery when the destination belongs to this
 // stack, otherwise the embedding link's packet queue.
-func (s *Stack) outputQueue(packet []byte) (chan []byte, bool) {
+func (s *Stack) outputQueue(packet []byte) (chan []byte, *packetQueueState, bool) {
 	if destination, ok := packetDestination(packet); ok && s.isLocal(destination) {
-		return s.loopback, true
+		return s.loopback, &s.loopbackQueue, true
 	}
-	return s.outbound, false
+	return s.outbound, &s.outboundQueue, false
 }
 
 // recordOutput updates the appropriate queue statistic.
@@ -1102,14 +1444,11 @@ func (s *Stack) recordOutput(loopback bool) {
 	}
 }
 
-// handlePacket processes one packet supplied through Write.
-func (s *Stack) handlePacket(packet []byte) error {
-	return s.handlePacketAt(packet, time.Now())
-}
-
-// handlePacketAt preserves the embedding link's batch-arrival time across
-// parsing, reassembly, and transport dispatch.
-func (s *Stack) handlePacketAt(packet []byte, receivedAt time.Time) error {
+// handleInboundPacket validates and reassembles one L3 packet before
+// dispatching it to ICMP, TCP, UDP, or a raw IP endpoint. receivedAt is shared
+// by packets from one device batch so transport timing does not depend on
+// parsing order.
+func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time) error {
 	s.stats.inboundPackets.Add(1)
 	parsed, ok := parseIPPacket(packet)
 	if !ok {
@@ -1137,9 +1476,21 @@ func (s *Stack) handlePacketAt(packet []byte, receivedAt time.Time) error {
 	network := s.network.Load()
 	limitedBroadcast := parsed.source.Is4() && parsed.source == netip.AddrFrom4([4]byte{255, 255, 255, 255})
 	foreignLoopback := parsed.source.IsLoopback() && !networkStateHasLocal(network, parsed.source)
-	if !ok || !networkStateHasLocal(network, parsed.target) || parsed.source.IsUnspecified() || parsed.source.IsMulticast() || parsed.source.Is4In6() || limitedBroadcast ||
-		network.invalidInboundSource(parsed.source) || foreignLoopback {
+	localDestination := ok && networkStateHasLocal(network, parsed.target)
+	invalidSource := ok && (parsed.source.IsUnspecified() || parsed.source.IsMulticast() || parsed.source.Is4In6() || limitedBroadcast ||
+		network.invalidInboundSource(parsed.source) || foreignLoopback)
+	if !ok || !localDestination || invalidSource {
 		s.stats.inboundDroppedPackets.Add(1)
+		if !ok {
+			s.stats.invalidIPPackets.Add(1)
+		} else {
+			s.stats.unacceptedIPPackets.Add(1)
+			if !localDestination {
+				s.stats.nonlocalDestinationPackets.Add(1)
+			} else {
+				s.stats.invalidSourcePackets.Add(1)
+			}
+		}
 		return nil
 	}
 	s.mu.RLock()
@@ -1300,15 +1651,4 @@ func (s *Stack) removeTCP(connection *TCPConn) {
 		s.stats.activeTCPConnections.Add(^uint64(0))
 	}
 	s.mu.Unlock()
-}
-
-// nextIPv4ID returns an identification value for a possibly fragmented IPv4
-// datagram. DF packets use zero and do not consume this sequence.
-func (s *Stack) nextIPv4ID() uint16 {
-	return uint16(s.ipv4ID.Add(1))
-}
-
-// nextIPv6FragmentID returns an IPv6 Fragment-header identification value.
-func (s *Stack) nextIPv6FragmentID() uint32 {
-	return s.ipv6FragmentID.Add(1)
 }

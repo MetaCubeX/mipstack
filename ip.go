@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -29,6 +30,25 @@ type ipDatagram struct {
 	source  netip.Addr
 	target  netip.Addr
 	options ipPacketOptions
+}
+
+// IPInfo is a point-in-time diagnostic snapshot of one IP protocol socket.
+type IPInfo struct {
+	LocalAddress         netip.Addr
+	RemoteAddress        netip.Addr
+	Protocol             uint8
+	Closed               bool
+	ReceiveQueuePackets  int
+	ReceiveQueueBytes    int
+	ReceiveQueueCapacity int
+	PacketsSent          uint64
+	BytesSent            uint64
+	PacketsReceived      uint64
+	BytesReceived        uint64
+	PacketsDropped       uint64
+	PathMTU              int
+	HopLimit             int
+	TrafficClass         uint8
 }
 
 // ipKey identifies one specific or wildcard raw protocol binding.
@@ -75,6 +95,12 @@ type IPConn struct {
 	writeDeadline   time.Time
 	readChanged     chan struct{}
 	writeChanged    chan struct{}
+	defaultOptions  ipPacketOptions
+	packetsSent     atomic.Uint64
+	bytesSent       atomic.Uint64
+	packetsReceived atomic.Uint64
+	bytesReceived   atomic.Uint64
+	packetsDropped  atomic.Uint64
 }
 
 // ListenIP creates an unconnected IPv4 or IPv6 protocol socket. Network must
@@ -235,10 +261,15 @@ func validateIPProtocol(protocol byte) error {
 
 // newIPConn allocates one unregistered protocol socket.
 func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.Addr) *IPConn {
+	defaults := DatagramSocketDefaults{ReceiveBuffer: ipDefaultReceiveCapacity, HopLimit: 64}
+	if stack != nil {
+		defaults = stack.network.Load().ipDefaults
+	}
 	return &IPConn{
 		stack: stack, net: network, protocol: protocol, v6: local.Is6(), local: local, remote: remote,
-		closed: make(chan struct{}), receiveNotify: make(chan struct{}), receiveCapacity: ipDefaultReceiveCapacity,
+		closed: make(chan struct{}), receiveNotify: make(chan struct{}), receiveCapacity: defaults.ReceiveBuffer,
 		readChanged: make(chan struct{}), writeChanged: make(chan struct{}),
+		defaultOptions: ipPacketOptions{hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass},
 	}
 }
 
@@ -373,18 +404,22 @@ func (c *IPConn) enqueue(payload []byte, source, target netip.Addr, options ipPa
 	case <-c.closed:
 		c.mu.Unlock()
 		c.stack.stats.inboundDroppedPackets.Add(1)
+		c.packetsDropped.Add(1)
 		return
 	default:
 	}
 	if size > c.receiveCapacity || c.queuedBytes > c.receiveCapacity-size {
 		c.mu.Unlock()
 		c.stack.stats.inboundDroppedPackets.Add(1)
+		c.packetsDropped.Add(1)
 		return
 	}
 	datagram := ipDatagram{payload: append([]byte(nil), payload...), source: source, target: target, options: options}
 	wasEmpty := len(c.receive) == 0
 	c.receive = append(c.receive, datagram)
 	c.queuedBytes += size
+	c.packetsReceived.Add(1)
+	c.bytesReceived.Add(uint64(len(payload)))
 	if wasEmpty {
 		notified := c.receiveNotify
 		c.receiveNotify = make(chan struct{})
@@ -590,12 +625,15 @@ func (c *IPConn) writeTo(payload []byte, target netip.Addr, address net.Addr, pa
 		payload[2], payload[3] = 0, 0
 		binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, protocolICMPv6, payload))
 	}
+	options = c.outputOptions(options)
 	if err = c.stack.writeIPPayloadUntilOptions(source, target, c.protocol, payload, true, options, c.writeState); err != nil {
 		if errors.Is(err, syscall.EMSGSIZE) {
-			return 0, messageTooLong(c.network(), c.LocalAddr(), address)
+			return 0, messageTooLong(c.net, c.LocalAddr(), address)
 		}
 		return 0, err
 	}
+	c.packetsSent.Add(1)
+	c.bytesSent.Add(uint64(len(payload)))
 	return len(payload), nil
 }
 
@@ -623,6 +661,30 @@ func (c *IPConn) LocalAddr() net.Addr { return ipNetAddr(c.local) }
 
 // RemoteAddr returns the connected peer, or nil for an unconnected socket.
 func (c *IPConn) RemoteAddr() net.Addr { return c.remoteAddr() }
+
+// Info returns a diagnostic snapshot of the protocol socket and its receive
+// queue.
+func (c *IPConn) Info() IPInfo {
+	c.mu.Lock()
+	info := IPInfo{
+		LocalAddress: c.local, RemoteAddress: c.remote, Protocol: c.protocol,
+		ReceiveQueuePackets: len(c.receive), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
+		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass,
+	}
+	select {
+	case <-c.closed:
+		info.Closed = true
+	default:
+	}
+	c.mu.Unlock()
+	info.PacketsSent, info.BytesSent = c.packetsSent.Load(), c.bytesSent.Load()
+	info.PacketsReceived, info.BytesReceived = c.packetsReceived.Load(), c.bytesReceived.Load()
+	info.PacketsDropped = c.packetsDropped.Load()
+	if c.remote.IsValid() {
+		info.PathMTU = c.stack.mtuFor(c.remote)
+	}
+	return info
+}
 
 // remoteAddr returns the connected peer without wrapping a nil pointer in a
 // non-nil net.Addr interface.
@@ -720,6 +782,51 @@ func (c *IPConn) SetWriteBuffer(bytes int) error {
 	}
 }
 
+// SetHopLimit changes the default IPv4 TTL or IPv6 Hop Limit for subsequent
+// writes. Zero is valid only on a dedicated IPv6 socket; it is ambiguous on a
+// dual-stack socket because IPv4 TTL zero is invalid. Per-packet message
+// control data may override the value.
+func (c *IPConn) SetHopLimit(hopLimit int) error {
+	if hopLimit < 0 || hopLimit > 255 || hopLimit == 0 && (!c.v6 || c.dual) {
+		return c.setOperationError(syscall.EINVAL)
+	}
+	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return c.setOperationError(net.ErrClosed)
+	default:
+		c.defaultOptions.hopLimit, c.defaultOptions.hopLimitSet = byte(hopLimit), true
+		c.mu.Unlock()
+		return nil
+	}
+}
+
+// SetTrafficClass changes the default IPv4 TOS or IPv6 Traffic Class byte.
+func (c *IPConn) SetTrafficClass(value int) error {
+	if value < 0 || value > 255 {
+		return c.setOperationError(syscall.EINVAL)
+	}
+	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return c.setOperationError(net.ErrClosed)
+	default:
+		c.defaultOptions.trafficClass = byte(value)
+		c.mu.Unlock()
+		return nil
+	}
+}
+
+// outputOptions merges one per-packet override with socket defaults.
+func (c *IPConn) outputOptions(options ipPacketOptions) ipPacketOptions {
+	c.mu.Lock()
+	defaults := c.defaultOptions
+	c.mu.Unlock()
+	return options.withDefaults(defaults)
+}
+
 // writeState snapshots the write deadline and closure notification.
 func (c *IPConn) writeState() (time.Time, <-chan struct{}, bool) {
 	c.mu.Lock()
@@ -732,22 +839,19 @@ func (c *IPConn) writeState() (time.Time, <-chan struct{}, bool) {
 	}
 }
 
-// network returns the standard protocol network label.
-func (c *IPConn) network() string { return c.net }
-
 // operationError wraps an error for the bound or connected socket.
 func (c *IPConn) operationError(operation string, err error) error {
-	return socketOperationError(operation, c.network(), c.LocalAddr(), c.remoteAddr(), err)
+	return socketOperationError(operation, c.net, c.LocalAddr(), c.remoteAddr(), err)
 }
 
 // operationErrorTo wraps an error for one explicit destination.
 func (c *IPConn) operationErrorTo(operation string, target net.Addr, err error) error {
-	return socketOperationError(operation, c.network(), c.LocalAddr(), target, err)
+	return socketOperationError(operation, c.net, c.LocalAddr(), target, err)
 }
 
 // setOperationError uses standard deadline and socket-option metadata.
 func (c *IPConn) setOperationError(err error) error {
-	return socketOperationError("set", c.network(), nil, c.LocalAddr(), err)
+	return socketOperationError("set", c.net, nil, c.LocalAddr(), err)
 }
 
 // ipNetAddr converts a valid address to IPAddr and preserves nil for no peer.

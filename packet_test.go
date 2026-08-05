@@ -7,8 +7,8 @@ import (
 	"time"
 )
 
-// FuzzHandlePacket verifies that arbitrary L3 input cannot panic the stack.
-func FuzzHandlePacket(f *testing.F) {
+// FuzzInboundPacket verifies that arbitrary L3 input cannot panic the stack.
+func FuzzInboundPacket(f *testing.F) {
 	f.Add([]byte(nil))
 	f.Add([]byte{0x45, 0, 0, 20})
 	f.Add(buildIPPacket(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.1"), protocolUDP, make([]byte, 8), 1, false))

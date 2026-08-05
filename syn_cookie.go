@@ -30,29 +30,41 @@ var synCookieMSSValues = [...]uint16{tcpMinimumPeerMSS, 256, 536, 1200, 1220, 13
 // synCookieOptions is the handshake state that can be reconstructed from a
 // final ACK without retaining the original SYN.
 type synCookieOptions struct {
-	mss           int
-	windowScale   uint8
-	windowScaling bool
-	sack          bool
-	timestamp     bool
-	ecn           bool
-	timestampNow  uint32
+	mss              int
+	windowScale      uint8
+	localWindowScale uint8
+	windowScaling    bool
+	sack             bool
+	timestamp        bool
+	ecn              bool
+	timestampNow     uint32
 }
 
-// key returns the lazily initialized per-stack-listener secret. A random
-// source failure is retried on a later SYN instead of permanently disabling
-// cookies.
-func (state *tcpPassiveState) synCookieKey(now time.Time) ([16]byte, uint64, error) {
+// synCookieKey returns the lazily initialized per-stack-listener secret and
+// fixes the advertised receive scale for one cookie period. A random source
+// failure is retried on a later SYN instead of permanently disabling cookies.
+func (state *tcpPassiveState) synCookieKey(now time.Time, windowScale uint8) ([16]byte, uint64, uint8, error) {
 	state.cookieMu.Lock()
 	defer state.cookieMu.Unlock()
 	if !state.cookieSet {
 		if _, err := rand.Read(state.cookieKey[:]); err != nil {
-			return [16]byte{}, 0, err
+			return [16]byte{}, 0, 0, err
 		}
 		state.cookieEpoch = now
 		state.cookieSet = true
 	}
-	return state.cookieKey, synCookiePeriodNumber(now, state.cookieEpoch), nil
+	period := synCookiePeriodNumber(now, state.cookieEpoch)
+	if !state.cookieScaleSet || period > state.cookieScalePeriod {
+		if state.cookieScaleSet {
+			state.previousScaleSet = true
+			state.previousScalePeriod = state.cookieScalePeriod
+			state.previousWindowScale = state.cookieWindowScale
+		}
+		state.cookieScaleSet = true
+		state.cookieScalePeriod = period
+		state.cookieWindowScale = windowScale
+	}
+	return state.cookieKey, period, state.cookieWindowScale, nil
 }
 
 // noteSYNCookie records the Linux-style recent-overflow window in which a
@@ -66,21 +78,26 @@ func (state *tcpPassiveState) noteSYNCookie(period uint64) {
 	state.cookieMu.Unlock()
 }
 
-// recentSYNCookieKey returns an existing key only after this passive state
-// actually issued a cookie in the current or preceding period.
-func (state *tcpPassiveState) recentSYNCookieKey(now time.Time) ([16]byte, uint64, bool) {
+// recentSYNCookieState returns the secret and per-period receive scales only
+// after this passive state issued a recent cookie.
+func (state *tcpPassiveState) recentSYNCookieState(now time.Time) ([16]byte, uint64, [2]uint64, [2]uint8, [2]bool, bool) {
 	state.cookieMu.Lock()
 	defer state.cookieMu.Unlock()
 	period := synCookiePeriodNumber(now, state.cookieEpoch)
 	if !state.cookieSet || !state.cookieActive || period < state.cookiePeriod || period-state.cookiePeriod > 1 {
-		return [16]byte{}, 0, false
+		return [16]byte{}, 0, [2]uint64{}, [2]uint8{}, [2]bool{}, false
 	}
-	return state.cookieKey, period, true
+	periods := [2]uint64{state.cookieScalePeriod, state.previousScalePeriod}
+	scales := [2]uint8{state.cookieWindowScale, state.previousWindowScale}
+	set := [2]bool{state.cookieScaleSet, state.previousScaleSet}
+	return state.cookieKey, period, periods, scales, set, true
 }
 
 // sendSYNCookie replies to a SYN without allocating a TCPConn.
 func (state *tcpPassiveState) sendSYNCookie(stack *Stack, key tcpKey, syn tcpSegment, now time.Time) error {
-	secret, period, err := state.synCookieKey(now)
+	defaults := stack.network.Load().tcpDefaults
+	configuredScale := tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer)
+	secret, period, windowScale, err := state.synCookieKey(now, configuredScale)
 	if err != nil {
 		return err
 	}
@@ -98,13 +115,17 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, key tcpKey, syn tcpSeg
 			timestamp |= 1
 		}
 	}
-	tcpOptions := tcpPassiveSYNOptions(localMSS, options.sack, options.windowScaling, options.timestamp, timestamp, options.timestampNow)
+	tcpOptions := tcpPassiveSYNOptions(localMSS, options.sack, options.windowScaling, options.timestamp, windowScale, timestamp, options.timestampNow)
 	flags := byte(tcpFlagSYN | tcpFlagACK)
 	if options.ecn {
 		flags |= tcpFlagECE
 	}
+	receiveWindow := defaults.ReceiveBuffer
+	if receiveWindow > 65535 {
+		receiveWindow = 65535
+	}
 	state.noteSYNCookie(period)
-	return stack.writeTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, 65535, tcpOptions, nil)
+	return stack.writeTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, uint16(receiveWindow), tcpOptions, nil, stack.mtuFor(key.remote.Addr()), defaults.TrafficClass, 0)
 }
 
 // validateSYNCookie authenticates a final ACK against the current or previous
@@ -113,7 +134,7 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	if ack.flags&tcpFlagACK == 0 || ack.flags&(tcpFlagSYN|tcpFlagRST) != 0 {
 		return 0, synCookieOptions{}, false
 	}
-	secret, period, active := state.recentSYNCookieKey(now)
+	secret, period, scalePeriods, windowScales, scalesSet, active := state.recentSYNCookieState(now)
 	if !active {
 		return 0, synCookieOptions{}, false
 	}
@@ -124,13 +145,26 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	ecn := timestamp && timestampEcho&1 != 0
 	authenticatedData := synCookieAuthenticatedData(data, timestamp, ecn)
 	valid := false
+	localWindowScale := uint8(0)
 	for attempt := uint64(0); attempt < 2; attempt++ {
 		if attempt > period {
 			break
 		}
-		expected := synCookieSequence(secret, key, clientSequence, period-attempt, data, authenticatedData)
+		candidatePeriod := period - attempt
+		candidateScale, scaleFound := uint8(0), false
+		for index := range scalePeriods {
+			if scalesSet[index] && scalePeriods[index] == candidatePeriod {
+				candidateScale, scaleFound = windowScales[index], true
+				break
+			}
+		}
+		if !scaleFound {
+			continue
+		}
+		expected := synCookieSequence(secret, key, clientSequence, candidatePeriod, data, authenticatedData)
 		if subtle.ConstantTimeEq(int32(expected), int32(serverSequence)) == 1 {
 			valid = true
+			localWindowScale = candidateScale
 		}
 	}
 	if !valid {
@@ -143,6 +177,7 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	options.timestamp = timestamp
 	options.timestampNow = timestampValue
 	options.ecn = ecn
+	options.localWindowScale = localWindowScale
 	return serverSequence, options, true
 }
 
@@ -247,10 +282,10 @@ func (c *TCPConn) runPassiveCookie(listener *TCPListener, finalACK tcpSegment, i
 	defer c.stack.removeTCP(c)
 	defer close(c.done)
 	if len(finalACK.payload) != 0 || finalACK.flags&tcpFlagFIN != 0 {
-		c.inbound <- finalACK
+		c.inbound.prepend(finalACK)
 	}
 	if !listener.enqueue(c) {
-		_ = c.sendSegment(initialSequence+1, c.receiveNext, tcpFlagRST|tcpFlagACK, 0, nil)
+		_ = c.sendAbortReset(initialSequence+1, c.receiveNext, 0)
 		c.finish(net.ErrClosed)
 		return
 	}

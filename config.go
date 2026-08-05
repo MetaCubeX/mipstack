@@ -20,7 +20,9 @@ type Route struct {
 type networkState struct {
 	mtu               int
 	maxTCPConnections int
-	congestionControl CongestionControl
+	tcpDefaults       TCPSocketDefaults
+	udpDefaults       DatagramSocketDefaults
+	ipDefaults        DatagramSocketDefaults
 	local             map[netip.Addr]struct{}
 	sources           []netip.Addr
 	localPrefixes     []netip.Prefix
@@ -39,15 +41,21 @@ func buildNetworkState(config Config) (*networkState, error) {
 	if config.MaxTCPConnections < 0 {
 		return nil, errors.New("mipstack: maximum TCP connections cannot be negative")
 	}
-	congestionControl := config.CongestionControl
-	if congestionControl == "" {
-		congestionControl = CongestionControlCUBIC
+	tcpDefaults, err := normalizeTCPSocketDefaults(config.TCP)
+	if err != nil {
+		return nil, err
 	}
-	if !congestionControl.valid() {
-		return nil, errors.New("mipstack: congestion control must be cubic, reno, or bbr")
+	udpDefaults, err := normalizeDatagramSocketDefaults(config.UDP, udpDefaultReceiveCapacity, udpDatagramMetadataSize)
+	if err != nil {
+		return nil, errors.New("mipstack: invalid UDP socket defaults: " + err.Error())
+	}
+	ipDefaults, err := normalizeDatagramSocketDefaults(config.IP, ipDefaultReceiveCapacity, ipDatagramMetadataSize)
+	if err != nil {
+		return nil, errors.New("mipstack: invalid IP socket defaults: " + err.Error())
 	}
 	state := &networkState{
-		mtu: mtu, maxTCPConnections: config.MaxTCPConnections, congestionControl: congestionControl,
+		mtu: mtu, maxTCPConnections: config.MaxTCPConnections,
+		tcpDefaults: tcpDefaults, udpDefaults: udpDefaults, ipDefaults: ipDefaults,
 		local:   make(map[netip.Addr]struct{}, len(config.LocalAddresses)),
 		sources: make([]netip.Addr, 0, len(config.LocalAddresses)),
 	}
@@ -130,6 +138,75 @@ func buildNetworkState(config Config) (*networkState, error) {
 		}
 	}
 	return state, nil
+}
+
+// normalizeTCPSocketDefaults validates optional limits and fills the policy
+// used by new sockets without changing Config's useful zero value.
+func normalizeTCPSocketDefaults(value TCPSocketDefaults) (TCPSocketDefaults, error) {
+	if value.CongestionControl == "" {
+		value.CongestionControl = CongestionControlCUBIC
+	}
+	if !value.CongestionControl.valid() {
+		return TCPSocketDefaults{}, errors.New("mipstack: congestion control must be cubic, reno, or bbr")
+	}
+	if value.ReceiveBuffer < 0 || value.MaximumReceiveBuffer < 0 || value.SendBuffer < 0 || value.MaximumSendBuffer < 0 ||
+		value.AcceptQueue < 0 || value.SYNBacklog < 0 || value.IdleTimeout < 0 || value.UserTimeout < 0 {
+		return TCPSocketDefaults{}, errors.New("mipstack: TCP socket defaults cannot be negative")
+	}
+	if value.ReceiveBuffer == 0 {
+		value.ReceiveBuffer = tcpReceiveCapacity
+	}
+	if value.MaximumReceiveBuffer == 0 {
+		value.MaximumReceiveBuffer = tcpMaximumReceiveCapacity
+	}
+	if value.SendBuffer == 0 {
+		value.SendBuffer = tcpSendCapacity
+	}
+	if value.MaximumSendBuffer == 0 {
+		value.MaximumSendBuffer = tcpMaximumSendCapacity
+	}
+	if value.MaximumReceiveBuffer < value.ReceiveBuffer || value.MaximumSendBuffer < value.SendBuffer {
+		return TCPSocketDefaults{}, errors.New("mipstack: TCP automatic buffer maximum is below its initial size")
+	}
+	if uint64(value.MaximumReceiveBuffer) > uint64(tcpMaximumScaledWindow) {
+		return TCPSocketDefaults{}, errors.New("mipstack: TCP receive buffer maximum exceeds the RFC 7323 window limit")
+	}
+	if value.AcceptQueue == 0 {
+		value.AcceptQueue = tcpAcceptQueue
+	}
+	if value.SYNBacklog == 0 {
+		value.SYNBacklog = tcpSYNBacklog
+	}
+	if value.KeepAliveConfig.Idle == 0 {
+		value.KeepAliveConfig.Idle = tcpDefaultKeepAliveIdle
+	}
+	if value.KeepAliveConfig.Interval == 0 {
+		value.KeepAliveConfig.Interval = tcpDefaultKeepAliveInterval
+	}
+	if value.KeepAliveConfig.Count == 0 {
+		value.KeepAliveConfig.Count = tcpDefaultKeepAliveCount
+	}
+	if value.KeepAliveConfig.Idle < 0 || value.KeepAliveConfig.Interval < 0 || value.KeepAliveConfig.Count < 0 {
+		return TCPSocketDefaults{}, errors.New("mipstack: TCP keepalive defaults cannot be negative")
+	}
+	value.TrafficClass &= 0xfc
+	return value, nil
+}
+
+// normalizeDatagramSocketDefaults validates one UDP or IP default policy.
+func normalizeDatagramSocketDefaults(value DatagramSocketDefaults, defaultReceiveBuffer, minimumReceiveBuffer int) (DatagramSocketDefaults, error) {
+	if value.ReceiveBuffer < 0 || value.HopLimit < 0 || value.HopLimit > 255 {
+		return DatagramSocketDefaults{}, errors.New("receive buffer and hop limit must be valid")
+	}
+	if value.ReceiveBuffer == 0 {
+		value.ReceiveBuffer = defaultReceiveBuffer
+	} else if value.ReceiveBuffer < minimumReceiveBuffer {
+		value.ReceiveBuffer = minimumReceiveBuffer
+	}
+	if value.HopLimit == 0 {
+		value.HopLimit = 64
+	}
+	return value, nil
 }
 
 // invalidInboundSource reports source addresses that RFC 1122 forbids on an

@@ -12,20 +12,20 @@ import (
 	"time"
 )
 
-func benchmarkTCPControllerConnection(b *testing.B, algorithm CongestionControl) net.Conn {
+func benchmarkTCPControllerConnection(b *testing.B, algorithm CongestionControl) (net.Conn, *Stack, *stackBridge) {
 	b.Helper()
 	clientAddress := netip.MustParseAddr("192.0.2.201")
 	serverAddress := netip.MustParseAddr("192.0.2.202")
 	client, err := New(Config{
-		LocalAddresses:    []netip.Prefix{netip.PrefixFrom(clientAddress, 32)},
-		CongestionControl: algorithm,
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(clientAddress, 32)},
+		TCP:            TCPSocketDefaults{CongestionControl: algorithm},
 	})
 	if err != nil {
 		b.Fatal(err)
 	}
 	server, err := New(Config{
-		LocalAddresses:    []netip.Prefix{netip.PrefixFrom(serverAddress, 32)},
-		CongestionControl: algorithm,
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(serverAddress, 32)},
+		TCP:            TCPSocketDefaults{CongestionControl: algorithm},
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -72,14 +72,14 @@ func benchmarkTCPControllerConnection(b *testing.B, algorithm CongestionControl)
 		<-bridge.done
 		<-bridge.done
 	})
-	return connection
+	return connection, server, bridge
 }
 
 func BenchmarkTCPControllerThroughput(b *testing.B) {
 	const size = 4 * 1024 * 1024
 	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
 		b.Run(string(algorithm), func(b *testing.B) {
-			connection := benchmarkTCPControllerConnection(b, algorithm)
+			connection, peer, bridge := benchmarkTCPControllerConnection(b, algorithm)
 			payload := bytes.Repeat([]byte{0x5a}, size)
 			received := make([]byte, size)
 			b.SetBytes(2 * size)
@@ -100,6 +100,32 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 					b.Fatal("echo payload mismatch")
 				}
 			}
+			if tcp, ok := connection.(*TCPConn); ok {
+				info := tcp.Info()
+				stats := tcp.stack.Stats()
+				peerStats := peer.Stats()
+				b.ReportMetric(float64(info.CongestionWindow), "cwnd-B")
+				b.ReportMetric(float64(info.BytesInFlight), "flight-B")
+				b.ReportMetric(float64(info.SlowStartThreshold), "ssthresh-B")
+				b.ReportMetric(float64(info.RTT)/float64(time.Microsecond), "rtt-us")
+				b.ReportMetric(float64(info.Retransmissions), "retransmissions")
+				b.ReportMetric(float64(info.InboundQueueDrops), "connection-queue-drops")
+				b.ReportMetric(float64(stats.InboundDroppedPackets), "rx-drops")
+				b.ReportMetric(float64(stats.TCPInboundQueueDrops), "queue-drops")
+				b.ReportMetric(float64(peerStats.InboundDroppedPackets), "peer-rx-drops")
+				b.ReportMetric(float64(peerStats.TCPInboundQueueDrops), "peer-queue-drops")
+				b.ReportMetric(float64(stats.TCPSACKRetransmissions), "sack-retransmissions")
+				b.ReportMetric(float64(stats.TCPRACKRetransmissions), "rack-retransmissions")
+				b.ReportMetric(float64(stats.TCPTailLossProbes), "tail-loss-probes")
+				b.ReportMetric(float64(info.SendBufferCapacity), "send-buffer-B")
+				b.ReportMetric(float64(info.InboundQueuePeak), "inbound-queue-peak-B")
+				bridge.mu.Lock()
+				b.ReportMetric(float64(bridge.clientGaps), "wire-gaps")
+				b.ReportMetric(float64(bridge.clientRepeats), "wire-repeats")
+				b.ReportMetric(float64(bridge.peerSACKs), "peer-sack-acks")
+				b.ReportMetric(float64(bridge.peerDSACKs), "peer-dsack-acks")
+				bridge.mu.Unlock()
+			}
 		})
 	}
 }
@@ -107,7 +133,7 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 func BenchmarkTCPControllerLatency(b *testing.B) {
 	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
 		b.Run(string(algorithm), func(b *testing.B) {
-			connection := benchmarkTCPControllerConnection(b, algorithm)
+			connection, _, _ := benchmarkTCPControllerConnection(b, algorithm)
 			_ = connection.SetDeadline(time.Now().Add(time.Minute))
 			request := []byte{0x5a}
 			response := make([]byte, 1)
@@ -128,11 +154,11 @@ func benchmarkTCPControllerConnections(b *testing.B, algorithm CongestionControl
 	b.Helper()
 	clientAddress := netip.MustParseAddr("192.0.2.211")
 	serverAddress := netip.MustParseAddr("192.0.2.212")
-	client, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(clientAddress, 32)}, CongestionControl: algorithm})
+	client, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(clientAddress, 32)}, TCP: TCPSocketDefaults{CongestionControl: algorithm}})
 	if err != nil {
 		b.Fatal(err)
 	}
-	server, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(serverAddress, 32)}, CongestionControl: algorithm})
+	server, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(serverAddress, 32)}, TCP: TCPSocketDefaults{CongestionControl: algorithm}})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -211,7 +237,7 @@ func benchmarkTCPControllerConnections(b *testing.B, algorithm CongestionControl
 func BenchmarkTCPControllerConcurrency(b *testing.B) {
 	const size = 128 * 1024
 	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
-		for _, count := range []int{16, 64, 256, 512, 1024, 2048} {
+		for _, count := range []int{16, 64, 256, 512, 1024, 2048, 4096} {
 			b.Run(fmt.Sprintf("%s-%d", algorithm, count), func(b *testing.B) {
 				connections := benchmarkTCPControllerConnections(b, algorithm, count)
 				payload := bytes.Repeat([]byte{0x6b}, size)
@@ -246,5 +272,53 @@ func BenchmarkTCPControllerConcurrency(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+func BenchmarkPacketDeviceBatchRead(b *testing.B) {
+	const payloadSize = 1200
+	for _, batch := range []int{1, deviceBatchSize} {
+		b.Run(fmt.Sprintf("batch-%d", batch), func(b *testing.B) {
+			local := netip.MustParseAddr("192.0.2.221")
+			remote := netip.MustParseAddrPort("192.0.2.222:9000")
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				b.Fatal(err)
+			}
+			connection, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, remote)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() {
+				_ = connection.Close()
+				_ = stack.Close()
+			})
+			payload := make([]byte, payloadSize)
+			buffers := make([][]byte, batch)
+			for index := range buffers {
+				buffers[index] = make([]byte, 1500)
+			}
+			sizes := make([]int, batch)
+			b.SetBytes(payloadSize * deviceBatchSize)
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				for packet := 0; packet < deviceBatchSize; packet++ {
+					if _, err = connection.Write(payload); err != nil {
+						b.Fatal(err)
+					}
+				}
+				read := 0
+				for read < deviceBatchSize {
+					count, readErr := stack.Read(buffers, sizes, 0)
+					if readErr != nil {
+						b.Fatal(readErr)
+					}
+					read += count
+				}
+			}
+		})
 	}
 }

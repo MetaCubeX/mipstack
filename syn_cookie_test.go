@@ -12,7 +12,8 @@ import (
 func TestSYNCookieBacklogHandshake(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.51")
 	remote := netip.MustParseAddr("198.51.100.51")
-	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	initialTCP := TCPSocketDefaults{ReceiveBuffer: 128 * 1024, MaximumReceiveBuffer: 2 * 1024 * 1024}
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, TCP: initialTCP})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +56,10 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 		t.Fatalf("SYN-cookie flags/ack = %#x/%#x", tcp[13], binary.BigEndian.Uint32(tcp[8:12]))
 	}
 	serverSequence := binary.BigEndian.Uint32(tcp[4:8])
+	_, serverWindowScale, serverWindowScaling, _, _, _ := parseTCPOptions(tcp[tcpHeaderSize:headerSize], 536, 65535)
+	if !serverWindowScaling {
+		t.Fatal("SYN cookie did not advertise window scaling")
+	}
 	serverTimestamp, _, timestampPresent := parseTCPTimestamp(tcp[tcpHeaderSize:headerSize])
 	if !timestampPresent {
 		t.Fatal("SYN cookie did not preserve timestamp negotiation")
@@ -69,6 +74,12 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	listener.mu.Lock()
 	listener.pending = make(map[*TCPConn]struct{})
 	listener.mu.Unlock()
+	if err = stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+		TCP:            TCPSocketDefaults{ReceiveBuffer: 64 * 1024, MaximumReceiveBuffer: 128 * 1024},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	ackOptions := tcpTimestampOptions(clientTimestamp+1, serverTimestamp)
 	ack := buildTestTCP(remote, local, 43001, 47002, clientSequence+1, serverSequence+1, tcpFlagACK, 1234, ackOptions, nil)
 	if err = writeTestPacket(stack, ack); err != nil {
@@ -91,8 +102,84 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	if connection.peerWindow != uint32(1234)<<5 {
 		t.Fatalf("restored peer window = %d, want %d", connection.peerWindow, uint32(1234)<<5)
 	}
+	if connection.receiveWindowScale != serverWindowScale {
+		t.Fatalf("restored local window scale = %d, want advertised %d", connection.receiveWindowScale, serverWindowScale)
+	}
 	if connection.RemoteAddr().(*net.TCPAddr).AddrPort() != netip.AddrPortFrom(remote, 43001) {
 		t.Fatalf("cookie connection remote = %v", connection.RemoteAddr())
+	}
+}
+
+// TestSYNCookieListenerCloseResetsPendingConnection covers the race where a
+// validated cookie ACK creates state immediately before the listener closes.
+func TestSYNCookieListenerCloseResetsPendingConnection(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.52")
+	remote := netip.MustParseAddr("198.51.100.52")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	listener, err := stack.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(local, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).AddrPort().Port()
+	key := tcpKey{
+		local:  netip.AddrPortFrom(local, port),
+		remote: netip.AddrPortFrom(remote, 43002),
+	}
+	connection := newTCPConn(stack, "tcp4", key, 1500)
+	connection.passive = true
+	connection.receiveNext = 0x12345679
+	if !listener.track(connection) {
+		t.Fatal("failed to track pending cookie connection")
+	}
+	if err = listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	const initialSequence = uint32(0x87654321)
+	connection.runPassiveCookie(listener, tcpSegment{}, initialSequence)
+	packet := readOutboundPacket(t, stack)
+	parsed, ok := parseIPPacket(packet)
+	if !ok || parsed.protocol != protocolTCP || len(parsed.payload) < tcpHeaderSize {
+		t.Fatalf("invalid abort reset: %x", packet)
+	}
+	tcp := parsed.payload
+	if tcp[13] != tcpFlagRST|tcpFlagACK || binary.BigEndian.Uint32(tcp[4:8]) != initialSequence+1 ||
+		binary.BigEndian.Uint32(tcp[8:12]) != connection.receiveNext {
+		t.Fatalf("abort reset flags/sequence/ack = %#x/%#x/%#x", tcp[13], binary.BigEndian.Uint32(tcp[4:8]), binary.BigEndian.Uint32(tcp[8:12]))
+	}
+}
+
+func TestSYNCookieHonorsConfiguredReceiveWindow(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.61")
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+		TCP:            TCPSocketDefaults{ReceiveBuffer: 4096, MaximumReceiveBuffer: 4096},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	key := tcpKey{local: netip.MustParseAddrPort("192.0.2.61:8080"), remote: netip.MustParseAddrPort("198.51.100.61:40000")}
+	syn := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}
+	if err = (&tcpPassiveState{}).sendSYNCookie(stack, key, syn, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	packet := readOutboundPacket(t, stack)
+	parsed, ok := parseIPPacket(packet)
+	if !ok || len(parsed.payload) < tcpHeaderSize {
+		t.Fatalf("invalid SYN-cookie packet: %x", packet)
+	}
+	if window := binary.BigEndian.Uint16(parsed.payload[14:16]); window != 4096 {
+		t.Fatalf("SYN-cookie receive window = %d, want 4096", window)
 	}
 }
 
@@ -107,7 +194,10 @@ func TestSYNCookieValidationIPv4AndIPv6(t *testing.T) {
 		{name: "IPv6", local: netip.MustParseAddr("2001:db8::61"), remote: netip.MustParseAddr("2001:db8:1::61")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			state := &tcpPassiveState{cookieSet: true, cookieActive: true, cookieEpoch: now, cookiePeriod: 0}
+			state := &tcpPassiveState{
+				cookieSet: true, cookieActive: true, cookieEpoch: now, cookiePeriod: 0,
+				cookieScaleSet: true, cookieScalePeriod: 0, cookieWindowScale: 4,
+			}
 			for index := range state.cookieKey {
 				state.cookieKey[index] = byte(index + 1)
 			}
@@ -132,5 +222,48 @@ func TestSYNCookieValidationIPv4AndIPv6(t *testing.T) {
 				t.Fatal("cookie ACK was accepted without recent cookie issuance")
 			}
 		})
+	}
+}
+
+func TestSYNCookieWindowScaleRotatesByPeriod(t *testing.T) {
+	now := time.Unix(2000001000, 0)
+	state := &tcpPassiveState{}
+	secret, period, firstScale, err := state.synCookieKey(now, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.noteSYNCookie(period)
+	if firstScale != 2 {
+		t.Fatalf("first SYN-cookie scale = %d, want 2", firstScale)
+	}
+	_, samePeriod, stableScale, err := state.synCookieKey(now.Add(time.Second), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if samePeriod != period || stableScale != 2 {
+		t.Fatalf("same-period SYN-cookie scale = period %d scale %d, want %d/2", samePeriod, stableScale, period)
+	}
+
+	key := tcpKey{
+		local:  netip.MustParseAddrPort("192.0.2.70:443"),
+		remote: netip.MustParseAddrPort("198.51.100.70:50000"),
+	}
+	clientSequence := uint32(100)
+	data := uint32(0)
+	cookie := synCookieSequence(secret, key, clientSequence, period, data, data)
+	ack := tcpSegment{sequence: clientSequence + 1, acknowledgement: cookie + 1, flags: tcpFlagACK}
+
+	next := now.Add(synCookiePeriod)
+	_, nextPeriod, nextScale, err := state.synCookieKey(next, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.noteSYNCookie(nextPeriod)
+	if nextPeriod != period+1 || nextScale != 7 {
+		t.Fatalf("next-period SYN-cookie scale = period %d scale %d, want %d/7", nextPeriod, nextScale, period+1)
+	}
+	_, options, valid := state.validateSYNCookie(key, ack, next)
+	if !valid || options.localWindowScale != 2 {
+		t.Fatalf("previous-period cookie = valid %t scale %d, want true/2", valid, options.localWindowScale)
 	}
 }

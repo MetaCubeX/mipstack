@@ -13,7 +13,7 @@ func TestIPv4ControlMessageMarshalAndParse(t *testing.T) {
 		t.Fatal(err)
 	}
 	parsedSource, options, err := parseControlMessageForWrite(control, false)
-	if err != nil || parsedSource != source || options != (ipPacketOptions{hopLimit: 31, trafficClass: 0xb8}) {
+	if err != nil || parsedSource != source || options != (ipPacketOptions{hopLimit: 31, trafficClass: 0xb8, hopLimitSet: true, trafficClassSet: true}) {
 		t.Fatalf("marshaled IPv4 control = source %v options %+v, %v", parsedSource, options, err)
 	}
 	var incoming IPv4ControlMessage
@@ -40,7 +40,7 @@ func TestIPv6ControlMessageMarshalAndParse(t *testing.T) {
 		t.Fatal(err)
 	}
 	parsedSource, options, err := parseControlMessageForWrite(control, true)
-	if err != nil || parsedSource != source || options != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e}) {
+	if err != nil || parsedSource != source || options != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e, hopLimitSet: true, trafficClassSet: true}) {
 		t.Fatalf("marshaled IPv6 control = source %v options %+v, %v", parsedSource, options, err)
 	}
 	var incoming IPv6ControlMessage
@@ -100,6 +100,15 @@ func TestControlMessageValidation(t *testing.T) {
 		if err != nil || parsedAddress != address || options.hopLimit != 0 {
 			t.Fatalf("zero-hop control for %v = %v, %+v, %v", address, parsedAddress, options, err)
 		}
+	}
+	zeroHopLimit := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6HopLimit, 0)
+	_, options, err := parseLinuxIPControlValues(zeroHopLimit, true, false)
+	if err != nil || options.hopLimit != 0 || !options.hopLimitSet {
+		t.Fatalf("IPv6 zero hop-limit control = %+v, %v", options, err)
+	}
+	zeroTTL := appendLinuxControlInt32(nil, linuxLevelIP, linuxIPTimeToLive, 0)
+	if _, _, err = parseLinuxIPControlValues(zeroTTL, false, false); err == nil {
+		t.Fatal("IPv4 zero TTL control message parsed successfully")
 	}
 }
 

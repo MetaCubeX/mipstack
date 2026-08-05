@@ -110,16 +110,17 @@ func (message *IPv4ControlMessage) Parse(control []byte) error {
 	return nil
 }
 
-// parseForWrite decodes send metadata into Src and the header fields.
-func (message *IPv4ControlMessage) parseForWrite(control []byte) error {
+// parseForWrite decodes send metadata into Src and the header fields while
+// retaining whether a zero-valued field was explicitly present.
+func (message *IPv4ControlMessage) parseForWrite(control []byte) (ipPacketOptions, error) {
 	address, options, err := parseLinuxIPControlValues(control, false, false)
 	if err != nil {
-		return err
+		return ipPacketOptions{}, err
 	}
 	*message = IPv4ControlMessage{
 		TTL: int(options.hopLimit), TOS: int(options.trafficClass), Src: address,
 	}
-	return nil
+	return options, nil
 }
 
 // IPv6ControlMessage represents per-packet IPv6 metadata carried by
@@ -207,16 +208,17 @@ func (message *IPv6ControlMessage) Parse(control []byte) error {
 	return nil
 }
 
-// parseForWrite decodes send metadata into Src and the header fields.
-func (message *IPv6ControlMessage) parseForWrite(control []byte) error {
+// parseForWrite decodes send metadata into Src and the header fields while
+// retaining whether a zero-valued field was explicitly present.
+func (message *IPv6ControlMessage) parseForWrite(control []byte) (ipPacketOptions, error) {
 	address, options, err := parseLinuxIPControlValues(control, true, false)
 	if err != nil {
-		return err
+		return ipPacketOptions{}, err
 	}
 	*message = IPv6ControlMessage{
 		TrafficClass: int(options.trafficClass), HopLimit: int(options.hopLimit), Src: address,
 	}
-	return nil
+	return options, nil
 }
 
 // linuxPacketInfoControl encodes source-selection metadata. Interface index
@@ -271,16 +273,18 @@ func appendLinuxControlInt32(control []byte, level, kind uint32, value int32) []
 func parseControlMessageForWrite(control []byte, v6 bool) (netip.Addr, ipPacketOptions, error) {
 	if v6 {
 		var message IPv6ControlMessage
-		if err := message.parseForWrite(control); err != nil {
+		options, err := message.parseForWrite(control)
+		if err != nil {
 			return netip.Addr{}, ipPacketOptions{}, err
 		}
-		return message.Src, ipPacketOptions{hopLimit: byte(message.HopLimit), trafficClass: byte(message.TrafficClass)}, nil
+		return message.Src, options, nil
 	}
 	var message IPv4ControlMessage
-	if err := message.parseForWrite(control); err != nil {
+	options, err := message.parseForWrite(control)
+	if err != nil {
 		return netip.Addr{}, ipPacketOptions{}, err
 	}
-	return message.Src, ipPacketOptions{hopLimit: byte(message.TTL), trafficClass: byte(message.TOS)}, nil
+	return message.Src, options, nil
 }
 
 // parseLinuxIPControlValues validates cmsghdr framing and extracts raw values.
@@ -332,25 +336,25 @@ func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPa
 			if v6 || err != nil || value < 0 || !receiving && value == 0 || value > 255 || haveHopLimit {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv4 TTL control message")
 			}
-			options.hopLimit, haveHopLimit = byte(value), true
+			options.hopLimit, options.hopLimitSet, haveHopLimit = byte(value), true, true
 		case level == linuxLevelIP && kind == linuxIPTypeOfService:
 			value, err := linuxControlByteOrInt32(data)
 			if v6 || err != nil || value < 0 || value > 255 || haveTrafficClass {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv4 TOS control message")
 			}
-			options.trafficClass, haveTrafficClass = byte(value), true
+			options.trafficClass, options.trafficClassSet, haveTrafficClass = byte(value), true, true
 		case level == linuxLevelIPv6 && kind == linuxIPv6HopLimit:
 			value, err := linuxControlInt32(data)
-			if !v6 || err != nil || value < 0 || !receiving && value == 0 || value > 255 || haveHopLimit {
+			if !v6 || err != nil || value < 0 || value > 255 || haveHopLimit {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 hop-limit control message")
 			}
-			options.hopLimit, haveHopLimit = byte(value), true
+			options.hopLimit, options.hopLimitSet, haveHopLimit = byte(value), true, true
 		case level == linuxLevelIPv6 && kind == linuxIPv6TrafficClass:
 			value, err := linuxControlInt32(data)
 			if !v6 || err != nil || value < 0 || value > 255 || haveTrafficClass {
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: invalid IPv6 traffic-class control message")
 			}
-			options.trafficClass, haveTrafficClass = byte(value), true
+			options.trafficClass, options.trafficClassSet, haveTrafficClass = byte(value), true, true
 		default:
 			return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: unsupported Linux IP control message")
 		}

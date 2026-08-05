@@ -530,3 +530,100 @@ func TestUnconnectedIPReadAndConnectedWriteToError(t *testing.T) {
 		t.Fatalf("connected IP WriteTo = %v, want net.ErrWriteToConnected", err)
 	}
 }
+
+func TestIPDefaultsAndDiagnostics(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::136")
+	remote := netip.MustParseAddr("2001:db8::137")
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}, MTU: 1400,
+		IP: DatagramSocketDefaults{ReceiveBuffer: 2048, HopLimit: 29, TrafficClass: 0x28},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	connection, err := stack.DialIP(context.Background(), "ip6:99", netip.Addr{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip := connection.(*IPConn)
+	if err = ip.SetHopLimit(41); err != nil {
+		t.Fatal(err)
+	}
+	if err = ip.SetTrafficClass(0x2e); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ip.Write([]byte("query")); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.hopLimit != 41 || packet.trafficClass != 0x2e || packet.protocol != 99 {
+		t.Fatalf("IP output options = protocol %d hop %d class %#x", packet.protocol, packet.hopLimit, packet.trafficClass)
+	}
+	if err = writeTestPacket(stack, buildIPPacket(remote, local, 99, []byte("answer"), 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 32)
+	if n, readErr := ip.Read(buffer); readErr != nil || string(buffer[:n]) != "answer" {
+		t.Fatalf("IP Read = %q, %v", buffer[:n], readErr)
+	}
+	if err = ip.SetReadBuffer(ipDatagramMetadataSize); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 2; index++ {
+		if err = writeTestPacket(stack, buildIPPacket(remote, local, 99, nil, uint16(index+2), true)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	info := ip.Info()
+	if info.Protocol != 99 || info.PacketsSent != 1 || info.BytesSent != 5 || info.PacketsReceived != 2 || info.BytesReceived != 6 ||
+		info.PacketsDropped != 1 || info.ReceiveQueuePackets != 1 || info.ReceiveQueueBytes != ipDatagramMetadataSize ||
+		info.ReceiveQueueCapacity != ipDatagramMetadataSize || info.PathMTU != 1400 || info.HopLimit != 41 || info.TrafficClass != 0x2e {
+		t.Fatalf("IP Info = %+v", info)
+	}
+}
+
+func TestIPZeroHopLimitFamilyValidation(t *testing.T) {
+	local4 := netip.MustParseAddr("192.0.2.136")
+	remote4 := netip.MustParseAddr("198.51.100.136")
+	local6 := netip.MustParseAddr("2001:db8::136")
+	remote6 := netip.MustParseAddr("2001:db8:1::136")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(local4, 32), netip.PrefixFrom(local6, 128),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection6, err := stack.DialIP(context.Background(), "ip6:99", netip.Addr{}, remote6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip6 := connection6.(*IPConn)
+	defer ip6.Close()
+	if err = ip6.SetHopLimit(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ip6.Write([]byte("zero")); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.hopLimit != 0 || packet.target != remote6 {
+		t.Fatalf("IPv6 default zero hop-limit packet = target %v hop %d, parsed = %v", packet.target, packet.hopLimit, ok)
+	}
+	connection4, err := stack.DialIP(context.Background(), "ip4:99", netip.Addr{}, remote4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip4 := connection4.(*IPConn)
+	defer ip4.Close()
+	if err = ip4.SetHopLimit(0); err == nil {
+		t.Fatal("IPv4 SetHopLimit(0) succeeded")
+	}
+}

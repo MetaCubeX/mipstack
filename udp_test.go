@@ -74,6 +74,127 @@ func TestUDPConcurrentDemultiplexing(t *testing.T) {
 	}
 }
 
+func TestUDPPacketizationLayerPathMTUDiscovery(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		local      netip.Addr
+		remote     netip.Addr
+		baseMTU    uint32
+		payloadLen int
+		connected  bool
+	}{
+		{name: "IPv4 connected", local: netip.MustParseAddr("192.0.2.231"), remote: netip.MustParseAddr("198.51.100.231"), baseMTU: 1000, payloadLen: 1200, connected: true},
+		{name: "IPv6 unconnected", local: netip.MustParseAddr("2001:db8::231"), remote: netip.MustParseAddr("2001:db8:1::231"), baseMTU: 1280, payloadLen: 1400},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bits := 32
+			if test.local.Is6() {
+				bits = 128
+			}
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.local, bits)}, MTU: 1500})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stack.Close() })
+			if !stack.observePathMTU(test.remote, test.baseMTU) {
+				t.Fatal("failed to install base PMTU")
+			}
+			target := netip.AddrPortFrom(test.remote, 5353)
+			var connection *UDPConn
+			if test.connected {
+				var netConnection net.Conn
+				netConnection, err = stack.DialUDP(context.Background(), "udp", netip.AddrPort{}, target)
+				if err == nil {
+					connection = netConnection.(*UDPConn)
+				}
+			} else {
+				var packetConnection net.PacketConn
+				packetConnection, err = stack.ListenUDP(context.Background(), "udp", netip.AddrPort{})
+				if err == nil {
+					connection = packetConnection.(*UDPConn)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			payload := bytes.Repeat([]byte{0x5a}, test.payloadLen)
+			if test.connected {
+				if _, err = connection.Write(payload); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err = connection.WriteToUDPAddrPort(payload, target); err != nil {
+				t.Fatal(err)
+			}
+			readPacket := func() []byte {
+				buffer := make([]byte, 1600)
+				sizes := []int{0}
+				if _, readErr := stack.Read([][]byte{buffer}, sizes, 0); readErr != nil {
+					t.Fatal(readErr)
+				}
+				return append([]byte(nil), buffer[:sizes[0]]...)
+			}
+			for fragment := 0; fragment < 2; fragment++ {
+				if packet := readPacket(); len(packet) > int(test.baseMTU) {
+					t.Fatalf("ordinary UDP fragment size = %d, want <= %d", len(packet), test.baseMTU)
+				}
+			}
+			if test.connected {
+				if _, err = connection.WritePathMTUProbe(payload); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err = connection.WritePathMTUProbeTo(payload, target); err != nil {
+				t.Fatal(err)
+			}
+			probe := readPacket()
+			wantProbeSize := test.payloadLen + udpHeaderSize + 20
+			if test.remote.Is6() {
+				wantProbeSize = test.payloadLen + udpHeaderSize + 40
+			}
+			if len(probe) != wantProbeSize {
+				t.Fatalf("UDP path probe size = %d, want %d", len(probe), wantProbeSize)
+			}
+			if test.connected {
+				err = connection.ConfirmPathMTU(wantProbeSize)
+			} else {
+				err = connection.ConfirmPathMTUFor(test.remote, wantProbeSize)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mtu, pathErr := stack.PathMTU(test.remote); pathErr != nil || mtu != wantProbeSize {
+				t.Fatalf("confirmed UDP PMTU = %d, %v, want %d", mtu, pathErr, wantProbeSize)
+			}
+		})
+	}
+}
+
+func TestUDPPathMTUConfirmationCanRaiseExpiredBaseline(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.150")
+	remote := netip.MustParseAddr("192.0.2.151")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stack.observePathMTU(remote, 1000) {
+		t.Fatal("initial path MTU was not recorded")
+	}
+	stack.pathMTUMu.Lock()
+	entry := stack.pathMTU[remote]
+	entry.updated = time.Now().Add(-pathMTULifetime)
+	stack.pathMTU[remote] = entry
+	stack.pathMTUMu.Unlock()
+	if err = stack.ConfirmPathMTU(remote, 1200); err != nil {
+		t.Fatalf("confirming above expired baseline: %v", err)
+	}
+	if mtu, pathErr := stack.PathMTU(remote); pathErr != nil || mtu != 1200 {
+		t.Fatalf("confirmed path MTU = %d, %v, want 1200", mtu, pathErr)
+	}
+}
+
 func BenchmarkUDPDatagramRoundTrip(b *testing.B) {
 	link, stack := newTestStack(b, netip.MustParseAddr("192.0.2.241"), netip.MustParseAddr("198.51.100.241"))
 	link.mu.Lock()
@@ -179,7 +300,7 @@ func TestConnectedUDP(t *testing.T) {
 			if _, err = udpConnection.WriteTo(payload, net.UDPAddrFromAddrPort(remote)); err == nil {
 				t.Fatal("WriteTo on connected UDP succeeded")
 			} else {
-				checkNetOpError(t, err, "write", udpConnection.network())
+				checkNetOpError(t, err, "write", udpConnection.net)
 			}
 
 			spoof, err := peer.ListenUDP(context.Background(), `udp`, wildcardUDP(test.client))
@@ -602,6 +723,74 @@ func TestUDPMessageControlValidationAndWriteBuffer(t *testing.T) {
 	}
 }
 
+func TestUDPMessageIPv6ZeroHopLimit(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::99")
+	remote := netip.MustParseAddr("2001:db8:1::99")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	packetConnection, err := stack.ListenUDP(context.Background(), "udp6", netip.AddrPortFrom(local, 50017))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := packetConnection.(*UDPConn)
+	defer connection.Close()
+	if err = connection.SetHopLimit(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = connection.WriteToUDPAddrPort([]byte("default-zero"), netip.AddrPortFrom(remote, 50018)); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.hopLimit != 0 || packet.target != remote {
+		t.Fatalf("IPv6 default zero hop-limit packet = target %v hop %d, parsed = %v", packet.target, packet.hopLimit, ok)
+	}
+	control := appendLinuxControlInt32(nil, linuxLevelIPv6, linuxIPv6HopLimit, 0)
+	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("zero"), control, netip.AddrPortFrom(remote, 50018)); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.hopLimit != 0 || packet.target != remote {
+		t.Fatalf("IPv6 zero hop-limit packet = target %v hop %d, parsed = %v", packet.target, packet.hopLimit, ok)
+	}
+}
+
+func TestUDPZeroHopLimitFamilyValidation(t *testing.T) {
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.MustParsePrefix("192.0.2.99/32"), netip.MustParsePrefix("2001:db8::99/128"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	for _, test := range []struct {
+		name, network string
+		local         netip.AddrPort
+	}{
+		{name: "IPv4", network: "udp4", local: netip.MustParseAddrPort("192.0.2.99:50019")},
+		{name: "dual stack", network: "udp", local: netip.AddrPort{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			packetConnection, listenErr := stack.ListenUDP(context.Background(), test.network, test.local)
+			if listenErr != nil {
+				t.Fatal(listenErr)
+			}
+			defer packetConnection.Close()
+			if setErr := packetConnection.(*UDPConn).SetHopLimit(0); setErr == nil {
+				t.Fatal("SetHopLimit(0) succeeded")
+			}
+		})
+	}
+}
+
 func TestUDPConnectedMessageMethods(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.100")
 	remote := netip.MustParseAddr("198.51.100.100")
@@ -730,5 +919,68 @@ func TestUDPIPv4MappedNetAddrWrites(t *testing.T) {
 	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
 	if !ok || packet.target != remote || string(packet.payload[udpHeaderSize:]) != "message" {
 		t.Fatalf("mapped WriteMsgUDP = %v -> %v payload %q, parsed = %v", packet.source, packet.target, packet.payload, ok)
+	}
+}
+
+func TestUDPDefaultsAndDiagnostics(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.134")
+	remote := netip.MustParseAddr("192.0.2.135")
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400,
+		UDP: DatagramSocketDefaults{ReceiveBuffer: 2048, HopLimit: 31, TrafficClass: 0xb8},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	connection, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 5353))
+	if err != nil {
+		t.Fatal(err)
+	}
+	udp := connection.(*UDPConn)
+	if err = udp.SetHopLimit(37); err != nil {
+		t.Fatal(err)
+	}
+	if err = udp.SetTrafficClass(0x2e); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = udp.Write([]byte("query")); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.hopLimit != 37 || packet.trafficClass != 0x2e {
+		t.Fatalf("UDP output options = hop %d class %#x", packet.hopLimit, packet.trafficClass)
+	}
+	zeroClass := appendLinuxControlInt32(nil, linuxLevelIP, linuxIPTypeOfService, 0)
+	if _, _, err = udp.WriteMsgUDP([]byte("zero"), zeroClass, nil); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.hopLimit != 37 || packet.trafficClass != 0 {
+		t.Fatalf("UDP explicit zero traffic class = hop %d class %#x", packet.hopLimit, packet.trafficClass)
+	}
+	if err = writeTestPacket(stack, buildTestUDP(remote, local, 5353, udp.port, []byte("answer"))); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 32)
+	if n, readErr := udp.Read(buffer); readErr != nil || string(buffer[:n]) != "answer" {
+		t.Fatalf("UDP Read = %q, %v", buffer[:n], readErr)
+	}
+	if err = udp.SetReadBuffer(udpDatagramMetadataSize); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 2; index++ {
+		if err = writeTestPacket(stack, buildTestUDP(remote, local, 5353, udp.port, nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	info := udp.Info()
+	if info.PacketsSent != 2 || info.BytesSent != 9 || info.PacketsReceived != 2 || info.BytesReceived != 6 ||
+		info.PacketsDropped != 1 || info.ReceiveQueuePackets != 1 || info.ReceiveQueueBytes != udpDatagramMetadataSize ||
+		info.ReceiveQueueCapacity != udpDatagramMetadataSize || info.PathMTU != 1400 || info.HopLimit != 37 || info.TrafficClass != 0x2e {
+		t.Fatalf("UDP Info = %+v", info)
 	}
 }

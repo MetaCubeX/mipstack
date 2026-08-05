@@ -18,6 +18,14 @@ const (
 )
 
 const (
+	// RFC 9406 HyStart++ delay-increase and Conservative Slow Start values.
+	hyStartMinimumRTTThreshold = 4 * time.Millisecond
+	hyStartMaximumRTTThreshold = 16 * time.Millisecond
+	hyStartRTTDivisor          = 8
+	hyStartMinimumRTTSamples   = 8
+	hyStartCSSGrowthDivisor    = 4
+	hyStartCSSRounds           = 5
+
 	// bbrBandwidthWindow is the number of packet-timed rounds retained by the
 	// bottleneck-bandwidth max filter.
 	bbrBandwidthWindow = 10
@@ -73,6 +81,104 @@ type tcpCongestionController struct {
 	pacingSegments uint64
 	cubic          cubicCongestionControl
 	bbr            bbrCongestionControl
+}
+
+// tcpHyStart implements RFC 9406 round tracking and Conservative Slow Start.
+// It is used only for the initial Reno/CUBIC slow start; BBR owns its Startup
+// transition and post-loss slow starts use ordinary RFC 5681 behavior.
+type tcpHyStart struct {
+	windowEnd       uint32
+	lastRoundMinRTT time.Duration
+	currentMinRTT   time.Duration
+	samples         int
+	css             bool
+	cssBaselineRTT  time.Duration
+	cssRounds       int
+	cssCredit       uint32
+	done            bool
+}
+
+// start initializes sequence-number round measurement at SND.NXT.
+func (h *tcpHyStart) start(sendNext uint32) {
+	*h = tcpHyStart{windowEnd: sendNext}
+}
+
+// restartRound discards measurements that span an application-idle restart.
+func (h *tcpHyStart) restartRound(sendNext uint32) {
+	if h.done {
+		return
+	}
+	h.windowEnd = sendNext
+	h.lastRoundMinRTT = 0
+	h.currentMinRTT = 0
+	h.samples = 0
+	h.css = false
+	h.cssBaselineRTT = 0
+	h.cssRounds = 0
+	h.cssCredit = 0
+}
+
+// disable prevents HyStart++ from restarting after loss, ECN, or completion.
+func (h *tcpHyStart) disable() {
+	h.done = true
+	h.css = false
+	h.cssCredit = 0
+}
+
+// onACK returns the byte credit that slow start may apply and whether CSS has
+// completed. The caller sets ssthresh to the current cwnd on completion.
+func (h *tcpHyStart) onACK(acknowledgement, sendNext, acknowledged uint32, sampleRTT time.Duration) (uint32, bool) {
+	if h.done || acknowledged == 0 {
+		return acknowledged, false
+	}
+	if tcpSequenceGreaterEqual(acknowledgement, h.windowEnd) {
+		if h.css {
+			if h.cssRounds >= hyStartCSSRounds {
+				h.disable()
+				return acknowledged, true
+			}
+			h.cssRounds++
+		}
+		h.lastRoundMinRTT = h.currentMinRTT
+		h.currentMinRTT = 0
+		h.samples = 0
+		h.windowEnd = sendNext
+	}
+	if sampleRTT > 0 {
+		if h.currentMinRTT == 0 || sampleRTT < h.currentMinRTT {
+			h.currentMinRTT = sampleRTT
+		}
+		h.samples++
+	}
+	if h.samples >= hyStartMinimumRTTSamples {
+		if h.css {
+			if h.currentMinRTT < h.cssBaselineRTT {
+				h.css = false
+				h.cssBaselineRTT = 0
+				h.cssRounds = 0
+				h.cssCredit = 0
+			}
+		} else if h.lastRoundMinRTT > 0 && h.currentMinRTT > 0 {
+			threshold := h.lastRoundMinRTT / hyStartRTTDivisor
+			if threshold < hyStartMinimumRTTThreshold {
+				threshold = hyStartMinimumRTTThreshold
+			} else if threshold > hyStartMaximumRTTThreshold {
+				threshold = hyStartMaximumRTTThreshold
+			}
+			if h.currentMinRTT >= h.lastRoundMinRTT+threshold {
+				h.css = true
+				h.cssBaselineRTT = h.currentMinRTT
+				h.cssRounds = 1 // A partial transition round counts per RFC 9406.
+			}
+		}
+	}
+	if !h.css {
+		return acknowledged, false
+	}
+	credit := uint64(h.cssCredit) + uint64(acknowledged)
+	growth := uint32(credit / hyStartCSSGrowthDivisor)
+	h.cssCredit = uint32(credit % hyStartCSSGrowthDivisor)
+	return growth, false
 }
 
 // newTCPCongestionController constructs one per-connection controller.
@@ -133,12 +239,12 @@ func (c *tcpCongestionController) onACK(window, acknowledged uint32, mss int, no
 	if slowStart {
 		threshold = ^uint32(0)
 	}
-	return c.onACKWithThreshold(window, acknowledged, mss, now, smoothedRTT, sampleRTT, flight, threshold)
+	return c.onACKWithThreshold(window, acknowledged, mss, now, smoothedRTT, sampleRTT, flight, threshold, !congestionWindowLimited(window, flight, mss))
 }
 
 // onACKWithThreshold splits one cumulative ACK at the slow-start boundary,
 // matching Linux tcp_slow_start's returned congestion-avoidance credit.
-func (c *tcpCongestionController) onACKWithThreshold(window, acknowledged uint32, mss int, now time.Time, smoothedRTT, sampleRTT time.Duration, flight, slowStartThreshold uint32) uint32 {
+func (c *tcpCongestionController) onACKWithThreshold(window, acknowledged uint32, mss int, now time.Time, smoothedRTT, sampleRTT time.Duration, flight, slowStartThreshold uint32, applicationLimited bool) uint32 {
 	if window == 0 || acknowledged == 0 || mss < 1 {
 		return window
 	}
@@ -160,7 +266,7 @@ func (c *tcpCongestionController) onACKWithThreshold(window, acknowledged uint32
 		}
 		return applyCongestionIncrease(window, &c.renoCredit, additiveIncrease(window, acknowledged, mss))
 	case CongestionControlBBR:
-		return c.bbr.onACK(window, acknowledged, mss, now, smoothedRTT, sampleRTT, flight, !congestionWindowLimited(window, flight, mss))
+		return c.bbr.onACK(window, acknowledged, mss, now, smoothedRTT, sampleRTT, flight, applicationLimited)
 	default:
 		if !congestionWindowLimited(window, flight, mss) {
 			c.cubic.onApplicationLimited(now)
@@ -185,11 +291,11 @@ func (c *tcpCongestionController) onACKWithThreshold(window, acknowledged uint32
 // while PRR or packet conservation owns the recovery congestion window. Linux
 // likewise runs BBR's model update for recovery ACKs before applying the
 // recovery-specific cwnd bound. Reno and CUBIC have no model-only work here.
-func (c *tcpCongestionController) observeRecoveryACK(window, acknowledged uint32, mss int, now time.Time, smoothedRTT, sampleRTT time.Duration, flight uint32) {
+func (c *tcpCongestionController) observeRecoveryACK(window, acknowledged uint32, mss int, now time.Time, smoothedRTT, sampleRTT time.Duration, flight uint32, applicationLimited bool) {
 	if c.algorithm != CongestionControlBBR || window == 0 || acknowledged == 0 || mss < 1 {
 		return
 	}
-	_ = c.bbr.onACK(window, acknowledged, mss, now, smoothedRTT, sampleRTT, flight, !congestionWindowLimited(window, flight, mss))
+	_ = c.bbr.onACK(window, acknowledged, mss, now, smoothedRTT, sampleRTT, flight, applicationLimited)
 }
 
 // congestionWindowLimited mirrors Linux's packet-granularity allowance: a
@@ -426,7 +532,6 @@ type cubicCongestionControl struct {
 	lastSend           time.Time
 	applicationLimited time.Time
 	lastMaximum        float64
-	previousMaximum    float64
 	priorWindow        float64
 	estimate           float64
 	origin             float64
@@ -472,12 +577,11 @@ func (c *cubicCongestionControl) onECN(window uint32, mss int) uint32 {
 // reduce updates CUBIC state for one congestion event.
 func (c *cubicCongestionControl) reduce(window uint32, mss, minimumSegments int) uint32 {
 	current := float64(window) / float64(mss)
-	if c.previousMaximum != 0 && current < c.previousMaximum {
+	if c.lastMaximum != 0 && current < c.lastMaximum {
 		c.lastMaximum = current * 0.85
 	} else {
 		c.lastMaximum = current
 	}
-	c.previousMaximum = current
 	c.epochStart = time.Time{}
 	c.applicationLimited = time.Time{}
 	c.priorWindow = current
@@ -495,7 +599,6 @@ func (c *cubicCongestionControl) onTimeout(window uint32, mss int) uint32 {
 	c.lastSend = time.Time{}
 	c.applicationLimited = time.Time{}
 	c.lastMaximum = 0
-	c.previousMaximum = 0
 	// cwnd_prior is the window at the most recent ssthresh update, even
 	// though W_max for the next epoch is reset at the later CA entry point.
 	// Keeping the two values distinct prevents W_est from switching to
@@ -521,7 +624,6 @@ func (c *cubicCongestionControl) onACK(window, acknowledged uint32, mss int, now
 		c.estimate = current
 		if c.afterTimeout {
 			c.lastMaximum = current
-			c.previousMaximum = current
 			c.origin = current
 			c.k = 0
 			c.afterTimeout = false
@@ -724,8 +826,11 @@ func (b *bbrCongestionControl) observeBandwidth(acknowledged uint32, now time.Ti
 			sample = float64(acknowledged) / rtt.Seconds()
 		}
 		b.sampleStart = now
-	} else if now.After(b.sampleStart) {
+	} else {
 		b.sampleBytes += uint64(acknowledged)
+		if !now.After(b.sampleStart) {
+			return
+		}
 		interval := now.Sub(b.sampleStart)
 		minimumInterval := b.minimumRTT / 4
 		if minimumInterval < 2*time.Millisecond {

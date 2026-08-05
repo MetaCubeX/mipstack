@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -18,6 +19,64 @@ var _ func(*Stack, context.Context, string, netip.AddrPort) (*TCPListener, error
 var _ func(*Stack, context.Context, string, netip.AddrPort) (net.PacketConn, error) = (*Stack).ListenUDP
 var _ func(*Stack, context.Context, string, netip.AddrPort) (*TCPListener, error) = (*Stack).ListenTCPReusePort
 var _ func(*Stack, context.Context, string, netip.AddrPort) (net.PacketConn, error) = (*Stack).ListenUDPReusePort
+
+func TestPacketQueueWaitDoesNotSerializeWriteDeadlines(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.1")
+	remote := netip.MustParseAddr("192.0.2.2")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	packet := buildIPPacket(local, remote, 99, []byte{1}, 0, true)
+	for index := 0; index < outboundPacketQueue; index++ {
+		if err = stack.writePacket(packet); err != nil {
+			t.Fatalf("fill packet %d: %v", index, err)
+		}
+
+	}
+	firstStarted := make(chan struct{})
+	firstDone := make(chan error, 1)
+	firstChanged := make(chan struct{})
+	var firstOnce sync.Once
+	go func() {
+		_, writeErr := stack.writePacketUntilTicket(packet, func() (time.Time, <-chan struct{}, bool) {
+			firstOnce.Do(func() { close(firstStarted) })
+			return time.Time{}, firstChanged, false
+		})
+		firstDone <- writeErr
+	}()
+	<-firstStarted
+
+	deadline := time.Now().Add(25 * time.Millisecond)
+	secondChanged := make(chan struct{})
+	startedAt := time.Now()
+	_, err = stack.writePacketUntilTicket(packet, func() (time.Time, <-chan struct{}, bool) {
+		return deadline, secondChanged, false
+	})
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("second queue write = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 250*time.Millisecond {
+		t.Fatalf("second queue deadline was delayed by first writer: %v", elapsed)
+	}
+
+	buffer := make([]byte, 1500)
+	if _, err = stack.Read([][]byte{buffer}, make([]int, 1), 0); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-firstDone:
+		if err != nil {
+			t.Fatalf("first queue write = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first queue write did not resume after dequeue")
+	}
+}
 
 func TestListenValidationPrecedesLifecycle(t *testing.T) {
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")}})
@@ -230,6 +289,36 @@ func TestFullLoopbackQueueDoesNotBlock(t *testing.T) {
 	}
 }
 
+func TestPacketQueueTicketTracksDeviceDequeue(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.13")
+	remote := netip.MustParseAddr("192.0.2.14")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	packet := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	ticket, err := stack.writePacketUntilTicket(packet, func() (time.Time, <-chan struct{}, bool) {
+		return time.Time{}, nil, false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ticket.pending() {
+		t.Fatal("new packet queue ticket is not pending")
+	}
+	buffer := make([]byte, 1500)
+	if count, readErr := stack.Read([][]byte{buffer}, []int{0}, 0); readErr != nil || count != 1 {
+		t.Fatalf("device Read = %d, %v", count, readErr)
+	}
+	if ticket.pending() {
+		t.Fatal("packet queue ticket remained pending after device Read")
+	}
+}
+
 // TestSocketReadDeadlineErrors verifies that TCP and UDP expose net.OpError
 // while preserving the standard deadline sentinel through errors.Is.
 func TestSocketReadDeadlineErrors(t *testing.T) {
@@ -297,5 +386,24 @@ func TestAutomaticPortRangeFallback(t *testing.T) {
 	}
 	if want := dynamicPortCount + fallbackPortCount; probes != want {
 		t.Fatalf("automatic allocation probed %d ports, want %d", probes, want)
+	}
+}
+
+func TestAutomaticPortCursorUsesKeyedIncrements(t *testing.T) {
+	first := automaticPortCursor{secret: [16]byte{1}}
+	second := automaticPortCursor{secret: [16]byte{2}}
+	firstPort, err := allocateAutomaticPort(&first, func(uint16) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPort, err := allocateAutomaticPort(&second, func(uint16) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstPort != dynamicPortFirst || secondPort != dynamicPortFirst {
+		t.Fatalf("initial automatic ports = %d, %d", firstPort, secondPort)
+	}
+	if first.dynamic == 1 || second.dynamic == 1 {
+		t.Fatal("automatic port cursor retained a sequential increment")
 	}
 }

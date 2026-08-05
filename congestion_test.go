@@ -25,20 +25,20 @@ func TestCUBICCongestionControl(t *testing.T) {
 	}
 }
 
-func TestCUBICRepeatedFastConvergenceRetainsWLastMax(t *testing.T) {
+func TestCUBICFastConvergenceComparesAdjustedMaximum(t *testing.T) {
 	const mss = 1000
 	var cubic cubicCongestionControl
 	cubic.onCongestion(100*mss, mss)
-	if cubic.lastMaximum != 100 || cubic.previousMaximum != 100 {
-		t.Fatalf("first congestion Wmax=%v Wlast=%v", cubic.lastMaximum, cubic.previousMaximum)
+	if cubic.lastMaximum != 100 {
+		t.Fatalf("first congestion Wmax=%v, want 100", cubic.lastMaximum)
 	}
 	cubic.onCongestion(80*mss, mss)
-	if cubic.lastMaximum != 68 || cubic.previousMaximum != 80 {
-		t.Fatalf("second congestion Wmax=%v Wlast=%v, want 68/80", cubic.lastMaximum, cubic.previousMaximum)
+	if cubic.lastMaximum != 68 {
+		t.Fatalf("second congestion Wmax=%v, want 68", cubic.lastMaximum)
 	}
 	cubic.onCongestion(70*mss, mss)
-	if cubic.lastMaximum != 59.5 || cubic.previousMaximum != 70 {
-		t.Fatalf("third congestion Wmax=%v Wlast=%v, want 59.5/70", cubic.lastMaximum, cubic.previousMaximum)
+	if cubic.lastMaximum != 70 {
+		t.Fatalf("third congestion Wmax=%v, want 70", cubic.lastMaximum)
 	}
 }
 
@@ -54,6 +54,55 @@ func TestRenoCongestionControl(t *testing.T) {
 	}
 	if grown := controller.onACK(window, mss, mss, time.Time{}, 0, 0, window, false); grown != 10100 {
 		t.Fatalf("Reno avoidance window = %d, want 10100", grown)
+	}
+}
+
+func TestHyStartPlusPlusDelayAndCSS(t *testing.T) {
+	var state tcpHyStart
+	state.start(1000)
+	for sample := 0; sample < hyStartMinimumRTTSamples; sample++ {
+		state.onACK(900, 2000, 1000, 20*time.Millisecond)
+	}
+	state.onACK(1000, 2000, 1000, 25*time.Millisecond)
+	for sample := 1; sample < hyStartMinimumRTTSamples; sample++ {
+		growth, completed := state.onACK(1100, 2000, 1000, 25*time.Millisecond)
+		if completed {
+			t.Fatal("HyStart++ completed before CSS")
+		}
+		if sample == hyStartMinimumRTTSamples-1 && (growth != 250 || !state.css || state.cssRounds != 1) {
+			t.Fatalf("CSS entry growth/state = %d/%t/%d, want 250/true/1", growth, state.css, state.cssRounds)
+		}
+	}
+	for round := 2; round <= hyStartCSSRounds; round++ {
+		state.onACK(state.windowEnd, state.windowEnd+1000, 1000, 25*time.Millisecond)
+	}
+	if _, completed := state.onACK(state.windowEnd, state.windowEnd+1000, 1000, 25*time.Millisecond); !completed || !state.done {
+		t.Fatal("HyStart++ did not leave CSS after five rounds")
+	}
+}
+
+func TestHyStartPlusPlusRejectsJitterAndUserPause(t *testing.T) {
+	state := tcpHyStart{
+		windowEnd: 2000, lastRoundMinRTT: 20 * time.Millisecond,
+		currentMinRTT: 25 * time.Millisecond, samples: hyStartMinimumRTTSamples - 1,
+	}
+	state.onACK(1500, 3000, 1000, 25*time.Millisecond)
+	if !state.css {
+		t.Fatal("delay increase did not enter CSS")
+	}
+	for sample := 0; sample < hyStartMinimumRTTSamples; sample++ {
+		state.onACK(1600, 3000, 1000, 19*time.Millisecond)
+	}
+	if state.css || state.done {
+		t.Fatal("lower CSS RTT did not resume ordinary slow start")
+	}
+	state.restartRound(4000)
+	if state.lastRoundMinRTT != 0 || state.currentMinRTT != 0 || state.samples != 0 {
+		t.Fatal("idle restart retained stale HyStart++ measurements")
+	}
+	state.disable()
+	if growth, completed := state.onACK(4000, 5000, 1000, time.Second); growth != 1000 || completed {
+		t.Fatalf("disabled HyStart++ result = %d/%t", growth, completed)
 	}
 }
 
@@ -187,7 +236,7 @@ func TestSlowStartReturnsExcessACKCreditToCongestionAvoidance(t *testing.T) {
 		t.Run(string(algorithm), func(t *testing.T) {
 			controller := newTCPCongestionController(algorithm)
 			const window = uint32(9 * mss)
-			grown := controller.onACKWithThreshold(window, 2*mss, mss, time.Unix(100, 0), 20*time.Millisecond, 0, window, 10*mss)
+			grown := controller.onACKWithThreshold(window, 2*mss, mss, time.Unix(100, 0), 20*time.Millisecond, 0, window, 10*mss, false)
 			if grown < 10*mss || grown >= 11*mss {
 				t.Fatalf("boundary ACK window = %d, want [10000, 11000)", grown)
 			}
@@ -345,6 +394,31 @@ func TestBBRIgnoresLowApplicationLimitedBandwidthSamples(t *testing.T) {
 	bbr.observeBandwidth(2000, start, 10*time.Millisecond, 2000, true)
 	if bbr.roundBandwidth != 200_000 || bbr.bandwidth != 200_000 {
 		t.Fatalf("high app-limited sample was ignored: round=%v bandwidth=%v", bbr.roundBandwidth, bbr.bandwidth)
+	}
+}
+
+func TestBBRAcceptsLowSampleWhilePacingLimited(t *testing.T) {
+	const mss = 1000
+	start := time.Unix(100, 0)
+	controller := newTCPCongestionController(CongestionControlBBR)
+	controller.bbr.bandwidth = 1_000_000
+	controller.bbr.minimumRTT = 10 * time.Millisecond
+	controller.bbr.sampleStart = start
+	controller.bbr.roundTarget = 100 * mss
+	controller.onACKWithThreshold(10*mss, mss, mss, start.Add(10*time.Millisecond), 10*time.Millisecond, 10*time.Millisecond, mss, ^uint32(0), false)
+	if controller.bbr.roundBandwidth == 0 {
+		t.Fatal("pacing-limited BBR delivery sample was treated as application-limited")
+	}
+}
+
+func TestBBRCountsACKsWithSharedBatchTimestamp(t *testing.T) {
+	start := time.Unix(100, 0)
+	bbr := bbrCongestionControl{minimumRTT: 20 * time.Millisecond, sampleStart: start}
+	bbr.observeBandwidth(1000, start, 20*time.Millisecond, 4000, false)
+	bbr.observeBandwidth(1000, start, 20*time.Millisecond, 3000, false)
+	bbr.observeBandwidth(1000, start.Add(5*time.Millisecond), 20*time.Millisecond, 2000, false)
+	if bbr.roundBandwidth != 600_000 {
+		t.Fatalf("batched ACK bandwidth = %v, want 600000", bbr.roundBandwidth)
 	}
 }
 
@@ -539,7 +613,7 @@ func TestBBRRecoveryACKUpdatesModelWithoutApplyingModelWindow(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlBBR)
 	start := time.Unix(100, 0)
 	window := uint32(10 * mss)
-	controller.observeRecoveryACK(window, 2*mss, mss, start, 100*time.Millisecond, 100*time.Millisecond, window)
+	controller.observeRecoveryACK(window, 2*mss, mss, start, 100*time.Millisecond, 100*time.Millisecond, window, false)
 	if controller.bbr.bandwidth == 0 || controller.bbr.minimumRTT != 100*time.Millisecond {
 		t.Fatalf("recovery ACK model = bandwidth %v min_rtt %v", controller.bbr.bandwidth, controller.bbr.minimumRTT)
 	}
@@ -548,7 +622,7 @@ func TestBBRRecoveryACKUpdatesModelWithoutApplyingModelWindow(t *testing.T) {
 	}
 
 	reno := newTCPCongestionController(CongestionControlReno)
-	reno.observeRecoveryACK(window, mss, mss, start, 100*time.Millisecond, 100*time.Millisecond, window)
+	reno.observeRecoveryACK(window, mss, mss, start, 100*time.Millisecond, 100*time.Millisecond, window, false)
 	if reno.renoCredit != 0 {
 		t.Fatalf("Reno recovery observation changed credit to %v", reno.renoCredit)
 	}
@@ -565,8 +639,8 @@ func TestTCPSelectableCongestionControls(t *testing.T) {
 			link.echoTCP = true
 			link.mu.Unlock()
 			if err := stack.UpdateConfig(Config{
-				LocalAddresses:    []netip.Prefix{netip.PrefixFrom(local, 32)},
-				CongestionControl: algorithm,
+				LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+				TCP:            TCPSocketDefaults{CongestionControl: algorithm},
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -578,6 +652,38 @@ func TestTCPSelectableCongestionControls(t *testing.T) {
 			_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
 			writeAndReadTCPEcho(t, connection, make([]byte, 64*1024))
 		})
+	}
+}
+
+func TestTCPControllerChangePreservesCongestionState(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.58")
+	remote := netip.MustParseAddr("192.0.2.59")
+	link, stack := newTestStack(t, local, remote)
+	defer stack.Close()
+	link.mu.Lock()
+	link.echoTCP = true
+	link.mu.Unlock()
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 8150))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+	writeAndReadTCPEcho(t, connection, make([]byte, 512*1024))
+	tcpConnection := connection.(*TCPConn)
+	before := tcpConnection.Info()
+	if before.CongestionWindow <= initialTCPWindow(before.MaximumSegmentSize) {
+		t.Fatalf("pre-change congestion window = %d, did not grow beyond initial window", before.CongestionWindow)
+	}
+	if err = tcpConnection.SetCongestionControl(CongestionControlBBR); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return tcpConnection.Info().CongestionControl == CongestionControlBBR
+	})
+	after := tcpConnection.Info()
+	if after.CongestionWindow != before.CongestionWindow || after.SlowStartThreshold != before.SlowStartThreshold {
+		t.Fatalf("controller change altered cwnd/ssthresh = %d/%d, want %d/%d", after.CongestionWindow, after.SlowStartThreshold, before.CongestionWindow, before.SlowStartThreshold)
 	}
 }
 
@@ -594,8 +700,8 @@ func TestTCPSelectableCongestionControlsRecoverMultipleLosses(t *testing.T) {
 			link.dropTCPOrdinals = map[int]bool{1: true, 3: true}
 			link.mu.Unlock()
 			if err := stack.UpdateConfig(Config{
-				LocalAddresses:    []netip.Prefix{netip.PrefixFrom(local, 32)},
-				CongestionControl: algorithm,
+				LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+				TCP:            TCPSocketDefaults{CongestionControl: algorithm},
 			}); err != nil {
 				t.Fatal(err)
 			}

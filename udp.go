@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -35,6 +36,26 @@ type udpDatagram struct {
 	source  netip.AddrPort
 	target  netip.Addr
 	options ipPacketOptions
+}
+
+// UDPInfo is a point-in-time diagnostic snapshot of one UDP socket.
+type UDPInfo struct {
+	LocalAddress         netip.AddrPort
+	RemoteAddress        netip.AddrPort
+	Closed               bool
+	ReceiveQueuePackets  int
+	ReceiveQueueBytes    int
+	ReceiveQueueCapacity int
+	PacketsSent          uint64
+	BytesSent            uint64
+	PacketsReceived      uint64
+	BytesReceived        uint64
+	PacketsDropped       uint64
+	ICMPErrors           uint64
+	PathMTU              int
+	HopLimit             int
+	TrafficClass         uint8
+	LastError            error
 }
 
 // udpReuseEndpoints is the optional REUSEPORT dispatcher retained by Stack.
@@ -83,15 +104,28 @@ type UDPConn struct {
 	readChanged     chan struct{}
 	writeChanged    chan struct{}
 	recentTargets   map[netip.AddrPort]time.Time
+	defaultOptions  ipPacketOptions
+	lastError       error
+	packetsSent     atomic.Uint64
+	bytesSent       atomic.Uint64
+	packetsReceived atomic.Uint64
+	bytesReceived   atomic.Uint64
+	packetsDropped  atomic.Uint64
+	icmpErrors      atomic.Uint64
 }
 
 // newUDPConn creates an unregistered UDP socket.
 func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.Addr, remote netip.AddrPort) *UDPConn {
+	defaults := DatagramSocketDefaults{ReceiveBuffer: udpDefaultReceiveCapacity, HopLimit: 64}
+	if stack != nil {
+		defaults = stack.network.Load().udpDefaults
+	}
 	return &UDPConn{
 		stack: stack, net: network, port: port, v6: v6, local: local, remote: remote,
-		errors: make(chan error, 8), closed: make(chan struct{}), receiveNotify: make(chan struct{}), receiveCapacity: udpDefaultReceiveCapacity,
+		errors: make(chan error, 8), closed: make(chan struct{}), receiveNotify: make(chan struct{}), receiveCapacity: defaults.ReceiveBuffer,
 		readChanged: make(chan struct{}), writeChanged: make(chan struct{}),
-		recentTargets: make(map[netip.AddrPort]time.Time),
+		recentTargets:  make(map[netip.AddrPort]time.Time),
+		defaultOptions: ipPacketOptions{hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass},
 	}
 }
 
@@ -188,24 +222,28 @@ func (c *UDPConn) acceptsLocal(address netip.Addr) bool {
 // enqueue copies and retains a datagram unless the configured receive
 // capacity is full. The capacity check precedes allocation on the drop path.
 func (c *UDPConn) enqueue(payload []byte, source netip.AddrPort, target netip.Addr, options ipPacketOptions) {
-	size := udpDatagramMetadataSize + len(payload)
+	size := udpDatagramSize(payload)
 	c.mu.Lock()
 	select {
 	case <-c.closed:
 		c.mu.Unlock()
 		c.stack.stats.inboundDroppedPackets.Add(1)
+		c.packetsDropped.Add(1)
 		return
 	default:
 	}
 	if size > c.receiveCapacity || c.queuedBytes > c.receiveCapacity-size {
 		c.mu.Unlock()
 		c.stack.stats.inboundDroppedPackets.Add(1)
+		c.packetsDropped.Add(1)
 		return
 	}
 	datagram := udpDatagram{payload: append([]byte(nil), payload...), source: source, target: target, options: options}
 	wasEmpty := len(c.receive) == 0
 	c.receive = append(c.receive, datagram)
 	c.queuedBytes += size
+	c.packetsReceived.Add(1)
+	c.bytesReceived.Add(uint64(len(payload)))
 	if wasEmpty {
 		notified := c.receiveNotify
 		c.receiveNotify = make(chan struct{})
@@ -214,9 +252,9 @@ func (c *UDPConn) enqueue(payload []byte, source netip.AddrPort, target netip.Ad
 	c.mu.Unlock()
 }
 
-// udpDatagramSize returns the approximate retained-memory cost of datagram.
-func udpDatagramSize(datagram udpDatagram) int {
-	return udpDatagramMetadataSize + len(datagram.payload)
+// udpDatagramSize returns the approximate retained-memory cost of a payload.
+func udpDatagramSize(payload []byte) int {
+	return udpDatagramMetadataSize + len(payload)
 }
 
 // ReadFrom returns the next complete datagram or socket error.
@@ -323,7 +361,7 @@ func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, tar
 			if len(c.receive) == 0 {
 				c.receive = nil
 			}
-			c.queuedBytes -= udpDatagramSize(datagram)
+			c.queuedBytes -= udpDatagramSize(datagram.payload)
 			c.mu.Unlock()
 			n = copy(buffer, datagram.payload)
 			return n, datagram.source, datagram.target, datagram.options, n < len(datagram.payload), nil
@@ -383,7 +421,7 @@ func (c *UDPConn) WriteToUDP(payload []byte, address *net.UDPAddr) (int, error) 
 
 // WriteToUDPAddrPort acts like WriteTo but accepts a netip.AddrPort directly.
 func (c *UDPConn) WriteToUDPAddrPort(payload []byte, address netip.AddrPort) (int, error) {
-	netAddress := udpNetAddr(address)
+	netAddress := net.UDPAddrFromAddrPort(address)
 	return c.writeToUDPAddrPort(payload, address, netAddress)
 }
 
@@ -414,6 +452,57 @@ func (c *UDPConn) Write(payload []byte) (int, error) {
 	return n, nil
 }
 
+// WritePathMTUProbe sends one connected UDP datagram without IPv4 or IPv6
+// fragmentation, permitting a size above the confirmed PMTU up to the
+// configured first-hop MTU. The application must confirm delivery separately.
+func (c *UDPConn) WritePathMTUProbe(payload []byte) (int, error) {
+	if !c.remote.IsValid() {
+		return 0, c.operationError("write", nil, errors.New("mipstack: UDP socket is not connected"))
+	}
+	address := c.remoteAddr()
+	n, err := c.writeToFromWith(payload, c.remote, address, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram)
+	if err != nil {
+		return n, c.operationError("write", address, err)
+	}
+	return n, nil
+}
+
+// WritePathMTUProbeTo is the unconnected netip form of WritePathMTUProbe.
+func (c *UDPConn) WritePathMTUProbeTo(payload []byte, target netip.AddrPort) (int, error) {
+	address := net.UDPAddrFromAddrPort(target)
+	if c.remote.IsValid() {
+		return 0, c.operationError("write", address, net.ErrWriteToConnected)
+	}
+	n, err := c.writeToFromWith(payload, target, address, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram)
+	if err != nil {
+		return n, c.operationError("write", address, err)
+	}
+	return n, nil
+}
+
+// ConfirmPathMTU records application-level acknowledgement of a connected
+// UDP probe. mtu is the complete IP packet size, not the UDP payload size.
+func (c *UDPConn) ConfirmPathMTU(mtu int) error {
+	if !c.remote.IsValid() {
+		return c.setOperationError(syscall.ENOTCONN)
+	}
+	if err := c.stack.ConfirmPathMTU(c.remote.Addr(), mtu); err != nil {
+		return c.setOperationError(err)
+	}
+	return nil
+}
+
+// ConfirmPathMTUFor is the unconnected form of ConfirmPathMTU.
+func (c *UDPConn) ConfirmPathMTUFor(target netip.Addr, mtu int) error {
+	if c.remote.IsValid() {
+		return c.setOperationError(net.ErrWriteToConnected)
+	}
+	if err := c.stack.ConfirmPathMTU(target, mtu); err != nil {
+		return c.setOperationError(err)
+	}
+	return nil
+}
+
 // WriteMsgUDP writes a payload using Linux-compatible packet-info ancillary
 // data. A connected socket requires a nil address.
 func (c *UDPConn) WriteMsgUDP(payload, oob []byte, address *net.UDPAddr) (n, oobn int, err error) {
@@ -439,7 +528,7 @@ func (c *UDPConn) WriteMsgUDPAddrPort(payload, oob []byte, address netip.AddrPor
 	var netAddress net.Addr
 	if c.remote.IsValid() {
 		if address.IsValid() {
-			netAddress = udpNetAddr(address)
+			netAddress = net.UDPAddrFromAddrPort(address)
 			return 0, 0, c.operationError("write", netAddress, net.ErrWriteToConnected)
 		}
 		address, netAddress = c.remote, c.remoteAddr()
@@ -447,7 +536,7 @@ func (c *UDPConn) WriteMsgUDPAddrPort(payload, oob []byte, address netip.AddrPor
 		if !address.IsValid() {
 			return 0, 0, c.operationError("write", nil, errors.New("mipstack: UDP destination is required"))
 		}
-		netAddress = udpNetAddr(address)
+		netAddress = net.UDPAddrFromAddrPort(address)
 	}
 	return c.writeMsgUDPAddrPort(payload, oob, address, netAddress)
 }
@@ -474,6 +563,13 @@ func (c *UDPConn) writeTo(payload []byte, target netip.AddrPort, address net.Add
 
 // writeToFrom sends one datagram with an optional packet-info source address.
 func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, address net.Addr, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
+	return c.writeToFromWith(payload, target, address, packetInfoSource, options, c.writeDatagram)
+}
+
+// writeToFromWith keeps source selection, checksums, deadlines, accounting,
+// and ICMP correlation shared while leaving optional output policies
+// independently reachable by the linker.
+func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, address net.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, []byte, ipPacketOptions) error) (int, error) {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
 	if target.Addr().Is6() != c.v6 && !c.dual || target.Port() == 0 || target.Addr().IsUnspecified() {
 		return 0, errors.New("mipstack: invalid UDP destination")
@@ -498,12 +594,13 @@ func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, address net
 		return 0, err
 	}
 	source = source.Unmap()
+	options = c.outputOptions(options)
 	maximumPayload := 65535 - udpHeaderSize
 	if target.Addr().Is4() {
 		maximumPayload -= 20
 	}
 	if len(payload) > maximumPayload {
-		return 0, messageTooLong(c.network(), c.LocalAddr(), address)
+		return 0, messageTooLong(c.net, c.LocalAddr(), address)
 	}
 	udp := make([]byte, udpHeaderSize+len(payload))
 	binary.BigEndian.PutUint16(udp[0:2], c.port)
@@ -515,14 +612,29 @@ func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, address net
 		value = 0xffff
 	}
 	binary.BigEndian.PutUint16(udp[6:8], value)
-	if err := c.stack.writeIPPayloadUntilOptions(source, target.Addr(), protocolUDP, udp, true, options, c.writeState); err != nil {
-		if errors.Is(err, syscall.EMSGSIZE) {
-			return 0, messageTooLong(c.network(), c.LocalAddr(), address)
+	writeErr := write(source, target.Addr(), udp, options)
+	if writeErr != nil {
+		if errors.Is(writeErr, syscall.EMSGSIZE) {
+			return 0, messageTooLong(c.net, c.LocalAddr(), address)
 		}
-		return 0, err
+		return 0, writeErr
 	}
 	c.rememberTarget(target)
+	c.packetsSent.Add(1)
+	c.bytesSent.Add(uint64(len(payload)))
 	return len(payload), nil
+}
+
+// writeDatagram emits ordinary UDP output against the confirmed path MTU and
+// permits source fragmentation.
+func (c *UDPConn) writeDatagram(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
+	return c.stack.writeIPPayloadUntilOptions(source, target, protocolUDP, payload, true, options, c.writeState)
+}
+
+// writePathMTUProbeDatagram is retained only when an application references
+// the UDP packetization-layer probing API.
+func (c *UDPConn) writePathMTUProbeDatagram(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
+	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, protocolUDP, payload, false, options, c.stack.network.Load().mtu, c.writeState)
 }
 
 // rememberTarget records an actual WriteTo destination for ICMP tuple
@@ -573,11 +685,16 @@ func (c *UDPConn) acceptsError(target netip.AddrPort) bool {
 
 // deliverError queues a destination-associated asynchronous network error.
 func (c *UDPConn) deliverError(target netip.AddrPort, err error) {
-	select {
-	case c.errors <- &net.OpError{
-		Op: "read", Net: c.network(), Source: c.LocalAddr(),
+	operationError := &net.OpError{
+		Op: "read", Net: c.net, Source: c.LocalAddr(),
 		Addr: net.UDPAddrFromAddrPort(target), Err: err,
-	}:
+	}
+	c.mu.Lock()
+	c.lastError = operationError
+	c.mu.Unlock()
+	c.icmpErrors.Add(1)
+	select {
+	case c.errors <- operationError:
 	default:
 	}
 }
@@ -625,17 +742,35 @@ func (c *UDPConn) LocalAddr() net.Addr {
 // packet socket.
 func (c *UDPConn) RemoteAddr() net.Addr { return c.remoteAddr() }
 
+// Info returns a diagnostic snapshot of the socket and its receive queue.
+func (c *UDPConn) Info() UDPInfo {
+	c.mu.Lock()
+	info := UDPInfo{
+		LocalAddress: netip.AddrPortFrom(c.local, c.port), RemoteAddress: c.remote,
+		ReceiveQueuePackets: len(c.receive), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
+		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass, LastError: c.lastError,
+	}
+	select {
+	case <-c.closed:
+		info.Closed = true
+	default:
+	}
+	c.mu.Unlock()
+	info.PacketsSent, info.BytesSent = c.packetsSent.Load(), c.bytesSent.Load()
+	info.PacketsReceived, info.BytesReceived = c.packetsReceived.Load(), c.bytesReceived.Load()
+	info.PacketsDropped, info.ICMPErrors = c.packetsDropped.Load(), c.icmpErrors.Load()
+	if c.remote.IsValid() {
+		info.PathMTU = c.stack.mtuFor(c.remote.Addr())
+	}
+	return info
+}
+
 // remoteAddr returns the connected remote address when present.
 func (c *UDPConn) remoteAddr() net.Addr {
 	if !c.remote.IsValid() {
 		return nil
 	}
 	return net.UDPAddrFromAddrPort(c.remote)
-}
-
-// network returns the socket's standard network name.
-func (c *UDPConn) network() string {
-	return c.net
 }
 
 // SetDeadline updates both read and write deadlines.
@@ -728,6 +863,51 @@ func (c *UDPConn) SetWriteBuffer(bytes int) error {
 	}
 }
 
+// SetHopLimit changes the default IPv4 TTL or IPv6 Hop Limit for subsequent
+// writes. Zero is valid only on a dedicated IPv6 socket; it is ambiguous on a
+// dual-stack socket because IPv4 TTL zero is invalid. Per-packet message
+// control data may override the value.
+func (c *UDPConn) SetHopLimit(hopLimit int) error {
+	if hopLimit < 0 || hopLimit > 255 || hopLimit == 0 && (!c.v6 || c.dual) {
+		return c.setOperationError(syscall.EINVAL)
+	}
+	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return c.setOperationError(net.ErrClosed)
+	default:
+		c.defaultOptions.hopLimit, c.defaultOptions.hopLimitSet = byte(hopLimit), true
+		c.mu.Unlock()
+		return nil
+	}
+}
+
+// SetTrafficClass changes the default IPv4 TOS or IPv6 Traffic Class byte.
+func (c *UDPConn) SetTrafficClass(value int) error {
+	if value < 0 || value > 255 {
+		return c.setOperationError(syscall.EINVAL)
+	}
+	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return c.setOperationError(net.ErrClosed)
+	default:
+		c.defaultOptions.trafficClass = byte(value)
+		c.mu.Unlock()
+		return nil
+	}
+}
+
+// outputOptions merges one per-packet override with socket defaults.
+func (c *UDPConn) outputOptions(options ipPacketOptions) ipPacketOptions {
+	c.mu.Lock()
+	defaults := c.defaultOptions
+	c.mu.Unlock()
+	return options.withDefaults(defaults)
+}
+
 // writeState snapshots the write deadline, notification, and closure state.
 func (c *UDPConn) writeState() (time.Time, <-chan struct{}, bool) {
 	c.mu.Lock()
@@ -740,29 +920,6 @@ func (c *UDPConn) writeState() (time.Time, <-chan struct{}, bool) {
 	}
 }
 
-// deadlineTimer returns a disabled channel for an unset deadline.
-func deadlineTimer(deadline time.Time) (*time.Timer, <-chan time.Time) {
-	if deadline.IsZero() {
-		return nil, nil
-	}
-	duration := time.Until(deadline)
-	if duration < 0 {
-		duration = 0
-	}
-	timer := time.NewTimer(duration)
-	return timer, timer.C
-}
-
-// stopTimer stops a non-nil timer.
-func stopTimer(timer *time.Timer) {
-	if timer != nil && !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
-	}
-}
-
 // messageTooLong constructs the standard net.OpError form for EMSGSIZE.
 func messageTooLong(network string, source, target net.Addr) error {
 	return &net.OpError{Op: "write", Net: network, Source: source, Addr: target, Err: syscall.EMSGSIZE}
@@ -771,13 +928,13 @@ func messageTooLong(network string, source, target net.Addr) error {
 // operationError wraps a UDP socket failure in the same public shape used by
 // the standard net package.
 func (c *UDPConn) operationError(operation string, target net.Addr, err error) error {
-	return socketOperationError(operation, c.network(), c.LocalAddr(), target, err)
+	return socketOperationError(operation, c.net, c.LocalAddr(), target, err)
 }
 
 // setOperationError wraps a deadline-setting failure using the local-address
 // metadata shape of the standard net package.
 func (c *UDPConn) setOperationError(err error) error {
-	return socketOperationError("set", c.network(), nil, c.LocalAddr(), err)
+	return socketOperationError("set", c.net, nil, c.LocalAddr(), err)
 }
 
 // socketOperationError constructs one net.OpError without wrapping an error
