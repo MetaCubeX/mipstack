@@ -88,6 +88,8 @@ MIPS provides:
 - `DialIP` and `ListenIP` for connected and unconnected IPv4 or IPv6 protocol
   payload sockets, using standard network names such as `ip4:icmp`,
   `ip6:ipv6-icmp`, and `ip:99`;
+- `TCPForwarder`, `UDPForwarder`, and `ICMPForwarder` for otherwise unhandled
+  inbound traffic, including transparent nonlocal destinations;
 - exported `TCPConn`, `TCPListener`, `UDPConn`, and `IPConn` implementations of the
   corresponding standard `net` interfaces.
 
@@ -115,6 +117,125 @@ bindings take precedence over wildcard bindings, and a per-registry keyed hash
 keeps each TCP or UDP flow on one group member. Closing a TCP listener permits
 an immediate rebind while its already accepted connections remain active,
 matching the `SO_REUSEADDR` behavior used by standard Go listeners.
+
+## Transparent interception
+
+`Config.Promiscuous` admits valid unicast IP packets whose destination is not
+listed by `LocalAddresses`. This is an L3 transparent-receive policy, not an L2
+interface or MAC promiscuous mode. Local ownership remains unchanged: ordinary
+wildcard sockets receive only managed local destinations, source selection
+uses only `LocalAddresses`, and nonlocal destinations never become loopback
+routes. The forwarder name refers to delivery into an application handler;
+MIPS still does not route or forward IP packets between links.
+
+Forwarders and promiscuous admission are independent. A forwarder always sees
+otherwise unhandled traffic addressed to `LocalAddresses`, without requiring
+`Promiscuous`. `Promiscuous` is required only when the original destination is
+not locally owned. Enabling it without a matching forwarder does not make
+ordinary wildcard sockets transparent and does not generate automatic replies;
+the admitted nonlocal TCP, UDP, and ICMP packet is silently dropped.
+
+`NewTCPForwarder`, `NewUDPForwarder`, and `NewICMPForwarder` install one
+protocol-specific fallback handler each. All three constructors take their own
+options type so later protocol policy can evolve independently. Established
+tuples and ordinary local listeners take precedence. A TCP request represents
+a valid initial SYN. Its handler runs in a new goroutine and may block, but an
+undecided handler occupies `TCPForwarderOptions.MaxInFlight` capacity. `Accept`
+blocks until the handshake, context cancellation, or stack closure and returns
+a `TCPConn` whose `LocalAddr` preserves the original destination. The handler
+must wait for `Accept` itself to return, but may return immediately afterward:
+the returned connection has its own lifetime and may instead be handed to
+another goroutine. `Drop` consumes the SYN silently, while `Reject` sends the
+RFC 9293 reset on a best-effort basis. Retransmitted SYNs do not create
+duplicate handler calls.
+
+`TCPForwarderRequest.Done` closes when its handler returns, a pending request
+is invalidated by configuration, or its forwarder or stack closes. Forwarder
+closure remains observable after the request has selected an action, allowing
+blocking handler work to stop promptly. Each forwarder's `Done` channel closes
+on direct closure or `Stack.Close`; `Close` does not wait for handlers,
+accepted endpoints, or replies already in progress.
+
+UDP requests expose the source, original destination, and triggering payload.
+`Accept` creates a connected `UDPConn`, offers a copy of that first datagram to
+its receive queue, and retains the complete four-tuple for subsequent dispatch.
+The connection is bound to the original destination and connected to the
+original source: `Read` accepts only that peer, `Write` replies to it, and
+`WriteTo` reports `net.ErrWriteToConnected`. `Listen` instead creates an
+unconnected `UDPConn` bound to the original destination: it receives all later
+sources through `ReadFrom` and replies through `WriteTo`. Both actions offer
+the first datagram to the new socket's capacity-bounded receive queue; a queue
+drop does not undo endpoint registration. The handler must wait for `Accept` or
+`Listen` to return, but the returned connection remains valid after the
+callback. `Reply` writes one reverse datagram without retaining a flow. Its
+first call selects synchronous reply mode, and it may then be repeated or
+retried until the callback returns.
+
+ICMP requests similarly expose a checksum-validated complete message and
+provide a repeatable, checksum-repairing reverse `Reply`. `IsEchoRequest`
+identifies an IPv4 or IPv6 Echo Request, while `ReplyEcho` constructs its reply
+directly, preserving the identifier, sequence, and data. A detached ICMP
+snapshot permits `Payload` modification, but its `Type` and `Code` retain the
+original classification; changing the corresponding `Payload` bytes makes
+`IsEchoRequest` false and causes `ReplyEcho` to report `syscall.EINVAL`.
+
+UDP and ICMP handlers run synchronously inside `Stack.Write` or loopback packet
+delivery. They may be invoked concurrently by concurrent writers and must
+return promptly; waiting for traffic that depends on the same delivery call
+would deadlock it. Request values and payloads returned by request methods are
+borrowed and valid only during the callback. Detached responders instead own
+their payload or message snapshot. Every handler must select one terminal
+action or make at least one `Reply` call before returning; otherwise MIPS
+applies `Drop`. After Reply mode begins, further Reply calls are allowed but
+other request actions report `ErrForwarderReplyActive`. Every call must finish
+before the callback returns.
+
+`Detach` instead finishes the callback-scoped ownership transfer and returns a
+responder with its own payload or message snapshot. That responder may be
+retained or handed to another goroutine, while concurrent access to its mutable
+snapshot remains the application's responsibility. Repeated or invalidated
+terminal request actions report `ErrForwarderRequestCompleted`.
+
+A detached UDP or ICMP responder starts pending. Its first `Reply` selects
+reply mode, after which `Reply` may be called repeatedly or concurrently until
+`Close`; concurrent calls have no ordering guarantee. Reply mode is selected
+before output validation, so an output error does not change the legal next
+operations and may be retried.
+
+`Reject` and `Drop` are available only before the first `Reply`. `Close` before
+reply mode is equivalent to `Drop`, while closing an active responder prevents
+new replies and permits already started calls to finish. `Drop` or `Reject` in
+reply mode reports `ErrForwarderReplyActive`; actions after closure report
+`net.ErrClosed`. The forwarder does not retain the responder, create a timer,
+or impose a detached-request capacity. The application owns its memory,
+concurrency bound, cancellation, timeout, and eventual logical closure. Every
+output call revalidates forwarder closure and the current destination policy.
+`Done` lets asynchronous work observe permanent forwarder or stack closure;
+configuration changes remain dynamic and are reported by individual calls.
+
+Request-scoped `Reply` and every `Reject` action are nonblocking with respect to
+the outbound packet queue. They report `ErrResourceLimit` when capacity is
+unavailable; a fragmented reply reserves all required slots before publishing
+any fragment. TCP resets and ICMP errors generated automatically for unhandled
+local traffic follow the same best-effort policy but silently discard queue
+pressure. Applications that need ordinary UDP write backpressure should use
+`Accept` or `Listen`, retain the returned `UDPConn`, and set a write deadline.
+
+`ForwarderInfo.Pending` excludes caller-owned responders and handlers that
+continue running after selecting an action. `Accepted` counts created TCP/UDP
+endpoints, `Replies` counts successfully queued replies, and `ReplyErrors`
+counts failed attempts after reply mode was selected. Consequently reply
+counters may exceed `Requests` when one request produces several packets.
+
+Only a forwarded endpoint, request-scoped reply, or detached responder may use
+an intercepted destination as an output source. Removing that destination's
+admission by disabling `Promiscuous` closes affected forwarded connections,
+removes pending fragments, invalidates callback-scoped requests, and makes
+later responder output fail current-policy validation. Closing a forwarder
+stops new fallback requests and invalidates undecided callback-scoped requests
+without waiting for callbacks to return. An output action already claimed by
+a request or responder may finish. Accepted TCP and UDP endpoints remain usable
+until closed or invalidated by configuration.
 
 Active sockets allocate from the IANA dynamic range (`49152..65535`) first.
 Only when that range is unavailable for the requested binding or TCP tuple do
@@ -316,8 +437,9 @@ limiting.
 Optional surfaces are arranged for ordinary Go linker reachability rather than
 build tags. A consumer that only dials TCP and listens for UDP does not retain
 TCP listener/SYN-cookie code, `ReusePort` registries, raw `IPConn` support,
-message-control helpers, or other unreferenced public methods. No package-level
-registration table or reflection root keeps these APIs alive.
+message-control helpers, forwarder implementations, or other unreferenced
+public methods. No package-level registration table or reflection root keeps
+these APIs alive.
 
 ## Scope
 

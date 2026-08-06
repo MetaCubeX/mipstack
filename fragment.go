@@ -121,7 +121,7 @@ func (s *Stack) runFragmentCleaner() {
 // from malformed input. pending is true only when the fragment was retained.
 func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, pending bool) {
 	fragment, ok := parseFragment(packet)
-	if !ok || fragment.truncated || fragment.parameter || !s.isLocal(fragment.key.target) || fragment.key.source.IsUnspecified() || fragment.key.source.IsMulticast() || fragment.key.source.Is4In6() {
+	if !ok || fragment.truncated || fragment.parameter || !s.network.Load().acceptsInboundDestination(fragment.key.target) || fragment.key.source.IsUnspecified() || fragment.key.source.IsMulticast() || fragment.key.source.Is4In6() {
 		return nil, false
 	}
 	s.fragmentMu.Lock()
@@ -691,7 +691,7 @@ func (s *Stack) discardFragment(key fragmentKey) {
 func (s *Stack) pruneFragments(network *networkState) {
 	s.fragmentMu.Lock()
 	for key, set := range s.fragments {
-		if !networkStateHasLocal(network, key.target) {
+		if !network.acceptsInboundDestination(key.target) {
 			s.removeFragmentLocked(key, set)
 		}
 	}
@@ -784,20 +784,19 @@ func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, prot
 	return s.writeIPFragmentsUntilOptionsForMTU(source, target, protocol, payload, nil, options, mtu, state)
 }
 
-// writeIPPayload emits one packet or a complete source-fragmented sequence.
+// writeIPPayload atomically queues one best-effort protocol response or its
+// complete source-fragmented sequence without waiting for device capacity.
 func (s *Stack) writeIPPayload(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool) error {
-	return s.writeIPPayloadUntilOptionsForMTU(source, target, protocol, payload, allowFragment, ipPacketOptions{}, s.mtuFor(target), openPacketWriteState)
+	packets, err := s.ipPayloadPackets(source, target, protocol, payload, allowFragment)
+	if err != nil {
+		return err
+	}
+	return s.tryWritePackets(packets)
 }
 
 // writeIPPayloadUntilOptions emits raw IP output with mutable deadline state.
 func (s *Stack) writeIPPayloadUntilOptions(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, state func() (time.Time, <-chan struct{}, bool)) error {
 	return s.writeIPPayloadUntilOptionsForMTU(source, target, protocol, payload, allowFragment, options, s.mtuFor(target), state)
-}
-
-// openPacketWriteState supplies an unlimited deadline to internal protocol
-// replies while Stack.reservePacketUntil still observes stack closure.
-func openPacketWriteState() (time.Time, <-chan struct{}, bool) {
-	return time.Time{}, nil, false
 }
 
 // writeIPFragmentsUntilOptionsForMTU writes fragments directly into reserved

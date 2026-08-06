@@ -77,13 +77,16 @@ type exclusiveUDPSocketBinding struct{}
 
 // UDPConn is a connected or unconnected userspace UDP socket.
 type UDPConn struct {
-	stack  *Stack
-	net    string
-	port   uint16
-	v6     bool
-	dual   bool
-	local  netip.Addr
-	remote netip.AddrPort
+	stack *Stack
+	net   string
+	port  uint16
+	v6    bool
+	dual  bool
+	// forwarded authorizes this socket's intercepted nonlocal address as an
+	// explicit output source while promiscuous admission remains enabled.
+	forwarded bool
+	local     netip.Addr
+	remote    netip.AddrPort
 
 	errors chan error
 	closed chan struct{}
@@ -145,7 +148,7 @@ func (exclusiveUDPSocketBinding) register(stack *Stack, connection *UDPConn) err
 }
 
 // handleUDP validates and dispatches one UDP datagram.
-func (s *Stack) handleUDP(packet ipPacket) error {
+func (s *Stack) handleUDP(packet ipPacket, localDestination bool) error {
 	udp := packet.payload
 	if len(udp) < udpHeaderSize {
 		s.stats.inboundDroppedPackets.Add(1)
@@ -166,10 +169,23 @@ func (s *Stack) handleUDP(packet ipPacket) error {
 	source := netip.AddrPortFrom(packet.source, sourcePort)
 	target := netip.AddrPortFrom(packet.target, targetPort)
 	s.mu.RLock()
-	connection := s.udpConnectionLocked(target, source)
+	connection := s.udpForwardedConnectionLocked(target, source)
+	if connection == nil && localDestination {
+		connection = s.udpOrdinaryConnectionLocked(target, source)
+	}
+	forwarder := s.udpForwarder
 	s.mu.RUnlock()
 	if connection == nil {
-		return s.sendPortUnreachable(packet)
+		packet.payload = udp[:length]
+		options := ipPacketOptions{hopLimit: packet.hopLimit, trafficClass: packet.trafficClass, flowLabel: packet.flowLabel}
+		if forwarder != nil && forwarder.handlePacket(packet, TransportFlow{Source: source, Destination: target}, options) {
+			return nil
+		}
+		if !localDestination {
+			return nil
+		}
+		_ = s.sendPortUnreachable(packet)
+		return nil
 	}
 	if (!connection.local.IsUnspecified() && packet.target != connection.local) || (connection.remote.IsValid() && source != connection.remote) {
 		s.stats.inboundDroppedPackets.Add(1)
@@ -184,6 +200,24 @@ func (s *Stack) handleUDP(packet ipPacket) error {
 // udpConnectionLocked selects an exact binding before a family wildcard and
 // a dual-stack wildcard. REUSEPORT groups hash the complete flow tuple.
 func (s *Stack) udpConnectionLocked(local, remote netip.AddrPort) *UDPConn {
+	if connection := s.udpForwardedConnectionLocked(local, remote); connection != nil {
+		return connection
+	}
+	return s.udpOrdinaryConnectionLocked(local, remote)
+}
+
+// udpForwardedConnectionLocked selects a connected forwarded flow before an
+// unconnected forwarded endpoint bound to the original destination.
+func (s *Stack) udpForwardedConnectionLocked(local, remote netip.AddrPort) *UDPConn {
+	if connection := s.udpForwarded[udpFlowKey{local: local, remote: remote}]; connection != nil {
+		return connection
+	}
+	return s.udpForwarded[udpFlowKey{local: local}]
+}
+
+// udpOrdinaryConnectionLocked selects an ordinary exact, wildcard, or
+// REUSEPORT binding without considering forwarded four-tuples.
+func (s *Stack) udpOrdinaryConnectionLocked(local, remote netip.AddrPort) *UDPConn {
 	if connection := s.udp[udpKey{address: local.Addr(), port: local.Port()}]; connection != nil {
 		return connection
 	}
@@ -217,6 +251,123 @@ func (s *Stack) udpConnectionLocked(local, remote netip.AddrPort) *UDPConn {
 		}
 	}
 	return nil
+}
+
+// acceptUDP registers one handler-approved connected endpoint and queues its
+// triggering datagram before making the flow visible to concurrent input.
+func (f *UDPForwarder) acceptUDP(request *UDPForwarderRequest) (*UDPConn, error) {
+	stack := f.stack
+	stack.mu.Lock()
+	defer stack.mu.Unlock()
+	if stack.closed {
+		return nil, ErrClosed
+	}
+	if stack.udpForwarder != f {
+		return nil, net.ErrClosed
+	}
+	state := stack.network.Load()
+	local, remote := request.flow.Destination, request.flow.Source
+	if !state.acceptsInboundDestination(local.Addr()) {
+		return nil, syscall.EADDRNOTAVAIL
+	}
+	if _, routed := state.routeFor(remote.Addr()); !routed {
+		return nil, syscall.ENETUNREACH
+	}
+	key := udpFlowKey{local: local, remote: remote}
+	if stack.udpForwardedConnectionLocked(local, remote) != nil || networkStateHasLocal(state, local.Addr()) && stack.udpOrdinaryConnectionLocked(local, remote) != nil {
+		return nil, syscall.EADDRINUSE
+	}
+	network := "udp4"
+	if local.Addr().Is6() {
+		network = "udp6"
+	}
+	connection := newUDPConn(stack, network, local.Port(), local.Addr().Is6(), local.Addr(), remote)
+	connection.forwarded = true
+	connection.enqueue(request.Payload(), remote, local.Addr(), request.options)
+	if stack.udpForwarded == nil {
+		stack.udpForwarded = make(map[udpFlowKey]*UDPConn)
+	}
+	stack.udpForwarded[key] = connection
+	stack.stats.activeUDPSockets.Add(1)
+	return connection, nil
+}
+
+// listenUDP registers one handler-approved unconnected endpoint and queues its
+// triggering datagram before making the local binding visible to concurrent
+// input.
+func (f *UDPForwarder) listenUDP(request *UDPForwarderRequest) (*UDPConn, error) {
+	stack := f.stack
+	stack.mu.Lock()
+	defer stack.mu.Unlock()
+	if stack.closed {
+		return nil, ErrClosed
+	}
+	if stack.udpForwarder != f {
+		return nil, net.ErrClosed
+	}
+	state := stack.network.Load()
+	local, remote := request.flow.Destination, request.flow.Source
+	if !state.acceptsInboundDestination(local.Addr()) {
+		return nil, syscall.EADDRNOTAVAIL
+	}
+	key := udpFlowKey{local: local}
+	for existing := range stack.udpForwarded {
+		if existing.local == local {
+			return nil, syscall.EADDRINUSE
+		}
+	}
+	if networkStateHasLocal(state, local.Addr()) &&
+		!stack.udpEndpointAvailableLocked(exclusiveUDPSocketBinding{}, local.Addr(), local.Port(), false) {
+		return nil, syscall.EADDRINUSE
+	}
+	network := "udp4"
+	if local.Addr().Is6() {
+		network = "udp6"
+	}
+	connection := newUDPConn(stack, network, local.Port(), local.Addr().Is6(), local.Addr(), netip.AddrPort{})
+	connection.forwarded = true
+	connection.enqueue(request.Payload(), remote, local.Addr(), request.options)
+	if stack.udpForwarded == nil {
+		stack.udpForwarded = make(map[udpFlowKey]*UDPConn)
+	}
+	stack.udpForwarded[key] = connection
+	stack.stats.activeUDPSockets.Add(1)
+	return connection, nil
+}
+
+// replyUDP sends one reverse-flow response without retaining a registered
+// endpoint after the write completes.
+func (f *UDPForwarder) replyUDP(request *UDPForwarderRequest, payload []byte) (int, error) {
+	return f.replyUDPFlow(request.flow, payload)
+}
+
+// replyUDPFlow sends one reverse-flow response without retaining a registered
+// endpoint after the write completes.
+func (f *UDPForwarder) replyUDPFlow(flow TransportFlow, payload []byte) (int, error) {
+	local, remote := flow.Destination, flow.Source
+	state := f.stack.network.Load()
+	if !state.acceptsInboundDestination(local.Addr()) {
+		return 0, syscall.EADDRNOTAVAIL
+	}
+	if _, routed := state.routeFor(remote.Addr()); !routed {
+		return 0, syscall.ENETUNREACH
+	}
+	maximumPayload := 65535 - udpHeaderSize
+	if local.Addr().Is4() {
+		maximumPayload -= 20
+	}
+	if len(payload) > maximumPayload {
+		return 0, syscall.EMSGSIZE
+	}
+	defaults := state.udpDefaults
+	options := ipPacketOptions{
+		hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
+		flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
+	}
+	if err := f.stack.tryWriteUDPDatagram(local.Addr(), remote.Addr(), local.Port(), remote.Port(), payload, options); err != nil {
+		return 0, err
+	}
+	return len(payload), nil
 }
 
 // acceptsLocal reports whether an ICMP quote belongs to this socket's local
@@ -621,9 +772,25 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetI
 		}
 		requestedSource = packetInfoSource
 	}
-	source, err := c.stack.sourceForRequested(target.Addr(), requestedSource)
-	if err != nil {
-		return 0, err
+	var source netip.Addr
+	if c.forwarded {
+		if packetInfoSource.IsValid() && !packetInfoSource.IsUnspecified() && packetInfoSource != c.local {
+			return 0, syscall.EADDRNOTAVAIL
+		}
+		state := c.stack.network.Load()
+		if !state.acceptsInboundDestination(c.local) {
+			return 0, syscall.EADDRNOTAVAIL
+		}
+		if _, routed := state.routeFor(target.Addr()); !routed {
+			return 0, syscall.ENETUNREACH
+		}
+		source = c.local
+	} else {
+		var err error
+		source, err = c.stack.sourceForRequested(target.Addr(), requestedSource)
+		if err != nil {
+			return 0, err
+		}
 	}
 	source = source.Unmap()
 	maximumPayload := 65535 - udpHeaderSize
@@ -650,6 +817,22 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetI
 // permits source fragmentation.
 func (c *UDPConn) writeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions) error {
 	return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, true, c.stack.mtuFor(target))
+}
+
+// tryWriteUDPDatagram atomically queues one best-effort UDP datagram or all of
+// its source fragments without waiting for device capacity.
+func (s *Stack) tryWriteUDPDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions) error {
+	udpSize := udpHeaderSize + len(payload)
+	if udpSize > 65535 {
+		return syscall.EMSGSIZE
+	}
+	datagram := make([]byte, udpSize)
+	marshalUDPDatagram(datagram, source, target, sourcePort, targetPort, payload)
+	packets, err := s.ipPayloadPacketsWithOptions(source, target, protocolUDP, datagram, true, options)
+	if err != nil {
+		return err
+	}
+	return s.tryWritePackets(packets)
 }
 
 // writePathMTUProbeDatagram is retained only when an application references

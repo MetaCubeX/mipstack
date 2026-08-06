@@ -2,7 +2,8 @@
 // IPv4/IPv6 endpoint stack for applications that exchange complete packets
 // with an L3 link. It implements active and passive TCP, connected and
 // unconnected UDP and IP protocol sockets, and the ICMP behavior required by
-// those transports.
+// those transports. Optional forwarders provide transparent handling of
+// otherwise unbound TCP, UDP, and ICMP traffic.
 package mipstack
 
 import (
@@ -85,6 +86,13 @@ var (
 	// ErrResourceLimit reports exhaustion of a bounded in-memory socket or
 	// protocol resource.
 	ErrResourceLimit = errors.New("mipstack: resource limit reached")
+	// ErrForwarderRequestCompleted reports an action on a forwarder request that
+	// was already accepted, detached, dropped, rejected, invalidated, or whose
+	// callback-scoped reply lifetime has ended.
+	ErrForwarderRequestCompleted = errors.New("mipstack: forwarder request is already completed")
+	// ErrForwarderReplyActive reports an action that conflicts with reply mode
+	// after a forwarder request or responder has begun replying.
+	ErrForwarderReplyActive = errors.New("mipstack: forwarder reply mode is active")
 )
 
 // TCPSocketDefaults configures policies inherited by newly created TCP
@@ -142,9 +150,17 @@ type DatagramSocketDefaults struct {
 
 // Config configures a Stack.
 type Config struct {
-	// LocalAddresses lists addresses that may receive packets and be selected
-	// as transport endpoints.
+	// LocalAddresses lists addresses owned by ordinary sockets and available
+	// for source selection and loopback delivery.
 	LocalAddresses []netip.Prefix
+	// Promiscuous admits unicast packets addressed to otherwise nonlocal
+	// destinations so protocol forwarders can intercept them. Forwarders do not
+	// require Promiscuous for unhandled packets addressed to LocalAddresses.
+	// Enabling Promiscuous without a matching forwarder only admits and silently
+	// drops nonlocal TCP, UDP, and ICMP traffic. Ordinary sockets retain
+	// LocalAddresses semantics, and only forwarder-created endpoints or
+	// request-scoped actions may reply from intercepted addresses.
+	Promiscuous bool
 	// MTU bounds packets emitted by Read. Zero selects 1500.
 	MTU uint32
 	// Routes optionally restrict admitted unicast destinations and provide a
@@ -170,15 +186,19 @@ type Stack struct {
 	outbound packetQueue
 	loopback packetQueue
 
-	mu         sync.RWMutex
-	started    bool
-	closed     bool
-	tcp        map[tcpKey]*TCPConn
-	tcpPassive tcpPassiveEndpoints
-	udp        map[udpKey]*UDPConn
-	udpReuse   udpReuseEndpoints
-	ip         ipEndpoints
-	nextPort   [2]automaticPortCursor
+	mu            sync.RWMutex
+	started       bool
+	closed        bool
+	tcp           map[tcpKey]*TCPConn
+	tcpPassive    tcpPassiveEndpoints
+	tcpForwarder  tcpForwarderEndpoints
+	udp           map[udpKey]*UDPConn
+	udpReuse      udpReuseEndpoints
+	udpForwarded  map[udpFlowKey]*UDPConn
+	udpForwarder  udpForwarderEndpoints
+	ip            ipEndpoints
+	icmpForwarder icmpForwarderEndpoints
+	nextPort      [2]automaticPortCursor
 
 	pathMTUMu sync.RWMutex
 	pathMTU   map[netip.Addr]pathMTUEntry
@@ -215,6 +235,9 @@ type StackStats struct {
 	UnacceptedIPPackets uint64
 	// NonlocalDestinationPackets is the unaccepted subset addressed elsewhere.
 	NonlocalDestinationPackets uint64
+	// PromiscuousInboundPackets counts valid packets admitted for a destination
+	// not present in LocalAddresses.
+	PromiscuousInboundPackets uint64
 	// InvalidSourcePackets is the unaccepted subset with a prohibited source.
 	InvalidSourcePackets uint64
 	// OutboundPackets counts complete packets accepted by the device queue.
@@ -296,6 +319,7 @@ type stackCounters struct {
 	invalidIPPackets            atomic.Uint64
 	unacceptedIPPackets         atomic.Uint64
 	nonlocalDestinationPackets  atomic.Uint64
+	promiscuousInboundPackets   atomic.Uint64
 	invalidSourcePackets        atomic.Uint64
 	outboundPackets             atomic.Uint64
 	loopbackPackets             atomic.Uint64
@@ -463,6 +487,13 @@ func (q *datagramQueue[T]) clear() {
 type udpKey struct {
 	address netip.Addr
 	port    uint16
+}
+
+// udpFlowKey identifies a connected forwarded UDP four-tuple. An invalid
+// remote identifies an unconnected endpoint bound only to local.
+type udpFlowKey struct {
+	local  netip.AddrPort
+	remote netip.AddrPort
 }
 
 // tcpKey is the four-tuple used to dispatch inbound TCP segments.
@@ -696,8 +727,8 @@ func New(config Config) (*Stack, error) {
 	return stack, nil
 }
 
-// UpdateConfig atomically replaces addresses, routes, the link MTU, congestion
-// control, and the optional TCP connection limit.
+// UpdateConfig atomically replaces addresses, routes, promiscuous admission,
+// the link MTU, congestion control, and the optional TCP connection limit.
 // Sockets bound to removed addresses or destinations without a remaining
 // route are closed. Other TCP connections immediately reclamp their MSS.
 func (s *Stack) UpdateConfig(config Config) error {
@@ -724,16 +755,26 @@ func (s *Stack) UpdateConfig(config Config) error {
 		tcpConnections = append(tcpConnections, connection)
 	}
 	tcpPassive := s.tcpPassive
+	tcpForwarder, udpForwarder, icmpForwarder := s.tcpForwarder, s.udpForwarder, s.icmpForwarder
 	udpConnections := s.udpConnectionsLocked()
 	ip := s.ip
 	s.mu.Unlock()
 	if tcpPassive != nil {
 		tcpPassive.updateConfig(s, state)
 	}
+	if tcpForwarder != nil {
+		tcpForwarder.updateConfig(state)
+	}
+	if udpForwarder != nil {
+		udpForwarder.updateConfig(state)
+	}
+	if icmpForwarder != nil {
+		icmpForwarder.updateConfig(state)
+	}
 	for _, connection := range tcpConnections {
 		connection.updateDefaultCongestionControl(state.tcpDefaults.CongestionControl)
 		_, routed := state.routeFor(connection.key.remote.Addr())
-		if !networkStateHasLocal(state, connection.key.local.Addr()) {
+		if !networkStateHasLocal(state, connection.key.local.Addr()) && !(connection.forwarded && state.acceptsInboundDestination(connection.key.local.Addr())) {
 			connection.abortWithoutReset(syscall.EADDRNOTAVAIL)
 			continue
 		}
@@ -746,7 +787,7 @@ func (s *Stack) UpdateConfig(config Config) error {
 	for _, connection := range udpConnections {
 		if connection.dual && !networkStateHasFamily(state, false) && !networkStateHasFamily(state, true) ||
 			!connection.dual && connection.local.IsUnspecified() && !networkStateHasFamily(state, connection.v6) ||
-			connection.local.IsValid() && !connection.local.IsUnspecified() && !networkStateHasLocal(state, connection.local) {
+			connection.local.IsValid() && !connection.local.IsUnspecified() && !networkStateHasLocal(state, connection.local) && !(connection.forwarded && state.acceptsInboundDestination(connection.local)) {
 			s.closeUDP(connection)
 			continue
 		}
@@ -1088,6 +1129,7 @@ func (s *Stack) Stats() StackStats {
 		InvalidIPPackets:            s.stats.invalidIPPackets.Load(),
 		UnacceptedIPPackets:         s.stats.unacceptedIPPackets.Load(),
 		NonlocalDestinationPackets:  s.stats.nonlocalDestinationPackets.Load(),
+		PromiscuousInboundPackets:   s.stats.promiscuousInboundPackets.Load(),
 		InvalidSourcePackets:        s.stats.invalidSourcePackets.Load(),
 		OutboundPackets:             s.stats.outboundPackets.Load(),
 		LoopbackPackets:             s.stats.loopbackPackets.Load(),
@@ -1324,6 +1366,15 @@ func (s *Stack) udpEndpointAvailableLocked(binding udpSocketBinding, address net
 	}
 	for key, connection := range s.udp {
 		if key.port == port && listenAddressesOverlap(key.address, connection.dual, address, dual) {
+			return false
+		}
+	}
+	state := s.network.Load()
+	for key := range s.udpForwarded {
+		if key.remote.IsValid() || key.local.Port() != port || !networkStateHasLocal(state, key.local.Addr()) {
+			continue
+		}
+		if listenAddressesOverlap(key.local.Addr(), false, address, dual) {
 			return false
 		}
 	}
@@ -1684,6 +1735,52 @@ func (s *Stack) tryWritePacket(packet []byte) error {
 	return nil
 }
 
+// tryWritePackets atomically queues packets that all select the same output
+// queue. It reserves every required slot before publishing any packet, so a
+// fragmented datagram is either accepted in full or not emitted at all.
+func (s *Stack) tryWritePackets(packets [][]byte) error {
+	if len(packets) == 0 {
+		return nil
+	}
+	if len(packets) == 1 {
+		return s.tryWritePacket(packets[0])
+	}
+	select {
+	case <-s.closeCh:
+		return ErrClosed
+	default:
+	}
+	queue, loopback := s.outputQueue(packets[0])
+	if len(packets) > cap(queue.free) {
+		return ErrResourceLimit
+	}
+	slots := make([]uint16, len(packets))
+	reserved := 0
+	for ; reserved < len(slots); reserved++ {
+		slot, ok := queue.tryReserve()
+		if !ok {
+			for _, acquired := range slots[:reserved] {
+				queue.releaseReserved(acquired)
+			}
+			return ErrResourceLimit
+		}
+		slots[reserved] = slot
+	}
+	select {
+	case <-s.closeCh:
+		for _, slot := range slots {
+			queue.releaseReserved(slot)
+		}
+		return ErrClosed
+	default:
+	}
+	for index, packet := range packets {
+		queue.enqueueReservedPacket(slots[index], packet, false)
+		s.recordOutput(loopback)
+	}
+	return nil
+}
+
 // writePacketUntil queues a packet while observing a socket's mutable write
 // deadline. The fast path allocates no timer when the packet queue has room.
 func (s *Stack) writePacketUntil(packet []byte, state func() (time.Time, <-chan struct{}, bool)) error {
@@ -1911,19 +2008,23 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time) error {
 	s.stats.inboundPackets.Add(1)
 	parsed, ok := parseIPPacket(packet)
 	if !ok {
-		if fragment, valid := parseFragment(packet); valid && s.isLocal(fragment.key.target) &&
+		if fragment, valid := parseFragment(packet); valid && s.network.Load().acceptsInboundDestination(fragment.key.target) &&
 			!fragment.key.source.IsUnspecified() && !fragment.key.source.IsMulticast() && !fragment.key.source.Is4In6() {
 			if fragment.truncated || fragment.parameter {
 				s.discardFragment(fragment.key)
 				s.stats.inboundDroppedPackets.Add(1)
+				if !s.isLocal(fragment.key.target) {
+					return nil
+				}
 				code, at := byte(3), uint32(0)
 				if fragment.parameter && !fragment.truncated {
 					code, at = fragment.parameterCode, fragment.parameterAt
 				}
-				return s.sendParameterProblem(ipPacket{
+				_ = s.sendParameterProblem(ipPacket{
 					source: fragment.key.source, target: fragment.key.target, original: fragment.original,
 					parameterError: true, parameterCode: code, parameterAt: at,
 				})
+				return nil
 			}
 		}
 		if reassembled, pending := s.reassemblePacketStatus(packet, receivedAt); reassembled != nil {
@@ -1936,21 +2037,25 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time) error {
 	limitedBroadcast := parsed.source.Is4() && parsed.source == netip.AddrFrom4([4]byte{255, 255, 255, 255})
 	foreignLoopback := parsed.source.IsLoopback() && !networkStateHasLocal(network, parsed.source)
 	localDestination := ok && networkStateHasLocal(network, parsed.target)
+	acceptedDestination := localDestination || ok && network.acceptsNonlocalDestination(parsed.target)
 	invalidSource := ok && (parsed.source.IsUnspecified() || parsed.source.IsMulticast() || parsed.source.Is4In6() || limitedBroadcast ||
 		network.invalidInboundSource(parsed.source) || foreignLoopback)
-	if !ok || !localDestination || invalidSource {
+	if !ok || !acceptedDestination || invalidSource {
 		s.stats.inboundDroppedPackets.Add(1)
 		if !ok {
 			s.stats.invalidIPPackets.Add(1)
 		} else {
 			s.stats.unacceptedIPPackets.Add(1)
-			if !localDestination {
+			if !acceptedDestination {
 				s.stats.nonlocalDestinationPackets.Add(1)
 			} else {
 				s.stats.invalidSourcePackets.Add(1)
 			}
 		}
 		return nil
+	}
+	if !localDestination {
+		s.stats.promiscuousInboundPackets.Add(1)
 	}
 	s.mu.RLock()
 	closed := s.closed
@@ -1960,31 +2065,36 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time) error {
 	}
 	if parsed.parameterError {
 		s.stats.inboundDroppedPackets.Add(1)
-		return s.sendParameterProblem(parsed)
+		if !localDestination {
+			return nil
+		}
+		_ = s.sendParameterProblem(parsed)
+		return nil
 	}
 	s.mu.RLock()
 	ip := s.ip
 	s.mu.RUnlock()
-	rawDelivered := ip != nil && ip.deliver(s, parsed)
+	rawDelivered := localDestination && ip != nil && ip.deliver(s, parsed)
 	switch parsed.protocol {
 	case protocolTCP:
-		return s.handleTCP(parsed, receivedAt)
+		return s.handleTCPForDestination(parsed, receivedAt, localDestination)
 	case protocolUDP:
-		return s.handleUDP(parsed)
+		return s.handleUDP(parsed, localDestination)
 	case protocolICMPv4:
 		if parsed.source.Is4() {
-			return s.handleICMP(parsed)
+			return s.handleICMP(parsed, localDestination)
 		}
 	case protocolICMPv6:
 		if parsed.source.Is6() {
-			return s.handleICMP(parsed)
+			return s.handleICMP(parsed, localDestination)
 		}
 	default:
 	}
-	if parsed.protocol == 59 || rawDelivered {
+	if !localDestination || parsed.protocol == 59 || rawDelivered {
 		return nil
 	}
-	return s.sendProtocolUnreachable(parsed)
+	_ = s.sendProtocolUnreachable(parsed)
+	return nil
 }
 
 // Close closes every socket and releases all stack resources.
@@ -2003,11 +2113,16 @@ func (s *Stack) Close() error {
 	tcpPassive := s.tcpPassive
 	udpConnections := s.udpConnectionsLocked()
 	ip := s.ip
+	tcpForwarder, udpForwarder, icmpForwarder := s.tcpForwarder, s.udpForwarder, s.icmpForwarder
 	s.tcp = make(map[tcpKey]*TCPConn)
 	s.tcpPassive = nil
+	s.tcpForwarder = nil
 	s.udp = make(map[udpKey]*UDPConn)
 	s.udpReuse = nil
+	s.udpForwarded = nil
+	s.udpForwarder = nil
 	s.ip = nil
+	s.icmpForwarder = nil
 	s.stats.activeTCPConnections.Store(0)
 	s.stats.activeTCPListeners.Store(0)
 	s.stats.activeUDPSockets.Store(0)
@@ -2019,6 +2134,15 @@ func (s *Stack) Close() error {
 	s.fragmentMu.Unlock()
 	if tcpPassive != nil {
 		tcpPassive.closeAll()
+	}
+	if tcpForwarder != nil {
+		tcpForwarder.closeFromStack()
+	}
+	if udpForwarder != nil {
+		udpForwarder.closeFromStack()
+	}
+	if icmpForwarder != nil {
+		icmpForwarder.closeFromStack()
 	}
 	for _, connection := range tcpConnections {
 		connection.abortWithoutReset(ErrClosed)
@@ -2053,10 +2177,17 @@ func (s *Stack) closeTCPListener(listener *TCPListener) bool {
 // closeUDP removes connection from the UDP dispatcher and releases its port.
 func (s *Stack) closeUDP(connection *UDPConn) bool {
 	key := udpKey{address: connection.local, port: connection.port}
+	flow := udpFlowKey{local: netip.AddrPortFrom(connection.local, connection.port), remote: connection.remote}
 	s.mu.Lock()
 	removed := false
 	if s.udp[key] == connection {
 		delete(s.udp, key)
+		removed = true
+	} else if s.udpForwarded[flow] == connection {
+		delete(s.udpForwarded, flow)
+		if len(s.udpForwarded) == 0 {
+			s.udpForwarded = nil
+		}
 		removed = true
 	} else if s.udpReuse != nil && s.udpReuse.remove(connection) {
 		removed = true
@@ -2075,12 +2206,15 @@ func (s *Stack) closeUDP(connection *UDPConn) bool {
 // udpConnectionsLocked returns every exclusive and REUSEPORT socket while
 // Stack.mu is held.
 func (s *Stack) udpConnectionsLocked() []*UDPConn {
-	connections := make([]*UDPConn, 0, len(s.udp))
+	connections := make([]*UDPConn, 0, len(s.udp)+len(s.udpForwarded))
 	for _, connection := range s.udp {
 		connections = append(connections, connection)
 	}
 	if s.udpReuse != nil {
 		connections = append(connections, s.udpReuse.connections()...)
+	}
+	for _, connection := range s.udpForwarded {
+		connections = append(connections, connection)
 	}
 	return connections
 }

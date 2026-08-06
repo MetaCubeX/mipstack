@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net/netip"
+	"syscall"
 )
 
 // ICMPError describes a validated remote network error.
@@ -36,8 +37,42 @@ func (e ICMPError) Error() string {
 	return fmt.Sprintf("ICMP error from %s: type=%d code=%d", e.Reporter, e.Type, e.Code)
 }
 
-// handleICMP replies to echo requests and dispatches validated errors.
-func (s *Stack) handleICMP(packet ipPacket) error {
+// isICMPEchoRequest reports whether payload is one complete Echo Request for
+// the supplied ICMP address family.
+func isICMPEchoRequest(protocol byte, payload []byte) bool {
+	if len(payload) < 8 || payload[1] != 0 {
+		return false
+	}
+	switch protocol {
+	case protocolICMPv4:
+		return payload[0] == 8
+	case protocolICMPv6:
+		return payload[0] == 128
+	default:
+		return false
+	}
+}
+
+// makeICMPEchoReply copies one Echo Request into an Echo Reply with a cleared
+// checksum. The caller owns the returned payload and must calculate the
+// address-family checksum before transmission.
+func makeICMPEchoReply(protocol byte, request []byte) ([]byte, bool) {
+	if !isICMPEchoRequest(protocol, request) {
+		return nil, false
+	}
+	replyType := byte(0)
+	if protocol == protocolICMPv6 {
+		replyType = 129
+	}
+	reply := append([]byte(nil), request...)
+	reply[0], reply[2], reply[3] = replyType, 0, 0
+	return reply, true
+}
+
+// handleICMP replies to owned-address echo requests, dispatches validated
+// asynchronous errors, and offers otherwise unhandled messages to the ICMP
+// forwarder.
+func (s *Stack) handleICMP(packet ipPacket, localDestination bool) error {
 	icmp := packet.payload
 	if len(icmp) < 8 {
 		return nil
@@ -46,33 +81,49 @@ func (s *Stack) handleICMP(packet ipPacket) error {
 		if checksum(icmp) != 0 {
 			return nil
 		}
-		if icmp[0] == 8 && icmp[1] == 0 {
-			if !s.allowControlResponse(controlResponseEchoReply) {
+		if localDestination {
+			if reply, echoRequest := makeICMPEchoReply(packet.protocol, icmp); echoRequest {
+				if !s.allowControlResponse(controlResponseEchoReply) {
+					return nil
+				}
+				binary.BigEndian.PutUint16(reply[2:4], checksum(reply))
+				_ = s.writeIPPayload(packet.target, packet.source, protocolICMPv4, reply, true)
 				return nil
 			}
-			reply := append([]byte(nil), icmp...)
-			reply[0], reply[2], reply[3] = 0, 0, 0
-			binary.BigEndian.PutUint16(reply[2:4], checksum(reply))
-			return s.writeIPPayload(packet.target, packet.source, protocolICMPv4, reply, true)
 		}
 	} else {
 		if transportChecksum(packet.source, packet.target, protocolICMPv6, icmp) != 0 {
 			return nil
 		}
-		if icmp[0] == 128 && icmp[1] == 0 {
-			if !s.allowControlResponse(controlResponseEchoReply) {
+		if localDestination {
+			if reply, echoRequest := makeICMPEchoReply(packet.protocol, icmp); echoRequest {
+				if !s.allowControlResponse(controlResponseEchoReply) {
+					return nil
+				}
+				binary.BigEndian.PutUint16(reply[2:4], transportChecksum(packet.target, packet.source, protocolICMPv6, reply))
+				_ = s.writeIPPayload(packet.target, packet.source, protocolICMPv6, reply, true)
 				return nil
 			}
-			reply := append([]byte(nil), icmp...)
-			reply[0], reply[2], reply[3] = 129, 0, 0
-			binary.BigEndian.PutUint16(reply[2:4], transportChecksum(packet.target, packet.source, protocolICMPv6, reply))
-			return s.writeIPPayload(packet.target, packet.source, protocolICMPv6, reply, true)
 		}
 	}
 	remoteError, ok := parseICMPError(packet)
-	if !ok || !s.isLocal(remoteError.QuotedSource) {
+	if ok && s.deliverICMPError(remoteError) {
 		return nil
 	}
+	s.mu.RLock()
+	forwarder := s.icmpForwarder
+	s.mu.RUnlock()
+	if forwarder != nil && forwarder.handlePacket(packet) {
+		return nil
+	}
+	return nil
+}
+
+// deliverICMPError correlates one validated network error with an ordinary or
+// forwarded socket. It reports whether a transport or raw endpoint accepted
+// the error.
+func (s *Stack) deliverICMPError(remoteError ICMPError) bool {
+	accepted := false
 	switch remoteError.QuotedProtocol {
 	case protocolUDP:
 		if len(remoteError.QuotedPayload) >= udpHeaderSize {
@@ -83,7 +134,12 @@ func (s *Stack) handleICMP(packet ipPacket) error {
 			local := netip.AddrPortFrom(remoteError.QuotedSource, sourcePort)
 			target := netip.AddrPortFrom(remoteError.QuotedTarget, targetPort)
 			s.mu.RLock()
-			connection := s.udpConnectionLocked(local, target)
+			var connection *UDPConn
+			if s.isLocal(remoteError.QuotedSource) {
+				connection = s.udpConnectionLocked(local, target)
+			} else {
+				connection = s.udpForwardedConnectionLocked(local, target)
+			}
 			s.mu.RUnlock()
 			if connection != nil && connection.acceptsLocal(remoteError.QuotedSource) && connection.acceptsError(target) {
 				if remoteError.MTU != 0 {
@@ -93,6 +149,7 @@ func (s *Stack) handleICMP(packet ipPacket) error {
 				}
 				remoteError.QuotedPayload = append([]byte(nil), remoteError.QuotedPayload...)
 				connection.deliverError(target, remoteError)
+				accepted = true
 			}
 		}
 	case protocolTCP:
@@ -116,16 +173,79 @@ func (s *Stack) handleICMP(packet ipPacket) error {
 				}
 				remoteError.QuotedPayload = append([]byte(nil), remoteError.QuotedPayload...)
 				connection.deliverError(remoteError)
+				accepted = true
 			}
 		}
 	}
-	s.mu.RLock()
-	raw := s.ip
-	s.mu.RUnlock()
-	if raw != nil {
-		raw.deliverError(s, remoteError)
+	if s.isLocal(remoteError.QuotedSource) {
+		s.mu.RLock()
+		raw := s.ip
+		s.mu.RUnlock()
+		if raw != nil && raw.deliverError(s, remoteError) {
+			accepted = true
+		}
 	}
-	return nil
+	return accepted
+}
+
+// writeICMPReply emits a handler-supplied complete ICMP message in the reverse
+// direction after repairing its checksum.
+func (s *Stack) writeICMPReply(packet ipPacket, payload []byte) error {
+	if len(payload) < 8 {
+		return syscall.EINVAL
+	}
+	return s.writeOwnedICMPReply(packet, append([]byte(nil), payload...))
+}
+
+// writeOwnedICMPReply repairs and emits a caller-owned payload that may be
+// modified in place. It avoids copying replies constructed inside the stack.
+func (s *Stack) writeOwnedICMPReply(packet ipPacket, reply []byte) error {
+	if len(reply) < 8 {
+		return syscall.EINVAL
+	}
+	state := s.network.Load()
+	if _, routed := state.routeFor(packet.source); !routed {
+		return syscall.ENETUNREACH
+	}
+	if !state.acceptsInboundDestination(packet.target) {
+		return syscall.EADDRNOTAVAIL
+	}
+	reply[2], reply[3] = 0, 0
+	if packet.source.Is4() {
+		binary.BigEndian.PutUint16(reply[2:4], checksum(reply))
+		return s.writeIPPayload(packet.target, packet.source, protocolICMPv4, reply, true)
+	}
+	binary.BigEndian.PutUint16(reply[2:4], transportChecksum(packet.target, packet.source, protocolICMPv6, reply))
+	return s.writeIPPayload(packet.target, packet.source, protocolICMPv6, reply, true)
+}
+
+// sendAdministrativeUnreachable rejects a handler-supplied ICMP request when
+// RFC 792 or RFC 4443 permits an error response.
+func (s *Stack) sendAdministrativeUnreachable(packet ipPacket) error {
+	if !s.network.Load().acceptsInboundDestination(packet.target) || packetInvokesICMPError(packet.original) || !s.allowControlResponse(controlResponsePortUnreachable) {
+		return nil
+	}
+	quoteLength := len(packet.original)
+	if packet.source.Is4() {
+		header := int(packet.original[0]&0x0f) * 4
+		if quoteLength > header+8 {
+			quoteLength = header + 8
+		}
+		icmp := make([]byte, 8+quoteLength)
+		icmp[0], icmp[1] = 3, 13
+		copy(icmp[8:], packet.original[:quoteLength])
+		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+		return s.writeIPPayload(packet.target, packet.source, protocolICMPv4, icmp, false)
+	}
+	maximumQuote := ipv6MinimumMTU - 48
+	if quoteLength > maximumQuote {
+		quoteLength = maximumQuote
+	}
+	icmp := make([]byte, 8+quoteLength)
+	icmp[0], icmp[1] = 1, 1
+	copy(icmp[8:], packet.original[:quoteLength])
+	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, protocolICMPv6, icmp))
+	return s.writeIPPayload(packet.target, packet.source, protocolICMPv6, icmp, false)
 }
 
 // sendFragmentReassemblyTimeout reports an expired datagram when its first
@@ -133,6 +253,9 @@ func (s *Stack) handleICMP(packet ipPacket) error {
 // another ICMP error, while RFC 4443 also caps the complete IPv6 error at the
 // minimum IPv6 MTU.
 func (s *Stack) sendFragmentReassemblyTimeout(set *fragmentSet) error {
+	if !s.isLocal(set.target) {
+		return nil
+	}
 	fragment, ok := parseFragment(set.firstPacket)
 	if !ok || fragment.offset != 0 || packetInvokesICMPError(set.firstPacket) || !s.allowControlResponse(controlResponseFragmentTimeout) {
 		return nil
@@ -326,7 +449,7 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 
 // sendPortUnreachable rejects a valid UDP datagram with no local socket.
 func (s *Stack) sendPortUnreachable(packet ipPacket) error {
-	if !s.allowControlResponse(controlResponsePortUnreachable) {
+	if !s.network.Load().acceptsInboundDestination(packet.target) || !s.allowControlResponse(controlResponsePortUnreachable) {
 		return nil
 	}
 	quoteLength := len(packet.original)

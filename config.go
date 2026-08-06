@@ -20,6 +20,7 @@ type Route struct {
 type networkState struct {
 	mtu               int
 	maxTCPConnections int
+	promiscuous       bool
 	tcpDefaults       TCPSocketDefaults
 	udpDefaults       DatagramSocketDefaults
 	ipDefaults        DatagramSocketDefaults
@@ -81,7 +82,7 @@ func buildNetworkState(config Config) (*networkState, error) {
 		return nil, errors.New("mipstack: invalid IP socket defaults: " + err.Error())
 	}
 	state := &networkState{
-		mtu: mtu, maxTCPConnections: config.MaxTCPConnections,
+		mtu: mtu, maxTCPConnections: config.MaxTCPConnections, promiscuous: config.Promiscuous,
 		tcpDefaults: tcpDefaults, udpDefaults: udpDefaults, ipDefaults: ipDefaults,
 		local:   make(map[netip.Addr]struct{}, len(config.LocalAddresses)),
 		sources: make([]netip.Addr, 0, len(config.LocalAddresses)),
@@ -165,6 +166,27 @@ func buildNetworkState(config Config) (*networkState, error) {
 		}
 	}
 	return state, nil
+}
+
+// acceptsInboundDestination reports whether one unicast destination may enter
+// transport dispatch. Promiscuous admission deliberately remains separate
+// from local ownership, source selection, and loopback routing.
+func (state *networkState) acceptsInboundDestination(address netip.Addr) bool {
+	address = address.Unmap()
+	if _, local := state.local[address]; local {
+		return true
+	}
+	return state.acceptsNonlocalDestination(address)
+}
+
+// acceptsNonlocalDestination applies only the promiscuous branch after the
+// caller has already established that address is not locally owned.
+func (state *networkState) acceptsNonlocalDestination(address netip.Addr) bool {
+	address = address.Unmap()
+	if !state.promiscuous || !address.IsValid() || address.IsUnspecified() || address.IsMulticast() || address.IsLoopback() {
+		return false
+	}
+	return !state.broadcastDestination(address)
 }
 
 // normalizeTCPSocketDefaults validates optional limits and fills the policy

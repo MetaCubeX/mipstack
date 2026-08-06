@@ -126,7 +126,7 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, key tcpKey, syn tcpSeg
 		receiveWindow = 65535
 	}
 	state.noteSYNCookie(period)
-	return stack.writeTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, uint16(receiveWindow), tcpOptions, nil, stack.mtuFor(key.remote.Addr()), defaults.TrafficClass, 0)
+	return stack.tryWriteTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, uint16(receiveWindow), tcpOptions, nil, stack.mtuFor(key.remote.Addr()), defaults.TrafficClass, 0)
 }
 
 // validateSYNCookie authenticates a final ACK against the current or previous

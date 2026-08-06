@@ -1375,6 +1375,10 @@ type TCPConn struct {
 	// listener's local endpoint, matching the listener SO_REUSEADDR behavior
 	// used by the standard library.
 	passive bool
+	// forwarded authorizes this connection to retain an intercepted nonlocal
+	// destination as its local endpoint while promiscuous admission remains
+	// enabled.
+	forwarded bool
 
 	inbound            tcpSegmentQueue
 	networkError       chan error
@@ -2152,8 +2156,15 @@ func (s *Stack) tcpInitialSequence(key tcpKey, now time.Time) uint32 {
 }
 
 // handleTCP validates a segment, dispatches it by four-tuple, or emits RST for
-// an unbound destination.
+// an unbound local destination. Stack packet input uses
+// handleTCPForDestination after computing destination ownership once.
 func (s *Stack) handleTCP(packet ipPacket, receivedAt time.Time) error {
+	return s.handleTCPForDestination(packet, receivedAt, true)
+}
+
+// handleTCPForDestination preserves ordinary listener ownership while
+// allowing established forwarded tuples to use nonlocal destinations.
+func (s *Stack) handleTCPForDestination(packet ipPacket, receivedAt time.Time, localDestination bool) error {
 	tcp := packet.payload
 	if len(tcp) < tcpHeaderSize || transportChecksum(packet.source, packet.target, protocolTCP, tcp) != 0 {
 		s.stats.inboundDroppedPackets.Add(1)
@@ -2190,15 +2201,31 @@ func (s *Stack) handleTCP(packet ipPacket, receivedAt time.Time) error {
 		return nil
 	}
 	s.mu.RLock()
-	passive := s.tcpPassive
+	passive, forwarder := s.tcpPassive, s.tcpForwarder
 	s.mu.RUnlock()
-	if passive != nil {
+	if localDestination && passive != nil {
 		handled, err := passive.handleSegment(s, packet, segment, key)
 		if handled || err != nil {
 			return err
 		}
 	}
+	if forwarder != nil && forwarder.handleSegment(segment, key) {
+		return nil
+	}
+	if !localDestination {
+		return nil
+	}
+	_ = s.rejectTCPSegment(key, segment)
+	return nil
+}
+
+// rejectTCPSegment emits the RFC 9293 response for one otherwise unhandled
+// segment. Incoming resets never elicit another reset.
+func (s *Stack) rejectTCPSegment(key tcpKey, segment tcpSegment) error {
 	if segment.flags&tcpFlagRST != 0 {
+		return nil
+	}
+	if !s.network.Load().acceptsInboundDestination(key.local.Addr()) {
 		return nil
 	}
 	if !s.allowControlResponse(controlResponseTCPReset) {
@@ -2218,7 +2245,55 @@ func (s *Stack) handleTCP(packet ipPacket, receivedAt time.Time) error {
 		}
 		flags |= tcpFlagACK
 	}
-	return s.writeTCP(packet.target, packet.source, targetPort, sourcePort, sequence, acknowledgement, flags, 0, nil, nil, s.mtuFor(packet.source), 0, 0)
+	return s.tryWriteTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, acknowledgement, flags, 0, nil, nil, s.mtuFor(key.remote.Addr()), 0, 0)
+}
+
+// acceptTCP creates and starts one forwarded passive connection after the
+// handler has claimed its request.
+func (f *TCPForwarder) acceptTCP(request *TCPForwarderRequest) (*TCPConn, <-chan error, error) {
+	stack := f.stack
+	stack.mu.Lock()
+	if stack.closed {
+		stack.mu.Unlock()
+		return nil, nil, ErrClosed
+	}
+	if stack.tcpForwarder != f {
+		stack.mu.Unlock()
+		return nil, nil, net.ErrClosed
+	}
+	state := stack.network.Load()
+	if !state.acceptsInboundDestination(request.key.local.Addr()) {
+		stack.mu.Unlock()
+		return nil, nil, syscall.EADDRNOTAVAIL
+	}
+	if _, routed := state.routeFor(request.key.remote.Addr()); !routed {
+		stack.mu.Unlock()
+		return nil, nil, syscall.ENETUNREACH
+	}
+	if stack.tcp[request.key] != nil || networkStateHasLocal(state, request.key.local.Addr()) && stack.tcpPortListenedLocked(request.key.local.Addr(), request.key.local.Port()) {
+		stack.mu.Unlock()
+		return nil, nil, syscall.EADDRINUSE
+	}
+	if !stack.tcpConnectionAvailableLocked() {
+		stack.mu.Unlock()
+		return nil, nil, ErrResourceLimit
+	}
+	network := "tcp4"
+	if request.key.local.Addr().Is6() {
+		network = "tcp6"
+	}
+	connection := newTCPConn(stack, network, request.key, stack.mtuFor(request.key.remote.Addr()))
+	connection.passive = true
+	connection.forwarded = true
+	initialSequence := stack.tcpInitialSequence(request.key, tcpSegmentEventTime(request.segment, time.Now(), time.Time{}, stack.timestampEpoch))
+	connection.publishICMPSequenceRange(initialSequence, initialSequence+1)
+	stack.tcp[request.key] = connection
+	stack.stats.activeTCPConnections.Add(1)
+	stack.mu.Unlock()
+	f.remove(request)
+	result := make(chan error, 1)
+	go connection.runForwardedPassive(request.segment, initialSequence, result)
+	return connection, result, nil
 }
 
 // tcpConnectionAvailableLocked applies the optional embedding limit while
@@ -2288,6 +2363,8 @@ func (state *tcpPassiveState) handleSYN(stack *Stack, packet ipPacket, segment t
 	if err == nil {
 		listener.synCookiesSent.Add(1)
 		stack.stats.tcpSYNCookiesSent.Add(1)
+	} else if errors.Is(err, ErrResourceLimit) {
+		return true, nil
 	}
 	return true, err
 }
@@ -2430,10 +2507,9 @@ func buildTCPPacketViewInto(packet []byte, source, target netip.Addr, sourcePort
 	return packet, nil
 }
 
-// writeTCP emits a stack-owned control segment. Connection actors use their
-// cancellation-aware writer below so a stalled embedding link cannot retain a
-// terminated connection indefinitely.
-func (s *Stack) writeTCP(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte) error {
+// tryWriteTCP emits one best-effort stack-owned control segment without
+// waiting for device capacity.
+func (s *Stack) tryWriteTCP(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte) error {
 	flowLabel := uint32(0)
 	if source.Is6() {
 		flowLabel = s.network.Load().tcpDefaults.FlowLabel
@@ -2445,7 +2521,7 @@ func (s *Stack) writeTCP(source, target netip.Addr, sourcePort, targetPort uint1
 	if err != nil {
 		return err
 	}
-	return s.writePacket(packet)
+	return s.tryWritePacket(packet)
 }
 
 // deliverError queues a matching ICMP error without blocking packet input.
@@ -3540,6 +3616,23 @@ func (c *TCPConn) runPassive(listener *TCPListener, syn tcpSegment, initialSeque
 		return
 	}
 	queued = true
+	err := c.established(initialSequence+1, protocolTimer)
+	c.finish(err)
+}
+
+// runForwardedPassive completes a handler-approved passive open without an
+// ordinary listener accept queue, then owns the established connection.
+func (c *TCPConn) runForwardedPassive(syn tcpSegment, initialSequence uint32, result chan<- error) {
+	defer c.stack.removeTCP(c)
+	defer close(c.done)
+	protocolTimer := newOwnedTimer()
+	defer protocolTimer.close()
+	if err := c.passiveHandshake(syn, initialSequence, protocolTimer); err != nil {
+		result <- err
+		c.finish(err)
+		return
+	}
+	result <- nil
 	err := c.established(initialSequence+1, protocolTimer)
 	c.finish(err)
 }
@@ -5922,6 +6015,9 @@ func (c *TCPConn) sendSegment(sequence, acknowledgement uint32, flags byte, wind
 // sendAbortReset makes one nonblocking attempt to publish the final RST from
 // an actor whose normal packet writes have already been canceled.
 func (c *TCPConn) sendAbortReset(sequence, acknowledgement uint32, window uint16) error {
+	if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
+		return syscall.EADDRNOTAVAIL
+	}
 	flags := byte(tcpFlagRST | tcpFlagACK)
 	var options []byte
 	if c.peerTimestamp {
@@ -6022,6 +6118,9 @@ func (c *TCPConn) sendBufferedSegmentForMTU(sendBase uint32, segment sentTCPSegm
 // writeTCP emits one connection-owned segment and remains interruptible while
 // the embedding packet queue is full.
 func (c *TCPConn) writeTCP(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte) (packetQueueTicket, error) {
+	if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
+		return packetQueueTicket{}, syscall.EADDRNOTAVAIL
+	}
 	_, _, packetSize, err := tcpPacketLayout(c.key.local.Addr(), c.key.remote.Addr(), options, payload.size, mtu)
 	if err != nil {
 		return packetQueueTicket{}, err
