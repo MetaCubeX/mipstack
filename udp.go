@@ -91,6 +91,7 @@ type UDPConn struct {
 
 	mu              sync.Mutex
 	receive         datagramQueue[udpDatagram]
+	receiveSpare    []byte
 	receiveNotify   chan struct{}
 	receiveCapacity int
 	queuedBytes     int
@@ -126,9 +127,7 @@ func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.
 			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
 		},
 	}
-	if !remote.IsValid() {
-		connection.recentTargets = make(recentDestinationCache[netip.AddrPort])
-	} else if stack != nil && local.Is6() && remote.Addr().Is6() && defaults.FlowLabel == 0 {
+	if remote.IsValid() && stack != nil && local.Is6() && remote.Addr().Is6() && defaults.FlowLabel == 0 {
 		connection.automaticLabel = stack.automaticTransportFlowLabel(local, remote.Addr(), protocolUDP, port, remote.Port())
 	}
 	return connection
@@ -245,7 +244,17 @@ func (c *UDPConn) enqueue(payload []byte, source netip.AddrPort, target netip.Ad
 		c.packetsDropped.Add(1)
 		return
 	}
-	datagram := udpDatagram{payload: append([]byte(nil), payload...), source: source, target: target, options: options}
+	var retained []byte
+	if len(payload) != 0 {
+		if cap(c.receiveSpare) >= len(payload) {
+			retained = c.receiveSpare[:len(payload)]
+			c.receiveSpare = nil
+			copy(retained, payload)
+		} else {
+			retained = append([]byte(nil), payload...)
+		}
+	}
+	datagram := udpDatagram{payload: retained, source: source, target: target, options: options}
 	c.receive.push(datagram)
 	c.queuedBytes += size
 	c.packetsReceived.Add(1)
@@ -377,6 +386,17 @@ func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, tar
 			c.notifyReceiveLocked()
 			c.mu.Unlock()
 			n = copy(buffer, datagram.payload)
+			if cap(datagram.payload) != 0 && cap(datagram.payload) <= datagramReusablePayloadLimit {
+				c.mu.Lock()
+				select {
+				case <-c.closed:
+				default:
+					if cap(datagram.payload) > cap(c.receiveSpare) {
+						c.receiveSpare = datagram.payload[:0]
+					}
+				}
+				c.mu.Unlock()
+			}
 			return n, datagram.source, datagram.target, datagram.options, n < len(datagram.payload), nil
 		}
 		deadline, changed, notified := c.readDeadline, c.readChanged, c.receiveNotify
@@ -583,7 +603,7 @@ func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, packetInfoS
 // independently reachable by the linker.
 func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, uint16, uint16, []byte, ipPacketOptions) error) (int, error) {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
-	if target.Addr().Is6() != c.v6 && !c.dual || target.Port() == 0 || target.Addr().IsUnspecified() {
+	if target.Addr().Is6() != c.v6 && !c.dual || target.Addr().IsUnspecified() {
 		return 0, errors.New("mipstack: invalid UDP destination")
 	}
 	deadline, _, closed, options := c.writeStateAndOptions(options)
@@ -659,20 +679,36 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 		if source.Is4() && allowFragment {
 			identification = uint16(c.stack.ipv4ID.Add(1))
 		}
-		packet := make([]byte, ipSize+udpSize)
+		queue, loopback := c.stack.outputQueueFor(target)
+		slot, err := c.stack.reservePacketUntil(queue, loopback, c.writeState)
+		if err != nil {
+			return err
+		}
+		packet, reusable := queue.acquireBuffer(ipSize + udpSize)
 		if !marshalIPHeader(packet, source, target, protocolUDP, identification, !allowFragment, options) {
+			queue.releaseBuffer(packet, reusable)
+			queue.releaseReserved(slot)
 			return syscall.EMSGSIZE
 		}
 		udp := packet[ipSize:]
 		marshalUDPDatagram(udp, source, target, sourcePort, targetPort, payload)
-		return c.stack.writePacketUntil(packet, c.writeState)
+		queue.enqueueReservedPacket(slot, packet, reusable)
+		c.stack.recordOutput(loopback)
+		return nil
 	}
 	if !allowFragment {
 		return syscall.EMSGSIZE
 	}
-	udp := make([]byte, udpSize)
-	marshalUDPDatagram(udp, source, target, sourcePort, targetPort, payload)
-	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, protocolUDP, udp, true, options, mtu, c.writeState)
+	var udpHeader [udpHeaderSize]byte
+	binary.BigEndian.PutUint16(udpHeader[0:2], sourcePort)
+	binary.BigEndian.PutUint16(udpHeader[2:4], targetPort)
+	binary.BigEndian.PutUint16(udpHeader[4:6], uint16(udpSize))
+	value := transportChecksumParts(source, target, protocolUDP, udpSize, udpHeader[:], payload)
+	if value == 0 {
+		value = 0xffff
+	}
+	binary.BigEndian.PutUint16(udpHeader[6:8], value)
+	return c.stack.writeIPFragmentsUntilOptionsForMTU(source, target, protocolUDP, udpHeader[:], payload, options, mtu, c.writeState)
 }
 
 // marshalUDPDatagram writes one UDP header, payload, and checksum into dst.
@@ -680,6 +716,7 @@ func marshalUDPDatagram(dst []byte, source, target netip.Addr, sourcePort, targe
 	binary.BigEndian.PutUint16(dst[0:2], sourcePort)
 	binary.BigEndian.PutUint16(dst[2:4], targetPort)
 	binary.BigEndian.PutUint16(dst[4:6], uint16(len(dst)))
+	binary.BigEndian.PutUint16(dst[6:8], 0)
 	copy(dst[udpHeaderSize:], payload)
 	value := transportChecksum(source, target, protocolUDP, dst)
 	if value == 0 {
@@ -757,6 +794,7 @@ func (c *UDPConn) closeFromStack() {
 	c.once.Do(func() {
 		c.mu.Lock()
 		c.receive.clear()
+		c.receiveSpare = nil
 		c.queuedBytes = 0
 		close(c.closed)
 		c.mu.Unlock()

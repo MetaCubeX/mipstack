@@ -223,6 +223,9 @@ CUBIC, Reno, and paced model-based BBR congestion control, window scaling,
 delayed ACKs, SACK multi-hole recovery with Proportional Rate Reduction, RACK
 time-based loss detection, tail-loss probes, timestamp negotiation with PAWS,
 and classic ECN feedback.
+Validated network- and host-unreachable feedback for `SND.UNA` applies RFC
+6069 TCP-LD one-step RTO backoff reversion without turning an established
+connection's soft network error into a hard failure.
 On a SACK-negotiated connection, only newly reported scoreboard information
 counts toward RFC 6675 `DupAcks`; repeated cumulative ACKs and window-probe
 responses without new SACK data cannot manufacture a loss episode.

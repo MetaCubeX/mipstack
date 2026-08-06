@@ -92,6 +92,7 @@ type IPConn struct {
 
 	mu              sync.Mutex
 	receive         datagramQueue[ipDatagram]
+	receiveSpare    []byte
 	receiveNotify   chan struct{}
 	receiveCapacity int
 	queuedBytes     int
@@ -284,9 +285,6 @@ func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.
 			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
 		},
 	}
-	if !remote.IsValid() {
-		connection.recentTargets = make(recentDestinationCache[netip.Addr])
-	}
 	return connection
 }
 
@@ -463,7 +461,17 @@ func (c *IPConn) enqueue(payload []byte, source, target netip.Addr, options ipPa
 		c.packetsDropped.Add(1)
 		return
 	}
-	datagram := ipDatagram{payload: append([]byte(nil), payload...), source: source, target: target, options: options}
+	var retained []byte
+	if len(payload) != 0 {
+		if cap(c.receiveSpare) >= len(payload) {
+			retained = c.receiveSpare[:len(payload)]
+			c.receiveSpare = nil
+			copy(retained, payload)
+		} else {
+			retained = append([]byte(nil), payload...)
+		}
+	}
+	datagram := ipDatagram{payload: retained, source: source, target: target, options: options}
 	c.receive.push(datagram)
 	c.queuedBytes += size
 	c.packetsReceived.Add(1)
@@ -559,6 +567,17 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 			c.notifyReceiveLocked()
 			c.mu.Unlock()
 			n = copy(buffer, datagram.payload)
+			if cap(datagram.payload) != 0 && cap(datagram.payload) <= datagramReusablePayloadLimit {
+				c.mu.Lock()
+				select {
+				case <-c.closed:
+				default:
+					if cap(datagram.payload) > cap(c.receiveSpare) {
+						c.receiveSpare = datagram.payload[:0]
+					}
+				}
+				c.mu.Unlock()
+			}
 			return n, datagram, n < len(datagram.payload), nil
 		}
 		deadline, changed, notified := c.readDeadline, c.readChanged, c.receiveNotify
@@ -778,6 +797,7 @@ func (c *IPConn) closeFromStack() {
 	c.once.Do(func() {
 		c.mu.Lock()
 		c.receive.clear()
+		c.receiveSpare = nil
 		c.queuedBytes = 0
 		close(c.closed)
 		c.mu.Unlock()

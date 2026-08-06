@@ -43,7 +43,7 @@ func TestPacketQueueWaitDoesNotSerializeWriteDeadlines(t *testing.T) {
 	firstChanged := make(chan struct{})
 	var firstOnce sync.Once
 	go func() {
-		_, writeErr := stack.writePacketUntilTicket(packet, func() (time.Time, <-chan struct{}, bool) {
+		writeErr := stack.writePacketUntil(packet, func() (time.Time, <-chan struct{}, bool) {
 			firstOnce.Do(func() { close(firstStarted) })
 			return time.Time{}, firstChanged, false
 		})
@@ -54,7 +54,7 @@ func TestPacketQueueWaitDoesNotSerializeWriteDeadlines(t *testing.T) {
 	deadline := time.Now().Add(25 * time.Millisecond)
 	secondChanged := make(chan struct{})
 	startedAt := time.Now()
-	_, err = stack.writePacketUntilTicket(packet, func() (time.Time, <-chan struct{}, bool) {
+	err = stack.writePacketUntil(packet, func() (time.Time, <-chan struct{}, bool) {
 		return deadline, secondChanged, false
 	})
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
@@ -75,6 +75,24 @@ func TestPacketQueueWaitDoesNotSerializeWriteDeadlines(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("first queue write did not resume after dequeue")
+	}
+}
+
+func TestMonotonicStampRoundTripAndClamping(t *testing.T) {
+	epoch := time.Unix(100, 123)
+	value := epoch.Add(250*time.Millisecond + 456*time.Nanosecond)
+	stamp := monotonicStampAt(epoch, value)
+	if got := stamp.time(epoch); got != value {
+		t.Fatalf("monotonic timestamp round trip = %v, want %v", got, value)
+	}
+	if got := monotonicStampAt(epoch, epoch.Add(-time.Nanosecond)).time(epoch); got != epoch {
+		t.Fatalf("pre-epoch timestamp = %v, want %v", got, epoch)
+	}
+	if got := monotonicStampAt(epoch, time.Time{}); got != 0 {
+		t.Fatalf("zero timestamp encoding = %d, want 0", got)
+	}
+	if got := monotonicStamp(0).time(epoch); !got.IsZero() {
+		t.Fatalf("zero timestamp decoding = %v, want zero time", got)
 	}
 }
 
@@ -299,12 +317,16 @@ func TestPacketQueueTicketTracksDeviceDequeue(t *testing.T) {
 		t.Fatal(err)
 	}
 	packet := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), 1, false)
-	ticket, err := stack.writePacketUntilTicket(packet, func() (time.Time, <-chan struct{}, bool) {
-		return time.Time{}, nil, false
-	})
-	if err != nil {
-		t.Fatal(err)
+	queue, loopback := stack.outputQueue(packet)
+	if loopback {
+		t.Fatal("remote packet selected the loopback queue")
 	}
+	slot, reserved := queue.tryReserve()
+	if !reserved {
+		t.Fatal("packet queue slot was not available")
+	}
+	ticket := queue.enqueueReserved(slot, packet, false)
+	stack.recordOutput(false)
 	if !ticket.pending() {
 		t.Fatal("new packet queue ticket is not pending")
 	}
@@ -319,24 +341,32 @@ func TestPacketQueueTicketTracksDeviceDequeue(t *testing.T) {
 
 func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
 	queue := newPacketQueue(1)
-	first, queued := queue.tryEnqueue([]byte{1})
-	if !queued || !first.pending() {
+	firstSlot, reserved := queue.tryReserve()
+	if !reserved {
+		t.Fatal("first queue slot was not available")
+	}
+	first := queue.enqueueReserved(firstSlot, []byte{1}, false)
+	if !first.pending() {
 		t.Fatal("first queue ticket was not pending")
 	}
 	entry := <-queue.packets
-	queue.consume(entry)
+	queue.release(entry)
 	if first.pending() {
 		t.Fatal("consumed queue ticket remained pending")
 	}
-	second, queued := queue.tryEnqueue([]byte{2})
-	if !queued || !second.pending() {
+	secondSlot, reserved := queue.tryReserve()
+	if !reserved {
+		t.Fatal("reused queue slot was not available")
+	}
+	second := queue.enqueueReserved(secondSlot, []byte{2}, false)
+	if !second.pending() {
 		t.Fatal("reused queue slot was not pending")
 	}
 	if first.pending() || first.generation == second.generation {
 		t.Fatalf("slot reuse revived generation %d as %d", first.generation, second.generation)
 	}
 	entry = <-queue.packets
-	queue.consume(entry)
+	queue.release(entry)
 	if second.pending() {
 		t.Fatal("second queue ticket remained pending")
 	}

@@ -66,8 +66,8 @@ func (message *IPv4ControlMessage) marshal(address netip.Addr, receiving bool) (
 	if message.IfIndex != 0 {
 		return nil, errors.New("mipstack: nonzero IPv4 control-message interface index is not supported")
 	}
-	var control []byte
 	address = address.Unmap()
+	capacity := 0
 	if address.IsValid() {
 		if !address.Is4() || address.Zone() != "" || !receiving && address.IsMulticast() {
 			field := "source"
@@ -76,16 +76,26 @@ func (message *IPv4ControlMessage) marshal(address netip.Addr, receiving bool) (
 			}
 			return nil, errors.New("mipstack: invalid IPv4 control-message " + field)
 		}
-		control = linuxPacketInfoControl(address)
+		capacity += 32
 	}
 	if message.TTL < 0 || message.TTL > 255 {
 		return nil, errors.New("mipstack: IPv4 control-message TTL must be between 0 and 255")
 	}
-	if receiving || message.TTL != 0 {
-		control = appendLinuxControlInt32(control, linuxLevelIP, linuxIPTimeToLive, int32(message.TTL))
-	}
 	if message.TOS < 0 || message.TOS > 255 {
 		return nil, errors.New("mipstack: IPv4 control-message TOS must be between 0 and 255")
+	}
+	if receiving || message.TTL != 0 {
+		capacity += 24
+	}
+	if receiving || message.TOS != 0 {
+		capacity += 24
+	}
+	control := make([]byte, 0, capacity)
+	if address.IsValid() {
+		control = appendLinuxPacketInfoControl(control, address)
+	}
+	if receiving || message.TTL != 0 {
+		control = appendLinuxControlInt32(control, linuxLevelIP, linuxIPTimeToLive, int32(message.TTL))
 	}
 	if receiving {
 		control = appendLinuxControl(control, linuxLevelIP, linuxIPTypeOfService, []byte{byte(message.TOS)})
@@ -169,8 +179,8 @@ func (message *IPv6ControlMessage) marshal(address netip.Addr, receiving bool) (
 	if message.IfIndex != 0 {
 		return nil, errors.New("mipstack: nonzero IPv6 control-message interface index is not supported")
 	}
-	var control []byte
 	address = address.Unmap()
+	capacity := 0
 	if address.IsValid() {
 		if !address.Is6() || address.Zone() != "" || !receiving && address.IsMulticast() {
 			field := "source"
@@ -179,22 +189,35 @@ func (message *IPv6ControlMessage) marshal(address netip.Addr, receiving bool) (
 			}
 			return nil, errors.New("mipstack: invalid IPv6 control-message " + field)
 		}
-		control = linuxPacketInfoControl(address)
+		capacity += 40
 	}
 	if message.HopLimit < 0 || message.HopLimit > 255 {
 		return nil, errors.New("mipstack: IPv6 control-message hop limit must be between 0 and 255")
 	}
-	if receiving || message.HopLimit != 0 {
-		control = appendLinuxControlInt32(control, linuxLevelIPv6, linuxIPv6HopLimit, int32(message.HopLimit))
-	}
 	if message.TrafficClass < 0 || message.TrafficClass > 255 {
 		return nil, errors.New("mipstack: IPv6 control-message traffic class must be between 0 and 255")
 	}
-	if receiving || message.TrafficClass != 0 {
-		control = appendLinuxControlInt32(control, linuxLevelIPv6, linuxIPv6TrafficClass, int32(message.TrafficClass))
-	}
 	if message.FlowLabel > ipv6MaximumFlowLabel {
 		return nil, errors.New("mipstack: IPv6 control-message flow label exceeds 20 bits")
+	}
+	if receiving || message.HopLimit != 0 {
+		capacity += 24
+	}
+	if receiving || message.TrafficClass != 0 {
+		capacity += 24
+	}
+	if message.FlowLabel != 0 || receiving && message.TrafficClass != 0 {
+		capacity += 24
+	}
+	control := make([]byte, 0, capacity)
+	if address.IsValid() {
+		control = appendLinuxPacketInfoControl(control, address)
+	}
+	if receiving || message.HopLimit != 0 {
+		control = appendLinuxControlInt32(control, linuxLevelIPv6, linuxIPv6HopLimit, int32(message.HopLimit))
+	}
+	if receiving || message.TrafficClass != 0 {
+		control = appendLinuxControlInt32(control, linuxLevelIPv6, linuxIPv6TrafficClass, int32(message.TrafficClass))
 	}
 	// Linux emits IPV6_FLOWINFO on receive only when the combined traffic
 	// class and flow label are nonzero. Structured sends omit a zero label so
@@ -237,19 +260,21 @@ func (message *IPv6ControlMessage) parseForWrite(control []byte) (ipPacketOption
 	return options, nil
 }
 
-// linuxPacketInfoControl encodes source-selection metadata. Interface index
-// zero selects MIPS's single embedding link.
-func linuxPacketInfoControl(address netip.Addr) []byte {
+// appendLinuxPacketInfoControl encodes source-selection metadata. Interface
+// index zero selects MIPS's single embedding link.
+func appendLinuxPacketInfoControl(control []byte, address netip.Addr) []byte {
 	address = address.Unmap()
 	if address.Is4() {
-		data := make([]byte, 12)
-		copy(data[4:8], address.AsSlice())
-		copy(data[8:12], address.AsSlice())
-		return appendLinuxControl(nil, linuxLevelIP, linuxIPPacketInfo, data)
+		var data [12]byte
+		addressBytes := address.As4()
+		copy(data[4:8], addressBytes[:])
+		copy(data[8:12], addressBytes[:])
+		return appendLinuxControl(control, linuxLevelIP, linuxIPPacketInfo, data[:])
 	}
-	data := make([]byte, 20)
-	copy(data[0:16], address.AsSlice())
-	return appendLinuxControl(nil, linuxLevelIPv6, linuxIPv6PacketInfo, data)
+	var data [20]byte
+	addressBytes := address.As16()
+	copy(data[0:16], addressBytes[:])
+	return appendLinuxControl(control, linuxLevelIPv6, linuxIPv6PacketInfo, data[:])
 }
 
 // controlMessageForRead encodes receive metadata through the public control

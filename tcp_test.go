@@ -88,6 +88,27 @@ func TestTCPListenerAcceptAndClose(t *testing.T) {
 	}
 }
 
+func TestTCPDestinationPortZeroUsesProtocolPath(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		network        string
+		client, server netip.Addr
+	}{
+		{name: "IPv4", network: "tcp4", client: netip.MustParseAddr("192.0.2.232"), server: netip.MustParseAddr("192.0.2.233")},
+		{name: "IPv6", network: "tcp6", client: netip.MustParseAddr("2001:db8::232"), server: netip.MustParseAddr("2001:db8::233")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, server := newStackPair(t, test.client, test.server, 1400)
+			newStackBridge(t, client, server)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if _, err := client.DialTCP(ctx, test.network, netip.AddrPort{}, netip.AddrPortFrom(test.server, 0)); !errors.Is(err, syscall.ECONNREFUSED) {
+				t.Fatalf("DialTCP to port zero = %v, want ECONNREFUSED", err)
+			}
+		})
+	}
+}
+
 func TestTCPListenerCompletedConnectionsLeaveSYNBacklog(t *testing.T) {
 	listener := &TCPListener{
 		accept: make(chan *TCPConn, 2), closed: make(chan struct{}), changed: make(chan struct{}), backlog: 1,
@@ -404,6 +425,106 @@ func TestTCPReaderFromWriterToAndMultipathQuery(t *testing.T) {
 	}
 }
 
+type tcpTestWriterFunc func([]byte) (int, error)
+
+func (f tcpTestWriterFunc) Write(payload []byte) (int, error) { return f(payload) }
+
+func TestTCPWriteToKeepsDirectChunkStableWhileReceiving(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	connection.mu.Lock()
+	connection.readBuffer.append([]byte("first"))
+	connection.readErr = io.EOF
+	connection.mu.Unlock()
+	var received bytes.Buffer
+	writes := 0
+	n, err := connection.WriteTo(tcpTestWriterFunc(func(payload []byte) (int, error) {
+		writes++
+		if writes == 1 {
+			if string(payload) != "first" {
+				t.Fatalf("first direct WriteTo chunk = %q", payload)
+			}
+			second := []byte("second")
+			if accepted := connection.appendReadBuffer(second, second, 0); accepted != len(second) {
+				t.Fatalf("concurrent receive accepted %d bytes", accepted)
+			}
+			if string(payload) != "first" {
+				t.Fatalf("concurrent receive changed direct WriteTo chunk to %q", payload)
+			}
+		}
+		return received.Write(payload)
+	}))
+	if err != nil || n != int64(len("firstsecond")) || received.String() != "firstsecond" || writes != 2 {
+		t.Fatalf("direct WriteTo = %d, %v, data %q, writes %d", n, err, received.String(), writes)
+	}
+}
+
+func TestTCPReadBufferAdoptsOwnedPayload(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	payload := []byte("data")
+	payload = payload[:len(payload):len(payload)]
+	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+		t.Fatalf("appendReadBuffer accepted %d bytes, want %d", accepted, len(payload))
+	}
+	if &connection.readBuffer.chunks[0][0] != &payload[0] {
+		t.Fatal("empty receive buffer did not adopt actor-owned payload")
+	}
+	buffer := make([]byte, len(payload))
+	if n, err := connection.read(buffer); err != nil || n != len(payload) || string(buffer) != "data" {
+		t.Fatalf("Read = %d, %q, %v; want 4, data, nil", n, buffer, err)
+	}
+}
+
+func TestTCPReadCrossesReceiveChunks(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	for _, payload := range [][]byte{[]byte("one"), []byte("two"), []byte("three")} {
+		if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+			t.Fatalf("accepted %d of %d bytes", accepted, len(payload))
+		}
+	}
+	buffer := make([]byte, len("onetwothree"))
+	if n, err := connection.Read(buffer); err != nil || n != len(buffer) || string(buffer) != "onetwothree" {
+		t.Fatalf("cross-chunk Read = %d, %v, %q", n, err, buffer)
+	}
+	if connection.readBuffer.size != 0 || connection.readBuffer.head != 0 || len(connection.readBuffer.chunks) != 0 {
+		t.Fatalf("drained receive deque = size %d head %d chunks %d", connection.readBuffer.size, connection.readBuffer.head, len(connection.readBuffer.chunks))
+	}
+}
+
+func TestTCPWriteToBatchesReceiveChunks(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	const chunks = 40
+	chunk := bytes.Repeat([]byte{0x5a}, 1024)
+	for index := 0; index < chunks; index++ {
+		connection.readBuffer.append(append([]byte(nil), chunk...))
+	}
+	connection.readErr = io.EOF
+	writes := 0
+	n, err := connection.WriteTo(tcpTestWriterFunc(func(payload []byte) (int, error) {
+		writes++
+		if len(payload) > 32*1024 {
+			t.Fatalf("WriteTo batch = %d bytes", len(payload))
+		}
+		return len(payload), nil
+	}))
+	if err != nil || n != chunks*1024 || writes != 2 {
+		t.Fatalf("chunked WriteTo = %d, %v, writes %d; want %d, nil, 2", n, err, writes, chunks*1024)
+	}
+}
+
+func TestTCPReadDequeReleasesLargeMetadataBurst(t *testing.T) {
+	var buffer tcpReadBuffer
+	for index := 0; index <= tcpReadChunkRetain; index++ {
+		buffer.append([]byte{byte(index)})
+	}
+	destination := make([]byte, buffer.size)
+	if n := buffer.read(destination, len(destination)); n != len(destination) {
+		t.Fatalf("deque read = %d, want %d", n, len(destination))
+	}
+	if buffer.chunks != nil {
+		t.Fatalf("large drained deque retained capacity %d", cap(buffer.chunks))
+	}
+}
+
 // TestTCPListenerIPv6WildcardAndBinding verifies wildcard dispatch and
 // standard address-in-use errors for overlapping passive endpoints.
 func TestTCPListenerIPv6WildcardAndBinding(t *testing.T) {
@@ -555,6 +676,18 @@ func TestTCPTimeWaitAcceptsRetransmittedFINWithAdditionalFlags(t *testing.T) {
 	})
 }
 
+func testTCPHandshake(connection *TCPConn, initialSequence uint32) error {
+	timer := newOwnedTimer()
+	defer timer.close()
+	return connection.handshake(initialSequence, timer)
+}
+
+func testTCPPassiveHandshake(connection *TCPConn, syn tcpSegment, initialSequence uint32) error {
+	timer := newOwnedTimer()
+	defer timer.close()
+	return connection.passiveHandshake(syn, initialSequence, timer)
+}
+
 func TestTCPPassiveHandshakeChallengeAndResetResponses(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -590,7 +723,7 @@ func TestTCPPassiveHandshakeChallengeAndResetResponses(t *testing.T) {
 			connection.passive = true
 			result := make(chan error, 1)
 			go func() {
-				result <- connection.passiveHandshake(tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}, 1000)
+				result <- testTCPPassiveHandshake(connection, tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}, 1000)
 			}()
 			readPacket := func() []byte {
 				select {
@@ -633,7 +766,7 @@ func TestTCPPassiveHandshakeAcceptsOutOfOrderFinalACKData(t *testing.T) {
 	connection.passive = true
 	result := make(chan error, 1)
 	go func() {
-		result <- connection.passiveHandshake(tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}, 1000)
+		result <- testTCPPassiveHandshake(connection, tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}, 1000)
 	}()
 	select {
 	case <-link.outbound:
@@ -677,7 +810,7 @@ func TestTCPPassiveHandshakeECNFallback(t *testing.T) {
 	connection.passive = true
 	result := make(chan error, 1)
 	go func() {
-		result <- connection.passiveHandshake(tcpSegment{
+		result <- testTCPPassiveHandshake(connection, tcpSegment{
 			sequence: 100, flags: tcpFlagSYN | tcpFlagECE | tcpFlagCWR, window: 65535,
 		}, 1000)
 	}()
@@ -724,10 +857,10 @@ func TestTCPPassiveRetransmittedSYNUpdatesTimestampEcho(t *testing.T) {
 	}, 1400)
 	connection.passive = true
 	result := make(chan error, 1)
+	initialSYN := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}
+	initialSYN.setOptions(tcpTimestampOptions(100, 0))
 	go func() {
-		result <- connection.passiveHandshake(tcpSegment{
-			sequence: 100, flags: tcpFlagSYN, window: 65535, options: tcpTimestampOptions(100, 0),
-		}, 1000)
+		result <- testTCPPassiveHandshake(connection, initialSYN, 1000)
 	}()
 	readTimestampEcho := func() uint32 {
 		select {
@@ -750,14 +883,15 @@ func TestTCPPassiveRetransmittedSYNUpdatesTimestampEcho(t *testing.T) {
 	if echo := readTimestampEcho(); echo != 100 {
 		t.Fatalf("initial SYN-ACK TSecr = %d, want 100", echo)
 	}
-	enqueueTCPTestSegment(t, connection, tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535, options: tcpTimestampOptions(200, 0)})
+	retransmittedSYN := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}
+	retransmittedSYN.setOptions(tcpTimestampOptions(200, 0))
+	enqueueTCPTestSegment(t, connection, retransmittedSYN)
 	if echo := readTimestampEcho(); echo != 200 {
 		t.Fatalf("retransmitted SYN-ACK TSecr = %d, want 200", echo)
 	}
-	enqueueTCPTestSegment(t, connection, tcpSegment{
-		sequence: 101, acknowledgement: 1001, flags: tcpFlagACK, window: 65535,
-		options: tcpTimestampOptions(300, 1),
-	})
+	finalACK := tcpSegment{sequence: 101, acknowledgement: 1001, flags: tcpFlagACK, window: 65535}
+	finalACK.setOptions(tcpTimestampOptions(300, 1))
+	enqueueTCPTestSegment(t, connection, finalACK)
 	select {
 	case err := <-result:
 		if err != nil {
@@ -777,7 +911,7 @@ func TestTCPHandshakeMaintenanceDoesNotConsumeRTOBudget(t *testing.T) {
 			local: netip.AddrPortFrom(local, 45000), remote: netip.AddrPortFrom(remote, 8080),
 		}, 1400)
 		result := make(chan error, 1)
-		go func() { result <- connection.handshake(1000) }()
+		go func() { result <- testTCPHandshake(connection, 1000) }()
 		read := func() byte {
 			select {
 			case packet := <-link.outbound:
@@ -795,7 +929,7 @@ func TestTCPHandshakeMaintenanceDoesNotConsumeRTOBudget(t *testing.T) {
 			t.Fatalf("initial SYN flags = %02x", flags)
 		}
 		for index := 0; index < tcpActiveSYNMaximumAttempts+1; index++ {
-			connection.pathMTUUpdate <- struct{}{}
+			connection.wakeActor(tcpActorWakePathMTU)
 			if flags := read(); flags&(tcpFlagECE|tcpFlagCWR) != tcpFlagECE|tcpFlagCWR {
 				t.Fatalf("maintenance SYN %d flags = %02x", index, flags)
 			}
@@ -826,7 +960,7 @@ func TestTCPHandshakeMaintenanceDoesNotConsumeRTOBudget(t *testing.T) {
 		connection.passive = true
 		syn := tcpSegment{sequence: 100, flags: tcpFlagSYN | tcpFlagECE | tcpFlagCWR, window: 65535}
 		result := make(chan error, 1)
-		go func() { result <- connection.passiveHandshake(syn, 1000) }()
+		go func() { result <- testTCPPassiveHandshake(connection, syn, 1000) }()
 		read := func() {
 			select {
 			case <-link.outbound:
@@ -913,13 +1047,13 @@ func TestTCPCloseReadKeepsReceiveWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := []byte("discarded peer data")
-	if accepted := connection.appendReadBuffer(payload, 0); accepted != len(payload) {
+	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
 		t.Fatalf("discarded bytes accepted = %d, want %d", accepted, len(payload))
 	}
 	if window := connection.receiveWindow(0, true); window == 0 {
 		t.Fatal("CloseRead advertised a zero receive window")
 	}
-	if len(connection.readBuffer) != 0 {
+	if connection.readBuffer.size != 0 {
 		t.Fatal("CloseRead retained discarded peer data")
 	}
 }
@@ -1083,7 +1217,7 @@ func TestTCPWindowScalingRequiresPeerOption(t *testing.T) {
 // enough scaled sequence space for the automatic receive ceiling.
 func TestTCPReceiveWindowScaleSupportsAutoTuning(t *testing.T) {
 	windowScale := tcpReceiveWindowScaleFor(tcpMaximumReceiveCapacity)
-	_, scale, enabled, _, _, _ := parseTCPOptions(tcpSYNOptions(1360, windowScale, 1), 536, 1360)
+	_, scale, enabled, _, _, _ := parseTCPOptions(tcpSYNOptions(nil, 1360, windowScale, 1), 536, 1360)
 	if !enabled || scale != windowScale {
 		t.Fatalf("SYN window scale = %d, enabled=%t; want %d, true", scale, enabled, windowScale)
 	}
@@ -1341,9 +1475,9 @@ func TestTCPReceiveWindowAvoidsSillyWindowGrowth(t *testing.T) {
 func TestTCPWindowUpdatePromotesContiguousData(t *testing.T) {
 	connection := &TCPConn{
 		readChanged: make(chan struct{}), readNotify: make(chan struct{}),
-		windowUpdate: make(chan struct{}, 1), receiveCapacity: 4,
-		readBuffer: []byte("full"),
+		receiveCapacity: 4,
 	}
+	connection.readBuffer.append([]byte("full"))
 	receiveNext := uint32(100)
 	outOfOrder := []tcpReceivedPiece{{sequence: receiveNext, payload: []byte("next")}}
 	outOfOrderBytes := len(outOfOrder[0].payload)
@@ -1357,8 +1491,8 @@ func TestTCPWindowUpdatePromotesContiguousData(t *testing.T) {
 	if receiveNext != 104 || len(outOfOrder) != 0 || outOfOrderBytes != 0 {
 		t.Fatalf("receive state = next %d, pieces %d, bytes %d; want 104, 0, 0", receiveNext, len(outOfOrder), outOfOrderBytes)
 	}
-	if string(connection.readBuffer) != "next" {
-		t.Fatalf("promoted read buffer = %q, want next", connection.readBuffer)
+	if got := string(testTCPReadBufferBytes(&connection.readBuffer)); got != "next" {
+		t.Fatalf("promoted read buffer = %q, want next", got)
 	}
 }
 
@@ -1400,7 +1534,7 @@ func TestTCPRejectsOutOfWindowACK(t *testing.T) {
 	}
 	time.Sleep(10 * time.Millisecond)
 	tcpConnection.mu.Lock()
-	retained := len(tcpConnection.sendBuffer)
+	retained := tcpConnection.sendBuffer.size
 	tcpConnection.mu.Unlock()
 	if retained == 0 {
 		t.Fatal("out-of-window segment acknowledged the send buffer")
@@ -1411,7 +1545,7 @@ func TestTCPRejectsOutOfWindowACK(t *testing.T) {
 	waitFor(t, time.Second, func() bool {
 		tcpConnection.mu.Lock()
 		defer tcpConnection.mu.Unlock()
-		return len(tcpConnection.sendBuffer) == 0
+		return tcpConnection.sendBuffer.size == 0
 	})
 }
 
@@ -1521,7 +1655,7 @@ func TestTCPActiveOpenRetainsSoftNetworkError(t *testing.T) {
 		return false
 	})
 	connection.deliverError(ICMPError{Reporter: link.remote, Type: 3, Code: 1})
-	connection.pathMTUUpdate <- struct{}{}
+	connection.wakeActor(tcpActorWakePathMTU)
 	select {
 	case err := <-result:
 		if err != nil {
@@ -2158,6 +2292,19 @@ func TestTCPTailLossProbeSendsNewData(t *testing.T) {
 	}
 }
 
+func TestTCPTailLossProbeAllowsRemoteDelayedACK(t *testing.T) {
+	const smoothedRTT = 20 * time.Millisecond
+	if delay := tailLossProbeDelay(smoothedRTT, time.Second, true); delay != 2*smoothedRTT+tcpTailLossProbeACKDelay {
+		t.Fatalf("single-segment TLP delay = %v, want %v", delay, 2*smoothedRTT+tcpTailLossProbeACKDelay)
+	}
+	if delay := tailLossProbeDelay(smoothedRTT, time.Second, false); delay != 2*smoothedRTT {
+		t.Fatalf("multi-segment TLP delay = %v, want %v", delay, 2*smoothedRTT)
+	}
+	if delay := tailLossProbeDelay(450*time.Millisecond, time.Second, true); delay != time.Second {
+		t.Fatalf("RTO-capped TLP delay = %v, want %v", delay, time.Second)
+	}
+}
+
 // TestTCPPathMTUReduction verifies that Packet Too Big resegments outstanding
 // data and keeps an established stream alive.
 func TestTCPPathMTUReduction(t *testing.T) {
@@ -2193,7 +2340,6 @@ func TestTCPPathMTUReduction(t *testing.T) {
 func TestTCPPathMTUReductionPreservesFINSequence(t *testing.T) {
 	original := sentTCPSegment{
 		sequence: 100, end: 1101, flags: tcpFlagACK | tcpFlagPSH | tcpFlagFIN,
-		payload: make([]byte, 1000),
 	}
 	segments := splitTCPSegments([]sentTCPSegment{original}, 600)
 	if len(segments) != 2 {
@@ -2469,14 +2615,29 @@ func TestTCPOutOfOrderEarlierFINWins(t *testing.T) {
 	receiveWindow := uint32(1000)
 	var pieces []tcpReceivedPiece
 	bytes := 0
-	if !connection.storeTCPOutOfOrder(receiveNext, receiveWindow, 200, nil, true, &pieces, &bytes) {
+	if !connection.storeTCPOutOfOrder(receiveNext, receiveWindow, 200, nil, nil, true, &pieces, &bytes) {
 		t.Fatal("later out-of-order FIN was not retained")
 	}
-	if !connection.storeTCPOutOfOrder(receiveNext, receiveWindow, 150, nil, true, &pieces, &bytes) {
+	if !connection.storeTCPOutOfOrder(receiveNext, receiveWindow, 150, nil, nil, true, &pieces, &bytes) {
 		t.Fatal("earlier out-of-order FIN was not retained")
 	}
 	if len(pieces) != 1 || pieces[0].sequence != 150 || !pieces[0].fin {
 		t.Fatalf("normalized FIN pieces = %+v, want FIN at 150", pieces)
+	}
+}
+
+func TestTCPOutOfOrderFINCompactsTruncatedRange(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	owner := make([]byte, 32)
+	copy(owner, "abcdefghijklmnopqrstuvwxyz")
+	pieces := []tcpReceivedPiece{{sequence: 104, payload: owner}}
+	bytes := len(owner)
+	if !connection.storeTCPOutOfOrder(100, 64, 106, nil, nil, true, &pieces, &bytes) {
+		t.Fatal("earlier FIN was not retained")
+	}
+	if len(pieces) != 1 || !pieces[0].fin || string(pieces[0].payload) != "ab" ||
+		&pieces[0].payload[0] == &owner[0] || cap(pieces[0].payload) != len(pieces[0].payload) || bytes != 2 {
+		t.Fatalf("FIN-truncated range retained owner backing: pieces=%+v bytes=%d capacity=%d", pieces, bytes, cap(pieces[0].payload))
 	}
 }
 
@@ -2492,14 +2653,14 @@ func TestTCPOutOfOrderFINWaitsForSequenceGap(t *testing.T) {
 	if delivered, closed := connection.receiveTCPData(104, []byte("ef"), true, 32, &receiveNext, &pieces, &outOfOrderBytes); delivered || closed {
 		t.Fatalf("out-of-order data plus FIN = delivered %t closed %t", delivered, closed)
 	}
-	if receiveNext != 100 || len(connection.readBuffer) != 0 {
-		t.Fatalf("gapped receive state = next %d buffer %q", receiveNext, connection.readBuffer)
+	if receiveNext != 100 || connection.readBuffer.size != 0 {
+		t.Fatalf("gapped receive state = next %d buffer %q", receiveNext, testTCPReadBufferBytes(&connection.readBuffer))
 	}
 	if delivered, closed := connection.receiveTCPData(100, []byte("abcd"), false, 32, &receiveNext, &pieces, &outOfOrderBytes); !delivered || !closed {
 		t.Fatalf("gap completion = delivered %t closed %t", delivered, closed)
 	}
-	if receiveNext != 107 || string(connection.readBuffer) != "abcdef" || len(pieces) != 0 || outOfOrderBytes != 0 {
-		t.Fatalf("completed receive state = next %d buffer %q pieces %d bytes %d", receiveNext, connection.readBuffer, len(pieces), outOfOrderBytes)
+	if receiveNext != 107 || string(testTCPReadBufferBytes(&connection.readBuffer)) != "abcdef" || len(pieces) != 0 || outOfOrderBytes != 0 {
+		t.Fatalf("completed receive state = next %d buffer %q pieces %d bytes %d", receiveNext, testTCPReadBufferBytes(&connection.readBuffer), len(pieces), outOfOrderBytes)
 	}
 	connection.setReadEOF()
 	buffer := make([]byte, 6)
@@ -2514,18 +2675,18 @@ func TestTCPOutOfOrderFINWaitsForSequenceGap(t *testing.T) {
 func TestTCPPartialACKCanLeaveFINOnly(t *testing.T) {
 	segment := sentTCPSegment{
 		sequence: 100, end: 104, flags: tcpFlagACK | tcpFlagPSH | tcpFlagFIN,
-		payload: []byte{1, 2, 3}, cwr: true,
+		cwr: true,
 	}
 	trimAcknowledgedTCPSegment(&segment, 103)
-	if segment.sequence != 103 || segment.end != 104 || len(segment.payload) != 0 || segment.flags&tcpFlagFIN == 0 || segment.flags&tcpFlagPSH != 0 || segment.cwr {
+	if segment.sequence != 103 || segment.end != 104 || segment.dataSize() != 0 || segment.flags&tcpFlagFIN == 0 || segment.flags&tcpFlagPSH != 0 || segment.cwr {
 		t.Fatalf("FIN-only remainder = %+v", segment)
 	}
 }
 
 func TestTCPCloseWithUnreadDataIsAbortive(t *testing.T) {
 	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
-	connection.readBuffer = []byte("unread")
-	connection.sendBuffer = []byte("unsent")
+	connection.readBuffer.append([]byte("unread"))
+	connection.sendBuffer.append([]byte("unsent"))
 	if err := connection.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -2537,8 +2698,40 @@ func TestTCPCloseWithUnreadDataIsAbortive(t *testing.T) {
 	if !connection.resetAfterAbort() {
 		t.Fatal("unread-data close suppressed the reset")
 	}
-	if len(connection.sendBuffer) != 0 {
-		t.Fatalf("abortive close retained %d send bytes", len(connection.sendBuffer))
+	if connection.sendBuffer.size != 0 {
+		t.Fatalf("abortive close retained %d send bytes", connection.sendBuffer.size)
+	}
+}
+
+func TestTCPSendBufferChunkOwnership(t *testing.T) {
+	payload := make([]byte, tcpSendChunkMaximum+512)
+	for index := range payload {
+		payload[index] = byte(index*37 + 11)
+	}
+	var buffer tcpSendBuffer
+	buffer.append(payload)
+	if buffer.size != len(payload) || len(buffer.chunks) != 2 {
+		t.Fatalf("chunked send buffer = %d bytes in %d chunks", buffer.size, len(buffer.chunks))
+	}
+	const gather = 300
+	offset := tcpSendChunkMaximum - 100
+	snapshot, total := buffer.snapshot(offset, gather)
+	if total != len(payload) || !bytes.Equal(snapshot, payload[offset:offset+gather]) {
+		t.Fatalf("cross-chunk snapshot = %d/%d bytes, equal %t", len(snapshot), total, bytes.Equal(snapshot, payload[offset:offset+gather]))
+	}
+	buffer.acknowledge(tcpSendChunkMaximum)
+	remaining, total := buffer.snapshot(0, len(payload))
+	if total != 512 || !bytes.Equal(remaining, payload[tcpSendChunkMaximum:]) {
+		t.Fatalf("acknowledged send buffer = %d/%d bytes, equal %t", len(remaining), total, bytes.Equal(remaining, payload[tcpSendChunkMaximum:]))
+	}
+
+	var reusable tcpSendBuffer
+	reusable.append([]byte("first"))
+	firstStorage := &reusable.chunks[0].storage[0]
+	reusable.acknowledge(len("first"))
+	reusable.append([]byte("second"))
+	if &reusable.chunks[0].storage[0] != firstStorage {
+		t.Fatal("acknowledged storage was not reused")
 	}
 }
 
@@ -2573,8 +2766,8 @@ func TestTCPTimeoutErrorPreservesSoftFailure(t *testing.T) {
 func TestRACKMarksOlderTransmission(t *testing.T) {
 	base := time.Unix(100, 0)
 	outstanding := []sentTCPSegment{
-		{sequence: 100, end: 200, sentAt: base},
-		{sequence: 200, end: 300, sentAt: base.Add(20 * time.Millisecond)},
+		{sequence: 100, end: 200, hostQueue: testPacketQueueTicketAt(base, base)},
+		{sequence: 200, end: 300, hostQueue: testPacketQueueTicketAt(base, base.Add(20*time.Millisecond))},
 	}
 	var latest tcpRACKSample
 	outstanding, _, _, _, latest, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 200, right: 300}})
@@ -2591,10 +2784,10 @@ func TestRACKMarksOlderTransmission(t *testing.T) {
 func TestRACKWaitsFromCurrentTime(t *testing.T) {
 	base := time.Unix(100, 0)
 	outstanding := []sentTCPSegment{
-		{sequence: 100, end: 200, sentAt: base},
-		{sequence: 200, end: 300, sentAt: base.Add(time.Millisecond), sacked: true},
+		{sequence: 100, end: 200, hostQueue: testPacketQueueTicketAt(base, base)},
+		{sequence: 200, end: 300, hostQueue: testPacketQueueTicketAt(base, base.Add(time.Millisecond)), sacked: true},
 	}
-	delivered := tcpRACKSample{sentAt: outstanding[1].sentAt, end: outstanding[1].end, rtt: 10 * time.Millisecond}
+	delivered := tcpRACKSample{sentAt: outstanding[1].transmittedAt(), end: outstanding[1].end, rtt: 10 * time.Millisecond}
 	if delay, ok := rackLossDelay(outstanding, delivered, base.Add(15*time.Millisecond), 10*time.Millisecond); !ok || delay != 5*time.Millisecond {
 		t.Fatalf("RACK loss delay = %v, %t; want 5ms, true", delay, ok)
 	}
@@ -2616,10 +2809,10 @@ func TestRACKWaitsFromCurrentTime(t *testing.T) {
 func TestRACKCanDetectLostRetransmission(t *testing.T) {
 	base := time.Unix(100, 0)
 	outstanding := []sentTCPSegment{
-		{sequence: 100, end: 200, sentAt: base, sackRetried: true},
-		{sequence: 200, end: 300, sentAt: base.Add(time.Millisecond), sacked: true},
+		{sequence: 100, end: 200, sackRetried: true, hostQueue: testPacketQueueTicketAt(base, base)},
+		{sequence: 200, end: 300, sacked: true, hostQueue: testPacketQueueTicketAt(base, base.Add(time.Millisecond))},
 	}
-	delivered := tcpRACKSample{sentAt: outstanding[1].sentAt, end: outstanding[1].end, rtt: 5 * time.Millisecond}
+	delivered := tcpRACKSample{sentAt: outstanding[1].transmittedAt(), end: outstanding[1].end, rtt: 5 * time.Millisecond}
 	markRACKLoss(outstanding, delivered, base.Add(15*time.Millisecond), 10*time.Millisecond)
 	if !outstanding[0].rackLost || outstanding[0].sackRetried {
 		t.Fatalf("lost retransmission state = lost %t retried %t", outstanding[0].rackLost, outstanding[0].sackRetried)
@@ -2629,11 +2822,11 @@ func TestRACKCanDetectLostRetransmission(t *testing.T) {
 func TestRACKUsesMaximumRemainingWait(t *testing.T) {
 	base := time.Unix(100, 0)
 	outstanding := []sentTCPSegment{
-		{sequence: 100, end: 200, sentAt: base},
-		{sequence: 200, end: 300, sentAt: base.Add(3 * time.Millisecond)},
-		{sequence: 300, end: 400, sentAt: base.Add(5 * time.Millisecond), sacked: true},
+		{sequence: 100, end: 200, hostQueue: testPacketQueueTicketAt(base, base)},
+		{sequence: 200, end: 300, hostQueue: testPacketQueueTicketAt(base, base.Add(3*time.Millisecond))},
+		{sequence: 300, end: 400, sacked: true, hostQueue: testPacketQueueTicketAt(base, base.Add(5*time.Millisecond))},
 	}
-	delivered := tcpRACKSample{sentAt: outstanding[2].sentAt, end: outstanding[2].end, rtt: 10 * time.Millisecond}
+	delivered := tcpRACKSample{sentAt: outstanding[2].transmittedAt(), end: outstanding[2].end, rtt: 10 * time.Millisecond}
 	if delay, ok := rackLossDelay(outstanding, delivered, base.Add(10*time.Millisecond), 5*time.Millisecond); !ok || delay != 8*time.Millisecond {
 		t.Fatalf("RACK maximum loss delay = %v, %t; want 8ms, true", delay, ok)
 	}
@@ -2659,7 +2852,7 @@ func TestRACKRejectsAmbiguousRetransmissionRTT(t *testing.T) {
 
 func TestRACKRepeatedSACKIsNotNewDelivery(t *testing.T) {
 	base := time.Unix(100, 0)
-	outstanding := []sentTCPSegment{{sequence: 100, end: 200, sentAt: base, timestamp: 10}}
+	outstanding := []sentTCPSegment{{sequence: 100, end: 200, timestamp: 10, hostQueue: testPacketQueueTicketAt(base, base)}}
 	outstanding, _, _, newInformation, latest, _ := applyTCPSACK(outstanding, []tcpSACKBlock{{left: 100, right: 200}})
 	if !newInformation || latest.sentAt != base {
 		t.Fatalf("initial SACK = new %t latest %+v", newInformation, latest)
@@ -2736,17 +2929,18 @@ func TestTCPRTTSampleUsesSegmentArrivalTime(t *testing.T) {
 func TestTCPSegmentEventTime(t *testing.T) {
 	now := time.Unix(200, 0)
 	receivedAt := now.Add(-10 * time.Millisecond)
-	if got := tcpSegmentEventTime(tcpSegment{receivedAt: receivedAt}, now, time.Time{}); got != receivedAt {
+	epoch := receivedAt.Add(-time.Second)
+	if got := tcpSegmentEventTime(tcpSegment{receivedAt: monotonicStampAt(epoch, receivedAt)}, now, time.Time{}, epoch); got != receivedAt {
 		t.Fatalf("segment event time = %v, want %v", got, receivedAt)
 	}
-	if got := tcpSegmentEventTime(tcpSegment{}, now, time.Time{}); got != now {
+	if got := tcpSegmentEventTime(tcpSegment{}, now, time.Time{}, epoch); got != now {
 		t.Fatalf("missing segment event time = %v, want %v", got, now)
 	}
-	if got := tcpSegmentEventTime(tcpSegment{receivedAt: now.Add(time.Second)}, now, time.Time{}); got != now {
+	if got := tcpSegmentEventTime(tcpSegment{receivedAt: monotonicStampAt(epoch, now.Add(time.Second))}, now, time.Time{}, epoch); got != now {
 		t.Fatalf("future segment event time = %v, want %v", got, now)
 	}
 	previous := receivedAt.Add(time.Second)
-	if got := tcpSegmentEventTime(tcpSegment{receivedAt: receivedAt}, now, previous); got != previous {
+	if got := tcpSegmentEventTime(tcpSegment{receivedAt: monotonicStampAt(epoch, receivedAt)}, now, previous, epoch); got != previous {
 		t.Fatalf("regressing segment event time = %v, want %v", got, previous)
 	}
 }
@@ -2765,7 +2959,7 @@ func TestTCPDispatchPreservesPacketArrivalTime(t *testing.T) {
 	if !ok {
 		t.Fatal("test TCP packet did not parse")
 	}
-	receivedAt := time.Unix(250, 0)
+	receivedAt := stack.timestampEpoch.Add(250 * time.Millisecond)
 	if err = stack.handleTCP(packet, receivedAt); err != nil {
 		t.Fatal(err)
 	}
@@ -2775,8 +2969,8 @@ func TestTCPDispatchPreservesPacketArrivalTime(t *testing.T) {
 		if !dequeued {
 			t.Fatal("TCP dispatch notification had no segment")
 		}
-		if segment.receivedAt != receivedAt {
-			t.Fatalf("dispatched arrival time = %v, want %v", segment.receivedAt, receivedAt)
+		if got := segment.receivedAt.time(stack.timestampEpoch); got != receivedAt {
+			t.Fatalf("dispatched arrival time = %v, want %v", got, receivedAt)
 		}
 	default:
 		t.Fatal("TCP segment was not dispatched")
@@ -2873,8 +3067,7 @@ func TestTCPRepeatedSACKIsNotNewInformation(t *testing.T) {
 // TestTCPPartialSACKSplitsScoreboard verifies byte-accurate RFC 6675 state
 // when a valid SACK block covers only the middle of one transmission.
 func TestTCPPartialSACKSplitsScoreboard(t *testing.T) {
-	payload := make([]byte, 300)
-	outstanding := []sentTCPSegment{{sequence: 100, end: 400, flags: tcpFlagACK | tcpFlagPSH, payload: payload, transmissions: 1}}
+	outstanding := []sentTCPSegment{{sequence: 100, end: 400, flags: tcpFlagACK | tcpFlagPSH, transmissions: 1}}
 	var present, fresh bool
 	var delivered []sentTCPSegment
 	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 200, right: 300}})
@@ -2888,8 +3081,8 @@ func TestTCPPartialSACKSplitsScoreboard(t *testing.T) {
 		push       bool
 	}{{100, 200, false, 100, false}, {200, 300, true, 100, false}, {300, 400, false, 100, true}} {
 		segment := outstanding[index]
-		if segment.sequence != want.start || segment.end != want.end || segment.sacked != want.sacked || len(segment.payload) != want.payload || segment.flags&tcpFlagPSH != 0 != want.push {
-			t.Fatalf("segment %d = [%d,%d) sacked=%t payload=%d flags=%#x", index, segment.sequence, segment.end, segment.sacked, len(segment.payload), segment.flags)
+		if segment.sequence != want.start || segment.end != want.end || segment.sacked != want.sacked || segment.dataSize() != want.payload || segment.flags&tcpFlagPSH != 0 != want.push {
+			t.Fatalf("segment %d = [%d,%d) sacked=%t payload=%d flags=%#x", index, segment.sequence, segment.end, segment.sacked, segment.dataSize(), segment.flags)
 		}
 	}
 	if ranges, bytes := tcpSACKedState(outstanding); ranges != 1 || bytes != 100 {
@@ -2898,9 +3091,9 @@ func TestTCPPartialSACKSplitsScoreboard(t *testing.T) {
 }
 
 func TestTCPSACKSplitMetadataIsBounded(t *testing.T) {
-	payload := make([]byte, 4*tcpMaximumSACKSplitRanges)
-	outstanding := []sentTCPSegment{{sequence: 0, end: uint32(len(payload)), payload: payload, transmissions: 1}}
-	for offset := uint32(1); offset+1 < uint32(len(payload)); offset += 2 {
+	payloadSize := uint32(4 * tcpMaximumSACKSplitRanges)
+	outstanding := []sentTCPSegment{{sequence: 0, end: payloadSize, transmissions: 1}}
+	for offset := uint32(1); offset+1 < payloadSize; offset += 2 {
 		outstanding, _, _, _, _, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: offset, right: offset + 1}})
 	}
 	splitRanges := 0
@@ -3037,10 +3230,28 @@ func TestTCPSACKCoalescesAdjacentPieces(t *testing.T) {
 		{sequence: 102, payload: []byte("cd")},
 		{sequence: 106, payload: []byte("ef")},
 	}
-	options := tcpSACKOptions(pieces, 103, 4, tcpSACKBlock{}, false)
+	var workspace [34]byte
+	options := tcpSACKOptions(pieces, 103, 4, tcpSACKBlock{}, false, &workspace)
 	blocks := parseTCPSACKOptions(options, 90, 120)
 	if len(blocks) != 2 || blocks[0] != (tcpSACKBlock{left: 100, right: 104}) || blocks[1] != (tcpSACKBlock{left: 106, right: 108}) {
 		t.Fatalf("coalesced SACK blocks = %#v", blocks)
+	}
+}
+
+func TestTCPSACKOptionsDoNotAllocate(t *testing.T) {
+	pieces := []tcpReceivedPiece{
+		{sequence: 100, payload: []byte("ab")},
+		{sequence: 102, payload: []byte("cd")},
+		{sequence: 108, payload: []byte("ef")},
+	}
+	allocations := testing.AllocsPerRun(100, func() {
+		var workspace [34]byte
+		if options := tcpSACKOptions(pieces, 103, 4, tcpSACKBlock{}, false, &workspace); len(options) != 18 {
+			panic("unexpected SACK option size")
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("SACK option allocations = %v, want 0", allocations)
 	}
 }
 
@@ -3115,7 +3326,8 @@ func TestTCPDSACKGeneration(t *testing.T) {
 	if !ok || block != (tcpSACKBlock{left: 125, right: 140}) {
 		t.Fatalf("contained duplicate block = %#v, %t", block, ok)
 	}
-	options := tcpSACKOptions(pieces, 125, 2, block, true)
+	var workspace [34]byte
+	options := tcpSACKOptions(pieces, 125, 2, block, true, &workspace)
 	if len(options) != 18 || binary.BigEndian.Uint32(options[2:6]) != 125 || binary.BigEndian.Uint32(options[6:10]) != 140 ||
 		binary.BigEndian.Uint32(options[10:14]) != 120 || binary.BigEndian.Uint32(options[14:18]) != 140 {
 		t.Fatalf("DSACK-first options = %x", options)
@@ -3129,7 +3341,8 @@ func TestTCPOutOfOrderOverlapPreservesFirstData(t *testing.T) {
 	receiveNext := uint32(100)
 	outOfOrder := []tcpReceivedPiece{{sequence: 104, payload: []byte("old")}}
 	outOfOrderBytes := 3
-	if !connection.storeTCPOutOfOrder(receiveNext, 32, 102, []byte("abcdef"), false, &outOfOrder, &outOfOrderBytes) {
+	incoming := []byte("abcdef")
+	if !connection.storeTCPOutOfOrder(receiveNext, 32, 102, incoming, incoming, false, &outOfOrder, &outOfOrderBytes) {
 		t.Fatal("overlapping segment added no new data")
 	}
 	if len(outOfOrder) != 3 || outOfOrderBytes != 6 {
@@ -3138,8 +3351,53 @@ func TestTCPOutOfOrderOverlapPreservesFirstData(t *testing.T) {
 	if delivered, closed := connection.receiveTCPData(100, []byte("00"), false, 32, &receiveNext, &outOfOrder, &outOfOrderBytes); !delivered || closed {
 		t.Fatalf("receiveTCPData = %t, %t; want true, false", delivered, closed)
 	}
-	if got := string(connection.readBuffer); got != "00aboldf" {
+	if got := string(testTCPReadBufferBytes(&connection.readBuffer)); got != "00aboldf" {
 		t.Fatalf("overlap payload = %q, want %q", got, "00aboldf")
+	}
+}
+
+func TestTCPOutOfOrderAdoptsCompleteOwnedRange(t *testing.T) {
+	connection := &TCPConn{receiveCapacity: 32, readChanged: make(chan struct{}), readNotify: make(chan struct{})}
+	payload := []byte("owned")
+	payload = payload[:len(payload):len(payload)]
+	var pieces []tcpReceivedPiece
+	bytes := 0
+	if !connection.storeTCPOutOfOrder(100, 32, 104, payload, payload, false, &pieces, &bytes) {
+		t.Fatal("out-of-order payload was not retained")
+	}
+	if len(pieces) != 1 || &pieces[0].payload[0] != &payload[0] {
+		t.Fatal("single uncovered range did not transfer its backing")
+	}
+}
+
+func TestTCPOutOfOrderCompactsPartialOwnedRange(t *testing.T) {
+	connection := &TCPConn{receiveCapacity: 32, readChanged: make(chan struct{}), readNotify: make(chan struct{})}
+	owner := make([]byte, 32)
+	copy(owner[28:], "tail")
+	payload := owner[28:]
+	var pieces []tcpReceivedPiece
+	bytes := 0
+	if !connection.storeTCPOutOfOrder(100, 32, 104, payload, owner, false, &pieces, &bytes) {
+		t.Fatal("partial out-of-order payload was not retained")
+	}
+	if len(pieces) != 1 || string(pieces[0].payload) != "tail" || &pieces[0].payload[0] == &owner[28] || cap(pieces[0].payload) != len(pieces[0].payload) {
+		t.Fatalf("partial payload retained owner backing: pieces=%+v capacity=%d", pieces, cap(pieces[0].payload))
+	}
+}
+
+func TestTCPPromoteCompactsPartiallyDeliveredRange(t *testing.T) {
+	connection := &TCPConn{receiveCapacity: 2, readChanged: make(chan struct{}), readNotify: make(chan struct{})}
+	owner := make([]byte, 32)
+	copy(owner, "data")
+	pieces := []tcpReceivedPiece{{sequence: 100, payload: owner[:4]}}
+	bytes := 4
+	receiveNext := uint32(100)
+	if delivered, closed := connection.promoteTCPReceived(&receiveNext, &pieces, &bytes); !delivered || closed {
+		t.Fatalf("partial promotion = delivered %t closed %t", delivered, closed)
+	}
+	if receiveNext != 102 || bytes != 2 || len(pieces) != 1 || string(pieces[0].payload) != "ta" ||
+		&pieces[0].payload[0] == &owner[2] || cap(pieces[0].payload) != len(pieces[0].payload) {
+		t.Fatalf("partial promotion retained owner backing: next=%d bytes=%d pieces=%+v capacity=%d", receiveNext, bytes, pieces, cap(pieces[0].payload))
 	}
 }
 
@@ -3150,10 +3408,12 @@ func TestTCPOutOfOrderUsesPromisedWindow(t *testing.T) {
 	receiveNext := uint32(100)
 	var outOfOrder []tcpReceivedPiece
 	outOfOrderBytes := 0
-	if !connection.storeTCPOutOfOrder(receiveNext, 32, 120, []byte("first"), false, &outOfOrder, &outOfOrderBytes) {
+	first := []byte("first")
+	if !connection.storeTCPOutOfOrder(receiveNext, 32, 120, first, first, false, &outOfOrder, &outOfOrderBytes) {
 		t.Fatal("first out-of-order range was rejected")
 	}
-	if !connection.storeTCPOutOfOrder(receiveNext, 32, 128, []byte("edge"), false, &outOfOrder, &outOfOrderBytes) {
+	edge := []byte("edge")
+	if !connection.storeTCPOutOfOrder(receiveNext, 32, 128, edge, edge, false, &outOfOrder, &outOfOrderBytes) {
 		t.Fatal("range at the promised right edge was rejected after buffer use")
 	}
 	if outOfOrderBytes != 9 {
@@ -3277,6 +3537,40 @@ func TestTCPInboundQueueRetainsOnlySmallBacking(t *testing.T) {
 	}
 }
 
+func TestTCPInboundQueueCompactsConsumedPrefixBeforeGrowing(t *testing.T) {
+	queue := newTCPSegmentQueue()
+	queue.segments = make([]tcpSegment, 0, 8)
+	for index := 0; index < cap(queue.segments); index++ {
+		segment := tcpSegment{sequence: uint32(index), payload: []byte{byte(index)}}
+		segment.setOptions([]byte{1, byte(index)})
+		if !queue.enqueue(segment) {
+			t.Fatal("inbound queue rejected a segment")
+		}
+	}
+	backing := &queue.segments[0]
+	capacity := cap(queue.segments)
+	for index := 0; index < capacity/2; index++ {
+		segment, ok := queue.dequeue()
+		if !ok || segment.sequence != uint32(index) {
+			t.Fatalf("inbound queue dequeue = %d, %v, want %d, true", segment.sequence, ok, index)
+		}
+	}
+	last := tcpSegment{sequence: uint32(capacity), payload: []byte{byte(capacity)}}
+	last.setOptions([]byte{1, byte(capacity)})
+	if !queue.enqueue(last) {
+		t.Fatal("inbound queue rejected a segment after consuming its prefix")
+	}
+	if queue.head != 0 || cap(queue.segments) != capacity || &queue.segments[0] != backing {
+		t.Fatalf("inbound queue grew instead of compacting: head %d len %d cap %d", queue.head, len(queue.segments), cap(queue.segments))
+	}
+	for index := capacity / 2; index <= capacity; index++ {
+		segment, ok := queue.dequeue()
+		if !ok || segment.sequence != uint32(index) || !bytes.Equal(segment.payload, []byte{byte(index)}) || !bytes.Equal(segment.optionBytes(), []byte{1, byte(index)}) {
+			t.Fatalf("compacted inbound queue dequeue = %+v, %v, want sequence %d", segment, ok, index)
+		}
+	}
+}
+
 func BenchmarkTCPInboundQueueSmallBurst(b *testing.B) {
 	queue := newTCPSegmentQueue()
 	b.ReportAllocs()
@@ -3292,6 +3586,129 @@ func BenchmarkTCPInboundQueueSmallBurst(b *testing.B) {
 				b.Fatal("small inbound queue lost a segment")
 			}
 		}
+	}
+}
+
+func BenchmarkTCPHandlePureACK(b *testing.B) {
+	local := netip.MustParseAddr("192.0.2.241")
+	remote := netip.MustParseAddr("198.51.100.241")
+	_, stack := newTestStack(b, local, remote)
+	key := tcpKey{
+		local:  netip.AddrPortFrom(local, 8443),
+		remote: netip.AddrPortFrom(remote, 49152),
+	}
+	connection := newTCPConn(stack, "tcp4", key, 1500)
+	stack.mu.Lock()
+	stack.tcp[key] = connection
+	stack.mu.Unlock()
+	packet, ok := parseIPPacket(buildTestTCP(remote, local, key.remote.Port(), key.local.Port(), 100, 200, tcpFlagACK, 65535, tcpTimestampOptions(123, 456), nil))
+	if !ok {
+		b.Fatal("failed to parse benchmark packet")
+	}
+	receivedAt := time.Now()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		if err := stack.handleTCP(packet, receivedAt); err != nil {
+			b.Fatal(err)
+		}
+		if _, ok = connection.inbound.dequeue(); !ok {
+			b.Fatal("TCP segment was not queued")
+		}
+	}
+}
+
+func TestBuildTCPPacketIntoOverwritesReusedBuffer(t *testing.T) {
+	source := netip.MustParseAddr("192.0.2.242")
+	target := netip.MustParseAddr("198.51.100.242")
+	options := tcpTimestampOptions(123, 456)
+	payload := []byte("reused TCP packet")
+	want, err := buildTCPPacket(source, target, 49152, 8443, 100, 200, tcpFlagACK|tcpFlagPSH, 32768, options, payload, 1500, 0x28, 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirty := make([]byte, len(want))
+	for index := range dirty {
+		dirty[index] = 0xff
+	}
+	got, err := buildTCPPacketInto(dirty, source, target, 49152, 8443, 100, 200, tcpFlagACK|tcpFlagPSH, 32768, options, payload, 1500, 0x28, 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("reused TCP packet differs:\n got %x\nwant %x", got, want)
+	}
+}
+
+func TestTCPSegmentTimestampOptionsUseFixedWorkspace(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.243")
+	remote := netip.MustParseAddr("198.51.100.243")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newTCPConn(stack, "tcp4", tcpKey{
+		local:  netip.AddrPortFrom(local, 49152),
+		remote: netip.AddrPortFrom(remote, 8443),
+	}, 1500)
+	connection.peerTimestamp = true
+	connection.recentTimestamp = 0x10203040
+	extra := []byte{1, 1, 5, 10, 0, 0, 0, 1, 0, 0, 0, 2}
+	timestamp, _, err := connection.sendSegmentForMTU(100, 200, tcpFlagACK, 32768, extra, nil, false, 1500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || len(packet.payload) < tcpHeaderSize {
+		t.Fatal("timestamped TCP segment could not be parsed")
+	}
+	headerSize := int(packet.payload[12]>>4) * 4
+	if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+		t.Fatalf("timestamped TCP header size = %d", headerSize)
+	}
+	want := append(tcpTimestampOptions(timestamp, connection.recentTimestamp), extra...)
+	if got := packet.payload[tcpHeaderSize:headerSize]; !bytes.Equal(got, want) {
+		t.Fatalf("timestamped TCP options = %x, want %x", got, want)
+	}
+	if _, _, err = connection.sendSegmentForMTU(100, 200, tcpFlagACK, 32768, make([]byte, 29), nil, false, 1500); err == nil || err.Error() != "mipstack: invalid TCP options" {
+		t.Fatalf("oversized timestamp options error = %v", err)
+	}
+	select {
+	case entry := <-stack.outbound.packets:
+		stack.outbound.release(entry)
+		t.Fatal("oversized timestamp options emitted a packet")
+	default:
+	}
+}
+
+func TestTCPActorWakeCoalescesStateChanges(t *testing.T) {
+	connection := &TCPConn{actorWake: make(chan struct{}, 1)}
+	connection.wakeActor(tcpActorWakeSend)
+	connection.wakeActor(tcpActorWakeWindow)
+	connection.wakeActor(tcpActorWakeOptions | tcpActorWakePathMTU)
+	select {
+	case <-connection.actorWake:
+	default:
+		t.Fatal("actor wake was not published")
+	}
+	want := uint32(tcpActorWakeSend | tcpActorWakeWindow | tcpActorWakeOptions | tcpActorWakePathMTU)
+	if got := connection.takeActorWake(); got != want {
+		t.Fatalf("actor wake flags = %#x, want %#x", got, want)
+	}
+	select {
+	case <-connection.actorWake:
+		t.Fatal("coalesced actor wake published more than one token")
+	default:
+	}
+	connection.wakeActor(tcpActorWakeSend)
+	select {
+	case <-connection.actorWake:
+	default:
+		t.Fatal("actor wake did not rearm after consumption")
 	}
 }
 
@@ -3328,12 +3745,13 @@ func TestTCPTimerOrderingDrainsPreDeadlineBacklog(t *testing.T) {
 	// its loss timer became ready concurrently.
 	tcpConnection.mu.Lock()
 	arrival := time.Now().Add(-time.Second)
+	arrivalStamp := monotonicStampAt(tcpConnection.stack.timestampEpoch, arrival)
 	queued := true
 	for index := 0; index < 2048; index++ {
-		queued = tcpConnection.enqueueInbound(tcpSegment{sequence: sequence, window: 65535, receivedAt: arrival}) && queued
+		queued = tcpConnection.enqueueInbound(tcpSegment{sequence: sequence, window: 65535, receivedAt: arrivalStamp}) && queued
 	}
 	queued = tcpConnection.enqueueInbound(tcpSegment{
-		sequence: sequence, acknowledgement: cumulativeACK, flags: tcpFlagACK, window: 65535, receivedAt: arrival,
+		sequence: sequence, acknowledgement: cumulativeACK, flags: tcpFlagACK, window: 65535, receivedAt: arrivalStamp,
 	}) && queued
 	time.Sleep(tcpMinimumRTO + 50*time.Millisecond)
 	tcpConnection.mu.Unlock()
@@ -3823,7 +4241,7 @@ func TestTCPDelayedECNSYNACKDoesNotUndoFallback(t *testing.T) {
 		local: netip.AddrPortFrom(local, 45000), remote: netip.AddrPortFrom(remote, 8080),
 	}, 1400)
 	result := make(chan error, 1)
-	go func() { result <- connection.handshake(1000) }()
+	go func() { result <- testTCPHandshake(connection, 1000) }()
 	readSYN := func() []byte {
 		select {
 		case packet := <-link.outbound:
@@ -3902,7 +4320,7 @@ func TestTCPReservedHeaderBitsAreIgnored(t *testing.T) {
 	}
 	select {
 	case entry := <-stack.outbound.packets:
-		response := stack.outbound.consume(entry)
+		response := consumeTestPacket(&stack.outbound, entry)
 		parsed, ok := parseIPPacket(response)
 		if !ok || len(parsed.payload) < tcpHeaderSize || parsed.payload[13] != tcpFlagRST|tcpFlagACK {
 			t.Fatalf("reserved TCP header response = %x", response)
@@ -3917,6 +4335,41 @@ func TestRTTSampleIsSaturatedBeforeArithmetic(t *testing.T) {
 	estimator.observe(time.Duration(1<<63 - 1))
 	if estimator.srtt != tcpMaximumRTO || estimator.rto != tcpMaximumRTO || estimator.minimum != tcpMaximumRTO {
 		t.Fatalf("saturated RTT estimator = srtt %v rto %v minimum %v", estimator.srtt, estimator.rto, estimator.minimum)
+	}
+}
+
+func TestTCPRFC6069RTOBackoffRevert(t *testing.T) {
+	estimator := newRTTEstimator(time.Second)
+	estimator.backoff()
+	estimator.backoff()
+	quote := make([]byte, 8)
+	binary.BigEndian.PutUint32(quote[4:8], 100)
+	networkUnreachable := ICMPError{
+		Type: 3, Code: 0, QuotedSource: netip.MustParseAddr("192.0.2.1"), QuotedPayload: quote,
+	}
+	if !tcpRevertRTOBackoff(networkUnreachable, 100, 2, &estimator) || estimator.rto != 2*time.Second || estimator.backoffs != 1 {
+		t.Fatalf("RFC 6069 IPv4 revert = RTO %v backoffs %d", estimator.rto, estimator.backoffs)
+	}
+	if tcpRevertRTOBackoff(networkUnreachable, 101, 2, &estimator) {
+		t.Fatal("RFC 6069 accepted a quote outside SND.UNA")
+	}
+	portUnreachable := networkUnreachable
+	portUnreachable.Code = 3
+	if tcpRevertRTOBackoff(portUnreachable, 100, 2, &estimator) {
+		t.Fatal("RFC 6069 accepted port unreachable")
+	}
+	ipv6NoRoute := ICMPError{
+		Type: 1, Code: 0, QuotedSource: netip.MustParseAddr("2001:db8::1"), QuotedPayload: quote,
+	}
+	if !tcpRevertRTOBackoff(ipv6NoRoute, 100, 2, &estimator) || estimator.rto != time.Second || estimator.backoffs != 0 {
+		t.Fatalf("RFC 6069 IPv6 revert = RTO %v backoffs %d", estimator.rto, estimator.backoffs)
+	}
+
+	capped := newRTTEstimator(80 * time.Second)
+	capped.backoff()
+	capped.backoff()
+	if capped.rto != tcpMaximumRTO || !capped.revertBackoff() || capped.rto != tcpMaximumRTO || !capped.revertBackoff() || capped.rto != 80*time.Second {
+		t.Fatalf("capped RTO revert = RTO %v backoffs %d", capped.rto, capped.backoffs)
 	}
 }
 
@@ -4029,7 +4482,7 @@ func TestExplicitTCPSourceAndLocalLoopback(t *testing.T) {
 	}
 	select {
 	case entry := <-stack.outbound.packets:
-		packet := stack.outbound.consume(entry)
+		packet := consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("local traffic escaped to the link: %x", packet)
 	default:
 	}
@@ -4254,6 +4707,42 @@ func BenchmarkTCPStreamRoundTrip(b *testing.B) {
 			b.Fatal(err)
 		}
 		if _, err = io.ReadFull(connection, response); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkTCPReadFrom(b *testing.B) {
+	link, stack := newTestStack(b, netip.MustParseAddr("192.0.2.244"), netip.MustParseAddr("198.51.100.244"))
+	link.mu.Lock()
+	link.echoTCP = true
+	link.mu.Unlock()
+	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8443))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer connection.Close()
+	if err = connection.SetDeadline(time.Now().Add(10 * time.Minute)); err != nil {
+		b.Fatal(err)
+	}
+	go io.Copy(io.Discard, connection)
+	payload := bytes.Repeat([]byte{0x6c}, 4*1024*1024)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		if n, readErr := connection.(*TCPConn).ReadFrom(bytes.NewReader(payload)); readErr != nil || n != int64(len(payload)) {
+			b.Fatalf("ReadFrom = %d, %v", n, readErr)
+		}
+	}
+}
+
+func BenchmarkTCPSetDeadline(b *testing.B) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		if err := connection.SetDeadline(time.Time{}); err != nil {
 			b.Fatal(err)
 		}
 	}

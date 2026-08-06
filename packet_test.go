@@ -7,29 +7,93 @@ import (
 	"time"
 )
 
-func TestChecksumMatchesReference(t *testing.T) {
-	reference := func(data []byte) uint16 {
-		var sum uint32
-		for len(data) >= 2 {
-			sum += uint32(data[0])<<8 | uint32(data[1])
-			data = data[2:]
-		}
-		if len(data) != 0 {
-			sum += uint32(data[0]) << 8
-		}
-		for sum>>16 != 0 {
-			sum = sum&0xffff + sum>>16
-		}
-		return ^uint16(sum)
+func referenceChecksum(data []byte) uint16 {
+	var sum uint32
+	for len(data) >= 2 {
+		sum += uint32(data[0])<<8 | uint32(data[1])
+		data = data[2:]
 	}
+	if len(data) != 0 {
+		sum += uint32(data[0]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = sum&0xffff + sum>>16
+	}
+	return ^uint16(sum)
+}
+
+func TestChecksumMatchesReference(t *testing.T) {
 	data := make([]byte, 65535)
 	for index := range data {
 		data[index] = byte(index*37 + 11)
 	}
 	for _, size := range []int{0, 1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33, 1500, 65534, 65535} {
-		if got, want := checksum(data[:size]), reference(data[:size]); got != want {
+		if got, want := checksum(data[:size]), referenceChecksum(data[:size]); got != want {
 			t.Fatalf("checksum at length %d = %#x, want %#x", size, got, want)
 		}
+	}
+}
+
+func TestTransportChecksumMatchesReference(t *testing.T) {
+	payload := make([]byte, 65535)
+	for index := range payload {
+		payload[index] = byte(index*53 + 17)
+	}
+	for _, test := range []struct {
+		name           string
+		source, target netip.Addr
+	}{
+		{"IPv4", netip.MustParseAddr("192.0.2.129"), netip.MustParseAddr("198.51.100.231")},
+		{"IPv6", netip.MustParseAddr("2001:db8:ffff:1::abcd"), netip.MustParseAddr("fdff:ffff:ffff:ffff::1234")},
+	} {
+		for _, size := range []int{0, 1, 7, 8, 15, 16, 17, 1500, 65535} {
+			pseudoHeader := make([]byte, 0, 40+size)
+			pseudoHeader = append(pseudoHeader, test.source.AsSlice()...)
+			pseudoHeader = append(pseudoHeader, test.target.AsSlice()...)
+			if test.source.Is4() {
+				pseudoHeader = append(pseudoHeader, 0, protocolTCP, byte(size>>8), byte(size))
+			} else {
+				pseudoHeader = append(pseudoHeader, byte(size>>24), byte(size>>16), byte(size>>8), byte(size), 0, 0, 0, protocolTCP)
+			}
+			pseudoHeader = append(pseudoHeader, payload[:size]...)
+			if got, want := transportChecksum(test.source, test.target, protocolTCP, payload[:size]), referenceChecksum(pseudoHeader); got != want {
+				t.Fatalf("%s transport checksum at length %d = %#x, want %#x", test.name, size, got, want)
+			}
+		}
+	}
+}
+
+func TestTransportChecksumPartsMatchesContiguousPayload(t *testing.T) {
+	payload := make([]byte, 257)
+	for index := range payload {
+		payload[index] = byte(index*29 + 7)
+	}
+	for _, addresses := range [][2]netip.Addr{
+		{netip.MustParseAddr("192.0.2.17"), netip.MustParseAddr("198.51.100.17")},
+		{netip.MustParseAddr("2001:db8::17"), netip.MustParseAddr("2001:db8:1::17")},
+	} {
+		want := transportChecksum(addresses[0], addresses[1], protocolUDP, payload)
+		for split := 0; split <= len(payload); split++ {
+			if got := transportChecksumParts(addresses[0], addresses[1], protocolUDP, len(payload), payload[:split], payload[split:]); got != want {
+				t.Fatalf("%s split %d checksum = %#x, want %#x", addresses[0], split, got, want)
+			}
+		}
+	}
+}
+
+func BenchmarkChecksum(b *testing.B) {
+	data := make([]byte, 1500)
+	for index := range data {
+		data[index] = byte(index*37 + 11)
+	}
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	var result uint16
+	for index := 0; index < b.N; index++ {
+		result = checksum(data)
+	}
+	if result == 0 {
+		b.Fatal("unexpected zero checksum")
 	}
 }
 
@@ -185,7 +249,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	}
 	select {
 	case entry := <-stack.outbound.packets:
-		response = stack.outbound.consume(entry)
+		response = consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("non-initial malformed fragment produced Parameter Problem: %x", response)
 	case <-time.After(25 * time.Millisecond):
 	}
@@ -214,7 +278,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	}
 	select {
 	case entry := <-stack.outbound.packets:
-		response = stack.outbound.consume(entry)
+		response = consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("ICMPv6 error produced recursive Parameter Problem: %x", response)
 	case <-time.After(25 * time.Millisecond):
 	}
@@ -239,7 +303,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	}
 	select {
 	case entry := <-stack.outbound.packets:
-		response = stack.outbound.consume(entry)
+		response = consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("IPv6 No Next Header produced a response: %x", response)
 	default:
 	}
@@ -309,7 +373,7 @@ func TestIPv4MappedIPv6WireSourceIsDropped(t *testing.T) {
 	}
 	select {
 	case entry := <-stack.outbound.packets:
-		response := stack.outbound.consume(entry)
+		response := consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("mapped IPv6 source produced response: %x", response)
 	default:
 	}
@@ -331,7 +395,7 @@ func TestIPv4DirectedBroadcastSourceIsDropped(t *testing.T) {
 	}
 	select {
 	case entry := <-stack.outbound.packets:
-		response := stack.outbound.consume(entry)
+		response := consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("directed-broadcast source produced a response: %x", response)
 	case <-time.After(25 * time.Millisecond):
 	}

@@ -74,6 +74,41 @@ func TestUDPConcurrentDemultiplexing(t *testing.T) {
 	}
 }
 
+func TestUDPDestinationPortZeroUsesProtocolPath(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		network        string
+		client, server netip.Addr
+	}{
+		{name: "IPv4", network: "udp4", client: netip.MustParseAddr("192.0.2.230"), server: netip.MustParseAddr("192.0.2.231")},
+		{name: "IPv6", network: "udp6", client: netip.MustParseAddr("2001:db8::230"), server: netip.MustParseAddr("2001:db8::231")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, server := newStackPair(t, test.client, test.server, 1400)
+			newStackBridge(t, client, server)
+			connection, err := client.DialUDP(context.Background(), test.network, netip.AddrPort{}, netip.AddrPortFrom(test.server, 0))
+			if err != nil {
+				t.Fatalf("DialUDP to port zero: %v", err)
+			}
+			defer connection.Close()
+			if n, writeErr := connection.Write([]byte("zero")); writeErr != nil || n != len("zero") {
+				t.Fatalf("Write to port zero = %d, %v", n, writeErr)
+			}
+			if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, readErr := connection.Read(make([]byte, 1)); readErr == nil {
+				t.Fatal("port-zero datagram did not receive an ICMP error")
+			} else {
+				var networkError ICMPError
+				if !errors.As(readErr, &networkError) || networkError.QuotedTargetPort != 0 {
+					t.Fatalf("port-zero read error = %#v", readErr)
+				}
+			}
+		})
+	}
+}
+
 func TestUDPPacketizationLayerPathMTUDiscovery(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -195,6 +230,22 @@ func TestUDPPathMTUConfirmationCanRaiseExpiredBaseline(t *testing.T) {
 	}
 }
 
+func TestMarshalUDPDatagramOverwritesReusedBuffer(t *testing.T) {
+	source := netip.MustParseAddr("192.0.2.243")
+	target := netip.MustParseAddr("198.51.100.243")
+	payload := []byte("reused UDP datagram")
+	want := make([]byte, udpHeaderSize+len(payload))
+	marshalUDPDatagram(want, source, target, 49152, 5353, payload)
+	dirty := make([]byte, len(want))
+	for index := range dirty {
+		dirty[index] = 0xff
+	}
+	marshalUDPDatagram(dirty, source, target, 49152, 5353, payload)
+	if !bytes.Equal(dirty, want) {
+		t.Fatalf("reused UDP datagram differs:\n got %x\nwant %x", dirty, want)
+	}
+}
+
 func BenchmarkUDPDatagramRoundTrip(b *testing.B) {
 	link, stack := newTestStack(b, netip.MustParseAddr("192.0.2.241"), netip.MustParseAddr("198.51.100.241"))
 	link.mu.Lock()
@@ -220,6 +271,57 @@ func BenchmarkUDPDatagramRoundTrip(b *testing.B) {
 		if _, err = connection.Read(response); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
+	for _, test := range []struct {
+		name           string
+		source, target netip.Addr
+	}{
+		{"IPv4", netip.MustParseAddr("192.0.2.245"), netip.MustParseAddr("198.51.100.245")},
+		{"IPv6", netip.MustParseAddr("2001:db8::245"), netip.MustParseAddr("2001:db8:1::245")},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			bits := 32
+			if test.source.Is6() {
+				bits = 128
+			}
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.source, bits)}, MTU: 1280})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				b.Fatal(err)
+			}
+			defer stack.Close()
+			connection := newUDPConn(stack, "udp", 49152, test.source.Is6(), test.source, netip.AddrPort{})
+			payload := bytes.Repeat([]byte{0x6d}, 60*1024)
+			maximum := (1280 - 20) &^ 7
+			if test.source.Is6() {
+				maximum = (1280 - 48) &^ 7
+			}
+			fragments := (udpHeaderSize + len(payload) + maximum - 1) / maximum
+			drain := func() {
+				for index := 0; index < fragments; index++ {
+					entry := <-stack.outbound.packets
+					stack.outbound.release(entry)
+				}
+			}
+			if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, true, 1280); err != nil {
+				b.Fatal(err)
+			}
+			drain()
+			b.SetBytes(int64(len(payload)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, true, 1280); err != nil {
+					b.Fatal(err)
+				}
+				drain()
+			}
+		})
 	}
 }
 
@@ -744,7 +846,7 @@ func TestUDPMessageControlValidationAndWriteBuffer(t *testing.T) {
 	if err = connection.SetWriteBuffer(0); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("SetWriteBuffer(0) = %v, want EINVAL", err)
 	}
-	control := linuxPacketInfoControl(local)
+	control := appendLinuxPacketInfoControl(nil, local)
 	binary.LittleEndian.PutUint32(control[16:20], 1)
 	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("bad"), control, netip.AddrPortFrom(remote, 50016)); err == nil {
 		t.Fatal("WriteMsgUDPAddrPort accepted a nonzero interface index")
@@ -1091,5 +1193,65 @@ func TestUDPDefaultsAndDiagnostics(t *testing.T) {
 		info.PacketsDropped != 1 || info.ReceiveQueuePackets != 1 || info.ReceiveQueueBytes != udpDatagramMetadataSize ||
 		info.ReceiveQueueCapacity != udpDatagramMetadataSize || info.PathMTU != 1400 || info.HopLimit != 37 || info.TrafficClass != 0x2e {
 		t.Fatalf("UDP Info = %+v", info)
+	}
+}
+
+func BenchmarkUDPReceiveQueue(b *testing.B) {
+	local := netip.MustParseAddr("192.0.2.243")
+	remote := netip.MustParseAddrPort("198.51.100.243:5353")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	connection := newUDPConn(stack, "udp4", 5300, false, local, remote)
+	b.Cleanup(connection.closeFromStack)
+	payload := bytes.Repeat([]byte{0x5a}, 1200)
+	buffer := make([]byte, len(payload))
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		connection.enqueue(payload, remote, local, ipPacketOptions{})
+		if n, _, _, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) {
+			b.Fatalf("readDatagram = %d, %v", n, readErr)
+		}
+	}
+}
+
+func TestUDPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.247")
+	remote := netip.MustParseAddrPort("198.51.100.247:5353")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := newUDPConn(stack, "udp4", 5300, false, local, remote)
+	read := func(payload []byte) {
+		connection.enqueue(payload, remote, local, ipPacketOptions{})
+		buffer := make([]byte, len(payload))
+		if n, _, _, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) || !bytes.Equal(buffer, payload) {
+			t.Fatalf("readDatagram = %d bytes, %v", n, readErr)
+		}
+	}
+	read(make([]byte, 1200))
+	connection.mu.Lock()
+	spareCapacity := cap(connection.receiveSpare)
+	connection.mu.Unlock()
+	if spareCapacity < 1200 || spareCapacity > datagramReusablePayloadLimit {
+		t.Fatalf("receive spare capacity = %d", spareCapacity)
+	}
+	read(make([]byte, datagramReusablePayloadLimit+1))
+	connection.mu.Lock()
+	retainedAfterJumbo := cap(connection.receiveSpare)
+	connection.mu.Unlock()
+	if retainedAfterJumbo != spareCapacity {
+		t.Fatalf("jumbo read changed receive spare capacity from %d to %d", spareCapacity, retainedAfterJumbo)
+	}
+	connection.closeFromStack()
+	connection.mu.Lock()
+	retainedAfterClose := cap(connection.receiveSpare)
+	connection.mu.Unlock()
+	if retainedAfterClose != 0 {
+		t.Fatalf("closed socket retained receive spare capacity %d", retainedAfterClose)
 	}
 }

@@ -77,52 +77,67 @@ func checksum(data []byte) uint16 {
 	return ^uint16(sum)
 }
 
-// checksumSum accumulates one contiguous Internet-checksum region. A maximum
-// IP packet contains fewer than 32768 words, so a uint32 cannot overflow
-// before the caller folds it. Unrolling the common packet-sized loop avoids
-// making checksum traversal dominate TCP throughput.
+// checksumSum accumulates one contiguous Internet-checksum region. Grouping
+// adjacent 16-bit words into 32-bit halves is valid because 2^16 is congruent
+// to one modulo 2^16-1. A uint64 holds every half in a maximum IP packet, and
+// folding it to uint32 keeps separately accumulated pseudo-header regions
+// associative for the caller's final 16-bit fold.
 func checksumSum(data []byte) uint32 {
-	var sum uint32
+	var sum uint64
 	for len(data) >= 16 {
-		sum += uint32(binary.BigEndian.Uint16(data[0:2]))
-		sum += uint32(binary.BigEndian.Uint16(data[2:4]))
-		sum += uint32(binary.BigEndian.Uint16(data[4:6]))
-		sum += uint32(binary.BigEndian.Uint16(data[6:8]))
-		sum += uint32(binary.BigEndian.Uint16(data[8:10]))
-		sum += uint32(binary.BigEndian.Uint16(data[10:12]))
-		sum += uint32(binary.BigEndian.Uint16(data[12:14]))
-		sum += uint32(binary.BigEndian.Uint16(data[14:16]))
+		first := binary.BigEndian.Uint64(data[:8])
+		second := binary.BigEndian.Uint64(data[8:16])
+		sum += first>>32 + first&0xffffffff + second>>32 + second&0xffffffff
 		data = data[16:]
 	}
 	for len(data) >= 2 {
-		sum += uint32(binary.BigEndian.Uint16(data[:2]))
+		sum += uint64(binary.BigEndian.Uint16(data[:2]))
 		data = data[2:]
 	}
 	if len(data) != 0 {
-		sum += uint32(data[0]) << 8
+		sum += uint64(data[0]) << 8
 	}
-	return sum
+	for sum>>16 != 0 {
+		sum = sum&0xffff + sum>>16
+	}
+	return uint32(sum)
 }
 
 // transportChecksum computes an IPv4 or IPv6 pseudo-header checksum.
 func transportChecksum(source, target netip.Addr, protocol byte, payload []byte) uint16 {
+	return transportChecksumParts(source, target, protocol, len(payload), payload, nil)
+}
+
+// transportChecksumParts computes one transport checksum without gathering two
+// adjacent payload regions. It also handles an odd first-region boundary so
+// callers are not required to align their virtual headers.
+func transportChecksumParts(source, target netip.Addr, protocol byte, payloadLength int, first, second []byte) uint16 {
 	source, target = source.Unmap(), target.Unmap()
 	var sum uint32
 	if source.Is4() && target.Is4() {
-		sum += checksumSum(source.AsSlice())
-		sum += checksumSum(target.AsSlice())
+		sourceBytes, targetBytes := source.As4(), target.As4()
+		sum += checksumSum(sourceBytes[:])
+		sum += checksumSum(targetBytes[:])
 		sum += uint32(protocol)
-		sum += uint32(len(payload))
+		sum += uint32(payloadLength)
 	} else if source.Is6() && target.Is6() {
-		sum += checksumSum(source.AsSlice())
-		sum += checksumSum(target.AsSlice())
-		sum += uint32(len(payload) >> 16)
-		sum += uint32(len(payload) & 0xffff)
+		sourceBytes, targetBytes := source.As16(), target.As16()
+		sum += checksumSum(sourceBytes[:])
+		sum += checksumSum(targetBytes[:])
+		sum += uint32(payloadLength >> 16)
+		sum += uint32(payloadLength & 0xffff)
 		sum += uint32(protocol)
 	} else {
 		return 0
 	}
-	sum += checksumSum(payload)
+	sum += checksumSum(first)
+	if len(first)&1 != 0 && len(second) != 0 {
+		last := uint32(first[len(first)-1]) << 8
+		sum -= last
+		sum += last | uint32(second[0])
+		second = second[1:]
+	}
+	sum += checksumSum(second)
 	for sum>>16 != 0 {
 		sum = sum&0xffff + sum>>16
 	}
@@ -477,12 +492,15 @@ func marshalIPHeader(packet []byte, source, target netip.Addr, protocol byte, id
 		packet[0] = 0x45
 		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
 		binary.BigEndian.PutUint16(packet[4:6], identification)
+		binary.BigEndian.PutUint16(packet[6:8], 0)
 		if dontFragment {
 			binary.BigEndian.PutUint16(packet[6:8], 0x4000)
 		}
 		packet[1], packet[8], packet[9] = options.trafficClass, options.hopLimit, protocol
-		copy(packet[12:16], source.AsSlice())
-		copy(packet[16:20], target.AsSlice())
+		sourceBytes, targetBytes := source.As4(), target.As4()
+		copy(packet[12:16], sourceBytes[:])
+		copy(packet[16:20], targetBytes[:])
+		binary.BigEndian.PutUint16(packet[10:12], 0)
 		binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:20]))
 		return true
 	}
@@ -491,8 +509,9 @@ func marshalIPHeader(packet []byte, source, target netip.Addr, protocol byte, id
 	binary.BigEndian.PutUint16(packet[2:4], uint16(options.flowLabel))
 	packet[6], packet[7] = protocol, options.hopLimit
 	binary.BigEndian.PutUint16(packet[4:6], uint16(len(packet)-40))
-	copy(packet[8:24], source.AsSlice())
-	copy(packet[24:40], target.AsSlice())
+	sourceBytes, targetBytes := source.As16(), target.As16()
+	copy(packet[8:24], sourceBytes[:])
+	copy(packet[24:40], targetBytes[:])
 	return true
 }
 

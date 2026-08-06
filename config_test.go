@@ -110,6 +110,41 @@ func TestPathMTUUsesOneConfigurationSnapshot(t *testing.T) {
 	}
 }
 
+func TestUpdateConfigInvalidatesOnlyChangedPathState(t *testing.T) {
+	first := netip.MustParseAddr("192.0.2.10")
+	second := netip.MustParseAddr("192.0.2.11")
+	remote := netip.MustParseAddr("198.51.100.10")
+	destination := netip.MustParsePrefix("198.51.100.0/24")
+	config := Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(first, 32), netip.PrefixFrom(second, 32)},
+		Routes:         []Route{{Destination: destination, Source: first}},
+		MTU:            1500,
+	}
+	stack, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stack.observePathMTU(remote, 1200) {
+		t.Fatal("failed to install test PMTU")
+	}
+	unchanged := config
+	unchanged.TCP.DisableNoDelay = true
+	if err = stack.UpdateConfig(unchanged); err != nil {
+		t.Fatal(err)
+	}
+	if mtu := stack.mtuFor(remote); mtu != 1200 {
+		t.Fatalf("socket-policy update discarded PMTU = %d, want 1200", mtu)
+	}
+	changed := config
+	changed.Routes = []Route{{Destination: destination, Source: second}}
+	if err = stack.UpdateConfig(changed); err != nil {
+		t.Fatal(err)
+	}
+	if mtu := stack.mtuFor(remote); mtu != 1500 {
+		t.Fatalf("source-route update retained stale PMTU = %d, want 1500", mtu)
+	}
+}
+
 func TestTCPConnectionLimitConfiguration(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.12")
 	if _, err := New(Config{
@@ -415,6 +450,12 @@ func TestRFC6724AddressLabels(t *testing.T) {
 		if label := addressLabel(netip.MustParseAddr(test.address)); label != test.label {
 			t.Errorf("addressLabel(%s) = %d, want %d", test.address, label, test.label)
 		}
+	}
+}
+
+func TestCommonPrefixBitsRejectsInvalidAddresses(t *testing.T) {
+	if bits := commonPrefixBits(netip.Addr{}, netip.Addr{}); bits != 0 {
+		t.Fatalf("invalid common-prefix length = %d", bits)
 	}
 }
 

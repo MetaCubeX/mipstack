@@ -13,6 +13,21 @@ import (
 	"time"
 )
 
+// testPacketQueueTicketAt constructs host-queue timing evidence without a
+// live packet queue.
+func testPacketQueueTicketAt(epoch, value time.Time) packetQueueTicket {
+	queue := &packetQueue{epoch: epoch}
+	return packetQueueTicket{queue: queue, queuedAt: monotonicStampAt(epoch, value)}
+}
+
+func testTCPReadBufferBytes(buffer *tcpReadBuffer) []byte {
+	payload := make([]byte, 0, buffer.size)
+	for index := buffer.head; index < len(buffer.chunks); index++ {
+		payload = append(payload, buffer.chunks[index]...)
+	}
+	return payload
+}
+
 // buildIPPacket constructs a packet with default output fields for tests.
 func buildIPPacket(source, target netip.Addr, protocol byte, payload []byte, identification uint16, dontFragment bool) []byte {
 	return buildIPPacketWithOptions(source, target, protocol, payload, identification, dontFragment, ipPacketOptions{})
@@ -85,6 +100,12 @@ type testPacketLink struct {
 	pathMTUInjected        bool
 	postPathMTUMaximum     int
 	done                   chan struct{}
+}
+
+func consumeTestPacket(queue *packetQueue, entry packetQueueEntry) []byte {
+	packet := append([]byte(nil), entry.packet...)
+	queue.release(entry)
+	return packet
 }
 
 // stackBridge connects two Stack packet devices for fragmentation tests.
@@ -740,7 +761,7 @@ func readOutboundPacket(t *testing.T, stack *Stack) []byte {
 	t.Helper()
 	select {
 	case entry := <-stack.outbound.packets:
-		return stack.outbound.consume(entry)
+		return consumeTestPacket(&stack.outbound, entry)
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for outbound packet")
 		return nil
@@ -750,7 +771,7 @@ func readOutboundPacket(t *testing.T, stack *Stack) []byte {
 func fillTestPacketQueue(t *testing.T, queue *packetQueue, packet []byte) {
 	t.Helper()
 	for len(queue.packets) < cap(queue.packets) {
-		if _, queued := queue.tryEnqueue(packet); !queued {
+		if !queue.tryEnqueue(packet) {
 			t.Fatal("packet queue became full before its channel capacity")
 		}
 	}

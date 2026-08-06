@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 )
@@ -390,6 +392,73 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 		if id := binary.BigEndian.Uint32(packet[44:48]); id != 1001 {
 			t.Fatalf("IPv6 fragment %d ID = %d, want 1001", index, id)
 		}
+	}
+}
+
+func TestDirectIPv6FragmentOutputOverwritesReusableHeader(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::43")
+	remote := netip.MustParseAddr("2001:db8:1::43")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}, MTU: 1280})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	dirty := bytes.Repeat([]byte{0xff}, 1280)
+	stack.outbound.buffers <- dirty[:0]
+	if err = stack.writeIPPayload(local, remote, protocolUDP, make([]byte, 1300), true); err != nil {
+		t.Fatal(err)
+	}
+	entry := <-stack.outbound.packets
+	if len(entry.packet) != 1280 || entry.packet[40] != protocolUDP || entry.packet[41] != 0 {
+		t.Fatalf("reused IPv6 fragment header = %x", entry.packet[40:48])
+	}
+	stack.outbound.release(entry)
+	entry = <-stack.outbound.packets
+	stack.outbound.release(entry)
+}
+
+func TestDirectFragmentOutputPreservesPartialDeadlineEmission(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.44")
+	remote := netip.MustParseAddr("198.51.100.44")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 68})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	dummy := buildIPPacket(local, remote, 99, []byte{1}, 0, true)
+	for index := 0; index < cap(stack.outbound.packets)-1; index++ {
+		if !stack.outbound.tryEnqueue(dummy) {
+			t.Fatalf("dummy packet %d was not queued", index)
+		}
+	}
+	stack.ipv4ID.Store(100)
+	deadline := time.Now().Add(20 * time.Millisecond)
+	changed := make(chan struct{})
+	err = stack.writeIPPayloadUntilOptionsForMTU(local, remote, protocolUDP, make([]byte, 96), true, ipPacketOptions{}, 68, func() (time.Time, <-chan struct{}, bool) {
+		return deadline, changed, false
+	})
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("fragmented write error = %v, want deadline exceeded", err)
+	}
+	fragments := 0
+	for len(stack.outbound.packets) != 0 {
+		entry := <-stack.outbound.packets
+		if len(entry.packet) >= 20 && entry.packet[9] == protocolUDP && binary.BigEndian.Uint16(entry.packet[6:8])&0x2000 != 0 {
+			fragments++
+			if identification := binary.BigEndian.Uint16(entry.packet[4:6]); identification != 101 {
+				t.Fatalf("partial fragment ID = %d, want 101", identification)
+			}
+		}
+		stack.outbound.release(entry)
+	}
+	if fragments != 1 {
+		t.Fatalf("published fragments = %d, want 1", fragments)
 	}
 }
 
@@ -1013,5 +1082,67 @@ func TestIPv4FragmentOptionsLimit(t *testing.T) {
 				t.Fatalf("oversized fragment set retained: sets=%d bytes=%d", sets, retained)
 			}
 		})
+	}
+}
+
+func BenchmarkFragmentReassembly(b *testing.B) {
+	for _, test := range []struct {
+		name          string
+		local, remote netip.Addr
+	}{
+		{name: "IPv4", local: netip.MustParseAddr("192.0.2.240"), remote: netip.MustParseAddr("198.51.100.240")},
+		{name: "IPv6", local: netip.MustParseAddr("2001:db8::240"), remote: netip.MustParseAddr("2001:db8:1::240")},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			_, stack := newTestStack(b, test.local, test.remote)
+			payload := bytes.Repeat([]byte{0x5a}, 60*1024)
+			var fragments [][]byte
+			if test.local.Is4() {
+				fragments = buildIPv4Fragments(test.remote, test.local, protocolUDP, payload, 1280, 240)
+			} else {
+				fragments = buildIPv6FragmentsWithOptions(test.remote, test.local, protocolUDP, payload, 1280, 240, ipPacketOptions{})
+			}
+			b.SetBytes(int64(len(payload)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				var packet []byte
+				for _, fragment := range fragments {
+					packet = stack.reassemblePacket(fragment, time.Now())
+				}
+				if len(packet) == 0 {
+					b.Fatal("fragment sequence did not reassemble")
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkIPv6FragmentBuild(b *testing.B) {
+	source := netip.MustParseAddr("2001:db8::241")
+	target := netip.MustParseAddr("2001:db8:1::241")
+	payload := bytes.Repeat([]byte{0x6b}, 60*1024)
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	for iteration := 0; iteration < b.N; iteration++ {
+		fragments := buildIPv6FragmentsWithOptions(source, target, protocolUDP, payload, 1280, uint32(iteration), ipPacketOptions{})
+		if len(fragments) == 0 {
+			b.Fatal("payload was not fragmented")
+		}
+	}
+}
+
+func BenchmarkFragmentRangeCovered(b *testing.B) {
+	pieces := make([]fragmentPiece, fragmentMaximumPieces)
+	for index := range pieces {
+		pieces[index] = fragmentPiece{offset: index * 8, data: make([]byte, 8)}
+	}
+	end := len(pieces) * 8
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		if !fragmentRangeCovered(pieces, 0, end) {
+			b.Fatal("contiguous range was not covered")
+		}
 	}
 }

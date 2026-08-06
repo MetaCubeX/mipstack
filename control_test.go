@@ -159,3 +159,32 @@ func FuzzControlMessageParsing(f *testing.F) {
 		_, _, _ = parseControlMessageForWrite(control, true)
 	})
 }
+
+func BenchmarkControlMessageMarshal(b *testing.B) {
+	address4 := netip.MustParseAddr("192.0.2.245")
+	address6 := netip.MustParseAddr("2001:db8::245")
+	benchmarks := []struct {
+		name    string
+		marshal func() ([]byte, error)
+	}{
+		{name: "IPv4Send", marshal: (&IPv4ControlMessage{TTL: 31, TOS: 0xb8, Src: address4}).Marshal},
+		{name: "IPv4Receive", marshal: func() ([]byte, error) {
+			return controlMessageForRead(address4, ipPacketOptions{hopLimit: 31, trafficClass: 0xb8})
+		}},
+		{name: "IPv6Send", marshal: (&IPv6ControlMessage{HopLimit: 29, TrafficClass: 0x2e, FlowLabel: 0x12345, Src: address6}).Marshal},
+		{name: "IPv6Receive", marshal: func() ([]byte, error) {
+			return controlMessageForRead(address6, ipPacketOptions{hopLimit: 29, trafficClass: 0x2e, flowLabel: 0x12345})
+		}},
+	}
+	for _, benchmark := range benchmarks {
+		b.Run(benchmark.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for iteration := 0; iteration < b.N; iteration++ {
+				control, err := benchmark.marshal()
+				if err != nil || len(control) == 0 {
+					b.Fatalf("Marshal = %d bytes, %v", len(control), err)
+				}
+			}
+		})
+	}
+}

@@ -814,3 +814,97 @@ func TestIPZeroHopLimitFamilyValidation(t *testing.T) {
 		t.Fatal("IPv4 SetHopLimit(0) succeeded")
 	}
 }
+
+func BenchmarkIPReceiveQueue(b *testing.B) {
+	local := netip.MustParseAddr("192.0.2.244")
+	remote := netip.MustParseAddr("198.51.100.244")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	connection := newIPConn(stack, "ip4:99", 99, local, remote)
+	b.Cleanup(connection.closeFromStack)
+	payload := bytes.Repeat([]byte{0x6b}, 1200)
+	buffer := make([]byte, len(payload))
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		connection.enqueue(payload, remote, local, ipPacketOptions{})
+		if n, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) {
+			b.Fatalf("readDatagram = %d, %v", n, readErr)
+		}
+	}
+}
+
+func TestIPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.248")
+	remote := netip.MustParseAddr("198.51.100.248")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := newIPConn(stack, "ip4:99", 99, local, remote)
+	read := func(payload []byte) {
+		connection.enqueue(payload, remote, local, ipPacketOptions{})
+		buffer := make([]byte, len(payload))
+		if n, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) || !bytes.Equal(buffer, payload) {
+			t.Fatalf("readDatagram = %d bytes, %v", n, readErr)
+		}
+	}
+	read(make([]byte, 1200))
+	connection.mu.Lock()
+	spareCapacity := cap(connection.receiveSpare)
+	connection.mu.Unlock()
+	if spareCapacity < 1200 || spareCapacity > datagramReusablePayloadLimit {
+		t.Fatalf("receive spare capacity = %d", spareCapacity)
+	}
+	read(make([]byte, datagramReusablePayloadLimit+1))
+	connection.mu.Lock()
+	retainedAfterJumbo := cap(connection.receiveSpare)
+	connection.mu.Unlock()
+	if retainedAfterJumbo != spareCapacity {
+		t.Fatalf("jumbo read changed receive spare capacity from %d to %d", spareCapacity, retainedAfterJumbo)
+	}
+	connection.closeFromStack()
+	connection.mu.Lock()
+	retainedAfterClose := cap(connection.receiveSpare)
+	connection.mu.Unlock()
+	if retainedAfterClose != 0 {
+		t.Fatalf("closed socket retained receive spare capacity %d", retainedAfterClose)
+	}
+}
+
+func BenchmarkIPPacketWrite(b *testing.B) {
+	local := netip.MustParseAddr("192.0.2.246")
+	remote := netip.MustParseAddr("198.51.100.246")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		b.Fatal(err)
+	}
+	connection, err := stack.DialIP(context.Background(), "ip4:99", netip.Addr{}, remote)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		_ = connection.Close()
+		_ = stack.Close()
+	})
+	payload := bytes.Repeat([]byte{0x7c}, 1200)
+	buffers := [][]byte{make([]byte, 1500)}
+	sizes := make([]int, 1)
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		if _, err = connection.Write(payload); err != nil {
+			b.Fatal(err)
+		}
+		if count, readErr := stack.Read(buffers, sizes, 0); readErr != nil || count != 1 {
+			b.Fatalf("Stack.Read = %d, %v", count, readErr)
+		}
+	}
+}

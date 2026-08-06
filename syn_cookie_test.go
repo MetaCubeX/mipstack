@@ -219,7 +219,8 @@ func TestSYNCookieValidationIPv4AndIPv6(t *testing.T) {
 				state.cookieKey[index] = byte(index + 1)
 			}
 			key := tcpKey{local: netip.AddrPortFrom(test.local, 443), remote: netip.AddrPortFrom(test.remote, 50000)}
-			syn := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535, options: []byte{2, 4, 0x05, 0xb4, 4, 2}}
+			syn := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}
+			syn.setOptions([]byte{2, 4, 0x05, 0xb4, 4, 2})
 			_, data := encodeSYNCookieOptions(syn, test.remote)
 			cookie := synCookieSequence(state.cookieKey, key, syn.sequence, synCookiePeriodNumber(now, state.cookieEpoch), data, data)
 			ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: cookie + 1, flags: tcpFlagACK, window: 4096}

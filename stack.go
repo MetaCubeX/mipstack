@@ -39,6 +39,9 @@ const (
 	// loopbackPacketQueue bounds asynchronous local delivery and prevents a
 	// socket actor from recursively entering its own protocol handler.
 	loopbackPacketQueue = 256
+	// packetReusableBufferLimit retains common link-MTU packets while allowing
+	// uncommon jumbo packets to be collected immediately after transmission.
+	packetReusableBufferLimit = 2048
 	// pathMTUMaximumEntries bounds destinations learned from authenticated
 	// transport tuples so long-running proxy workloads cannot grow the cache
 	// without limit.
@@ -61,6 +64,9 @@ const (
 	// datagramQueueRetain keeps a small metadata burst allocation after a queue
 	// drains without pinning an application-sized receive queue on idle sockets.
 	datagramQueueRetain = 4
+	// datagramReusablePayloadLimit keeps one common MTU payload backing per
+	// active socket while allowing jumbo datagrams to be collected after Read.
+	datagramReusablePayloadLimit = 2048
 	// deadlineTimerCacheLimit bounds stopped timers retained by concurrent
 	// datagram readers. Additional readers allocate transient timers rather than
 	// making one unusually concurrent socket retain them indefinitely.
@@ -362,29 +368,33 @@ type recentDestinationCache[T comparable] map[T]time.Time
 
 // remember records a successful transmission and evicts expired or oldest
 // evidence when the bound is full.
-func (c recentDestinationCache[T]) remember(destination T, now time.Time) {
-	if _, exists := c[destination]; exists {
-		c[destination] = now
+func (c *recentDestinationCache[T]) remember(destination T, now time.Time) {
+	if *c == nil {
+		*c = make(recentDestinationCache[T])
+	}
+	cache := *c
+	if _, exists := cache[destination]; exists {
+		cache[destination] = now
 		return
 	}
-	if len(c) >= recentDestinationMaximum {
+	if len(cache) >= recentDestinationMaximum {
 		var oldest T
 		var oldestTime time.Time
 		haveOldest := false
-		for candidate, updated := range c {
+		for candidate, updated := range cache {
 			if now.Sub(updated) >= recentDestinationLifetime {
-				delete(c, candidate)
+				delete(cache, candidate)
 				continue
 			}
 			if !haveOldest || updated.Before(oldestTime) {
 				oldest, oldestTime, haveOldest = candidate, updated, true
 			}
 		}
-		if len(c) >= recentDestinationMaximum && haveOldest {
-			delete(c, oldest)
+		if len(cache) >= recentDestinationMaximum && haveOldest {
+			delete(cache, oldest)
 		}
 	}
-	c[destination] = now
+	cache[destination] = now
 }
 
 // contains reports recent transmission evidence and removes it after expiry.
@@ -474,8 +484,9 @@ type automaticPortCursor struct {
 // packetQueueEntry couples one packet with its fixed queue slot. The entry is
 // stored inline in the bounded channel and does not allocate per packet.
 type packetQueueEntry struct {
-	packet []byte
-	slot   uint16
+	packet   []byte
+	slot     uint16
+	reusable bool
 }
 
 // packetQueue uses one reusable slot per channel position. The free-slot
@@ -486,6 +497,32 @@ type packetQueue struct {
 	packets chan packetQueueEntry
 	free    chan uint16
 	slots   []atomic.Uint64
+	buffers chan []byte
+	epoch   time.Time
+}
+
+// monotonicStamp stores an exact monotonic duration relative to one stack
+// epoch. Zero remains the unset value used by zero-initialized protocol state.
+type monotonicStamp int64
+
+func monotonicStampAt(epoch, value time.Time) monotonicStamp {
+	if value.IsZero() {
+		return 0
+	}
+	elapsed := value.Sub(epoch)
+	if elapsed < 0 {
+		// Internal packet timestamps are always taken after New. Clamping keeps
+		// manually supplied test times and defensive callers representable.
+		elapsed = 0
+	}
+	return monotonicStamp(elapsed) + 1
+}
+
+func (s monotonicStamp) time(epoch time.Time) time.Time {
+	if s == 0 {
+		return time.Time{}
+	}
+	return epoch.Add(time.Duration(s - 1))
 }
 
 // packetQueueTicket identifies one generation of a fixed queue slot. TCP uses
@@ -495,20 +532,36 @@ type packetQueueTicket struct {
 	queue      *packetQueue
 	slot       uint16
 	generation uint64
-	queuedAt   time.Time
+	queuedAt   monotonicStamp
 }
 
 // newPacketQueue constructs a bounded queue with every slot initially free.
 func newPacketQueue(capacity int) packetQueue {
+	return newPacketQueueAt(capacity, time.Now())
+}
+
+// newPacketQueueAt constructs a queue sharing its stack's monotonic epoch.
+func newPacketQueueAt(capacity int, epoch time.Time) packetQueue {
 	queue := packetQueue{
 		packets: make(chan packetQueueEntry, capacity),
 		free:    make(chan uint16, capacity),
 		slots:   make([]atomic.Uint64, capacity),
+		// A full queue may legitimately own one buffer per position. Retaining no
+		// more than that avoids reallocating after a burst while the per-buffer
+		// limit keeps the cache below 512 KiB for the standard queue size.
+		buffers: make(chan []byte, capacity), epoch: epoch,
 	}
 	for slot := range queue.slots {
 		queue.free <- uint16(slot)
 	}
 	return queue
+}
+
+func (t packetQueueTicket) queuedTime() time.Time {
+	if t.queue == nil {
+		return time.Time{}
+	}
+	return t.queuedAt.time(t.queue.epoch)
 }
 
 // pending reports whether Read or local delivery has not consumed this exact
@@ -536,32 +589,72 @@ func (q *packetQueue) releaseReserved(slot uint16) { q.free <- slot }
 // enqueueReserved publishes a packet after its caller has acquired slot.
 // Since the packet channel and slot semaphore have equal capacities, a
 // reserved slot always has a corresponding channel position.
-func (q *packetQueue) enqueueReserved(slot uint16, packet []byte) packetQueueTicket {
+func (q *packetQueue) enqueueReserved(slot uint16, packet []byte, reusable bool) packetQueueTicket {
+	queuedAt := monotonicStampAt(q.epoch, time.Now())
+	generation := q.publishReserved(slot, packet, reusable)
+	return packetQueueTicket{queue: q, slot: slot, generation: generation, queuedAt: queuedAt}
+}
+
+// enqueueReservedPacket publishes a packet that does not need TCP host-queue
+// loss tracking and therefore avoids reading the clock.
+func (q *packetQueue) enqueueReservedPacket(slot uint16, packet []byte, reusable bool) {
+	q.publishReserved(slot, packet, reusable)
+}
+
+// publishReserved marks and publishes one already-reserved slot.
+func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool) uint64 {
 	state := q.slots[slot].Load()
 	generation := state>>1 + 1
 	q.slots[slot].Store(generation<<1 | 1)
-	queuedAt := time.Now()
-	q.packets <- packetQueueEntry{packet: packet, slot: slot}
-	return packetQueueTicket{queue: q, slot: slot, generation: generation, queuedAt: queuedAt}
+	q.packets <- packetQueueEntry{packet: packet, slot: slot, reusable: reusable}
+	return generation
 }
 
 // tryEnqueue publishes one packet only when a queue slot is immediately
 // available.
-func (q *packetQueue) tryEnqueue(packet []byte) (packetQueueTicket, bool) {
+func (q *packetQueue) tryEnqueue(packet []byte) bool {
 	slot, ok := q.tryReserve()
 	if !ok {
-		return packetQueueTicket{}, false
+		return false
 	}
-	return q.enqueueReserved(slot, packet), true
+	q.enqueueReservedPacket(slot, packet, false)
+	return true
 }
 
-// consume marks an entry as no longer pending before making its slot
-// available to exactly one waiting producer.
-func (q *packetQueue) consume(entry packetQueueEntry) []byte {
+// acquireBuffer returns bounded queue-owned storage for one complete packet.
+func (q *packetQueue) acquireBuffer(size int) ([]byte, bool) {
+	if size > packetReusableBufferLimit {
+		return make([]byte, size), false
+	}
+	select {
+	case buffer := <-q.buffers:
+		if cap(buffer) >= size {
+			return buffer[:size], true
+		}
+	default:
+	}
+	return make([]byte, size), true
+}
+
+// releaseBuffer returns reusable storage without publishing a queue slot.
+func (q *packetQueue) releaseBuffer(packet []byte, reusable bool) {
+	if !reusable {
+		return
+	}
+	select {
+	case q.buffers <- packet[:0]:
+	default:
+	}
+}
+
+// release marks an entry as consumed, recycles bounded packet storage, and
+// makes its slot available to exactly one waiting producer. The caller must
+// finish reading packet before release because another writer may reuse it.
+func (q *packetQueue) release(entry packetQueueEntry) {
 	state := q.slots[entry.slot].Load()
 	q.slots[entry.slot].Store(state &^ 1)
+	q.releaseBuffer(entry.packet, entry.reusable)
 	q.free <- entry.slot
-	return entry.packet
 }
 
 // New constructs an inactive-socket stack.
@@ -588,11 +681,12 @@ func New(config Config) (*Stack, error) {
 	copy(ports6.secret[:], seed[56:72])
 	ipv4ID := binary.BigEndian.Uint32(seed[16:20])
 	ipv6FragmentID := binary.BigEndian.Uint32(seed[20:24])
+	timestampEpoch := time.Now()
 	stack := &Stack{
-		outbound: newPacketQueue(outboundPacketQueue), loopback: newPacketQueue(loopbackPacketQueue),
+		outbound: newPacketQueueAt(outboundPacketQueue, timestampEpoch), loopback: newPacketQueueAt(loopbackPacketQueue, timestampEpoch),
 		tcp: make(map[tcpKey]*TCPConn), udp: make(map[udpKey]*UDPConn),
 		nextPort: [2]automaticPortCursor{ports4, ports6}, pathMTU: make(map[netip.Addr]pathMTUEntry),
-		closeCh: make(chan struct{}), timestampEpoch: time.Now(), fragments: make(map[fragmentKey]*fragmentSet), fragmentWake: make(chan struct{}, 1),
+		closeCh: make(chan struct{}), timestampEpoch: timestampEpoch, fragments: make(map[fragmentKey]*fragmentSet), fragmentWake: make(chan struct{}, 1),
 	}
 	copy(stack.tcpISNSecret[:], seed[24:40])
 	copy(stack.flowLabelSecret[:], seed[72:88])
@@ -617,7 +711,7 @@ func (s *Stack) UpdateConfig(config Config) error {
 		return ErrClosed
 	}
 	previous := s.network.Load()
-	if previous == nil || previous.mtu != state.mtu {
+	if !previous.samePathConfiguration(state) {
 		s.pathMTUMu.Lock()
 		s.network.Store(state)
 		s.pathMTU = make(map[netip.Addr]pathMTUEntry)
@@ -647,10 +741,7 @@ func (s *Stack) UpdateConfig(config Config) error {
 			connection.abortWithoutReset(syscall.ENETUNREACH)
 			continue
 		}
-		select {
-		case connection.pathMTUUpdate <- struct{}{}:
-		default:
-		}
+		connection.wakeActor(tcpActorWakePathMTU)
 	}
 	for _, connection := range udpConnections {
 		if connection.dual && !networkStateHasFamily(state, false) && !networkStateHasFamily(state, true) ||
@@ -876,10 +967,7 @@ func (s *Stack) notifyTCPPathMTU(destination netip.Addr, except *TCPConn) {
 		if connection == nil || connection == except || key.remote.Addr() != destination {
 			continue
 		}
-		select {
-		case connection.pathMTUUpdate <- struct{}{}:
-		default:
-		}
+		connection.wakeActor(tcpActorWakePathMTU)
 	}
 	s.mu.RUnlock()
 }
@@ -1081,8 +1169,8 @@ func (s *Stack) runLoopback() {
 	for {
 		select {
 		case entry := <-s.loopback.packets:
-			packet := s.loopback.consume(entry)
-			_ = s.handleInboundPacket(packet, time.Now())
+			_ = s.handleInboundPacket(entry.packet, time.Now())
+			s.loopback.release(entry)
 		case <-s.closeCh:
 			return
 		}
@@ -1375,7 +1463,7 @@ func (s *Stack) DialUDP(ctx context.Context, network string, source, remote neti
 	if err := validateTransportNetwork(network, "udp", remote.Addr()); err != nil {
 		return wrap(nil, err)
 	}
-	if !remote.IsValid() || remote.Port() == 0 || remote.Addr().IsUnspecified() || remote.Addr().IsMulticast() || remote.Addr().Zone() != "" {
+	if !remote.IsValid() || remote.Addr().IsUnspecified() || remote.Addr().IsMulticast() || remote.Addr().Zone() != "" {
 		return wrap(nil, errors.New("mipstack: invalid UDP destination"))
 	}
 	if err := ctx.Err(); err != nil {
@@ -1485,11 +1573,12 @@ func (s *Stack) Read(buffers [][]byte, sizes []int, offset int) (int, error) {
 	default:
 	}
 	readPacket := func(index int, entry packetQueueEntry) error {
-		packet := s.outbound.consume(entry)
-		if len(packet) > len(buffers[index])-offset {
+		if len(entry.packet) > len(buffers[index])-offset {
+			s.outbound.release(entry)
 			return io.ErrShortBuffer
 		}
-		sizes[index] = copy(buffers[index][offset:], packet)
+		sizes[index] = copy(buffers[index][offset:], entry.packet)
+		s.outbound.release(entry)
 		return nil
 	}
 	var first packetQueueEntry
@@ -1548,7 +1637,7 @@ func (s *Stack) writePacket(packet []byte) error {
 	}
 	queue, loopback := s.outputQueue(packet)
 	if loopback {
-		if _, queued := queue.tryEnqueue(packet); queued {
+		if queue.tryEnqueue(packet) {
 			s.recordOutput(true)
 			return nil
 		}
@@ -1563,13 +1652,13 @@ func (s *Stack) writePacket(packet []byte) error {
 		}
 	}
 	for {
-		if _, queued := queue.tryEnqueue(packet); queued {
+		if queue.tryEnqueue(packet) {
 			s.recordOutput(false)
 			return nil
 		}
 		select {
 		case slot := <-queue.free:
-			queue.enqueueReserved(slot, packet)
+			queue.enqueueReservedPacket(slot, packet, false)
 			s.recordOutput(false)
 			return nil
 		case <-s.closeCh:
@@ -1588,7 +1677,7 @@ func (s *Stack) tryWritePacket(packet []byte) error {
 	default:
 	}
 	queue, loopback := s.outputQueue(packet)
-	if _, queued := queue.tryEnqueue(packet); !queued {
+	if !queue.tryEnqueue(packet) {
 		return ErrResourceLimit
 	}
 	s.recordOutput(loopback)
@@ -1598,38 +1687,42 @@ func (s *Stack) tryWritePacket(packet []byte) error {
 // writePacketUntil queues a packet while observing a socket's mutable write
 // deadline. The fast path allocates no timer when the packet queue has room.
 func (s *Stack) writePacketUntil(packet []byte, state func() (time.Time, <-chan struct{}, bool)) error {
-	_, err := s.writePacketUntilTicket(packet, state)
-	return err
+	queue, loopback := s.outputQueue(packet)
+	slot, err := s.reservePacketUntil(queue, loopback, state)
+	if err != nil {
+		return err
+	}
+	queue.enqueueReservedPacket(slot, packet, false)
+	s.recordOutput(loopback)
+	return nil
 }
 
-// writePacketUntilTicket is writePacketUntil plus the exact FIFO position
-// used by TCP's host-queue-aware loss probing.
-func (s *Stack) writePacketUntilTicket(packet []byte, state func() (time.Time, <-chan struct{}, bool)) (packetQueueTicket, error) {
-	queue, loopback := s.outputQueue(packet)
+// reservePacketUntil acquires one queue slot while observing a socket's
+// mutable write deadline. Callers must release the slot if packet construction
+// fails before enqueueReserved publishes it.
+func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, state func() (time.Time, <-chan struct{}, bool)) (uint16, error) {
 	for {
 		deadline, changed, closed := state()
 		if closed {
-			return packetQueueTicket{}, net.ErrClosed
+			return 0, net.ErrClosed
 		}
 		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			select {
 			case <-changed:
 				continue
 			default:
-				return packetQueueTicket{}, os.ErrDeadlineExceeded
+				return 0, os.ErrDeadlineExceeded
 			}
 		}
-		ticket, queued := queue.tryEnqueue(packet)
-		if queued {
-			s.recordOutput(loopback)
-			return ticket, nil
+		if slot, reserved := queue.tryReserve(); reserved {
+			return slot, nil
 		}
 		if loopback {
 			select {
 			case <-s.closeCh:
-				return packetQueueTicket{}, ErrClosed
+				return 0, ErrClosed
 			default:
-				return packetQueueTicket{}, ErrResourceLimit
+				return 0, ErrResourceLimit
 			}
 		}
 		timer, timeout := deadlineTimer(deadline)
@@ -1639,7 +1732,7 @@ func (s *Stack) writePacketUntilTicket(packet []byte, state func() (time.Time, <
 			deadline, changed, closed = state()
 			if closed {
 				queue.releaseReserved(slot)
-				return packetQueueTicket{}, net.ErrClosed
+				return 0, net.ErrClosed
 			}
 			if !deadline.IsZero() && !time.Now().Before(deadline) {
 				select {
@@ -1648,19 +1741,17 @@ func (s *Stack) writePacketUntilTicket(packet []byte, state func() (time.Time, <
 					continue
 				default:
 					queue.releaseReserved(slot)
-					return packetQueueTicket{}, os.ErrDeadlineExceeded
+					return 0, os.ErrDeadlineExceeded
 				}
 			}
-			ticket = queue.enqueueReserved(slot, packet)
-			s.recordOutput(loopback)
-			return ticket, nil
+			return slot, nil
 		case <-changed:
 			stopTimer(timer)
 		case <-timeout:
-			return packetQueueTicket{}, os.ErrDeadlineExceeded
+			return 0, os.ErrDeadlineExceeded
 		case <-s.closeCh:
 			stopTimer(timer)
-			return packetQueueTicket{}, ErrClosed
+			return 0, ErrClosed
 		}
 	}
 }
@@ -1788,7 +1879,16 @@ func (t *ownedTimer) close() {
 // outputQueue chooses local delivery when the destination belongs to this
 // stack, otherwise the embedding link's packet queue.
 func (s *Stack) outputQueue(packet []byte) (*packetQueue, bool) {
-	if destination, ok := packetDestination(packet); ok && s.isLocal(destination) {
+	if destination, ok := packetDestination(packet); ok {
+		return s.outputQueueFor(destination)
+	}
+	return &s.outbound, false
+}
+
+// outputQueueFor chooses a queue when the packet builder already has the
+// validated destination address.
+func (s *Stack) outputQueueFor(destination netip.Addr) (*packetQueue, bool) {
+	if s.isLocal(destination) {
 		return &s.loopback, true
 	}
 	return &s.outbound, false

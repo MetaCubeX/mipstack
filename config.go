@@ -29,6 +29,33 @@ type networkState struct {
 	routes            []Route
 }
 
+// samePathConfiguration reports whether cached destination PMTU information
+// remains valid across a configuration update. Address order participates in
+// source selection, while prefix and route order can change admission and
+// equal-priority route selection.
+func (state *networkState) samePathConfiguration(other *networkState) bool {
+	if state == nil || other == nil || state.mtu != other.mtu ||
+		len(state.sources) != len(other.sources) || len(state.localPrefixes) != len(other.localPrefixes) || len(state.routes) != len(other.routes) {
+		return false
+	}
+	for index := range state.sources {
+		if state.sources[index] != other.sources[index] {
+			return false
+		}
+	}
+	for index := range state.localPrefixes {
+		if state.localPrefixes[index] != other.localPrefixes[index] {
+			return false
+		}
+	}
+	for index := range state.routes {
+		if state.routes[index] != other.routes[index] {
+			return false
+		}
+	}
+	return true
+}
+
 // buildNetworkState validates and normalizes one public configuration.
 func buildNetworkState(config Config) (*networkState, error) {
 	mtu := int(config.MTU)
@@ -224,12 +251,14 @@ func (state *networkState) invalidInboundSource(address netip.Addr) bool {
 	if !address.Is4() {
 		return false
 	}
-	value := binary.BigEndian.Uint32(address.AsSlice())
+	addressBytes := address.As4()
+	value := binary.BigEndian.Uint32(addressBytes[:])
 	for _, prefix := range state.localPrefixes {
 		if !prefix.Addr().Is4() || prefix.Bits() >= 31 || !prefix.Contains(address) {
 			continue
 		}
-		network := binary.BigEndian.Uint32(prefix.Addr().AsSlice())
+		networkBytes := prefix.Addr().As4()
+		network := binary.BigEndian.Uint32(networkBytes[:])
 		hostMask := uint32((uint64(1) << (32 - prefix.Bits())) - 1)
 		if value == network|hostMask {
 			return true
@@ -247,7 +276,8 @@ func (state *networkState) broadcastDestination(address netip.Addr) bool {
 	if !address.Is4() {
 		return false
 	}
-	value := binary.BigEndian.Uint32(address.AsSlice())
+	addressBytes := address.As4()
+	value := binary.BigEndian.Uint32(addressBytes[:])
 	if value == ^uint32(0) {
 		return true
 	}
@@ -255,7 +285,8 @@ func (state *networkState) broadcastDestination(address netip.Addr) bool {
 		if !prefix.Addr().Is4() || prefix.Bits() >= 31 || !prefix.Contains(address) {
 			continue
 		}
-		network := binary.BigEndian.Uint32(prefix.Addr().AsSlice())
+		networkBytes := prefix.Addr().As4()
+		network := binary.BigEndian.Uint32(networkBytes[:])
 		hostMask := uint32((uint64(1) << (32 - prefix.Bits())) - 1)
 		if value == network|hostMask {
 			return true
@@ -267,14 +298,16 @@ func (state *networkState) broadcastDestination(address netip.Addr) bool {
 // isIPv4Broadcast reports limited broadcast and subnet broadcast addresses.
 // Prefixes /31 and /32 do not reserve a subnet broadcast address.
 func isIPv4Broadcast(prefix netip.Prefix, address netip.Addr, bits int) bool {
-	value := binary.BigEndian.Uint32(address.AsSlice())
+	addressBytes := address.As4()
+	value := binary.BigEndian.Uint32(addressBytes[:])
 	if value == ^uint32(0) {
 		return true
 	}
 	if bits >= 31 {
 		return false
 	}
-	network := binary.BigEndian.Uint32(prefix.Masked().Addr().Unmap().AsSlice())
+	networkBytes := prefix.Masked().Addr().Unmap().As4()
+	network := binary.BigEndian.Uint32(networkBytes[:])
 	hostMask := uint32((uint64(1) << (32 - bits)) - 1)
 	return value == network|hostMask
 }
@@ -430,10 +463,15 @@ func addressLabel(address netip.Addr) uint8 {
 // commonPrefixBits counts equal high-order address bits.
 func commonPrefixBits(left, right netip.Addr) int {
 	left, right = left.Unmap(), right.Unmap()
-	if left.Is4() != right.Is4() {
+	if !left.IsValid() || !right.IsValid() || left.Is4() != right.Is4() {
 		return 0
 	}
-	leftBytes, rightBytes := left.AsSlice(), right.AsSlice()
+	leftValue, rightValue := left.As16(), right.As16()
+	start := 0
+	if left.Is4() {
+		start = 12
+	}
+	leftBytes, rightBytes := leftValue[start:], rightValue[start:]
 	result := 0
 	for index := range leftBytes {
 		difference := leftBytes[index] ^ rightBytes[index]

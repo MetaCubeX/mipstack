@@ -115,7 +115,8 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, key tcpKey, syn tcpSeg
 			timestamp |= 1
 		}
 	}
-	tcpOptions := tcpPassiveSYNOptions(localMSS, options.sack, options.windowScaling, options.timestamp, windowScale, timestamp, options.timestampNow)
+	var optionStorage [40]byte
+	tcpOptions := tcpPassiveSYNOptions(optionStorage[:0], localMSS, options.sack, options.windowScaling, options.timestamp, windowScale, timestamp, options.timestampNow)
 	flags := byte(tcpFlagSYN | tcpFlagACK)
 	if options.ecn {
 		flags |= tcpFlagECE
@@ -148,7 +149,7 @@ func (state *tcpPassiveState) validateSYNCookieCandidate(key tcpKey, ack tcpSegm
 	serverSequence := ack.acknowledgement - 1
 	clientSequence := ack.sequence - 1
 	data := serverSequence & synCookieDataMask
-	timestampValue, timestampEcho, timestamp := parseTCPTimestamp(ack.options)
+	timestampValue, timestampEcho, timestamp := parseTCPTimestamp(ack.optionBytes())
 	ecn := timestamp && timestampEcho&1 != 0
 	authenticatedData := synCookieAuthenticatedData(data, timestamp, ecn)
 	valid := false
@@ -191,7 +192,7 @@ func (state *tcpPassiveState) validateSYNCookieCandidate(key tcpKey, ack tcpSegm
 // encodeSYNCookieOptions converts a SYN's offered options into eight sequence
 // bits. Timestamp and ECN flags are authenticated separately.
 func encodeSYNCookieOptions(syn tcpSegment, remoteAddress netip.Addr) (synCookieOptions, uint32) {
-	mss, scale, scaling, sack, timestamp, timestampValue := parseTCPOptions(syn.options, defaultTCPPeerMSS(remoteAddress), 65535)
+	mss, scale, scaling, sack, timestamp, timestampValue := parseTCPOptions(syn.optionBytes(), defaultTCPPeerMSS(remoteAddress), 65535)
 	mssIndex := 0
 	for index, value := range synCookieMSSValues {
 		if int(value) > mss {
@@ -288,6 +289,8 @@ func (c *TCPConn) runPassiveCookie(listener *TCPListener, finalACK tcpSegment, i
 	}()
 	defer c.stack.removeTCP(c)
 	defer close(c.done)
+	protocolTimer := newOwnedTimer()
+	defer protocolTimer.close()
 	if len(finalACK.payload) != 0 || finalACK.flags&tcpFlagFIN != 0 {
 		c.inbound.prepend(finalACK)
 	}
@@ -297,5 +300,5 @@ func (c *TCPConn) runPassiveCookie(listener *TCPListener, finalACK tcpSegment, i
 		return
 	}
 	queued = true
-	c.finish(c.established(initialSequence + 1))
+	c.finish(c.established(initialSequence+1, protocolTimer))
 }

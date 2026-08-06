@@ -3,7 +3,6 @@ package mipstack
 import (
 	"encoding/binary"
 	"net/netip"
-	"sort"
 	"syscall"
 	"time"
 )
@@ -219,7 +218,6 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, 
 		if set.total < 0 {
 			return nil, true
 		}
-		sort.Slice(set.pieces, func(left, right int) bool { return set.pieces[left].offset < set.pieces[right].offset })
 		next := 0
 		for _, piece := range set.pieces {
 			if piece.offset != next {
@@ -285,7 +283,17 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, 
 	} else {
 		data = append([]byte(nil), fragment.payload...)
 	}
-	set.pieces = append(set.pieces, fragmentPiece{offset: fragment.offset, data: data})
+	piece := fragmentPiece{offset: fragment.offset, data: data}
+	insertAt := len(set.pieces)
+	for index, existing := range set.pieces {
+		if fragment.offset < existing.offset {
+			insertAt = index
+			break
+		}
+	}
+	set.pieces = append(set.pieces, fragmentPiece{})
+	copy(set.pieces[insertAt+1:], set.pieces[insertAt:])
+	set.pieces[insertAt] = piece
 	set.bytes += retainedBytes
 	if now.After(set.updated) {
 		set.updated = now
@@ -300,7 +308,6 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, 
 	if set.total < 0 {
 		return nil, true
 	}
-	sort.Slice(set.pieces, func(left, right int) bool { return set.pieces[left].offset < set.pieces[right].offset })
 	next := 0
 	for _, piece := range set.pieces {
 		if piece.offset != next {
@@ -314,34 +321,31 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, 
 	return s.finishFragmentReassembly(fragment.key, set)
 }
 
-// fragmentRangeCovered reports whether existing non-overlapping pieces cover
-// every byte in [start,end). Pieces need not have arrived in offset order.
+// fragmentRangeCovered reports whether sorted, non-overlapping pieces cover
+// every byte in [start,end).
 func fragmentRangeCovered(pieces []fragmentPiece, start, end int) bool {
 	if start >= end {
 		return false
 	}
-	for cursor := start; cursor < end; {
-		next := cursor
-		for _, piece := range pieces {
-			pieceEnd := piece.offset + len(piece.data)
-			if piece.offset <= cursor && pieceEnd > next {
-				next = pieceEnd
-			}
+	cursor := start
+	for _, piece := range pieces {
+		pieceEnd := piece.offset + len(piece.data)
+		if pieceEnd <= cursor {
+			continue
 		}
-		if next == cursor {
+		if piece.offset > cursor {
 			return false
 		}
-		cursor = next
+		cursor = pieceEnd
+		if cursor >= end {
+			return true
+		}
 	}
-	return true
+	return false
 }
 
 // finishFragmentReassembly builds and removes one contiguous fragment set.
 func (s *Stack) finishFragmentReassembly(key fragmentKey, set *fragmentSet) ([]byte, bool) {
-	payload := make([]byte, set.total)
-	for _, piece := range set.pieces {
-		copy(payload[piece.offset:], piece.data)
-	}
 	s.removeFragmentLocked(key, set)
 	ecn, valid := fragmentECN(set.ecnMask)
 	if !valid {
@@ -349,21 +353,23 @@ func (s *Stack) finishFragmentReassembly(key fragmentKey, set *fragmentSet) ([]b
 	}
 	set.options.trafficClass = set.options.trafficClass&^3 | ecn
 	dontFragment := !set.v6 && set.maxDFSize != 0 && set.maxDFSize == set.maxSize
-	packet := buildReassembledPacket(set, payload, dontFragment)
+	packet := buildReassembledPacket(set, dontFragment)
 	setPacketECN(packet, ecn)
 	return packet, false
 }
 
 // buildReassembledPacket removes fragmentation state while preserving the
 // complete offset-zero IPv4 header or IPv6 unfragmentable header chain.
-func buildReassembledPacket(set *fragmentSet, payload []byte, dontFragment bool) []byte {
+func buildReassembledPacket(set *fragmentSet, dontFragment bool) []byte {
 	if !set.v6 {
-		if len(set.header) < 20 || len(set.header)+len(payload) > 65535 {
+		if len(set.header) < 20 || len(set.header)+set.total > 65535 {
 			return nil
 		}
-		packet := make([]byte, len(set.header)+len(payload))
+		packet := make([]byte, len(set.header)+set.total)
 		copy(packet, set.header)
-		copy(packet[len(set.header):], payload)
+		for _, piece := range set.pieces {
+			copy(packet[len(set.header)+piece.offset:], piece.data)
+		}
 		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
 		field := uint16(0)
 		if dontFragment {
@@ -374,13 +380,15 @@ func buildReassembledPacket(set *fragmentSet, payload []byte, dontFragment bool)
 		binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:len(set.header)]))
 		return packet
 	}
-	if len(set.header) < 40 || set.nextHeader < 0 || set.nextHeader >= len(set.header) || len(set.header)-40+len(payload) > 65535 {
+	if len(set.header) < 40 || set.nextHeader < 0 || set.nextHeader >= len(set.header) || len(set.header)-40+set.total > 65535 {
 		return nil
 	}
-	packet := make([]byte, len(set.header)+len(payload))
+	packet := make([]byte, len(set.header)+set.total)
 	copy(packet, set.header)
 	packet[set.nextHeader] = set.protocol
-	copy(packet[len(set.header):], payload)
+	for _, piece := range set.pieces {
+		copy(packet[len(set.header)+piece.offset:], piece.data)
+	}
 	binary.BigEndian.PutUint16(packet[4:6], uint16(len(packet)-40))
 	return packet
 }
@@ -741,44 +749,138 @@ func (s *Stack) ipPayloadPacketsForMTU(source, target netip.Addr, protocol byte,
 // writeIPPayloadUntilOptionsForMTU emits output against an explicit packet
 // ceiling while preserving socket deadline and closure behavior.
 func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, mtu int, state func() (time.Time, <-chan struct{}, bool)) error {
-	packets, err := s.ipPayloadPacketsForMTU(source, target, protocol, payload, allowFragment, options, mtu)
-	if err != nil {
-		return err
+	if source.Is6() && !options.flowLabelSet {
+		options.flowLabel = s.automaticFlowLabel(source, target, protocol, payload)
+		options.flowLabelSet = true
 	}
-	for _, packet := range packets {
-		if err = s.writePacketUntil(packet, state); err != nil {
+	headerSize := ipHeaderSize(source, target, len(payload))
+	if headerSize == 0 {
+		return syscall.EMSGSIZE
+	}
+	if headerSize+len(payload) <= mtu {
+		var identification uint16
+		if source.Is4() && allowFragment {
+			identification = uint16(s.ipv4ID.Add(1))
+		}
+		queue, loopback := s.outputQueueFor(target)
+		slot, err := s.reservePacketUntil(queue, loopback, state)
+		if err != nil {
 			return err
 		}
+		packet, reusable := queue.acquireBuffer(headerSize + len(payload))
+		if !marshalIPHeader(packet, source, target, protocol, identification, !allowFragment, options) {
+			queue.releaseBuffer(packet, reusable)
+			queue.releaseReserved(slot)
+			return syscall.EMSGSIZE
+		}
+		copy(packet[headerSize:], payload)
+		queue.enqueueReservedPacket(slot, packet, reusable)
+		s.recordOutput(loopback)
+		return nil
 	}
-	return nil
+	if !allowFragment {
+		return syscall.EMSGSIZE
+	}
+	return s.writeIPFragmentsUntilOptionsForMTU(source, target, protocol, payload, nil, options, mtu, state)
 }
 
 // writeIPPayload emits one packet or a complete source-fragmented sequence.
 func (s *Stack) writeIPPayload(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool) error {
-	packets, err := s.ipPayloadPackets(source, target, protocol, payload, allowFragment)
-	if err != nil {
-		return err
-	}
-	for _, packet := range packets {
-		if err = s.writePacket(packet); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.writeIPPayloadUntilOptionsForMTU(source, target, protocol, payload, allowFragment, ipPacketOptions{}, s.mtuFor(target), openPacketWriteState)
 }
 
 // writeIPPayloadUntilOptions emits raw IP output with mutable deadline state.
 func (s *Stack) writeIPPayloadUntilOptions(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, state func() (time.Time, <-chan struct{}, bool)) error {
-	packets, err := s.ipPayloadPacketsWithOptions(source, target, protocol, payload, allowFragment, options)
-	if err != nil {
-		return err
+	return s.writeIPPayloadUntilOptionsForMTU(source, target, protocol, payload, allowFragment, options, s.mtuFor(target), state)
+}
+
+// openPacketWriteState supplies an unlimited deadline to internal protocol
+// replies while Stack.reservePacketUntil still observes stack closure.
+func openPacketWriteState() (time.Time, <-chan struct{}, bool) {
+	return time.Time{}, nil, false
+}
+
+// writeIPFragmentsUntilOptionsForMTU writes fragments directly into reserved
+// queue storage. first and second are adjacent logical payload regions; this
+// lets UDP prepend its virtual header without gathering the complete datagram.
+func (s *Stack) writeIPFragmentsUntilOptionsForMTU(source, target netip.Addr, protocol byte, first, second []byte, options ipPacketOptions, mtu int, state func() (time.Time, <-chan struct{}, bool)) error {
+	payloadSize := len(first) + len(second)
+	maximum := (mtu - 20) &^ 7
+	headerSize := 20
+	identification4 := uint16(0)
+	identification6 := uint32(0)
+	if source.Is4() {
+		if maximum < 8 || payloadSize > 65515 {
+			return syscall.EMSGSIZE
+		}
+		identification4 = uint16(s.ipv4ID.Add(1))
+	} else {
+		headerSize = 48
+		maximum = (mtu - headerSize) &^ 7
+		if maximum < 8 || payloadSize > 65535 {
+			return syscall.EMSGSIZE
+		}
+		identification6 = s.ipv6FragmentID.Add(1)
 	}
-	for _, packet := range packets {
-		if err = s.writePacketUntil(packet, state); err != nil {
+	queue, loopback := s.outputQueueFor(target)
+	for offset := 0; offset < payloadSize; {
+		size := payloadSize - offset
+		if size > maximum {
+			size = maximum
+		}
+		slot, err := s.reservePacketUntil(queue, loopback, state)
+		if err != nil {
 			return err
 		}
+		packet, reusable := queue.acquireBuffer(headerSize + size)
+		if source.Is4() {
+			if !marshalIPHeader(packet, source, target, protocol, identification4, false, options) {
+				queue.releaseBuffer(packet, reusable)
+				queue.releaseReserved(slot)
+				return syscall.EMSGSIZE
+			}
+			field := uint16(offset / 8)
+			if offset+size < payloadSize {
+				field |= 0x2000
+			}
+			binary.BigEndian.PutUint16(packet[6:8], field)
+			packet[10], packet[11] = 0, 0
+			binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:20]))
+		} else {
+			if !marshalIPHeader(packet, source, target, 44, 0, false, options) {
+				queue.releaseBuffer(packet, reusable)
+				queue.releaseReserved(slot)
+				return syscall.EMSGSIZE
+			}
+			fragment := packet[40:48]
+			fragment[0], fragment[1] = protocol, 0
+			field := uint16(offset)
+			if offset+size < payloadSize {
+				field |= 1
+			}
+			binary.BigEndian.PutUint16(fragment[2:4], field)
+			binary.BigEndian.PutUint32(fragment[4:8], identification6)
+		}
+		copyIPPayloadParts(packet[headerSize:], offset, first, second)
+		queue.enqueueReservedPacket(slot, packet, reusable)
+		s.recordOutput(loopback)
+		offset += size
 	}
 	return nil
+}
+
+// copyIPPayloadParts copies one logical range from adjacent payload regions.
+func copyIPPayloadParts(destination []byte, offset int, first, second []byte) {
+	if offset < len(first) {
+		n := copy(destination, first[offset:])
+		destination = destination[n:]
+		offset = 0
+	} else {
+		offset -= len(first)
+	}
+	if len(destination) != 0 {
+		copy(destination, second[offset:])
+	}
 }
 
 // buildIPv4FragmentsWithOptions preserves raw output fields on every fragment.
@@ -819,16 +921,20 @@ func buildIPv6FragmentsWithOptions(source, target netip.Addr, protocol byte, pay
 		if size > maximum {
 			size = maximum
 		}
-		fragmentPayload := make([]byte, 8+size)
-		fragmentPayload[0] = protocol
+		packet := make([]byte, 48+size)
+		if !marshalIPHeader(packet, source, target, 44, 0, false, options) {
+			return nil
+		}
+		fragment := packet[40:]
+		fragment[0] = protocol
 		field := uint16(offset)
 		if offset+size < len(payload) {
 			field |= 1
 		}
-		binary.BigEndian.PutUint16(fragmentPayload[2:4], field)
-		binary.BigEndian.PutUint32(fragmentPayload[4:8], identification)
-		copy(fragmentPayload[8:], payload[offset:offset+size])
-		result = append(result, buildIPPacketWithOptions(source, target, 44, fragmentPayload, 0, false, options))
+		binary.BigEndian.PutUint16(fragment[2:4], field)
+		binary.BigEndian.PutUint32(fragment[4:8], identification)
+		copy(fragment[8:], payload[offset:offset+size])
+		result = append(result, packet)
 		offset += size
 	}
 	return result
