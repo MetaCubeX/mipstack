@@ -251,7 +251,8 @@ func TestTCPSocketDefaultConfiguration(t *testing.T) {
 	defaults := TCPSocketDefaults{
 		ReceiveBuffer: 128 * 1024, MaximumReceiveBuffer: 2 * 1024 * 1024,
 		SendBuffer: 64 * 1024, MaximumSendBuffer: 4 * 1024 * 1024,
-		AcceptQueue: 17, SYNBacklog: 29, KeepAlive: true,
+		MaximumPacingRate: 12_345_678,
+		AcceptQueue:       17, SYNBacklog: 29, KeepAlive: true,
 		KeepAliveConfig: KeepAliveConfig{Idle: time.Minute, Interval: 3 * time.Second, Count: 4},
 		IdleTimeout:     5 * time.Minute, UserTimeout: 30 * time.Second, DisableNoDelay: true, TrafficClass: 0xab,
 	}
@@ -266,7 +267,7 @@ func TestTCPSocketDefaultConfiguration(t *testing.T) {
 	connection := newTCPConn(stack, "tcp", tcpKey{}, 1500)
 	if connection.receiveCapacity != defaults.ReceiveBuffer || connection.receiveMaximum != defaults.MaximumReceiveBuffer ||
 		connection.sendCapacity != defaults.SendBuffer || connection.sendMaximum != defaults.MaximumSendBuffer ||
-		connection.noDelay || !connection.keepAlive || connection.userTimeout != defaults.UserTimeout || connection.receiveWindowScale != tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer) {
+		connection.maximumPacingRate != defaults.MaximumPacingRate || connection.noDelay || !connection.keepAlive || connection.userTimeout != defaults.UserTimeout || connection.receiveWindowScale != tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer) {
 		t.Fatalf("connection did not inherit TCP defaults: %+v", connection)
 	}
 	if got := uint8(connection.trafficClass.Load()); got != 0xa8 {

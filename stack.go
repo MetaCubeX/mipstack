@@ -110,6 +110,10 @@ type TCPSocketDefaults struct {
 	SendBuffer int
 	// MaximumSendBuffer bounds automatic send tuning.
 	MaximumSendBuffer int
+	// MaximumPacingRate caps the paced-data rate of new TCP connections in
+	// bytes per second. Zero leaves the pacing rate unlimited. Initial and
+	// control bursts mean this is not a strict byte-rate shaper.
+	MaximumPacingRate uint64
 	// AcceptQueue bounds completed connections waiting for Accept.
 	AcceptQueue int
 	// SYNBacklog bounds stateful handshakes before SYN cookies are used.

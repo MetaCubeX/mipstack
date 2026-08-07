@@ -108,6 +108,7 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 				b.ReportMetric(float64(info.DeliveryRate), "delivery-B/s")
 				b.ReportMetric(float64(info.BytesInFlight), "flight-B")
 				b.ReportMetric(float64(info.PacingRate), "pacing-B/s")
+				b.ReportMetric(float64(info.SchedulerLimitedEvents), "scheduler-limited-events")
 				b.ReportMetric(float64(info.SlowStartThreshold), "ssthresh-B")
 				b.ReportMetric(float64(info.RTT)/float64(time.Microsecond), "rtt-us")
 				b.ReportMetric(float64(info.Retransmissions), "retransmissions")

@@ -300,5 +300,5 @@ func (c *TCPConn) runPassiveCookie(listener *TCPListener, finalACK tcpSegment, i
 		return
 	}
 	queued = true
-	c.finish(c.established(initialSequence+1, protocolTimer))
+	c.finish(c.established(initialSequence+1, protocolTimer, tcpInitialReceive{}))
 }

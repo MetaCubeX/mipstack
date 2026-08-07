@@ -1,8 +1,10 @@
 package mipstack
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"net"
 	"net/netip"
 	"testing"
@@ -124,6 +126,77 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	stats := stack.Stats()
 	if stats.TCPSYNCookiesSent != 1 || stats.TCPSYNCookiesRejected != 1 || stats.TCPSYNCookiesAccepted != 1 {
 		t.Fatalf("SYN cookie stack diagnostics = %+v", stats)
+	}
+}
+
+func TestSYNCookieFastOpenFallsBackToFinalACK(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.53")
+	remote := netip.MustParseAddr("198.51.100.53")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	listener, err := stack.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(local, 47003))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	for index := 0; index < tcpSYNBacklog; index++ {
+		if !listener.trackHandshake(&TCPConn{}) {
+			t.Fatalf("failed to fill SYN backlog at %d", index)
+		}
+	}
+	t.Cleanup(func() {
+		listener.mu.Lock()
+		listener.pending = make(map[*TCPConn]struct{})
+		listener.handshaking = make(map[*TCPConn]struct{})
+		listener.mu.Unlock()
+	})
+
+	const clientSequence = uint32(0x23456789)
+	payload := []byte("fast-open request")
+	syn := buildTestTCP(remote, local, 43003, 47003, clientSequence, 0, tcpFlagSYN, 65535, nil, payload)
+	if err = writeTestPacket(stack, syn); err != nil {
+		t.Fatal(err)
+	}
+	response := readOutboundPacket(t, stack)
+	parsed, ok := parseIPPacket(response)
+	if !ok || parsed.protocol != protocolTCP || len(parsed.payload) < tcpHeaderSize {
+		t.Fatalf("invalid SYN-cookie response: %x", response)
+	}
+	tcp := parsed.payload
+	if tcp[13]&byte(tcpFlagSYN|tcpFlagACK) != byte(tcpFlagSYN|tcpFlagACK) || binary.BigEndian.Uint32(tcp[8:12]) != clientSequence+1 {
+		t.Fatalf("SYN-cookie flags/ack = %#x/%#x", tcp[13], binary.BigEndian.Uint32(tcp[8:12]))
+	}
+	serverSequence := binary.BigEndian.Uint32(tcp[4:8])
+	finalACK := buildTestTCP(remote, local, 43003, 47003, clientSequence+1, serverSequence+1, tcpFlagACK|tcpFlagFIN, 65535, nil, payload)
+	if err = writeTestPacket(stack, finalACK); err != nil {
+		t.Fatal(err)
+	}
+	if err = listener.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := listener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, len(payload))
+	if _, err = io.ReadFull(connection, buffer); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buffer, payload) {
+		t.Fatalf("retransmitted SYN data = %q, want %q", buffer, payload)
+	}
+	if n, readErr := connection.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("read after retransmitted FIN = %d, %v, want 0, EOF", n, readErr)
 	}
 }
 

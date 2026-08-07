@@ -73,18 +73,25 @@ const (
 	bbrExtraACKedMaximumInterval = 100 * time.Millisecond
 	// tcpPacingInitialBurst matches Linux fq's unpaced first ten segments.
 	tcpPacingInitialBurst = 10
-	// tcpUserspacePacingQuantum amortizes connection-actor timer wakes and
-	// avoids treating sub-quantum clock jitter as host scheduling delay.
-	tcpUserspacePacingQuantum = 500 * time.Microsecond
+	// tcpUserspaceSchedulingTolerance avoids classifying ordinary timer and
+	// actor jitter as a host-scheduler limitation.
+	tcpUserspaceSchedulingTolerance = 25 * time.Microsecond
+	// tcpUserspacePacingBatch amortizes per-segment timer wakes for Reno and
+	// CUBIC while preserving their long-term window-derived pacing rate.
+	tcpUserspacePacingBatch = 500 * time.Microsecond
 	// bbrPacingLowRateThreshold is Linux BBR's 1.2 Mbit/s boundary between a
 	// one-MSS and two-MSS minimum send quantum.
 	bbrPacingLowRateThreshold = 1_200_000 / 8
-	// bbrMaximumSendQuantum matches Linux's maximum GSO/send quantum. The
-	// stack does not create a GSO packet, but may release this many paced bytes
-	// from one connection actor before waiting again.
-	bbrMaximumSendQuantum = 65535
+	// bbrSendQuantumByteTarget is the Linux-style byte target applied before
+	// dividing by MSS. The minimum segment goal can exceed it for unusual MSS
+	// values, just as bbr_tso_segs_goal permits in Linux.
+	bbrSendQuantumByteTarget = 65535
 	// bbrMaximumSendSegments is Linux's per-GSO segment-count cap.
 	bbrMaximumSendSegments = 127
+	// bbrMaximumUserspaceQuanta bounds one actor pacing group. Linux fq can
+	// revisit a single active flow after each quantum without a goroutine hop;
+	// mipstack groups at most four such quanta to amortize that userspace cost.
+	bbrMaximumUserspaceQuanta = 4
 )
 
 // bbrProbeBandwidthGains cycles above, below, and at the estimated bottleneck
@@ -103,12 +110,38 @@ func (c CongestionControl) valid() bool {
 
 // tcpCongestionController keeps algorithm state inside one connection actor.
 type tcpCongestionController struct {
-	algorithm      CongestionControl
-	renoCredit     float64
-	pacingNext     time.Time
-	pacingSegments uint64
-	cubic          cubicCongestionControl
-	bbr            bbrCongestionControl
+	algorithm         CongestionControl
+	renoCredit        float64
+	pacingNext        time.Time
+	pacingSegments    uint64
+	pacingRate        float64
+	maximumPacingRate uint64
+	cubic             cubicCongestionControl
+	bbr               bbrCongestionControl
+}
+
+// setMaximumPacingRate updates the socket policy without discarding the
+// congestion controller's unconstrained model rate. It reports a change so
+// the connection actor can cancel a timer based on the former policy.
+func (c *tcpCongestionController) setMaximumPacingRate(rate uint64) bool {
+	if c.maximumPacingRate == rate {
+		return false
+	}
+	c.pacingNext = time.Time{}
+	c.bbr.nextSend = time.Time{}
+	c.bbr.pacingWakeDeadline = time.Time{}
+	c.bbr.pacingBurstRemaining = 0
+	c.maximumPacingRate = rate
+	c.bbr.maximumPacingRate = rate
+	return true
+}
+
+// limitPacingRate applies the socket's sk_max_pacing_rate-style policy.
+func (c *tcpCongestionController) limitPacingRate(rate float64) float64 {
+	if c.maximumPacingRate != 0 && rate > float64(c.maximumPacingRate) {
+		return float64(c.maximumPacingRate)
+	}
+	return rate
 }
 
 // tcpHyStart implements RFC 9406 round tracking and Conservative Slow Start.
@@ -221,7 +254,7 @@ func newTCPCongestionController(algorithm CongestionControl) tcpCongestionContro
 }
 
 // onCongestion computes the slow-start threshold after packet loss.
-func (c *tcpCongestionController) onCongestion(window, flight uint32, mss int) uint32 {
+func (c *tcpCongestionController) onCongestion(window, flight, slowStartThreshold uint32, mss int) uint32 {
 	c.renoCredit = 0
 	switch c.algorithm {
 	case CongestionControlReno:
@@ -232,32 +265,34 @@ func (c *tcpCongestionController) onCongestion(window, flight uint32, mss int) u
 		// Linux BBR preserves ssthresh and manages recovery with packet
 		// conservation; it does not apply CUBIC's beta decrease.
 		c.bbr.saveWindow(window)
-		return window
+		return slowStartThreshold
 	default:
 		return c.cubic.onCongestion(window, mss)
 	}
 }
 
-// onECN computes the slow-start threshold for an ECN congestion event. RFC
-// 3168 and RFC 9438 permit an ECN response to reduce cwnd to one SMSS, while
-// loss recovery retains RFC 5681's two-SMSS threshold floor.
-func (c *tcpCongestionController) onECN(window, flight uint32, mss int) uint32 {
+// onECN computes both transport values changed by an ECN congestion event.
+// Reno and CUBIC reduce cwnd to their new threshold; Linux BBR leaves its
+// model-controlled cwnd and infinite threshold intact while entering CWR.
+func (c *tcpCongestionController) onECN(window, flight, slowStartThreshold uint32, mss int) (threshold, congestionWindow uint32) {
 	c.renoCredit = 0
 	switch c.algorithm {
 	case CongestionControlReno:
-		return congestionThresholdWithFloor(flight, mss, 1, 2, 1)
+		threshold = congestionThresholdWithFloor(flight, mss, 1, 2, 1)
+		return threshold, threshold
 	case CongestionControlBBR:
 		c.bbr.saveWindow(window)
-		return window
+		return slowStartThreshold, window
 	default:
-		return c.cubic.onECN(window, mss)
+		threshold = c.cubic.onECN(window, mss)
+		return threshold, threshold
 	}
 }
 
 // onTimeout applies the algorithm's retransmission-timeout response. CUBIC
 // starts its next congestion-avoidance epoch at K=0 as required by RFC 9438;
 // fast loss and ECN continue through onCongestion and onECN respectively.
-func (c *tcpCongestionController) onTimeout(window, flight uint32, mss int, now time.Time) uint32 {
+func (c *tcpCongestionController) onTimeout(window, flight, slowStartThreshold uint32, mss int, now time.Time) uint32 {
 	c.renoCredit = 0
 	switch c.algorithm {
 	case CongestionControlReno:
@@ -273,7 +308,7 @@ func (c *tcpCongestionController) onTimeout(window, flight uint32, mss int, now 
 		c.bbr.roundStart = true
 		c.bbr.updateLongTermBandwidth(bbrRateSample{losses: 1, ackTime: now})
 		c.bbr.sampledLost = c.bbr.totalLost
-		return window
+		return slowStartThreshold
 	default:
 		return c.cubic.onTimeout(window, mss)
 	}
@@ -381,17 +416,33 @@ func congestionWindowLimited(window, flight uint32, mss int) bool {
 
 // pacingDelay returns the remaining userspace pacing interval. BBR supplies
 // its model rate; Reno and CUBIC use Linux's cwnd/SRTT pacing formula.
-func (c *tcpCongestionController) pacingDelay(now time.Time, window, flight uint32, mss int, smoothedRTT time.Duration, slowStartThreshold uint32) time.Duration {
+func (c *tcpCongestionController) pacingDelay(now time.Time, bytes int, window, flight uint32, mss int, smoothedRTT time.Duration, slowStartThreshold uint32) time.Duration {
 	if c.algorithm == CongestionControlBBR {
 		if c.pacingSegments < tcpPacingInitialBurst {
 			return 0
 		}
-		return c.bbr.pacingDelay(now, mss)
+		return c.bbr.pacingDelay(now, bytes, mss, flight)
 	}
 	if c.pacingSegments < tcpPacingInitialBurst || smoothedRTT <= 0 || c.pacingNext.IsZero() || !now.Before(c.pacingNext) {
 		return 0
 	}
-	return pacingTimerDelay(c.pacingNext.Sub(now), tcpUserspacePacingQuantum)
+	return pacingTimerDelay(c.pacingNext.Sub(now), tcpUserspacePacingBatch)
+}
+
+// onPacingWake accounts an actual actor timer wake even when another socket
+// limit prevents the following send attempt from reaching pacingDelay.
+func (c *tcpCongestionController) onPacingWake(now time.Time, flight uint32) {
+	if c.algorithm == CongestionControlBBR {
+		c.bbr.consumePacingWake(now, flight)
+	}
+}
+
+// cancelPacingWake discards a BBR pacing request when the actor repurposes its
+// logical pacing timer for a different transport policy such as an ECN hold.
+func (c *tcpCongestionController) cancelPacingWake() {
+	if c.algorithm == CongestionControlBBR {
+		c.bbr.pacingWakeDeadline = time.Time{}
+	}
 }
 
 // onDataSend advances Reno/CUBIC pacing state after a first transmission.
@@ -433,14 +484,13 @@ func (c *tcpCongestionController) advanceWindowPacing(bytes, mss int, now time.T
 	if c.pacingSegments < tcpPacingInitialBurst || smoothedRTT <= 0 {
 		return
 	}
-	rate := windowPacingRate(window, flight, smoothedRTT, slowStartThreshold)
-	if rate <= 0 || math.IsInf(rate, 0) || math.IsNaN(rate) {
+	modelRate := windowPacingRate(window, flight, smoothedRTT, slowStartThreshold)
+	if modelRate <= 0 || math.IsInf(modelRate, 0) || math.IsNaN(modelRate) {
 		return
 	}
-	delay := time.Duration(float64(time.Second) * float64(bytes) / rate)
-	if delay < time.Microsecond {
-		delay = time.Microsecond
-	}
+	c.pacingRate = modelRate
+	rate := c.limitPacingRate(modelRate)
+	delay := pacingDuration(bytes, rate)
 	maximumDebt := delay
 	const maximumDuration = time.Duration(1<<63 - 1)
 	if delay <= maximumDuration/tcpPacingInitialBurst {
@@ -448,8 +498,17 @@ func (c *tcpCongestionController) advanceWindowPacing(bytes, mss int, now time.T
 	} else {
 		maximumDebt = maximumDuration
 	}
-	base, _ := pacingScheduleBase(c.pacingNext, now, maximumDebt, catchUp && flight != 0)
+	base := pacingScheduleBase(c.pacingNext, now, maximumDebt, catchUp && flight != 0)
 	c.pacingNext = base.Add(delay)
+}
+
+// pacingTimerDelay permits one bounded userspace batch ahead of the pacing
+// clock while preserving the long-term rate in the accumulated deadline.
+func pacingTimerDelay(delay, batch time.Duration) time.Duration {
+	if delay <= batch {
+		return 0
+	}
+	return delay - batch
 }
 
 // windowPacingRate applies Linux tcp_update_pacing_rate semantics. Linux uses
@@ -472,7 +531,8 @@ func windowPacingRate(window, flight uint32, smoothedRTT time.Duration, slowStar
 
 // bbrSendQuantum follows Linux BBR's send-quantum policy: one MSS below
 // 1.2 Mbit/s, two MSS above it, and otherwise the whole-MSS portion of 1/1024
-// second of the pacing rate, bounded by 65535 bytes and 127 segments. It
+// second of the pacing rate. The byte target is capped before applying the
+// one/two-segment minimum, and the final result is capped at 127 segments. It
 // amortizes userspace timer wakes without an operating-system-specific timer
 // allowance.
 func bbrSendQuantum(rate float64, mss int) int {
@@ -483,87 +543,81 @@ func bbrSendQuantum(rate float64, mss int) int {
 	if rate >= bbrPacingLowRateThreshold {
 		minimumSegments = 2
 	}
-	segments := bbrMaximumSendSegments
-	if candidate := rate / (1024 * float64(mss)); candidate < float64(segments) {
-		segments = int(candidate)
+	targetBytes := rate / 1024
+	if targetBytes > bbrSendQuantumByteTarget {
+		targetBytes = bbrSendQuantumByteTarget
 	}
+	segments := int(targetBytes / float64(mss))
 	if segments < minimumSegments {
 		segments = minimumSegments
 	}
 	if segments > bbrMaximumSendSegments {
 		segments = bbrMaximumSendSegments
 	}
-	maximumSegments := bbrMaximumSendQuantum / mss
-	if maximumSegments > 0 && segments > maximumSegments {
-		segments = maximumSegments
-	}
-	quantum := segments * mss
-	if quantum > bbrMaximumSendQuantum {
-		// One valid MSS can exceed the batching limit on unusual links; Linux's
-		// minimum segment goal likewise takes precedence over its byte target.
-		return mss
-	}
-	return quantum
+	return segments * mss
 }
 
 // bbrSendQuantumDuration converts the byte quantum to its interval at rate.
 func bbrSendQuantumDuration(rate float64, mss int) time.Duration {
 	quantum := bbrSendQuantum(rate, mss)
-	if quantum == 0 {
+	return pacingDuration(quantum, rate)
+}
+
+// pacingDuration converts a byte count and rate to a positive, saturated
+// scheduling interval.
+func pacingDuration(bytes int, rate float64) time.Duration {
+	if bytes <= 0 || rate <= 0 || math.IsNaN(rate) {
 		return 0
 	}
-	durationValue := float64(time.Second) * float64(quantum) / rate
+	durationValue := float64(time.Second) * float64(bytes) / rate
 	const maximumDuration = time.Duration(1<<63 - 1)
 	if durationValue >= float64(maximumDuration) {
 		return maximumDuration
 	}
 	duration := time.Duration(durationValue)
-	if duration < time.Microsecond {
-		duration = time.Microsecond
+	if duration < time.Nanosecond {
+		duration = time.Nanosecond
 	}
 	return duration
 }
 
-// bbrTimerQuantumDuration adds a small userspace timer floor to Linux's byte
-// quantum. Kernel fq can schedule a 64 KiB quantum at sub-millisecond
-// precision; waking a Go connection actor more often than this floor adds CPU
-// cost without improving the long-term pacing rate.
-func bbrTimerQuantumDuration(rate float64, mss int) time.Duration {
-	duration := bbrSendQuantumDuration(rate, mss)
-	if duration < tcpUserspacePacingQuantum {
-		return tcpUserspacePacingQuantum
-	}
-	return duration
-}
-
-// pacingTimerDelay retains a bounded send quantum to amortize timers while
-// preserving the long-term pacing rate, like Linux's fq/TSQ batching.
-func pacingTimerDelay(delay, quantum time.Duration) time.Duration {
-	if delay <= quantum {
+// bbrUserspacePacingBudget groups whole Linux send quanta only when one
+// quantum is shorter than the userspace timer batching interval.
+func bbrUserspacePacingBudget(rate float64, mss int) int {
+	quantum := bbrSendQuantum(rate, mss)
+	if quantum == 0 {
 		return 0
 	}
-	return delay - quantum
+	targetValue := math.Ceil(rate * tcpUserspacePacingBatch.Seconds())
+	if targetValue <= float64(quantum) {
+		return quantum
+	}
+	maximum := quantum * bbrMaximumUserspaceQuanta
+	if targetValue >= float64(maximum) {
+		return maximum
+	}
+	target := int(targetValue)
+	quanta := (target + quantum - 1) / quantum
+	return quanta * quantum
 }
 
-// pacingScheduleBase retains at most one send quantum of pacing debt after a
-// late userspace wake. late reports material host scheduling delay;
-// retransmissions pass catchUp=false so an RTO cannot release stale debt.
-func pacingScheduleBase(next, now time.Time, maximumDebt time.Duration, catchUp bool) (base time.Time, late bool) {
+// pacingScheduleBase retains bounded pacing debt after a late userspace wake.
+// Retransmissions pass catchUp=false so an RTO cannot release stale debt.
+func pacingScheduleBase(next, now time.Time, maximumDebt time.Duration, catchUp bool) time.Time {
 	if next.IsZero() {
-		return now, false
+		return now
 	}
 	if !next.Before(now) {
-		return next, false
+		return next
 	}
 	if !catchUp {
-		return now, false
+		return now
 	}
-	late = now.Sub(next) > tcpUserspacePacingQuantum
 	earliest := now.Add(-maximumDebt)
 	if next.Before(earliest) {
 		next = earliest
 	}
-	return next, late
+	return next
 }
 
 // onMTUChange resets packet-size-dependent epochs without discarding BBR's
@@ -573,6 +627,8 @@ func (c *tcpCongestionController) onMTUChange() {
 	c.pacingNext = time.Time{}
 	c.cubic = cubicCongestionControl{}
 	c.bbr.nextSend = time.Time{}
+	c.bbr.pacingWakeDeadline = time.Time{}
+	c.bbr.pacingBurstRemaining = 0
 }
 
 // congestionThreshold applies one multiplicative decrease with the RFC 5681
@@ -824,6 +880,7 @@ type bbrRateSample struct {
 	lastSent           monotonicStamp
 	lastEnd            uint32
 	applicationLimited bool
+	schedulerLimited   bool
 	retransmitted      bool
 	recovery           bool
 	fastRecovery       bool
@@ -850,6 +907,7 @@ func (s *bbrRateSample) observe(segment sentTCPSegment) {
 	s.lastSent = sent
 	s.lastEnd = segment.end
 	s.applicationLimited = snapshot.applicationLimited()
+	s.schedulerLimited = segment.rateSchedulerLimited
 	s.retransmitted = segment.transmissions > 1
 }
 
@@ -966,6 +1024,8 @@ type bbrCongestionControl struct {
 	deliveredStamp          bbrStamp
 	firstSent               bbrStamp
 	applicationLimitedUntil uint64
+	schedulerLimitedUntil   uint64
+	schedulerLimitedEvents  uint64
 	totalLost               uint64
 	sampledLost             uint64
 
@@ -983,10 +1043,13 @@ type bbrCongestionControl struct {
 	longTermLastStamp     time.Time
 	longTermRounds        int
 
-	pacingRate  float64
-	nextSend    time.Time
-	idleRestart bool
-	hasSeenRTT  bool
+	pacingRate           float64
+	maximumPacingRate    uint64
+	nextSend             time.Time
+	pacingWakeDeadline   time.Time
+	pacingBurstRemaining int
+	idleRestart          bool
+	hasSeenRTT           bool
 
 	recovery           bool
 	lossRecovery       bool
@@ -1031,6 +1094,9 @@ func (b *bbrCongestionControl) finishRateSample(sample *bbrRateSample, acknowled
 	}
 	if b.applicationLimitedUntil != 0 && b.delivered > b.applicationLimitedUntil {
 		b.applicationLimitedUntil = 0
+	}
+	if b.schedulerLimitedUntil != 0 && b.delivered > b.schedulerLimitedUntil {
+		b.schedulerLimitedUntil = 0
 	}
 	if sample.priorStamp == 0 {
 		return
@@ -1093,7 +1159,7 @@ func (b *bbrCongestionControl) updateBandwidth(sample bbrRateSample) {
 	}
 	b.updateLongTermBandwidth(sample)
 	rate := float64(sample.delivered) / sample.interval.Seconds()
-	if sample.applicationLimited && rate < b.bandwidth {
+	if sample.locallyLimited() && rate < b.bandwidth {
 		return
 	}
 	b.bandwidth = b.bandwidthFilter.update(bbrBandwidthWindow, b.roundCount, rate)
@@ -1112,6 +1178,14 @@ func (b *bbrCongestionControl) updateACKAggregation(sample bbrRateSample, window
 			b.extraACKedIndex ^= 1
 			b.extraACKed[b.extraACKedIndex] = 0
 		}
+	}
+	if sample.schedulerLimited {
+		// A delayed userspace sender can release overdue pacing groups close
+		// together. Their returning ACKs are not path aggregation evidence, but
+		// packet-timed rounds must still age the existing maximum filter.
+		b.ackEpochStamp = sample.ackTime
+		b.ackEpochBytes = 0
+		return
 	}
 	if b.ackEpochStamp.IsZero() {
 		b.ackEpochStamp = sample.ackTime
@@ -1146,9 +1220,10 @@ func (b *bbrCongestionControl) updateACKAggregation(sample bbrRateSample, window
 }
 
 // checkFullBandwidth applies Linux's 25-percent growth test for three
-// consecutive non-application-limited packet-timed rounds.
+// consecutive packet-timed rounds not limited by the application or host
+// scheduler.
 func (b *bbrCongestionControl) checkFullBandwidth(sample bbrRateSample) {
-	if b.fullBandwidthReached || !b.roundStart || sample.applicationLimited {
+	if b.fullBandwidthReached || !b.roundStart || sample.locallyLimited() {
 		return
 	}
 	if b.bandwidth >= b.fullBandwidth*bbrFullBandwidthGrowth {
@@ -1220,6 +1295,7 @@ func (b *bbrCongestionControl) updateMinimumRTT(window uint32, sample bbrRateSam
 		b.probeDone = time.Time{}
 		b.probeRound = false
 		b.nextSend = time.Time{}
+		b.pacingWakeDeadline = time.Time{}
 	}
 	if b.mode != bbrProbeRTT {
 		return window
@@ -1369,7 +1445,7 @@ func (b *bbrCongestionControl) quantizeWindowAt(target uint64, mss int, probeHig
 	if mss < 1 {
 		return 0
 	}
-	quantum := bbrSendQuantum(b.pacingRate, mss)
+	quantum := bbrSendQuantum(b.effectivePacingRate(), mss)
 	if quantum < mss {
 		quantum = mss
 	}
@@ -1403,7 +1479,7 @@ func (b *bbrCongestionControl) inflightTarget(gain float64, mss int) uint64 {
 func (b *bbrCongestionControl) packetsInNetwork(inflight uint32, now time.Time, mss int, gain float64) uint32 {
 	value := uint64(inflight)
 	if gain > 1 {
-		value += uint64(bbrSendQuantum(b.pacingRate, mss))
+		value += uint64(bbrSendQuantum(b.effectivePacingRate(), mss))
 	}
 	if now.Before(b.nextSend) && b.effectiveBandwidth() > 0 {
 		delivered := uint64(b.effectiveBandwidth() * b.nextSend.Sub(now).Seconds())
@@ -1444,9 +1520,8 @@ func (b *bbrCongestionControl) updateLongTermBandwidth(sample bbrRateSample) {
 		}
 		b.resetLongTermInterval(sample.ackTime)
 		b.longTermSampling = true
-		return
 	}
-	if sample.applicationLimited {
+	if sample.locallyLimited() {
 		b.resetLongTermBandwidth(sample.ackTime)
 		return
 	}
@@ -1538,6 +1613,25 @@ func (b *bbrCongestionControl) markApplicationLimited(flight uint32) {
 	b.applicationLimitedUntil = limit
 }
 
+// markSchedulerLimited records a delivery boundary whose samples include a
+// material userspace scheduling delay rather than a path limitation.
+func (b *bbrCongestionControl) markSchedulerLimited(flight uint32) {
+	limit := b.delivered + uint64(flight)
+	if limit == 0 {
+		limit = 1
+	}
+	if limit > b.schedulerLimitedUntil {
+		b.schedulerLimitedUntil = limit
+	}
+	b.schedulerLimitedEvents++
+}
+
+// schedulerLimited reports whether new transmissions still belong to a
+// scheduler-limited delivery interval.
+func (b *bbrCongestionControl) schedulerLimited() bool {
+	return b.schedulerLimitedUntil != 0
+}
+
 // snapshotSend captures delivery state for one original or retransmitted range.
 func (b *bbrCongestionControl) snapshotSend(stamp monotonicStamp, packetsOut uint32) bbrRateSnapshot {
 	compactStamp := bbrStampAt(stamp)
@@ -1545,6 +1639,8 @@ func (b *bbrCongestionControl) snapshotSend(stamp monotonicStamp, packetsOut uin
 		b.firstSent = compactStamp
 		b.deliveredStamp = compactStamp
 		b.nextSend = time.Time{}
+		b.pacingWakeDeadline = time.Time{}
+		b.pacingBurstRemaining = 0
 		if b.applicationLimitedUntil != 0 {
 			b.idleRestart = true
 			if b.mode == bbrProbeBandwidth && b.bandwidth > 0 {
@@ -1562,12 +1658,6 @@ func (b *bbrCongestionControl) snapshotSend(stamp monotonicStamp, packetsOut uin
 // onSend snapshots delivery state, handles Linux's idle ProbeRTT exit, and
 // advances BBR's packet pacing clock.
 func (b *bbrCongestionControl) onSend(bytes, mss int, now time.Time, stamp monotonicStamp, packetsOut, window uint32) (bbrRateSnapshot, uint32) {
-	// Kernel BBR relies on fq/high-resolution pacing. A Go actor that wakes
-	// beyond the userspace pacing allowance was locally limited, so its low
-	// delivery sample must not be mistaken for a path-bandwidth plateau.
-	if packetsOut != 0 && !b.nextSend.IsZero() && now.Sub(b.nextSend) > tcpUserspacePacingQuantum {
-		b.markApplicationLimited(packetsOut)
-	}
 	snapshot := b.snapshotSend(stamp, packetsOut)
 	if packetsOut == 0 && b.idleRestart {
 		// Mirror Linux CA_EVENT_TX_START. The first returning ACK may rotate this
@@ -1582,8 +1672,14 @@ func (b *bbrCongestionControl) onSend(bytes, mss int, now time.Time, stamp monot
 		}
 		b.resetMode(now)
 	}
+	b.consumePacingBurst(bytes)
 	b.advancePacing(bytes, mss, now)
 	return snapshot, window
+}
+
+// locallyLimited reports samples that cannot safely lower the path model.
+func (s bbrRateSample) locallyLimited() bool {
+	return s.applicationLimited || s.schedulerLimited
 }
 
 // resetMode returns from ProbeRTT according to whether Startup filled the pipe.
@@ -1679,11 +1775,68 @@ func (b *bbrCongestionControl) setPacingRate(window uint32, smoothedRTT time.Dur
 }
 
 // pacingDelay reports how long the sender should wait before new data.
-func (b *bbrCongestionControl) pacingDelay(now time.Time, mss int) time.Duration {
-	if b.pacingRate <= 0 || b.nextSend.IsZero() || !now.Before(b.nextSend) {
+func (b *bbrCongestionControl) pacingDelay(now time.Time, bytes, mss int, flight uint32) time.Duration {
+	rate := b.effectivePacingRate()
+	if bytes <= 0 || rate <= 0 {
 		return 0
 	}
-	return pacingTimerDelay(b.nextSend.Sub(now), bbrTimerQuantumDuration(b.pacingRate, mss))
+	b.consumePacingWake(now, flight)
+	if b.pacingBurstRemaining >= bytes {
+		return 0
+	}
+	budget := bbrUserspacePacingBudget(rate, mss)
+	if !b.nextSend.IsZero() && now.Before(b.nextSend) {
+		allowance := pacingDuration(budget, rate)
+		deadline := b.nextSend.Add(-allowance)
+		if now.Before(deadline) {
+			b.pacingWakeDeadline = deadline
+			return deadline.Sub(now)
+		}
+	}
+	if b.nextSend.IsZero() {
+		b.nextSend = now
+	}
+	// Linux fq releases one BBR send quantum at an EDT. A late actor retains at
+	// most one send quantum of debt in advancePacingAt. Already overdue groups
+	// may follow without an artificial actor yield; future transmission can
+	// never be released more than one bounded userspace group early.
+	b.pacingBurstRemaining = budget
+	return 0
+}
+
+// consumePacingWake clears one requested wake and records material local
+// lateness. The actor also calls it when a peer or congestion window prevents
+// pacingDelay from being reached after the timer fires.
+func (b *bbrCongestionControl) consumePacingWake(now time.Time, flight uint32) {
+	if b.pacingWakeDeadline.IsZero() {
+		return
+	}
+	deadline := b.pacingWakeDeadline
+	b.pacingWakeDeadline = time.Time{}
+	if flight != 0 && now.Sub(deadline) > tcpUserspaceSchedulingTolerance {
+		b.markSchedulerLimited(flight)
+	}
+}
+
+// effectivePacingRate applies the socket pacing ceiling while preserving the
+// unconstrained BBR model in pacingRate.
+func (b *bbrCongestionControl) effectivePacingRate() float64 {
+	rate := b.pacingRate
+	if b.maximumPacingRate != 0 && rate > float64(b.maximumPacingRate) {
+		return float64(b.maximumPacingRate)
+	}
+	return rate
+}
+
+// consumePacingBurst accounts bytes released by the current actor wake.
+func (b *bbrCongestionControl) consumePacingBurst(bytes int) {
+	if bytes <= 0 || b.pacingBurstRemaining <= 0 {
+		return
+	}
+	b.pacingBurstRemaining -= bytes
+	if b.pacingBurstRemaining < 0 {
+		b.pacingBurstRemaining = 0
+	}
 }
 
 // advancePacing moves BBR's new-data transmission clock with bounded debt.
@@ -1693,25 +1846,19 @@ func (b *bbrCongestionControl) advancePacing(bytes, mss int, now time.Time) {
 
 // advanceRetransmissionPacing discards stale debt after loss or an RTO.
 func (b *bbrCongestionControl) advanceRetransmissionPacing(bytes, mss int, now time.Time) {
+	b.pacingWakeDeadline = time.Time{}
+	b.consumePacingBurst(bytes)
 	b.advancePacingAt(bytes, mss, now, false)
 }
 
 // advancePacingAt advances the userspace pacing clock.
 func (b *bbrCongestionControl) advancePacingAt(bytes, mss int, now time.Time, catchUp bool) {
-	rate := b.pacingRate
+	rate := b.effectivePacingRate()
 	if bytes <= 0 || rate <= 0 {
 		return
 	}
-	delayValue := float64(time.Second) * float64(bytes) / rate
-	const maximumDuration = time.Duration(1<<63 - 1)
-	delay := maximumDuration
-	if delayValue < float64(maximumDuration) {
-		delay = time.Duration(delayValue)
-	}
-	if delay < time.Microsecond {
-		delay = time.Microsecond
-	}
+	delay := pacingDuration(bytes, rate)
 	maximumDebt := bbrSendQuantumDuration(rate, mss)
-	base, _ := pacingScheduleBase(b.nextSend, now, maximumDebt, catchUp)
+	base := pacingScheduleBase(b.nextSend, now, maximumDebt, catchUp)
 	b.nextSend = base.Add(delay)
 }

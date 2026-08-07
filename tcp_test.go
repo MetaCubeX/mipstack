@@ -710,13 +710,125 @@ func TestTCPTimeWaitAcceptsRetransmittedFINWithAdditionalFlags(t *testing.T) {
 func testTCPHandshake(connection *TCPConn, initialSequence uint32) error {
 	timer := newOwnedTimer()
 	defer timer.close()
-	return connection.handshake(initialSequence, timer)
+	return connection.handshake(initialSequence, timer, nil)
 }
 
 func testTCPPassiveHandshake(connection *TCPConn, syn tcpSegment, initialSequence uint32) error {
 	timer := newOwnedTimer()
 	defer timer.close()
 	return connection.passiveHandshake(syn, initialSequence, timer)
+}
+
+func TestTCPActiveHandshakeProcessesSYNACKText(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.69")
+	remote := netip.MustParseAddr("198.51.100.69")
+	link, stack := newTestStack(t, local, remote)
+	type dialResult struct {
+		connection net.Conn
+		err        error
+	}
+	result := make(chan dialResult, 1)
+	go func() {
+		connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 8080))
+		result <- dialResult{connection: connection, err: err}
+	}()
+	var synPacket []byte
+	select {
+	case synPacket = <-link.outbound:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for active SYN")
+	}
+	parsed, ok := parseIPPacket(synPacket)
+	if !ok || parsed.protocol != protocolTCP || len(parsed.payload) < tcpHeaderSize {
+		t.Fatalf("active SYN = %x", synPacket)
+	}
+	tcp := parsed.payload
+	clientPort := binary.BigEndian.Uint16(tcp[0:2])
+	clientSequence := binary.BigEndian.Uint32(tcp[4:8])
+	payload := []byte("syn-ack text")
+	response := buildTestTCP(remote, local, 8080, clientPort, 2000, clientSequence+1, tcpFlagSYN|tcpFlagACK|tcpFlagFIN, 65535, nil, payload)
+	if err := writeTestPacket(stack, response); err != nil {
+		t.Fatal(err)
+	}
+	var connection net.Conn
+	select {
+	case opened := <-result:
+		if opened.err != nil {
+			t.Fatal(opened.err)
+		}
+		connection = opened.connection
+	case <-time.After(time.Second):
+		t.Fatal("SYN-ACK text did not complete active open")
+	}
+	defer connection.Close()
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	received := make([]byte, len(payload))
+	if _, err := io.ReadFull(connection, received); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("SYN-ACK text = %q, want %q", received, payload)
+	}
+	if n, err := connection.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("SYN-ACK FIN read = %d, %v", n, err)
+	}
+}
+
+func TestTCPPassiveHandshakeProcessesSYNText(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.70")
+	remote := netip.MustParseAddr("198.51.100.70")
+	link, stack := newTestStack(t, local, remote)
+	listener, err := stack.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(local, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	localPort := listener.Addr().(*net.TCPAddr).AddrPort().Port()
+	const (
+		remotePort     = 45000
+		remoteSequence = 100
+	)
+	payload := []byte("syn text")
+	syn := buildTestTCP(remote, local, remotePort, localPort, remoteSequence, 0, tcpFlagSYN|tcpFlagFIN, 65535, nil, payload)
+	if err = writeTestPacket(stack, syn); err != nil {
+		t.Fatal(err)
+	}
+	var synACKPacket []byte
+	select {
+	case synACKPacket = <-link.outbound:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for passive SYN-ACK")
+	}
+	parsed, ok := parseIPPacket(synACKPacket)
+	if !ok || parsed.protocol != protocolTCP || len(parsed.payload) < tcpHeaderSize {
+		t.Fatalf("passive SYN-ACK = %x", synACKPacket)
+	}
+	tcp := parsed.payload
+	serverSequence := binary.BigEndian.Uint32(tcp[4:8])
+	if acknowledgement := binary.BigEndian.Uint32(tcp[8:12]); acknowledgement != remoteSequence+1 {
+		t.Fatalf("SYN-ACK acknowledgement = %d, want SYN-only %d", acknowledgement, remoteSequence+1)
+	}
+	finalSequence := uint32(remoteSequence + 1 + len(payload) + 1)
+	finalACK := buildTestTCP(remote, local, remotePort, localPort, finalSequence, serverSequence+1, tcpFlagACK, 65535, nil, nil)
+	if err = writeTestPacket(stack, finalACK); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	received := make([]byte, len(payload))
+	if _, err = io.ReadFull(connection, received); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("SYN text = %q, want %q", received, payload)
+	}
+	if n, readErr := connection.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("SYN FIN read = %d, %v", n, readErr)
+	}
 }
 
 func TestTCPPassiveHandshakeChallengeAndResetResponses(t *testing.T) {
@@ -1310,6 +1422,11 @@ func TestTCPBufferAutoTuning(t *testing.T) {
 	if receive.growReceiveCapacity(target) || receive.receiveCapacity != 2*tcpReceiveCapacity {
 		t.Fatalf("user-locked receive capacity changed to %d", receive.receiveCapacity)
 	}
+	customMaximum := 32 * 1024 * 1024
+	customTuner := tcpBufferAutoTune{updated: base}
+	if target = customTuner.target(base.Add(100*time.Millisecond), 100*time.Millisecond, uint64(customMaximum), customMaximum); target != customMaximum {
+		t.Fatalf("custom automatic maximum target = %d, want %d", target, customMaximum)
+	}
 
 	send := &TCPConn{sendCapacity: tcpSendCapacity, sendAutoTune: true, sendChanged: make(chan struct{})}
 	sendTuner := tcpBufferAutoTune{updated: base}
@@ -1822,6 +1939,37 @@ func TestTCPSimultaneousOpen(t *testing.T) {
 	}
 }
 
+// TestTCPMaximumPacingRateLiveUpdate verifies actor-visible option changes and
+// the standard closed-connection error.
+func TestTCPMaximumPacingRateLiveUpdate(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.31"), netip.MustParseAddr("192.0.2.32"))
+	defer stack.Close()
+	link.echoTCP = true
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 7994))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConnection := connection.(*TCPConn)
+	const limit = uint64(1_000_000)
+	if err = tcpConnection.SetMaximumPacingRate(limit); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		info := tcpConnection.Info()
+		return info.MaximumPacingRate == limit && info.PacingRate <= limit
+	})
+	if err = tcpConnection.SetMaximumPacingRate(0); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return tcpConnection.Info().MaximumPacingRate == 0 })
+	if err = tcpConnection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = tcpConnection.SetMaximumPacingRate(limit); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed SetMaximumPacingRate = %v, want net.ErrClosed", err)
+	}
+}
+
 // TestTCPNewRenoPartialACKRetransmitsNextHole verifies RFC 6582 recovery when
 // SACK was not negotiated and two packets are lost from one flight.
 func TestTCPNewRenoPartialACKRetransmitsNextHole(t *testing.T) {
@@ -1919,6 +2067,34 @@ func TestTCPECNAtMinimumWindowWaitsForRTO(t *testing.T) {
 	writeAndReadTCPEcho(t, connection, []byte{3})
 	if elapsed := time.Since(start); elapsed < tcpMinimumRTO-50*time.Millisecond {
 		t.Fatalf("one-MSS repeated ECE delayed next send by %v, want approximately one RTO", elapsed)
+	}
+}
+
+func TestTCPBBRECNPreservesModelWindow(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.33"), netip.MustParseAddr("192.0.2.34"))
+	defer stack.Close()
+	link.echoTCP = true
+	link.ecnTCP = true
+	link.sendTCPECE = true
+	if err := stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(link.local, 32)},
+		TCP:            TCPSocketDefaults{CongestionControl: CongestionControlBBR},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 7997))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	writeAndReadTCPEcho(t, connection, bytes.Repeat([]byte{0x5a}, 4096))
+	info := connection.(*TCPConn).Info()
+	if info.CongestionWindow > 1024*1024 {
+		t.Fatalf("BBR cwnd after ECE = %d, want model-sized window", info.CongestionWindow)
+	}
+	if info.SlowStartThreshold != ^uint32(0)>>1 {
+		t.Fatalf("BBR ssthresh after ECE = %d, want preserved infinite threshold", info.SlowStartThreshold)
 	}
 }
 
@@ -2291,6 +2467,31 @@ func TestTCPLimitedTransmitIsExcludedFromRecoveryFlight(t *testing.T) {
 	}
 	if flight := lossRecoveryFlightSize(outstanding); flight != 100 {
 		t.Fatalf("Limited Transmit recovery flight = %d, want 100", flight)
+	}
+}
+
+func TestTCPRateApplicationLimitedWaitsForKnownLoss(t *testing.T) {
+	const mss = 1000
+	outstanding := []sentTCPSegment{
+		{sequence: 0, end: mss, transmissions: 1},
+		{sequence: mss, end: 2 * mss, sacked: true, transmissions: 1},
+		{sequence: 2 * mss, end: 3 * mss, sacked: true, transmissions: 1},
+		{sequence: 3 * mss, end: 4 * mss, sacked: true, transmissions: 1},
+	}
+	if tcpRateApplicationLimited(0, false, mss, 10*mss, true, true, outstanding, mss) {
+		t.Fatal("known unretransmitted SACK loss was classified as application limited")
+	}
+	outstanding[0].sackRetried = true
+	if !tcpRateApplicationLimited(0, false, mss, 10*mss, true, true, outstanding, mss) {
+		t.Fatal("drained application queue after retransmitting known losses was not classified as application limited")
+	}
+	if !tcpRateApplicationLimited(0, false, mss, 10*mss, false, true, outstanding, mss) {
+		t.Fatal("known loss outside recovery incorrectly blocked application-limited state")
+	}
+	if tcpRateApplicationLimited(mss, false, mss, 10*mss, true, true, outstanding, mss) ||
+		tcpRateApplicationLimited(0, true, mss, 10*mss, true, true, outstanding, mss) ||
+		tcpRateApplicationLimited(0, false, 10*mss, 10*mss, true, true, outstanding, mss) {
+		t.Fatal("write queue, host queue, or congestion window limitation was classified as application limited")
 	}
 }
 

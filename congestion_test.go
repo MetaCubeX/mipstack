@@ -11,7 +11,7 @@ import (
 func TestCUBICCongestionControl(t *testing.T) {
 	const mss = 1200
 	controller := newTCPCongestionController(CongestionControlCUBIC)
-	if threshold := controller.onCongestion(12000, 9000, mss); threshold != 8400 {
+	if threshold := controller.onCongestion(12000, 9000, 0, mss); threshold != 8400 {
 		t.Fatalf("CUBIC threshold = %d, want 8400", threshold)
 	}
 	start := time.Unix(100, 0)
@@ -46,7 +46,7 @@ func TestCUBICFastConvergenceComparesAdjustedMaximum(t *testing.T) {
 func TestRenoCongestionControl(t *testing.T) {
 	const mss = 1000
 	controller := newTCPCongestionController(CongestionControlReno)
-	if threshold := controller.onCongestion(12000, 9000, mss); threshold != 4500 {
+	if threshold := controller.onCongestion(12000, 9000, 0, mss); threshold != 4500 {
 		t.Fatalf("Reno threshold = %d, want 4500", threshold)
 	}
 	window := uint32(10000)
@@ -133,6 +133,69 @@ func TestWindowPacingUsesLinuxRates(t *testing.T) {
 	}
 }
 
+func TestMaximumPacingRateLimitsEveryController(t *testing.T) {
+	const (
+		mss   = 1000
+		limit = uint64(50_000)
+	)
+	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+		controller := newTCPCongestionController(algorithm)
+		if algorithm == CongestionControlBBR {
+			controller.bbr.pacingBurstRemaining = 64 * 1024
+		}
+		controller.setMaximumPacingRate(limit)
+		if algorithm == CongestionControlBBR {
+			controller.bbr.pacingRate = 1_000_000
+			if rate := controller.bbr.effectivePacingRate(); rate != float64(limit) {
+				t.Fatalf("%s limited pacing rate = %v, want %d", algorithm, rate, limit)
+			}
+			if controller.bbr.pacingBurstRemaining != 0 {
+				t.Fatal("new pacing ceiling retained credit granted at the old rate")
+			}
+			controller.setMaximumPacingRate(0)
+			if rate := controller.bbr.effectivePacingRate(); rate != 1_000_000 {
+				t.Fatalf("%s restored pacing rate = %v, want 1000000", algorithm, rate)
+			}
+			continue
+		}
+		controller.pacingSegments = tcpPacingInitialBurst - 1
+		controller.onDataSend(mss, mss, time.Unix(100, 0), 10*mss, 10*mss, time.Millisecond, 10*mss)
+		if effective := controller.limitPacingRate(controller.pacingRate); effective != float64(limit) || controller.pacingRate <= effective {
+			t.Fatalf("%s pacing model/effective rate = %v/%v, want model above %d and effective at limit", algorithm, controller.pacingRate, effective, limit)
+		}
+		controller.setMaximumPacingRate(0)
+		if effective := controller.limitPacingRate(controller.pacingRate); effective != controller.pacingRate || effective <= float64(limit) {
+			t.Fatalf("%s pacing rate did not recover immediately: model/effective %v/%v", algorithm, controller.pacingRate, effective)
+		}
+	}
+}
+
+func TestMaximumPacingRateChangeInvalidatesPacingSchedule(t *testing.T) {
+	start := time.Unix(100, 0)
+	controller := newTCPCongestionController(CongestionControlBBR)
+	controller.pacingNext = start.Add(time.Second)
+	controller.bbr.nextSend = start.Add(2 * time.Second)
+	controller.bbr.pacingWakeDeadline = start.Add(1500 * time.Millisecond)
+	controller.bbr.pacingBurstRemaining = 32 * 1024
+	controller.bbr.pacingRate = 1_000_000
+
+	if !controller.setMaximumPacingRate(50_000) {
+		t.Fatal("new pacing ceiling was not reported as a policy change")
+	}
+	if !controller.pacingNext.IsZero() || !controller.bbr.nextSend.IsZero() || !controller.bbr.pacingWakeDeadline.IsZero() || controller.bbr.pacingBurstRemaining != 0 {
+		t.Fatalf("stale pacing state = window %v, BBR %v, wake %v, credit %d", controller.pacingNext, controller.bbr.nextSend, controller.bbr.pacingWakeDeadline, controller.bbr.pacingBurstRemaining)
+	}
+	if controller.bbr.pacingRate != 1_000_000 {
+		t.Fatalf("model pacing rate = %v, want 1000000", controller.bbr.pacingRate)
+	}
+	if controller.setMaximumPacingRate(50_000) {
+		t.Fatal("unchanged pacing ceiling was reported as a policy change")
+	}
+	if !controller.setMaximumPacingRate(0) || controller.bbr.effectivePacingRate() != 1_000_000 {
+		t.Fatalf("removing ceiling did not immediately restore model rate: %v", controller.bbr.effectivePacingRate())
+	}
+}
+
 func TestWindowPacingDefersAfterInitialBurst(t *testing.T) {
 	const mss = 1000
 	controller := newTCPCongestionController(CongestionControlReno)
@@ -140,7 +203,7 @@ func TestWindowPacingDefersAfterInitialBurst(t *testing.T) {
 	for segment := 0; segment < tcpPacingInitialBurst+4; segment++ {
 		controller.onDataSend(mss, mss, start, 10*mss, uint32(segment*mss), 100*time.Millisecond, ^uint32(0))
 	}
-	if delay := controller.pacingDelay(start, 10*mss, 10*mss, mss, 100*time.Millisecond, ^uint32(0)); delay <= 0 {
+	if delay := controller.pacingDelay(start, mss, 10*mss, 10*mss, mss, 100*time.Millisecond, ^uint32(0)); delay <= 0 {
 		t.Fatal("window-based pacer did not defer after its initial burst")
 	}
 }
@@ -148,17 +211,17 @@ func TestWindowPacingDefersAfterInitialBurst(t *testing.T) {
 func TestPacingScheduleRetainsBoundedLateDebt(t *testing.T) {
 	start := time.Unix(100, 0)
 	now := start.Add(100 * time.Millisecond)
-	base, late := pacingScheduleBase(start, now, 2*time.Millisecond, true)
-	if !late || base != now.Add(-2*time.Millisecond) {
-		t.Fatalf("late pacing base/flag = %v/%v", base, late)
+	base := pacingScheduleBase(start, now, 2*time.Millisecond, true)
+	if base != now.Add(-2*time.Millisecond) {
+		t.Fatalf("late pacing base = %v", base)
 	}
-	base, late = pacingScheduleBase(start, now, time.Millisecond, false)
-	if late || base != now {
-		t.Fatalf("retransmission pacing base/flag = %v/%v, want now/false", base, late)
+	base = pacingScheduleBase(start, now, time.Millisecond, false)
+	if base != now {
+		t.Fatalf("retransmission pacing base = %v, want now", base)
 	}
-	base, late = pacingScheduleBase(now.Add(time.Millisecond), now, time.Millisecond, true)
-	if late || base != now.Add(time.Millisecond) {
-		t.Fatalf("early pacing base/flag = %v/%v", base, late)
+	base = pacingScheduleBase(now.Add(time.Millisecond), now, time.Millisecond, true)
+	if base != now.Add(time.Millisecond) {
+		t.Fatalf("early pacing base = %v", base)
 	}
 }
 
@@ -170,17 +233,29 @@ func TestBBRSendQuantumMatchesLinuxPolicy(t *testing.T) {
 	if quantum := bbrSendQuantum(200_000, mss); quantum != 2*mss {
 		t.Fatalf("normal-rate send quantum = %d, want %d", quantum, 2*mss)
 	}
-	if quantum := bbrSendQuantum(1024*100_000, mss); quantum != bbrMaximumSendQuantum/mss*mss {
-		t.Fatalf("high-rate send quantum = %d, want %d", quantum, bbrMaximumSendQuantum/mss*mss)
+	if quantum := bbrSendQuantum(1024*100_000, mss); quantum != bbrSendQuantumByteTarget/mss*mss {
+		t.Fatalf("high-rate send quantum = %d, want %d", quantum, bbrSendQuantumByteTarget/mss*mss)
 	}
 	if quantum := bbrSendQuantum(1024*100_000, 100); quantum != bbrMaximumSendSegments*100 {
 		t.Fatalf("small-MSS send quantum = %d, want %d", quantum, bbrMaximumSendSegments*100)
 	}
-	if quantum := bbrSendQuantum(math.MaxFloat64, mss); quantum != bbrMaximumSendQuantum/mss*mss {
-		t.Fatalf("extreme-rate send quantum = %d, want %d", quantum, bbrMaximumSendQuantum/mss*mss)
+	if quantum := bbrSendQuantum(1024*100_000, 40_000); quantum != 80_000 {
+		t.Fatalf("large-MSS send quantum = %d, want Linux's two-segment minimum", quantum)
 	}
-	if duration := bbrTimerQuantumDuration(1024*1024*1024, mss); duration != tcpUserspacePacingQuantum {
-		t.Fatalf("high-rate timer quantum = %v, want userspace floor %v", duration, tcpUserspacePacingQuantum)
+	if quantum := bbrSendQuantum(math.MaxFloat64, mss); quantum != bbrSendQuantumByteTarget/mss*mss {
+		t.Fatalf("extreme-rate send quantum = %d, want %d", quantum, bbrSendQuantumByteTarget/mss*mss)
+	}
+	if duration := bbrSendQuantumDuration(1024*1024*1024, mss); duration < 60*time.Microsecond || duration > 61*time.Microsecond {
+		t.Fatalf("high-rate send-quantum duration = %v, want approximately 60us", duration)
+	}
+	if budget := bbrUserspacePacingBudget(math.MaxFloat64, mss); budget != bbrMaximumUserspaceQuanta*(bbrSendQuantumByteTarget/mss*mss) {
+		t.Fatalf("extreme-rate userspace budget = %d", budget)
+	}
+	if duration := bbrSendQuantumDuration(math.MaxFloat64, mss); duration != time.Nanosecond {
+		t.Fatalf("extreme-rate quantum duration = %v, want 1ns", duration)
+	}
+	if duration := pacingDuration(1, math.SmallestNonzeroFloat64); duration != time.Duration(1<<63-1) {
+		t.Fatalf("tiny-rate pacing duration = %v, want saturation", duration)
 	}
 }
 
@@ -200,14 +275,30 @@ func TestECNCongestionWindowCanReachOneSegment(t *testing.T) {
 	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			controller := newTCPCongestionController(algorithm)
-			if threshold := controller.onECN(mss, mss, mss); threshold != mss {
-				t.Fatalf("one-segment ECN threshold = %d, want %d", threshold, mss)
+			if threshold, window := controller.onECN(mss, mss, 0, mss); threshold != mss || window != mss {
+				t.Fatalf("one-segment ECN threshold/window = %d/%d, want %d/%d", threshold, window, mss, mss)
 			}
 			controller = newTCPCongestionController(algorithm)
-			if threshold := controller.onCongestion(mss, mss, mss); threshold != 2*mss {
+			if threshold := controller.onCongestion(mss, mss, 0, mss); threshold != 2*mss {
 				t.Fatalf("one-segment loss threshold = %d, want %d", threshold, 2*mss)
 			}
 		})
+	}
+}
+
+func TestBBRECNPreservesModelWindowAndThreshold(t *testing.T) {
+	const (
+		mss       = 1000
+		window    = uint32(20 * mss)
+		threshold = uint32(200 * mss)
+	)
+	controller := newTCPCongestionController(CongestionControlBBR)
+	gotThreshold, gotWindow := controller.onECN(window, 10*mss, threshold, mss)
+	if gotThreshold != threshold || gotWindow != window {
+		t.Fatalf("BBR ECN threshold/window = %d/%d, want %d/%d", gotThreshold, gotWindow, threshold, window)
+	}
+	if controller.bbr.priorWindow != window {
+		t.Fatalf("BBR ECN saved window = %d, want %d", controller.bbr.priorWindow, window)
 	}
 }
 
@@ -318,8 +409,8 @@ func TestCUBICCapsTargetAndKeepsFriendlyEstimateSeparate(t *testing.T) {
 func TestCUBICTimeoutStartsNextEpochAtKZero(t *testing.T) {
 	const mss = 1000
 	controller := newTCPCongestionController(CongestionControlCUBIC)
-	_ = controller.onCongestion(100*mss, 100*mss, mss)
-	if threshold := controller.onTimeout(70*mss, 60*mss, mss, time.Unix(100, 0)); threshold != 49*mss {
+	_ = controller.onCongestion(100*mss, 100*mss, 0, mss)
+	if threshold := controller.onTimeout(70*mss, 60*mss, 0, mss, time.Unix(100, 0)); threshold != 49*mss {
 		t.Fatalf("CUBIC timeout threshold = %d, want %d", threshold, 49*mss)
 	}
 	start := time.Unix(100, 0)
@@ -366,7 +457,7 @@ func TestBBRCongestionControl(t *testing.T) {
 		t.Fatalf("BBR initial bandwidth = %v, want 20000", controller.bbr.bandwidth)
 	}
 	_, _ = controller.onBBRDataSend(mss, mss, start, 1, 0, window)
-	if delay := controller.pacingDelay(start, window, 0, mss, 100*time.Millisecond, ^uint32(0)); delay >= 100*time.Millisecond {
+	if delay := controller.pacingDelay(start, mss, window, 0, mss, 100*time.Millisecond, ^uint32(0)); delay >= 100*time.Millisecond {
 		t.Fatalf("BBR startup pacing delay = %v, want less than 100ms", delay)
 	}
 	for round := 0; round < 4; round++ {
@@ -593,6 +684,21 @@ func TestBBRLongTermPolicerDetection(t *testing.T) {
 	}
 }
 
+func TestBBRPolicerSamplingProcessesFirstLossRound(t *testing.T) {
+	start := time.Unix(100, 0)
+	bbr := bbrCongestionControl{delivered: 1000, totalLost: 300, roundStart: true}
+	bbr.updateLongTermBandwidth(bbrRateSample{losses: 300, ackTime: start})
+	if !bbr.longTermSampling || bbr.longTermRounds != 1 {
+		t.Fatalf("first-loss sampling state = active %t, rounds %d", bbr.longTermSampling, bbr.longTermRounds)
+	}
+
+	bbr = bbrCongestionControl{delivered: 1000, totalLost: 300, roundStart: true}
+	bbr.updateLongTermBandwidth(bbrRateSample{losses: 300, ackTime: start, schedulerLimited: true})
+	if bbr.longTermSampling || bbr.longTermRounds != 0 || bbr.longTermBandwidth != 0 {
+		t.Fatalf("locally limited first-loss sample retained policer state: %+v", bbr)
+	}
+}
+
 func TestBBRPolicerGainOnlyOverridesProbeBandwidth(t *testing.T) {
 	bbr := bbrCongestionControl{longTermUseBandwidth: true}
 	if gain := bbr.pacingGain(); gain != bbrStartupPacingGain {
@@ -661,13 +767,34 @@ func TestBBRInitialPacingQuantumAllowsTenSegments(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlBBR)
 	controller.bbr.pacingRate = 10_000
 	for segment := 0; segment < tcpPacingInitialBurst; segment++ {
-		if delay := controller.pacingDelay(start, 10*mss, uint32(segment*mss), mss, 100*time.Millisecond, ^uint32(0)); delay != 0 {
+		if delay := controller.pacingDelay(start, mss, 10*mss, uint32(segment*mss), mss, 100*time.Millisecond, ^uint32(0)); delay != 0 {
 			t.Fatalf("initial segment %d pacing delay = %v", segment+1, delay)
 		}
 		_, _ = controller.onBBRDataSend(mss, mss, start, monotonicStamp(segment+1), uint32(segment*mss), 10*mss)
 	}
-	if delay := controller.pacingDelay(start, 10*mss, 10*mss, mss, 100*time.Millisecond, ^uint32(0)); delay <= 0 {
+	if delay := controller.pacingDelay(start, mss, 10*mss, 10*mss, mss, 100*time.Millisecond, ^uint32(0)); delay <= 0 {
 		t.Fatalf("post-initial-quantum pacing delay = %v", delay)
+	}
+}
+
+func TestBBRPacedBatchBoundsFutureCredit(t *testing.T) {
+	const mss = 1000
+	start := time.Unix(100, 0)
+	controller := newTCPCongestionController(CongestionControlBBR)
+	controller.pacingSegments = tcpPacingInitialBurst
+	controller.bbr.pacingRate = 1_000_000
+	controller.bbr.nextSend = start
+	budget := bbrUserspacePacingBudget(controller.bbr.pacingRate, mss)
+	// One due group and one group of future credit may be released at the
+	// deadline, but a third group must wait for the accumulated pacing clock.
+	for sent := 0; sent < 2*budget; sent += mss {
+		if delay := controller.pacingDelay(start, mss, 100*mss, uint32(sent+mss), mss, time.Millisecond, 100*mss); delay != 0 {
+			t.Fatalf("paced byte %d delayed by %v before credit exhaustion", sent, delay)
+		}
+		_, _ = controller.onBBRDataSend(mss, mss, start, monotonicStamp(sent+1), uint32(sent+mss), 100*mss)
+	}
+	if delay := controller.pacingDelay(start, mss, 100*mss, uint32(2*budget), mss, time.Millisecond, 100*mss); delay <= 0 {
+		t.Fatalf("sender released more than one future %d-byte pacing group", budget)
 	}
 }
 
@@ -730,17 +857,127 @@ func TestBBRLateWakeRetainsBoundedPacingDebt(t *testing.T) {
 	}
 }
 
-func TestBBRLatePacingWakeMarksDeliverySampleLimited(t *testing.T) {
+func TestBBRLatePacingWakeMarksDeliverySampleSchedulerLimited(t *testing.T) {
 	const mss = 1000
 	start := time.Unix(100, 0)
-	bbr := bbrCongestionControl{pacingRate: 1_000_000, nextSend: start, delivered: 1000}
+	bbr := bbrCongestionControl{pacingRate: 1_000_000, nextSend: start.Add(10 * time.Millisecond), delivered: 1000}
+	if delay := bbr.pacingDelay(start, mss, mss, 10*mss); delay != 8*time.Millisecond {
+		t.Fatalf("initial pacing delay = %v, want 8ms", delay)
+	}
+	if delay := bbr.pacingDelay(start.Add(10*time.Millisecond), mss, mss, 10*mss); delay != 0 {
+		t.Fatalf("late-wake pacing delay = %v", delay)
+	}
 	snapshot, _ := bbr.onSend(mss, mss, start.Add(10*time.Millisecond), 1, 10*mss, 20*mss)
-	if !snapshot.applicationLimited() || bbr.applicationLimitedUntil != 11_000 {
-		t.Fatalf("late-wake snapshot = limited %t boundary %d", snapshot.applicationLimited(), bbr.applicationLimitedUntil)
+	if snapshot.applicationLimited() || !bbr.schedulerLimited() || bbr.schedulerLimitedUntil != 11_000 || bbr.schedulerLimitedEvents != 1 {
+		t.Fatalf("late-wake state = app %t scheduler %t boundary %d events %d", snapshot.applicationLimited(), bbr.schedulerLimited(), bbr.schedulerLimitedUntil, bbr.schedulerLimitedEvents)
 	}
 	bbr.markApplicationLimited(mss)
 	if bbr.applicationLimitedUntil != 2_000 {
 		t.Fatalf("refreshed application-limit boundary = %d, want 2000", bbr.applicationLimitedUntil)
+	}
+}
+
+func TestBBRSchedulerLimitUsesUserspaceWakeDeadline(t *testing.T) {
+	const mss = 1000
+	start := time.Unix(100, 0)
+	nextSend := start.Add(10 * time.Millisecond)
+	deadline := nextSend.Add(-2 * time.Millisecond) // 2 MSS at 1 MB/s.
+
+	early := bbrCongestionControl{pacingRate: 1_000_000, nextSend: nextSend, delivered: 1000}
+	if delay := early.pacingDelay(start, mss, mss, 10*mss); delay != 8*time.Millisecond {
+		t.Fatalf("initial pacing delay = %v, want 8ms", delay)
+	}
+	if delay := early.pacingDelay(deadline.Add(-time.Microsecond), mss, mss, 10*mss); delay != time.Microsecond {
+		t.Fatalf("pre-deadline pacing delay = %v, want 1us", delay)
+	}
+	if early.schedulerLimited() || early.schedulerLimitedEvents != 0 {
+		t.Fatal("pre-deadline sender was marked scheduler limited")
+	}
+
+	late := bbrCongestionControl{pacingRate: 1_000_000, nextSend: nextSend, delivered: 1000}
+	if delay := late.pacingDelay(start, mss, mss, 10*mss); delay != 8*time.Millisecond {
+		t.Fatalf("initial pacing delay = %v, want 8ms", delay)
+	}
+	now := deadline.Add(tcpUserspaceSchedulingTolerance + time.Microsecond)
+	if !now.Before(nextSend) {
+		t.Fatal("test wake must remain earlier than the pacing clock")
+	}
+	if delay := late.pacingDelay(now, mss, mss, 10*mss); delay != 0 {
+		t.Fatalf("late userspace wake delay = %v, want 0", delay)
+	}
+	if !late.schedulerLimited() || late.schedulerLimitedUntil != 11_000 || late.schedulerLimitedEvents != 1 {
+		t.Fatalf("late wake state = limited %t, boundary %d, events %d", late.schedulerLimited(), late.schedulerLimitedUntil, late.schedulerLimitedEvents)
+	}
+
+	unarmed := bbrCongestionControl{pacingRate: 1_000_000, nextSend: nextSend, delivered: 1000}
+	if delay := unarmed.pacingDelay(now, mss, mss, 10*mss); delay != 0 {
+		t.Fatalf("unarmed pacing delay = %v, want 0", delay)
+	}
+	if unarmed.schedulerLimited() || unarmed.schedulerLimitedEvents != 0 {
+		t.Fatal("sender without a prior pacing wait was marked scheduler limited")
+	}
+}
+
+func TestBBRSchedulerLimitedSampleCannotLowerBandwidthModel(t *testing.T) {
+	bbr := bbrCongestionControl{bandwidth: 1_000_000}
+	bbr.bandwidthFilter.reset(0, bbr.bandwidth)
+	bbr.updateBandwidth(bbrRateSample{
+		priorDelivered: 1, delivered: 1000, interval: 2 * time.Millisecond,
+		ackTime: time.Unix(100, 0), schedulerLimited: true, valid: true,
+	})
+	if bbr.bandwidth != 1_000_000 {
+		t.Fatalf("scheduler-limited sample lowered bandwidth to %v", bbr.bandwidth)
+	}
+}
+
+func TestBBRSchedulerLimitedSampleDoesNotCreateACKAggregation(t *testing.T) {
+	start := time.Unix(100, 0)
+	bbr := bbrCongestionControl{
+		bandwidth: 1_000_000, ackEpochStamp: start, ackEpochBytes: 1000,
+		extraACKed: [2]uint32{200, 100},
+	}
+	bbr.updateACKAggregation(bbrRateSample{
+		acked: 10_000, ackTime: start.Add(time.Millisecond),
+		schedulerLimited: true, valid: true,
+	}, 100_000, 1000)
+	if bbr.ackEpochStamp != start.Add(time.Millisecond) || bbr.ackEpochBytes != 0 {
+		t.Fatalf("scheduler-limited ACK epoch = %v/%d", bbr.ackEpochStamp, bbr.ackEpochBytes)
+	}
+	if bbr.extraACKed != [2]uint32{200, 100} {
+		t.Fatalf("scheduler-limited ACK changed aggregation history: %v", bbr.extraACKed)
+	}
+
+	bbr.roundStart = true
+	bbr.extraACKedRounds = bbrExtraACKedWindow - 1
+	bbr.updateACKAggregation(bbrRateSample{
+		acked: 10_000, ackTime: start.Add(2 * time.Millisecond),
+		schedulerLimited: true, valid: true,
+	}, 100_000, 1000)
+	if bbr.extraACKedRounds != 0 || bbr.extraACKedIndex != 1 || bbr.extraACKed != [2]uint32{200, 0} {
+		t.Fatalf("scheduler-limited round did not age aggregation history: rounds %d, index %d, values %v", bbr.extraACKedRounds, bbr.extraACKedIndex, bbr.extraACKed)
+	}
+}
+
+func TestBBRPacingTimerConsumesWakeWhenSendIsBlocked(t *testing.T) {
+	start := time.Unix(100, 0)
+	bbr := bbrCongestionControl{pacingWakeDeadline: start, delivered: 1000}
+	bbr.consumePacingWake(start.Add(tcpUserspaceSchedulingTolerance+time.Microsecond), 10_000)
+	if !bbr.pacingWakeDeadline.IsZero() || !bbr.schedulerLimited() || bbr.schedulerLimitedEvents != 1 {
+		t.Fatalf("consumed pacing wake = deadline %v, limited %t, events %d", bbr.pacingWakeDeadline, bbr.schedulerLimited(), bbr.schedulerLimitedEvents)
+	}
+	bbr.consumePacingWake(start.Add(time.Second), 10_000)
+	if bbr.schedulerLimitedEvents != 1 {
+		t.Fatalf("one pacing wake was counted %d times", bbr.schedulerLimitedEvents)
+	}
+}
+
+func TestBBRPacingWakeCanBeRepurposedWithoutSchedulerSample(t *testing.T) {
+	controller := newTCPCongestionController(CongestionControlBBR)
+	controller.bbr.pacingWakeDeadline = time.Unix(100, 0)
+	controller.cancelPacingWake()
+	controller.onPacingWake(time.Unix(101, 0), 10_000)
+	if !controller.bbr.pacingWakeDeadline.IsZero() || controller.bbr.schedulerLimited() || controller.bbr.schedulerLimitedEvents != 0 {
+		t.Fatalf("cancelled pacing wake = deadline %v, limited %t, events %d", controller.bbr.pacingWakeDeadline, controller.bbr.schedulerLimited(), controller.bbr.schedulerLimitedEvents)
 	}
 }
 
@@ -1026,8 +1263,9 @@ func TestBBRTimeoutRestoresWindowOnlyAfterLossRecovery(t *testing.T) {
 	controller.bbr.fullBandwidth = 1_000_000
 	controller.bbr.fullRounds = 2
 	now := time.Unix(100, 0)
-	if threshold := controller.onTimeout(20*mss, 10*mss, mss, now); threshold != 20*mss {
-		t.Fatalf("BBR timeout threshold = %d, want %d", threshold, 20*mss)
+	const slowStartThreshold = 15 * mss
+	if threshold := controller.onTimeout(20*mss, 10*mss, slowStartThreshold, mss, now); threshold != slowStartThreshold {
+		t.Fatalf("BBR timeout threshold = %d, want %d", threshold, slowStartThreshold)
 	}
 	if controller.bbr.recovery || !controller.bbr.lossRecovery || controller.bbr.packetConservation || controller.bbr.fullBandwidth != 0 || !controller.bbr.roundStart || !controller.bbr.longTermSampling {
 		t.Fatalf("BBR timeout state = recovery %t loss %t conservation %t full_bw %v round %t policer %t", controller.bbr.recovery, controller.bbr.lossRecovery, controller.bbr.packetConservation, controller.bbr.fullBandwidth, controller.bbr.roundStart, controller.bbr.longTermSampling)

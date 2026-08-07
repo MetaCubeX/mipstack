@@ -257,10 +257,14 @@ are themselves local. IPv4-only stacks accept MTUs down to 68; configurations
 containing IPv6 require the IPv6 minimum MTU of 1280.
 `Config.TCP` defines policies inherited by newly created connections and
 listeners: initial and maximum automatic receive/send buffers, completed and
-half-open listener queues, congestion control, keepalive, receive-idle timeout,
-Nagle behavior, TCP user timeout, DSCP bits, and IPv6 Flow Label policy. A zero
-TCP Flow Label selects a stable keyed label for the connection tuple; a
-nonzero value fixes the label for new connections. Congestion control accepts
+half-open listener queues, congestion control, maximum pacing rate, keepalive,
+receive-idle timeout, Nagle behavior, TCP user timeout, DSCP bits, and IPv6
+Flow Label policy. A zero TCP Flow Label selects a stable keyed label for the
+connection tuple; a nonzero value fixes the label for new connections. A zero
+maximum pacing rate is unlimited; nonzero values cap paced data in bytes per
+second. The initial data burst and control packets are not strictly shaped, so
+this policy is not a byte-exact traffic shaper.
+Congestion control accepts
 `CongestionControlCUBIC`, `CongestionControlReno`, or `CongestionControlBBR`;
 its zero value selects CUBIC. `UpdateConfig` applies a changed congestion
 controller to established connections without an explicit per-connection
@@ -272,8 +276,12 @@ connections can use their full automatic maximum. Calling `SetReadBuffer` or
 automatic growth, matching the user-locked behavior of operating-system TCP
 stacks. Automatic growth follows application-consumed and acknowledged bytes
 per RTT rather than queue size or cwnd alone, so short-RTT scheduler batches do
-not inflate buffers. `SetCongestionControl` and `SetTrafficClass` provide
-per-connection overrides.
+not inflate buffers. `SetCongestionControl`, `SetMaximumPacingRate`, and
+`SetTrafficClass` provide per-connection overrides. Passing zero to
+`SetMaximumPacingRate` removes the limit without resetting the controller's
+path model. BBR pacing groups whole Linux-style send quanta to amortize
+userspace actor scheduling; a group never exceeds four send quanta, and only
+one bounded group may be credited ahead of the pacing clock.
 
 `Config.UDP` and `Config.IP` define the receive-buffer capacity, default
 TTL/Hop Limit, default TOS/Traffic Class, and IPv6 Flow Label policy inherited
@@ -304,6 +312,10 @@ pacing rates and mode, path MTU and active probe state, buffer occupancy and
 automatic limits, byte counters, recovery state, inherited
 keepalive/Nagle/DSCP/Flow Label policies, window-scale values, and
 connection-local retransmission, PMTU-probe, and spurious-recovery counters.
+It distinguishes application-limited delivery from host-scheduler-limited
+delivery and counts material pacing wake delays, which helps distinguish a
+local runtime stall from a path-bandwidth reduction. The configured maximum
+pacing rate is reported alongside the effective rate.
 It also reports the current and peak byte-bounded actor queue occupancy and
 queue drops, making scheduler or embedding-link backpressure distinguishable
 from network loss.
@@ -344,7 +356,10 @@ send and receive buffers, adaptive RTO with exponential backoff, selectable
 CUBIC, Reno, and paced model-based BBR congestion control, window scaling,
 delayed ACKs, SACK multi-hole recovery with Proportional Rate Reduction, RACK
 time-based loss detection, tail-loss probes, timestamp negotiation with PAWS,
-and classic ECN feedback.
+and classic ECN feedback. Text and FIN carried in a stateful SYN or SYN-ACK are
+retained through the handshake and processed only after the connection enters
+ESTABLISHED. SYN-cookie mode remains stateless, so unacknowledged SYN text is
+accepted only when the peer retransmits it with or after the final ACK.
 Validated network- and host-unreachable feedback for `SND.UNA` applies RFC
 6069 TCP-LD one-step RTO backoff reversion without turning an established
 connection's soft network error into a hard failure.
@@ -371,9 +386,11 @@ merely speculative retransmissions out of BBR's loss model until a replacement
 generation is independently proven lost, and excludes isolated PLPMTU probe
 failures. BBR owns pacing and cwnd rather than duplicating the common recovery
 machinery. Since a Go connection actor does not have kernel fq pacing, a
-materially late pacing wake is marked locally limited and bounded to one send
-quantum so scheduler delay cannot become a false low path-bandwidth sample or
-an unbounded catch-up burst.
+materially late pacing wake is marked locally limited so scheduler delay cannot
+become a false low path-bandwidth sample. Pacing retains at most one send
+quantum of overdue debt, groups at most four whole quanta per actor turn, and
+credits at most one bounded group ahead of the pacing clock, preventing an
+unbounded catch-up burst.
 
 RTT sampling uses packet arrival time rather than actor scheduling time. Its
 minimum is the Linux-style three-sample running minimum over a 300-second

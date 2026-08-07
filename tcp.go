@@ -257,6 +257,7 @@ type TCPInfo struct {
 	BytesInFlight          uint32
 	DeliveryRate           uint64
 	PacingRate             uint64
+	MaximumPacingRate      uint64
 	CongestionState        string
 	PeerWindow             uint32
 	ReceiveWindow          uint32
@@ -298,17 +299,28 @@ type TCPInfo struct {
 	PathMTUProbes          uint64
 	PathMTUProbeSuccesses  uint64
 	PathMTUProbeFailures   uint64
+	ApplicationLimited     bool
+	SchedulerLimited       bool
+	SchedulerLimitedEvents uint64
 	LastError              error
 }
 
 // tcpSocketOptions is one lock-protected option snapshot.
 type tcpSocketOptions struct {
-	keepAlive       bool
-	keepAliveConfig KeepAliveConfig
-	idleTimeout     time.Duration
-	userTimeout     time.Duration
-	noDelay         bool
-	congestion      CongestionControl
+	keepAlive         bool
+	keepAliveConfig   KeepAliveConfig
+	idleTimeout       time.Duration
+	userTimeout       time.Duration
+	noDelay           bool
+	congestion        CongestionControl
+	maximumPacingRate uint64
+}
+
+// tcpInitialReceive carries SYN text across the handshake boundary without
+// increasing the persistent size of every TCPConn.
+type tcpInitialReceive struct {
+	payload []byte
+	fin     bool
 }
 
 // tcpSegment is a validated segment delivered to one connection actor.
@@ -711,23 +723,24 @@ func (t *tcpBufferAutoTune) target(now time.Time, rtt time.Duration, total uint6
 
 // sentTCPSegment retains retransmission state for one sequence range.
 type sentTCPSegment struct {
-	sequence      uint32
-	end           uint32
-	timestamp     uint32
-	flags         byte
-	sacked        bool
-	sackRetried   bool
-	rackLost      bool
-	limited       bool
-	cwr           bool
-	sackSplit     bool
-	mtuProbe      bool
-	ratePending   bool
-	firstSent     time.Duration
-	transmissions uint16
-	lossReported  uint16
-	rate          bbrRateSnapshot
-	hostQueue     packetQueueTicket
+	sequence             uint32
+	end                  uint32
+	timestamp            uint32
+	flags                byte
+	sacked               bool
+	sackRetried          bool
+	rackLost             bool
+	limited              bool
+	cwr                  bool
+	sackSplit            bool
+	mtuProbe             bool
+	ratePending          bool
+	rateSchedulerLimited bool
+	firstSent            time.Duration
+	transmissions        uint16
+	lossReported         uint16
+	rate                 bbrRateSnapshot
+	hostQueue            packetQueueTicket
 }
 
 // dataSize returns the application bytes covered by this sequence range.
@@ -1510,6 +1523,7 @@ type TCPConn struct {
 	noDelay            bool
 	congestion         CongestionControl
 	congestionUser     bool
+	maximumPacingRate  uint64
 	receiveWindowScale uint8
 	trafficClass       atomic.Uint32
 	flowLabel          uint32
@@ -2183,6 +2197,7 @@ func newTCPConn(stack *Stack, network string, key tcpKey, mtu int) *TCPConn {
 		sendAutoTune:    defaults.MaximumSendBuffer > defaults.SendBuffer,
 		keepAlive:       defaults.KeepAlive, keepAliveConfig: defaults.KeepAliveConfig,
 		idleTimeout: defaults.IdleTimeout, userTimeout: defaults.UserTimeout, congestion: defaults.CongestionControl,
+		maximumPacingRate:  defaults.MaximumPacingRate,
 		receiveWindowScale: tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer),
 	}
 	if key.local.Addr().Is6() {
@@ -2391,7 +2406,7 @@ func (state *tcpPassiveState) handleSegment(stack *Stack, packet ipPacket, segme
 	if key.remote.Port() == 0 {
 		return false, nil
 	}
-	if segment.flags&tcpFlagSYN != 0 && segment.flags&(tcpFlagACK|tcpFlagRST|tcpFlagFIN) == 0 {
+	if segment.flags&tcpFlagSYN != 0 && segment.flags&(tcpFlagACK|tcpFlagRST) == 0 {
 		return state.handleSYN(stack, packet, segment, key)
 	}
 	if segment.flags&tcpFlagACK != 0 && segment.flags&(tcpFlagSYN|tcpFlagRST) == 0 {
@@ -3069,7 +3084,7 @@ func (c *TCPConn) tcpInfoBaseLocked(state TCPState) TCPInfo {
 		PeerWindowScale: c.peerWindowScale, ReceiveWindowScale: c.receiveWindowScale,
 		SACK: c.peerSACK, Timestamps: c.peerTimestamp, ECN: c.peerECN,
 		KeepAlive: c.keepAlive, KeepAliveConfig: c.keepAliveConfig, IdleTimeout: c.idleTimeout, UserTimeout: c.userTimeout, NoDelay: c.noDelay,
-		TrafficClass: uint8(c.trafficClass.Load()), FlowLabel: c.flowLabel,
+		TrafficClass: uint8(c.trafficClass.Load()), FlowLabel: c.flowLabel, MaximumPacingRate: c.maximumPacingRate,
 		LastError: c.terminalErr,
 	}
 	return info
@@ -3233,6 +3248,15 @@ func (c *TCPConn) SetCongestionControl(algorithm CongestionControl) error {
 	})
 }
 
+// SetMaximumPacingRate caps this connection's paced-data rate in bytes per
+// second. Zero removes the limit. Initial and control bursts mean it is not a
+// strict byte-rate shaper. The selected congestion controller still maintains
+// its unconstrained path model so removing a limit takes effect without
+// resetting congestion state.
+func (c *TCPConn) SetMaximumPacingRate(bytesPerSecond uint64) error {
+	return c.updateSocketOptions(func() { c.maximumPacingRate = bytesPerSecond })
+}
+
 // SetTrafficClass sets IPv4 TOS or IPv6 Traffic Class DSCP bits. TCP owns and
 // replaces the two ECN bits on each packet.
 func (c *TCPConn) SetTrafficClass(value int) error {
@@ -3387,7 +3411,7 @@ func (c *TCPConn) socketOptions() tcpSocketOptions {
 	return tcpSocketOptions{
 		keepAlive: c.keepAlive, keepAliveConfig: c.keepAliveConfig,
 		idleTimeout: c.idleTimeout, userTimeout: c.userTimeout, noDelay: c.noDelay,
-		congestion: c.congestion,
+		congestion: c.congestion, maximumPacingRate: c.maximumPacingRate,
 	}
 }
 
@@ -3659,6 +3683,7 @@ func (c *TCPConn) finish(err error) {
 		info.InboundQueueDrops, info.InboundQueueBytes = base.InboundQueueDrops, base.InboundQueueBytes
 		info.InboundQueuePeak, info.InboundQueueCapacity = base.InboundQueuePeak, base.InboundQueueCapacity
 		info.KeepAlive, info.KeepAliveConfig, info.IdleTimeout, info.UserTimeout, info.NoDelay = base.KeepAlive, base.KeepAliveConfig, base.IdleTimeout, base.UserTimeout, base.NoDelay
+		info.MaximumPacingRate = base.MaximumPacingRate
 		info.TrafficClass = base.TrafficClass
 		info.LastError = err
 		c.lastInfo.Store(&info)
@@ -3674,14 +3699,15 @@ func (c *TCPConn) run(initialSequence uint32) {
 	defer close(c.done)
 	protocolTimer := newOwnedTimer()
 	defer protocolTimer.close()
-	err := c.handshake(initialSequence, protocolTimer)
+	var initialReceive tcpInitialReceive
+	err := c.handshake(initialSequence, protocolTimer, &initialReceive)
 	if err != nil {
 		c.connected <- err
 		c.finish(err)
 		return
 	}
 	c.connected <- nil
-	err = c.established(initialSequence+1, protocolTimer)
+	err = c.established(initialSequence+1, protocolTimer, initialReceive)
 	c.finish(err)
 }
 
@@ -3712,7 +3738,7 @@ func (c *TCPConn) runPassive(listener *TCPListener, syn tcpSegment, initialSeque
 		return
 	}
 	queued = true
-	err := c.established(initialSequence+1, protocolTimer)
+	err := c.established(initialSequence+1, protocolTimer, tcpInitialReceive{payload: syn.payload, fin: syn.flags&tcpFlagFIN != 0})
 	c.finish(err)
 }
 
@@ -3729,7 +3755,7 @@ func (c *TCPConn) runForwardedPassive(syn tcpSegment, initialSequence uint32, re
 		return
 	}
 	result <- nil
-	err := c.established(initialSequence+1, protocolTimer)
+	err := c.established(initialSequence+1, protocolTimer, tcpInitialReceive{payload: syn.payload, fin: syn.flags&tcpFlagFIN != 0})
 	c.finish(err)
 }
 
@@ -3955,7 +3981,7 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 }
 
 // handshake performs active open with bounded exponential SYN retransmission.
-func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer) error {
+func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialReceive *tcpInitialReceive) error {
 	localMSS := tcpMSSForMTU(c.mtu, c.key.local.Addr())
 	if localMSS < 1 {
 		return errors.New("mipstack: MTU is too small for TCP")
@@ -4036,6 +4062,9 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer) error {
 				// processing with our existing ISS and wait for the peer's
 				// final ACK of the SYN-ACK.
 				timer.stop()
+				if initialReceive != nil {
+					*initialReceive = tcpInitialReceive{payload: segment.payload, fin: segment.flags&tcpFlagFIN != 0}
+				}
 				return c.passiveHandshake(segment, initialSequence, timer)
 			}
 			if segment.flags&(tcpFlagSYN|tcpFlagACK) != tcpFlagSYN|tcpFlagACK || segment.acknowledgement != initialSequence+1 {
@@ -4051,6 +4080,9 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer) error {
 			// that fallback has started.
 			c.peerECN = !ecnFallback && segment.flags&tcpFlagECE != 0 && segment.flags&tcpFlagCWR == 0
 			c.receiveNext = segment.sequence + 1
+			if initialReceive != nil {
+				*initialReceive = tcpInitialReceive{payload: segment.payload, fin: segment.flags&tcpFlagFIN != 0}
+			}
 			// The window in SYN and SYN-ACK is never scaled. The negotiated
 			// shift applies only to later segments.
 			c.peerWindow = uint32(segment.window)
@@ -4111,7 +4143,7 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer) error {
 // thereafter belong exclusively to the connection actor.
 // established runs the serialized data, congestion, receive, and close state
 // machine.
-func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
+func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialReceive tcpInitialReceive) error {
 	localMaximum := tcpMSSForMTU(c.mtu, c.key.local.Addr())
 	if c.peerTimestamp {
 		localMaximum -= 12
@@ -4119,6 +4151,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 	peerMSS := clampMSS(c.peerMSS, localMaximum)
 	pathMSS := localMaximum
 	receiveMSS := pathMSS
+	initialSocketOptions := c.socketOptions()
 	var (
 		sendUnacknowledged  = sendNext
 		peerScale           = c.peerWindowScale
@@ -4170,7 +4203,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 		lastTimestampUpdate = time.Now()
 		ecnRecoveryPoint    uint32
 		ecnRecoveryActive   bool
-		controller          = newTCPCongestionController(c.socketOptions().congestion)
+		controller          = newTCPCongestionController(initialSocketOptions.congestion)
 		rackLatestDelivered tcpRACKSample
 		rackForwardACK      uint32
 		rackForwardACKSet   bool
@@ -4197,6 +4230,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 		sackedBytes         uint32
 		haveRACKLoss        bool
 	)
+	controller.setMaximumPacingRate(initialSocketOptions.maximumPacingRate)
 	compactOutstanding := func() {
 		if outstandingHead == 0 {
 			return
@@ -4329,9 +4363,15 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 		info.BytesInFlight = congestionFlight()
 		if controller.algorithm == CongestionControlBBR {
 			info.DeliveryRate = bbrRateValue(controller.bbr.effectiveBandwidth())
-			info.PacingRate = bbrRateValue(controller.bbr.pacingRate)
+			info.PacingRate = bbrRateValue(controller.bbr.effectivePacingRate())
 			info.CongestionState = controller.bbr.mode.String()
+			info.ApplicationLimited = controller.bbr.applicationLimitedUntil != 0
+			info.SchedulerLimited = controller.bbr.schedulerLimited()
+			info.SchedulerLimitedEvents = controller.bbr.schedulerLimitedEvents
+		} else {
+			info.PacingRate = bbrRateValue(controller.limitPacingRate(controller.pacingRate))
 		}
+		info.MaximumPacingRate = controller.maximumPacingRate
 		info.PeerWindow, info.ReceiveWindow = peerWindow, receiveWindowState.size(receiveNext)
 		info.MaximumSegmentSize, info.PathMTU = peerMSS, c.mtu
 		dataAcknowledged := bytesAcknowledged
@@ -4402,12 +4442,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 		pathMTUProbe = true
 		pathMTUDeadline = expiry
 	}
-	armPacing := func(delay time.Duration) {
-		if delay <= 0 {
-			return
-		}
+	armPacingAt := func(deadline time.Time) {
 		pacing = true
-		pacingDeadline = time.Now().Add(delay)
+		pacingDeadline = deadline
 	}
 	keepAliveEligible := func() bool {
 		if len(outstanding) != 0 {
@@ -4684,7 +4721,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 		now := time.Now()
 		if !ecnHoldUntil.IsZero() {
 			if now.Before(ecnHoldUntil) {
-				armPacing(ecnHoldUntil.Sub(now))
+				armPacingAt(ecnHoldUntil)
 				return false, nil
 			}
 			ecnHoldUntil = time.Time{}
@@ -4751,8 +4788,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 		if payload.size == 0 {
 			return false, nil
 		}
-		if delay := controller.pacingDelay(now, congestionWindow, congestionFlight, peerMSS, rtt.srtt, slowStartThreshold); delay > 0 {
-			armPacing(delay)
+		if delay := controller.pacingDelay(now, payload.size, congestionWindow, congestionFlight, peerMSS, rtt.srtt, slowStartThreshold); delay > 0 {
+			armPacingAt(now.Add(delay))
 			return false, nil
 		}
 		if congestionAllowance == 0 {
@@ -4791,7 +4828,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 		} else {
 			controller.onDataSend(payload.size, peerMSS, sentAt, congestionWindow, congestionFlight, rtt.srtt, slowStartThreshold)
 		}
-		appendOutstanding(sentTCPSegment{sequence: sendNext, end: next, flags: flags, timestamp: timestamp, firstSent: sentAt.Sub(c.stack.timestampEpoch), transmissions: 1, limited: limitedTransmit, cwr: carriesCWR, mtuProbe: probe, ratePending: processingBBRACK, hostQueue: hostQueue, rate: rate})
+		appendOutstanding(sentTCPSegment{sequence: sendNext, end: next, flags: flags, timestamp: timestamp, firstSent: sentAt.Sub(c.stack.timestampEpoch), transmissions: 1, limited: limitedTransmit, cwr: carriesCWR, mtuProbe: probe, ratePending: processingBBRACK, rateSchedulerLimited: controller.bbr.schedulerLimited(), hostQueue: hostQueue, rate: rate})
 		if processingBBRACK {
 			bbrACKAddedFlight = growCongestionWindow(bbrACKAddedFlight, uint32(payload.size))
 			bbrACKPendingSnapshots = true
@@ -4837,7 +4874,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 			// left it, every older range from the connection has left as well.
 			hostQueued = outstanding[len(outstanding)-1].hostQueue.pending()
 		}
-		if controller.algorithm == CongestionControlBBR && total-offset < peerMSS && !hostQueued && congestionFlight < congestionWindow {
+		if controller.algorithm == CongestionControlBBR && tcpRateApplicationLimited(total-offset, hostQueued, congestionFlight, congestionWindow, fastRecovery, peerSACK, outstanding, peerMSS) {
 			// Match Linux tcp_rate_check_app_limited: only an application
 			// bubble, rather than a congestion- or receive-window limit, marks
 			// delivery samples as application limited.
@@ -4966,7 +5003,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 			// every exponential-backoff retry.
 			if !rtoRecovery {
 				hyStart.disable()
-				slowStartThreshold = controller.onTimeout(congestionWindow, flight, peerMSS, oldest.transmittedAt())
+				slowStartThreshold = controller.onTimeout(congestionWindow, flight, slowStartThreshold, peerMSS, oldest.transmittedAt())
 				rtoRecovery = true
 				rtoRecoveryPoint = sendNext
 				if c.peerECN {
@@ -5008,7 +5045,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 				// A lost retransmission is the RFC 8985 exception: it is a new
 				// congestion indication even while the original recovery is active.
 				if lostRetransmission || lostCWR || tcpECNStartsRecovery(ecnRecoveryActive, sendUnacknowledged, ecnRecoveryPoint) {
-					slowStartThreshold = controller.onCongestion(congestionWindow, flight, peerMSS)
+					slowStartThreshold = controller.onCongestion(congestionWindow, flight, slowStartThreshold, peerMSS)
 					ecnRecoveryPoint = sendNext
 					ecnRecoveryActive = true
 					if c.peerECN {
@@ -5045,6 +5082,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 			armRetransmission()
 		}
 		oldest.rate = controller.onRetransmit(oldest.dataSize(), peerMSS, oldest.transmittedAt(), oldest.hostQueue.queuedAt, congestionWindow, congestionFlight(), sendNext-sendUnacknowledged, rtt.srtt, slowStartThreshold)
+		oldest.rateSchedulerLimited = controller.bbr.schedulerLimited()
 		oldest.ratePending = processingBBRACK
 		if processingBBRACK && peerSACK && fastRecovery {
 			bbrACKAddedFlight = growCongestionWindow(bbrACKAddedFlight, uint32(oldest.dataSize()))
@@ -5087,6 +5125,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 		tailProbeRetransmit = false
 		c.noteRetransmission()
 		segment.rate = controller.onRetransmit(segment.dataSize(), peerMSS, segment.transmittedAt(), segment.hostQueue.queuedAt, congestionWindow, ordinaryFlight(), sendNext-sendUnacknowledged, rtt.srtt, slowStartThreshold)
+		segment.rateSchedulerLimited = controller.bbr.schedulerLimited()
 		segment.ratePending = processingBBRACK
 		bbrACKPendingSnapshots = bbrACKPendingSnapshots || processingBBRACK
 		armRetransmission()
@@ -5140,6 +5179,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 		pathMTUFailures++
 		c.stack.stats.pathMTUProbeFailures.Add(1)
 		segment.rate = controller.onRetransmit(segment.dataSize(), peerMSS, segment.transmittedAt(), segment.hostQueue.queuedAt, congestionWindow, congestionFlight(), sendNext-sendUnacknowledged, rtt.srtt, slowStartThreshold)
+		segment.rateSchedulerLimited = controller.bbr.schedulerLimited()
 		segment.ratePending = processingBBRACK
 		if processingBBRACK && peerSACK && fastRecovery {
 			bbrACKAddedFlight = growCongestionWindow(bbrACKAddedFlight, uint32(segment.dataSize()))
@@ -5167,8 +5207,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 			}
 			if fastRecovery {
 				now := time.Now()
-				if delay := controller.pacingDelay(now, congestionWindow, pipe, peerMSS, rtt.srtt, slowStartThreshold); delay > 0 {
-					armPacing(delay)
+				if delay := controller.pacingDelay(now, int(size), congestionWindow, pipe, peerMSS, rtt.srtt, slowStartThreshold); delay > 0 {
+					armPacingAt(now.Add(delay))
 					return nil
 				}
 			}
@@ -5177,11 +5217,16 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 			}
 		}
 	}
-	changeCongestionController := func(configured CongestionControl) {
+	changeCongestionController := func(configured CongestionControl, maximumPacingRate uint64) {
 		if configured == controller.algorithm {
+			if controller.setMaximumPacingRate(maximumPacingRate) {
+				pacing = false
+				pacingDeadline = time.Time{}
+			}
 			return
 		}
 		controller = newTCPCongestionController(configured)
+		controller.setMaximumPacingRate(maximumPacingRate)
 		undo.active = false
 		for index := range outstanding {
 			outstanding[index].rate = bbrRateSnapshot{}
@@ -5202,7 +5247,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 		pacingDeadline = time.Time{}
 	}
 	applyPathMTU := func(mtu int, retransmit bool) error {
-		changeCongestionController(c.socketOptions().congestion)
+		options := c.socketOptions()
+		changeCongestionController(options.congestion, options.maximumPacingRate)
 		priorMTU := c.mtu
 		c.mtu = mtu
 		if mtu < priorMTU {
@@ -5258,11 +5304,30 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 			segment.advanceTransmissionGeneration()
 			c.noteRetransmission()
 			segment.rate = controller.onRetransmit(segment.dataSize(), peerMSS, segment.transmittedAt(), segment.hostQueue.queuedAt, congestionWindow, congestionFlight(), sendNext-sendUnacknowledged, rtt.srtt, slowStartThreshold)
+			segment.rateSchedulerLimited = controller.bbr.schedulerLimited()
 			segment.ratePending = processingBBRACK
 			bbrACKPendingSnapshots = bbrACKPendingSnapshots || processingBBRACK
 			armRetransmission()
 		}
 		return nil
+	}
+	if len(initialReceive.payload) != 0 || initialReceive.fin {
+		payload := initialReceive.payload
+		fin := initialReceive.fin
+		previousReceiveNext := receiveNext
+		_, closed := c.receiveTCPData(receiveNext, payload, fin, receiveWindowState.size(receiveNext), &receiveNext, &outOfOrder, &outOfOrderBytes)
+		advanced := receiveNext - previousReceiveNext
+		if closed && advanced != 0 {
+			advanced--
+		}
+		bytesReceived += uint64(advanced)
+		if closed {
+			remoteFINReceived = true
+			c.setReadEOF()
+		}
+		if err := scheduleACK(true, len(payload) != 0, time.Now()); err != nil {
+			return err
+		}
 	}
 	armPathMTUProbe()
 	armLiveness()
@@ -5493,8 +5558,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 					undo.active = false
 					minimumWindow := congestionWindow <= uint32(peerMSS)
 					flight := congestionFlight()
-					slowStartThreshold = controller.onECN(congestionWindow, flight, peerMSS)
-					congestionWindow = slowStartThreshold
+					slowStartThreshold, congestionWindow = controller.onECN(congestionWindow, flight, slowStartThreshold, peerMSS)
 					ecnRecoveryPoint = sendNext
 					ecnRecoveryActive = true
 					ecnCongestion = true
@@ -5503,7 +5567,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 						// RFC 3168 section 6.1.2 uses the retransmission interval
 						// to reduce an already one-segment sending rate further.
 						ecnHoldUntil = receivedAt.Add(rtt.rto)
-						armPacing(ecnHoldUntil.Sub(time.Now()))
+						controller.cancelPacingWake()
+						armPacingAt(ecnHoldUntil)
 					}
 				}
 				if tcpSequenceGreater(ack, sendUnacknowledged) {
@@ -5615,7 +5680,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 							if !fastRecovery {
 								if tcpECNStartsRecovery(ecnRecoveryActive, sendUnacknowledged, ecnRecoveryPoint) {
 									hyStart.disable()
-									slowStartThreshold = controller.onCongestion(congestionWindow, flightBeforeACK, peerMSS)
+									slowStartThreshold = controller.onCongestion(congestionWindow, flightBeforeACK, slowStartThreshold, peerMSS)
 									congestionWindow = slowStartThreshold
 									ecnRecoveryPoint = sendNext
 									ecnRecoveryActive = true
@@ -5660,7 +5725,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 						}
 						congestionWindow = controller.onACKWithThreshold(congestionWindow, growth, peerMSS, now, rtt.srtt, sample, flightBeforeACK, slowStartThreshold, false)
 					}
-					if target := sendAutoTune.target(receivedAt, rtt.srtt, bytesAcknowledged, tcpMaximumSendCapacity); target > 0 {
+					if target := sendAutoTune.target(receivedAt, rtt.srtt, bytesAcknowledged, c.sendMaximum); target > 0 {
 						c.growSendCapacity(target)
 					}
 					armRetransmissionAfterACK(receivedAt)
@@ -5882,8 +5947,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 						// still honors explicit SetWriteBuffer choices and its configured
 						// maximum and one-step growth bound.
 						target := uint64(congestionWindow) * 3
-						if target > uint64(tcpMaximumSendCapacity) {
-							target = uint64(tcpMaximumSendCapacity)
+						if target > uint64(c.sendMaximum) {
+							target = uint64(c.sendMaximum)
 						}
 						c.growSendCapacity(int(target))
 					}
@@ -5895,6 +5960,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 								continue
 							}
 							candidate.rate = controller.bbr.snapshotSend(candidate.hostQueue.queuedAt, packetsOut)
+							candidate.rateSchedulerLimited = controller.bbr.schedulerLimited()
 							candidate.ratePending = false
 						}
 					}
@@ -5971,14 +6037,15 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 				// Linux reinitializes only congestion-controller private state.
 				// The established connection's cwnd and ssthresh remain transport
 				// state across a TCP_CONGESTION change.
-				changeCongestionController(c.socketOptions().congestion)
+				options := c.socketOptions()
+				changeCongestionController(options.congestion, options.maximumPacingRate)
 				keepAliveProbes = 0
 				lastKeepAlive = time.Time{}
 				armLiveness()
 			}
 			if wake&tcpActorWakeWindow != 0 {
 				now := time.Now()
-				if target := receiveAutoTune.target(now, rtt.srtt, c.applicationReads.Load(), tcpMaximumReceiveCapacity); target > 0 {
+				if target := receiveAutoTune.target(now, rtt.srtt, c.applicationReads.Load(), c.receiveMaximum); target > 0 {
 					c.growReceiveCapacity(target)
 				}
 				if c.discardingReads() {
@@ -6095,6 +6162,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 					segment.advanceTransmissionGeneration()
 					c.noteRetransmission()
 					segment.rate = controller.onRetransmit(segment.dataSize(), peerMSS, segment.transmittedAt(), segment.hostQueue.queuedAt, congestionWindow, congestionFlight(), sendNext-sendUnacknowledged, rtt.srtt, slowStartThreshold)
+					segment.rateSchedulerLimited = controller.bbr.schedulerLimited()
 					segment.ratePending = processingBBRACK
 					bbrACKPendingSnapshots = bbrACKPendingSnapshots || processingBBRACK
 				}
@@ -6199,6 +6267,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer) error {
 			consumeActorTimer()
 			pacing = false
 			pacingDeadline = time.Time{}
+			controller.onPacingWake(time.Now(), congestionFlight())
 			if fastRecovery && peerSACK && len(outstanding) != 0 {
 				if err := recoverSACKHoles(highestSACKedSequence(outstanding), true); err != nil {
 					return err
@@ -7265,6 +7334,16 @@ func firstUnretriedLoss(outstanding []sentTCPSegment, mss int) int {
 		}
 	}
 	return index
+}
+
+// tcpRateApplicationLimited mirrors Linux tcp_rate_check_app_limited. In
+// particular, a SACK/RACK loss that is known but not yet retransmitted is a
+// recovery limitation rather than an application bubble.
+func tcpRateApplicationLimited(queued int, hostQueued bool, flight, window uint32, recovery, peerSACK bool, outstanding []sentTCPSegment, mss int) bool {
+	if queued >= mss || hostQueued || flight >= window {
+		return false
+	}
+	return !recovery || !peerSACK || firstUnretriedLoss(outstanding, mss) < 0
 }
 
 // firstUnretriedSACKHole implements RFC 6675 NextSeg rule 3 after all ranges
