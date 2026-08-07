@@ -387,7 +387,9 @@ generation is independently proven lost, and excludes isolated PLPMTU probe
 failures. BBR owns pacing and cwnd rather than duplicating the common recovery
 machinery. Since a Go connection actor does not have kernel fq pacing, a
 materially late pacing wake is marked locally limited so scheduler delay cannot
-become a false low path-bandwidth sample. Pacing retains at most one send
+become a false low path-bandwidth sample. Complete scheduler-limited rounds
+still participate in Startup plateau detection, preventing sustained host load
+from trapping the connection in Startup. Pacing retains at most one send
 quantum of overdue debt, groups at most four whole quanta per actor turn, and
 credits at most one bounded group ahead of the pacing clock, preventing an
 unbounded catch-up burst.

@@ -5629,7 +5629,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 								if tcpECNStartsRecovery(ecnRecoveryActive, sendUnacknowledged, ecnRecoveryPoint) {
 									hyStart.disable()
 									slowStartThreshold = controller.onCongestion(congestionWindow, flightBeforeACK, slowStartThreshold, peerMSS)
-									congestionWindow = slowStartThreshold
+									// Linux BBR keeps an effectively infinite ssthresh and
+									// leaves cwnd under its delivery model. Assigning that
+									// threshold here would open the sender after a tail loss.
+									if controller.algorithm != CongestionControlBBR {
+										congestionWindow = slowStartThreshold
+									}
 									ecnRecoveryPoint = sendNext
 									ecnRecoveryActive = true
 									if c.peerECN {
@@ -5649,7 +5654,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 							prrPriorFlight = 0
 							prrDelivered = 0
 							prrOut = 0
-							congestionWindow = slowStartThreshold
+							// Reno and CUBIC deflate to ssthresh when recovery
+							// completes. BBR instead exits packet conservation and
+							// retains the window maintained by its delivery model.
+							if controller.algorithm != CongestionControlBBR {
+								congestionWindow = slowStartThreshold
+							}
 						} else if !peerSACK {
 							// RFC 6582 NewReno: a partial ACK confirms one loss
 							// but not the recovery point. Deflate by newly ACKed

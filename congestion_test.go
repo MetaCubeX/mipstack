@@ -1,6 +1,7 @@
 package mipstack
 
 import (
+	"bytes"
 	"context"
 	"math"
 	"net"
@@ -962,6 +963,23 @@ func TestBBRSchedulerLimitedSampleDoesNotCreateACKAggregation(t *testing.T) {
 	}
 }
 
+func TestBBRSchedulerLimitedRoundsCanEndStartup(t *testing.T) {
+	bbr := bbrCongestionControl{
+		mode: bbrStartup, bandwidth: 1_000_000,
+		fullBandwidth: 1_000_000,
+	}
+	for round := 0; round < bbrFullBandwidthRounds; round++ {
+		bbr.roundStart = true
+		bbr.checkFullBandwidth(bbrRateSample{
+			delivered: 1000, interval: time.Millisecond,
+			schedulerLimited: true, valid: true,
+		})
+	}
+	if !bbr.fullBandwidthReached {
+		t.Fatal("BBR stayed in Startup under persistent scheduler limitation")
+	}
+}
+
 func TestBBRPacingTimerConsumesWakeWhenSendIsBlocked(t *testing.T) {
 	start := time.Unix(100, 0)
 	bbr := bbrCongestionControl{pacingWakeDeadline: start, delivered: 1000}
@@ -1438,7 +1456,63 @@ func TestTCPSelectableCongestionControlsRecoverMultipleLosses(t *testing.T) {
 			if recoveries := stack.Stats().TCPSACKRetransmissions; recoveries < 2 {
 				t.Fatalf("SACK retransmissions = %d, want at least 2", recoveries)
 			}
+			if algorithm == CongestionControlBBR {
+				info := connection.(*TCPConn).Info()
+				if info.CongestionWindow >= tcpMaximumScaledWindow {
+					t.Fatalf("BBR recovery window = %d after ssthresh %d", info.CongestionWindow, info.SlowStartThreshold)
+				}
+			}
 		})
+	}
+}
+
+// TestBBRTailLossRecoveryRetainsModelWindow verifies that confirmation of a
+// retransmitted tail does not copy BBR's effectively infinite ssthresh into
+// its congestion window.
+func TestBBRTailLossRecoveryRetainsModelWindow(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.78")
+	remote := netip.MustParseAddr("192.0.2.79")
+	link, stack := newTestStack(t, local, remote)
+	defer stack.Close()
+	link.mu.Lock()
+	link.echoTCP = true
+	link.mu.Unlock()
+	if err := stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+		TCP:            TCPSocketDefaults{CongestionControl: CongestionControlBBR},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 8278))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	writeAndReadTCPEcho(t, connection, []byte("warmup"))
+	// The echoed payload can wake the reader before the connection actor has
+	// finished applying the accompanying ACK. Info serializes with that actor,
+	// ensuring the following loss has an eligible prior RTT sample for TLP.
+	if info := connection.(*TCPConn).Info(); info.RTT <= 0 {
+		t.Fatal("warmup did not establish an RTT sample")
+	}
+	link.mu.Lock()
+	link.holdTCPACKs = 10
+	link.dropTCPOrdinals = map[int]bool{4: true}
+	link.mu.Unlock()
+	writeAndReadTCPEcho(t, connection, bytes.Repeat([]byte{0x5a}, 3*1280))
+	// The ACK for data beyond the retransmitted range supplies the loss proof
+	// that drives the tail-recovery congestion response.
+	link.mu.Lock()
+	link.holdTCPACKs = 0
+	link.mu.Unlock()
+	writeAndReadTCPEcho(t, connection, []byte("advance past tail"))
+	info := connection.(*TCPConn).Info()
+	if probes := stack.Stats().TCPTailLossProbes; probes == 0 {
+		t.Fatalf("BBR tail loss did not exercise a tail-loss probe: info=%+v stats=%+v", info, stack.Stats())
+	}
+	if info.CongestionWindow >= tcpMaximumScaledWindow {
+		t.Fatalf("BBR tail-loss window = %d after ssthresh %d", info.CongestionWindow, info.SlowStartThreshold)
 	}
 }
 
@@ -1475,6 +1549,8 @@ func TestTCPAlgorithmsShareBottleneckWithoutStarvation(t *testing.T) {
 		Latency: 8 * time.Millisecond, Jitter: time.Millisecond,
 		Bandwidth: 2 * 1024 * 1024, QueueBytes: 64 * 1024,
 	}
+	fairCompletion := time.Duration(payloadSize*flows) * time.Second / time.Duration(condition.Bandwidth)
+	maximumCompletion := 4*fairCompletion + 250*time.Millisecond
 	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			clientAddress := netip.MustParseAddr("192.0.2.231")
@@ -1517,6 +1593,7 @@ func TestTCPAlgorithmsShareBottleneckWithoutStarvation(t *testing.T) {
 				}
 			}
 			type flowResult struct {
+				flow     int
 				duration time.Duration
 				err      error
 			}
@@ -1527,10 +1604,11 @@ func TestTCPAlgorithmsShareBottleneckWithoutStarvation(t *testing.T) {
 					<-start
 					started := time.Now()
 					err := exchangeTestTCPPayload(clients[flow], servers[flow], payloadSize, 20*time.Second, uint32(flow+1))
-					results <- flowResult{duration: time.Since(started), err: err}
+					results <- flowResult{flow: flow, duration: time.Since(started), err: err}
 				}(flow)
 			}
 			close(start)
+			durations := make([]time.Duration, flows)
 			minimum, maximum := time.Duration(0), time.Duration(0)
 			for flow := 0; flow < flows; flow++ {
 				result := <-results
@@ -1543,18 +1621,22 @@ func TestTCPAlgorithmsShareBottleneckWithoutStarvation(t *testing.T) {
 				if result.duration > maximum {
 					maximum = result.duration
 				}
-			}
-			for flow := 0; flow < flows; flow++ {
-				_ = clients[flow].Close()
-				_ = servers[flow].Close()
+				durations[result.flow] = result.duration
 			}
 			stats := link.Stats(0)
 			t.Logf("flows=%d min=%v max=%v link=%+v", flows, minimum, maximum, stats)
 			if stats.QueueDrops == 0 {
 				t.Fatalf("bottleneck queue did not drop a packet: %+v", stats)
 			}
-			if maximum > 4*minimum+250*time.Millisecond {
-				t.Fatalf("flow completion spread %v..%v indicates starvation", minimum, maximum)
+			if maximum > maximumCompletion {
+				for flow := 0; flow < flows; flow++ {
+					t.Logf("flow=%d duration=%v info=%+v", flow, durations[flow], clients[flow].Info())
+				}
+				t.Fatalf("flow completion spread %v..%v exceeds fair-share limit %v", minimum, maximum, maximumCompletion)
+			}
+			for flow := 0; flow < flows; flow++ {
+				_ = clients[flow].Close()
+				_ = servers[flow].Close()
 			}
 		})
 	}

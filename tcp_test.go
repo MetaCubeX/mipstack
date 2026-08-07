@@ -4257,6 +4257,15 @@ func TestTCPZeroWindowProbePreservesSequenceSpace(t *testing.T) {
 	}
 	defer connection.Close()
 	tcpConnection := connection.(*TCPConn)
+	// Dial returns after the connection actor queues its final ACK; the device
+	// consumer may not have observed that packet yet. Synchronize with the
+	// emulated peer before disabling echo so the handshake ACK cannot be
+	// mistaken for the later persist probe under single-P scheduling.
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		defer link.mu.Unlock()
+		return link.clientACKs != 0
+	})
 	link.mu.Lock()
 	peer := link.tcp[tcpConnection.key.local.Port()]
 	sequence, acknowledgement := peer.serverNext, peer.clientNext

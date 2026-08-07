@@ -1220,10 +1220,11 @@ func (b *bbrCongestionControl) updateACKAggregation(sample bbrRateSample, window
 }
 
 // checkFullBandwidth applies Linux's 25-percent growth test for three
-// consecutive packet-timed rounds not limited by the application or host
-// scheduler.
+// consecutive packet-timed rounds not limited by the application. A
+// scheduler-limited sample cannot lower the bandwidth filter, but its complete
+// round still proves that Startup should not retain its high gain forever.
 func (b *bbrCongestionControl) checkFullBandwidth(sample bbrRateSample) {
-	if b.fullBandwidthReached || !b.roundStart || sample.locallyLimited() {
+	if b.fullBandwidthReached || !b.roundStart || sample.applicationLimited {
 		return
 	}
 	if b.bandwidth >= b.fullBandwidth*bbrFullBandwidthGrowth {
