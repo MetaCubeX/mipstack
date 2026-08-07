@@ -2,6 +2,7 @@ package mipstack
 
 import (
 	"context"
+	"math"
 	"net/netip"
 	"testing"
 	"time"
@@ -169,11 +170,28 @@ func TestBBRSendQuantumMatchesLinuxPolicy(t *testing.T) {
 	if quantum := bbrSendQuantum(200_000, mss); quantum != 2*mss {
 		t.Fatalf("normal-rate send quantum = %d, want %d", quantum, 2*mss)
 	}
-	if quantum := bbrSendQuantum(1024*100_000, mss); quantum != bbrMaximumSendQuantum {
-		t.Fatalf("high-rate send quantum = %d, want %d", quantum, bbrMaximumSendQuantum)
+	if quantum := bbrSendQuantum(1024*100_000, mss); quantum != bbrMaximumSendQuantum/mss*mss {
+		t.Fatalf("high-rate send quantum = %d, want %d", quantum, bbrMaximumSendQuantum/mss*mss)
+	}
+	if quantum := bbrSendQuantum(1024*100_000, 100); quantum != bbrMaximumSendSegments*100 {
+		t.Fatalf("small-MSS send quantum = %d, want %d", quantum, bbrMaximumSendSegments*100)
+	}
+	if quantum := bbrSendQuantum(math.MaxFloat64, mss); quantum != bbrMaximumSendQuantum/mss*mss {
+		t.Fatalf("extreme-rate send quantum = %d, want %d", quantum, bbrMaximumSendQuantum/mss*mss)
 	}
 	if duration := bbrTimerQuantumDuration(1024*1024*1024, mss); duration != tcpUserspacePacingQuantum {
 		t.Fatalf("high-rate timer quantum = %v, want userspace floor %v", duration, tcpUserspacePacingQuantum)
+	}
+}
+
+func TestBBRGainsAndUnknownRTTWindowMatchLinux(t *testing.T) {
+	if bbrStartupPacingGain != 739.0/256 || bbrDrainPacingGain != 88.0/256 {
+		t.Fatalf("BBR fixed-point gains = %v/%v", bbrStartupPacingGain, bbrDrainPacingGain)
+	}
+	const mss = 1000
+	bbr := bbrCongestionControl{mode: bbrStartup}
+	if target := bbr.inflightTarget(bbrStartupPacingGain, mss); target != 14*mss {
+		t.Fatalf("BBR target without RTT = %d, want %d", target, 14*mss)
 	}
 }
 
@@ -301,7 +319,7 @@ func TestCUBICTimeoutStartsNextEpochAtKZero(t *testing.T) {
 	const mss = 1000
 	controller := newTCPCongestionController(CongestionControlCUBIC)
 	_ = controller.onCongestion(100*mss, 100*mss, mss)
-	if threshold := controller.onTimeout(70*mss, 60*mss, mss); threshold != 49*mss {
+	if threshold := controller.onTimeout(70*mss, 60*mss, mss, time.Unix(100, 0)); threshold != 49*mss {
 		t.Fatalf("CUBIC timeout threshold = %d, want %d", threshold, 49*mss)
 	}
 	start := time.Unix(100, 0)
@@ -344,22 +362,21 @@ func TestBBRCongestionControl(t *testing.T) {
 	start := time.Unix(100, 0)
 	window := uint32(10 * mss)
 	window = controller.onACK(window, 2*mss, mss, start, 100*time.Millisecond, 100*time.Millisecond, window, true)
-	if controller.bbr.bandwidth != 100000 {
-		t.Fatalf("BBR initial bandwidth = %v, want 100000", controller.bbr.bandwidth)
+	if controller.bbr.bandwidth != 20000 {
+		t.Fatalf("BBR initial bandwidth = %v, want 20000", controller.bbr.bandwidth)
 	}
-	controller.onDataSend(mss, mss, start, window, 0, 100*time.Millisecond, ^uint32(0))
+	_, _ = controller.onBBRDataSend(mss, mss, start, 1, 0, window)
 	if delay := controller.pacingDelay(start, window, 0, mss, 100*time.Millisecond, ^uint32(0)); delay >= 100*time.Millisecond {
 		t.Fatalf("BBR startup pacing delay = %v, want less than 100ms", delay)
 	}
 	for round := 0; round < 4; round++ {
-		controller.bbr.roundTarget = mss
 		window = controller.onACK(window, mss, mss, start.Add(time.Duration(round+1)*100*time.Millisecond), 100*time.Millisecond, 100*time.Millisecond, window, false)
 	}
 	if controller.bbr.mode == bbrStartup {
 		t.Fatal("BBR remained in Startup after a sustained bandwidth plateau")
 	}
 	controller.bbr.mode = bbrProbeBandwidth
-	controller.bbr.minimumRTTStamp = start.Add(-bbrMinRTTWindow)
+	controller.bbr.minimumRTTStamp = start.Add(-bbrMinRTTWindow - time.Nanosecond)
 	window = controller.onACK(window, mss, mss, start.Add(time.Second), 100*time.Millisecond, 100*time.Millisecond, mss, false)
 	if controller.bbr.mode != bbrProbeRTT || window != bbrMinimumCongestionMSS*mss {
 		t.Fatalf("BBR ProbeRTT state/window = %v/%d", controller.bbr.mode, window)
@@ -368,57 +385,289 @@ func TestBBRCongestionControl(t *testing.T) {
 
 func TestBBRApplicationLimitedRoundsDoNotEndStartup(t *testing.T) {
 	const mss = 1000
-	controller := newTCPCongestionController(CongestionControlBBR)
-	controller.bbr.bandwidth = 100000
-	controller.bbr.fullBandwidth = 100000
+	bbr := bbrCongestionControl{bandwidth: 100000, fullBandwidth: 100000}
+	bbr.bandwidthFilter.reset(0, bbr.bandwidth)
+	now := time.Unix(100, 0)
 	for round := 0; round < bbrFullBandwidthRounds+2; round++ {
-		controller.bbr.roundTarget = mss
-		controller.bbr.roundBandwidth = 100000
-		if !controller.bbr.advanceRound(10*mss, mss, true) {
-			t.Fatal("application-limited BBR round did not complete")
-		}
+		bbr.delivered += mss
+		sample := bbrRateSample{priorDelivered: uint32(bbr.delivered - mss), delivered: mss, acked: mss, interval: 10 * time.Millisecond, ackTime: now.Add(time.Duration(round) * 10 * time.Millisecond), applicationLimited: true, valid: true}
+		_, _ = bbr.onRateSample(10*mss, mss, sample)
 	}
-	if controller.bbr.mode != bbrStartup || controller.bbr.fullRounds != 0 {
-		t.Fatalf("application-limited BBR state = mode %v full rounds %d", controller.bbr.mode, controller.bbr.fullRounds)
+	if bbr.mode != bbrStartup || bbr.fullRounds != 0 {
+		t.Fatalf("application-limited BBR state = mode %v full rounds %d", bbr.mode, bbr.fullRounds)
 	}
 }
 
 func TestBBRIgnoresLowApplicationLimitedBandwidthSamples(t *testing.T) {
 	start := time.Unix(100, 0)
-	bbr := bbrCongestionControl{bandwidth: 1_000_000}
-	bbr.observeBandwidth(1000, start, 10*time.Millisecond, 1000, true)
-	if bbr.roundBandwidth != 0 || bbr.bandwidth != 1_000_000 {
-		t.Fatalf("low app-limited sample changed BBR model: round=%v bandwidth=%v", bbr.roundBandwidth, bbr.bandwidth)
+	bbr := bbrCongestionControl{bandwidth: 1_000_000, nextRoundDelivered: 1}
+	bbr.bandwidthFilter.reset(0, bbr.bandwidth)
+	bbr.updateBandwidth(bbrRateSample{delivered: 1000, interval: 10 * time.Millisecond, ackTime: start, applicationLimited: true, valid: true})
+	if bbr.bandwidth != 1_000_000 {
+		t.Fatalf("low app-limited sample changed BBR model: bandwidth=%v", bbr.bandwidth)
 	}
-	bbr = bbrCongestionControl{bandwidth: 100_000}
-	bbr.observeBandwidth(2000, start, 10*time.Millisecond, 2000, true)
-	if bbr.roundBandwidth != 200_000 || bbr.bandwidth != 200_000 {
-		t.Fatalf("high app-limited sample was ignored: round=%v bandwidth=%v", bbr.roundBandwidth, bbr.bandwidth)
+	bbr = bbrCongestionControl{bandwidth: 100_000, nextRoundDelivered: 1}
+	bbr.bandwidthFilter.reset(0, bbr.bandwidth)
+	bbr.updateBandwidth(bbrRateSample{delivered: 2000, interval: 10 * time.Millisecond, ackTime: start, applicationLimited: true, valid: true})
+	if bbr.bandwidth != 200_000 {
+		t.Fatalf("high app-limited sample was ignored: bandwidth=%v", bbr.bandwidth)
+	}
+}
+
+func TestBBRApplicationLimitedSamplesDoNotExpireBandwidth(t *testing.T) {
+	const mss = 1000
+	start := time.Unix(100, 0)
+	bbr := bbrCongestionControl{bandwidth: 1_000_000}
+	bbr.bandwidthFilter.reset(0, bbr.bandwidth)
+	for round := 0; round < 2*bbrBandwidthWindow; round++ {
+		bbr.delivered += mss
+		bbr.updateBandwidth(bbrRateSample{
+			priorDelivered: uint32(bbr.delivered - mss), delivered: mss,
+			interval: 10 * time.Millisecond, ackTime: start.Add(time.Duration(round) * time.Millisecond),
+			applicationLimited: true, valid: true,
+		})
+	}
+	if bbr.bandwidth != 1_000_000 {
+		t.Fatalf("app-limited rounds expired BBR bandwidth: %v", bbr.bandwidth)
+	}
+	bbr.delivered += mss
+	bbr.updateBandwidth(bbrRateSample{
+		priorDelivered: uint32(bbr.delivered - mss), delivered: mss,
+		interval: 10 * time.Millisecond, ackTime: start.Add(time.Second), valid: true,
+	})
+	if bbr.bandwidth != 100_000 {
+		t.Fatalf("first usable sample after stale rounds retained bandwidth: %v", bbr.bandwidth)
 	}
 }
 
 func TestBBRAcceptsLowSampleWhilePacingLimited(t *testing.T) {
-	const mss = 1000
 	start := time.Unix(100, 0)
-	controller := newTCPCongestionController(CongestionControlBBR)
-	controller.bbr.bandwidth = 1_000_000
-	controller.bbr.minimumRTT = 10 * time.Millisecond
-	controller.bbr.sampleStart = start
-	controller.bbr.roundTarget = 100 * mss
-	controller.onACKWithThreshold(10*mss, mss, mss, start.Add(10*time.Millisecond), 10*time.Millisecond, 10*time.Millisecond, mss, ^uint32(0), false)
-	if controller.bbr.roundBandwidth == 0 {
+	bbr := bbrCongestionControl{bandwidth: 1_000_000, nextRoundDelivered: 1}
+	bbr.bandwidthFilter.reset(0, bbr.bandwidth)
+	bbr.updateBandwidth(bbrRateSample{delivered: 1000, interval: 10 * time.Millisecond, ackTime: start, valid: true})
+	if bbr.bandwidthFilter.samples[0].rate == 0 {
 		t.Fatal("pacing-limited BBR delivery sample was treated as application-limited")
 	}
 }
 
-func TestBBRCountsACKsWithSharedBatchTimestamp(t *testing.T) {
+func TestBBRRateSampleUsesLongerPipelinePhase(t *testing.T) {
+	stamp := func(value time.Duration) monotonicStamp { return monotonicStamp(value) + 1 }
+	bbr := bbrCongestionControl{deliveredStamp: bbrStampAt(stamp(10 * time.Millisecond)), firstSent: bbrStampAt(stamp(10 * time.Millisecond))}
+	segment := sentTCPSegment{
+		sequence: 1, end: 1001, transmissions: 1,
+		hostQueue: packetQueueTicket{queuedAt: stamp(20 * time.Millisecond)},
+		rate:      bbrRateSnapshot{firstSent: bbrStampAt(stamp(10 * time.Millisecond)), deliveredStamp: bbrStampAt(stamp(10 * time.Millisecond))},
+	}
+	var sample bbrRateSample
+	sample.observe(segment)
+	bbr.finishRateSample(&sample, 1000, 1000, 0, time.Unix(100, 0), stamp(25*time.Millisecond), time.Millisecond, time.Millisecond, time.Millisecond)
+	if !sample.valid || sample.interval != 15*time.Millisecond || sample.delivered != 1000 {
+		t.Fatalf("delivery sample = valid %t interval %v delivered %d", sample.valid, sample.interval, sample.delivered)
+	}
+	if bbr.firstSent != bbrStampAt(stamp(20*time.Millisecond)) {
+		t.Fatalf("next send-phase boundary = %d, want %d", bbr.firstSent, bbrStampAt(stamp(20*time.Millisecond)))
+	}
+}
+
+func TestBBRCompactStampWrapsAcrossUint32(t *testing.T) {
+	earlier := bbrStamp(^uint32(0) - 5)
+	later := bbrStamp(5)
+	if interval := bbrStampDuration(later, earlier); interval != 11*time.Microsecond {
+		t.Fatalf("wrapped BBR interval = %v, want 11us", interval)
+	}
+}
+
+func TestBBRDeliveredCounterWrapsAcross31Bits(t *testing.T) {
+	earlier := bbrRateDeliveredMask - 5
+	later := uint32(5)
+	if !bbrDeliveredAfterEqual(later, earlier) {
+		t.Fatal("wrapped delivered counter was ordered before its reference")
+	}
+	if bbrDeliveredAfterEqual(earlier, later) {
+		t.Fatal("reverse wrapped delivered counter comparison was accepted")
+	}
+	bbr := bbrCongestionControl{delivered: uint64(bbrRateApplicationLimited) + 5}
+	sample := bbrRateSample{
+		priorDelivered: earlier,
+		priorStamp:     1,
+		firstSent:      1,
+		lastSent:       monotonicStamp(time.Microsecond) + 1,
+	}
+	bbr.finishRateSample(&sample, 0, 0, 0, time.Unix(100, 0), monotonicStamp(2*time.Microsecond)+1, 0, 0, 0)
+	if sample.delivered != 11 || !sample.valid {
+		t.Fatalf("wrapped delivered sample = %d, valid %t; want 11, true", sample.delivered, sample.valid)
+	}
+}
+
+func TestBBRRateSnapshotPacksApplicationLimit(t *testing.T) {
+	bbr := bbrCongestionControl{delivered: 1234, applicationLimitedUntil: 2000}
+	snapshot := bbr.snapshotSend(monotonicStamp(time.Millisecond)+1, 1000)
+	if snapshot.delivered() != 1234 || !snapshot.applicationLimited() {
+		t.Fatalf("packed snapshot = delivered %d limited %t", snapshot.delivered(), snapshot.applicationLimited())
+	}
+	bbr.applicationLimitedUntil = 0
+	snapshot = bbr.snapshotSend(monotonicStamp(2*time.Millisecond)+1, 1000)
+	if snapshot.applicationLimited() {
+		t.Fatal("unlimited BBR snapshot retained application-limited flag")
+	}
+}
+
+func TestBBRACKAggregationTracksExcessDelivery(t *testing.T) {
 	start := time.Unix(100, 0)
-	bbr := bbrCongestionControl{minimumRTT: 20 * time.Millisecond, sampleStart: start}
-	bbr.observeBandwidth(1000, start, 20*time.Millisecond, 4000, false)
-	bbr.observeBandwidth(1000, start, 20*time.Millisecond, 3000, false)
-	bbr.observeBandwidth(1000, start.Add(5*time.Millisecond), 20*time.Millisecond, 2000, false)
-	if bbr.roundBandwidth != 600_000 {
-		t.Fatalf("batched ACK bandwidth = %v, want 600000", bbr.roundBandwidth)
+	bbr := bbrCongestionControl{bandwidth: 100_000}
+	bbr.updateACKAggregation(bbrRateSample{acked: 5000, delivered: 5000, interval: 10 * time.Millisecond, ackTime: start, valid: true}, 10_000, 1000)
+	if bbr.extraACKed[0] != 5000 {
+		t.Fatalf("extra ACKed = %d, want 5000", bbr.extraACKed[0])
+	}
+	bbr.updateACKAggregation(bbrRateSample{acked: 1000, delivered: 1000, interval: 10 * time.Millisecond, ackTime: start.Add(50 * time.Millisecond), valid: true}, 10_000, 1000)
+	if bbr.ackEpochBytes != 1000 {
+		t.Fatalf("slow ACK epoch retained %d bytes, want reset to 1000", bbr.ackEpochBytes)
+	}
+}
+
+func TestBBRACKAggregationEpochSaturates(t *testing.T) {
+	const mss = 48
+	maximum := uint32((1 << 20) * mss)
+	bbr := bbrCongestionControl{bandwidth: 1}
+	bbr.updateACKAggregation(bbrRateSample{
+		acked: maximum, delivered: maximum, interval: time.Second,
+		ackTime: time.Unix(100, 0), valid: true,
+	}, maximum, mss)
+	if want := uint64(maximum) - 1; bbr.ackEpochBytes != want {
+		t.Fatalf("ACK epoch bytes = %d, want %d", bbr.ackEpochBytes, want)
+	}
+}
+
+func TestBBRProbeBandwidthWaitsForInflightOrLoss(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	cycleStamp := bbrStampAt(monotonicStamp(time.Millisecond) + 1)
+	bbr := bbrCongestionControl{
+		mode: bbrProbeBandwidth, cycleIndex: 0, cycleStamp: cycleStamp,
+		deliveredStamp: cycleStamp + bbrStamp(20*time.Millisecond/time.Microsecond),
+		minimumRTT:     10 * time.Millisecond, bandwidth: 1_000_000, pacingRate: 1_000_000,
+	}
+	sample := bbrRateSample{ackTime: now, priorInFlight: mss, valid: true}
+	bbr.updateCycle(sample, mss)
+	if bbr.cycleIndex != 0 {
+		t.Fatalf("underfilled probe advanced to phase %d", bbr.cycleIndex)
+	}
+	sample.losses = mss
+	bbr.updateCycle(sample, mss)
+	if bbr.cycleIndex != 1 {
+		t.Fatalf("loss-limited probe phase = %d, want 1", bbr.cycleIndex)
+	}
+}
+
+func TestBBRProbeBandwidthUsesDeliveryClock(t *testing.T) {
+	const mss = 1000
+	cycleStamp := bbrStampAt(monotonicStamp(time.Millisecond) + 1)
+	bbr := bbrCongestionControl{
+		mode: bbrProbeBandwidth, cycleIndex: 2, cycleStamp: cycleStamp,
+		deliveredStamp: cycleStamp + bbrStamp(5*time.Millisecond/time.Microsecond),
+		minimumRTT:     10 * time.Millisecond,
+	}
+	bbr.updateCycle(bbrRateSample{ackTime: time.Unix(100, 0)}, mss)
+	if bbr.cycleIndex != 2 {
+		t.Fatalf("zero-delivery ACK advanced ProbeBW phase to %d", bbr.cycleIndex)
+	}
+	bbr.deliveredStamp = cycleStamp + bbrStamp(20*time.Millisecond/time.Microsecond)
+	bbr.updateCycle(bbrRateSample{ackTime: time.Unix(100, 0)}, mss)
+	if bbr.cycleIndex != 3 {
+		t.Fatalf("delivery clock did not advance ProbeBW phase: %d", bbr.cycleIndex)
+	}
+}
+
+func TestBBRLongTermPolicerDetection(t *testing.T) {
+	start := time.Unix(100, 0)
+	bbr := bbrCongestionControl{delivered: 1000, totalLost: 300}
+	bbr.updateLongTermBandwidth(bbrRateSample{losses: 300, ackTime: start})
+	for interval := 1; interval <= 2; interval++ {
+		bbr.longTermRounds = bbrLongTermMinimumRounds
+		bbr.delivered += 10_000
+		bbr.totalLost += 3000
+		bbr.updateLongTermBandwidth(bbrRateSample{losses: 3000, ackTime: start.Add(time.Duration(interval) * time.Second)})
+	}
+	if !bbr.longTermUseBandwidth || bbr.longTermBandwidth != 10_000 {
+		t.Fatalf("policer model = use %t rate %v", bbr.longTermUseBandwidth, bbr.longTermBandwidth)
+	}
+}
+
+func TestBBRPolicerGainOnlyOverridesProbeBandwidth(t *testing.T) {
+	bbr := bbrCongestionControl{longTermUseBandwidth: true}
+	if gain := bbr.pacingGain(); gain != bbrStartupPacingGain {
+		t.Fatalf("policed Startup gain = %v, want %v", gain, bbrStartupPacingGain)
+	}
+	bbr.mode = bbrDrain
+	if gain := bbr.pacingGain(); gain != bbrDrainPacingGain {
+		t.Fatalf("policed Drain gain = %v, want %v", gain, bbrDrainPacingGain)
+	}
+	bbr.mode = bbrProbeBandwidth
+	bbr.cycleIndex = 0
+	if gain := bbr.pacingGain(); gain != 1 {
+		t.Fatalf("policed ProbeBW gain = %v, want 1", gain)
+	}
+}
+
+func TestBBRPacingRateOnlyFallsAfterStartup(t *testing.T) {
+	bbr := bbrCongestionControl{bandwidth: 1_000_000}
+	bbr.setPacingRate(0, 0)
+	initial := bbr.pacingRate
+	bbr.bandwidth = 500_000
+	bbr.setPacingRate(0, 0)
+	if bbr.pacingRate != initial {
+		t.Fatalf("Startup pacing rate fell from %v to %v", initial, bbr.pacingRate)
+	}
+	bbr.fullBandwidthReached = true
+	bbr.setPacingRate(0, 0)
+	if bbr.pacingRate >= initial {
+		t.Fatalf("full-pipe pacing rate remained %v, initial %v", bbr.pacingRate, initial)
+	}
+}
+
+func TestBBRInitialPacingUsesWindowAndSRTT(t *testing.T) {
+	const mss = 1000
+	bbr := bbrCongestionControl{bandwidth: 20_000}
+	bbr.setPacingRate(10*mss, time.Millisecond)
+	want := float64(10*mss) / time.Millisecond.Seconds() * bbrStartupPacingGain * bbrPacingMargin
+	if bbr.pacingRate != want || !bbr.hasSeenRTT {
+		t.Fatalf("initial BBR pacing = %v seen %t, want %v/true", bbr.pacingRate, bbr.hasSeenRTT, want)
+	}
+	bbr.bandwidth = 1000
+	bbr.setPacingRate(10*mss, time.Millisecond)
+	if bbr.pacingRate != want {
+		t.Fatalf("Startup lowered initialized pacing rate to %v", bbr.pacingRate)
+	}
+}
+
+func TestBBRInitialPacingUsesNominalRTTUntilMeasured(t *testing.T) {
+	const mss = 1000
+	bbr := bbrCongestionControl{}
+	bbr.initializePacingRate(10*mss, 0)
+	want := float64(10*mss) / time.Millisecond.Seconds() * bbrStartupPacingGain * bbrPacingMargin
+	if bbr.pacingRate != want || bbr.hasSeenRTT {
+		t.Fatalf("nominal BBR pacing = %v seen %t, want %v/false", bbr.pacingRate, bbr.hasSeenRTT, want)
+	}
+	bbr.setPacingRate(10*mss, 10*time.Millisecond)
+	realWant := float64(10*mss) / (10 * time.Millisecond).Seconds() * bbrStartupPacingGain * bbrPacingMargin
+	if bbr.pacingRate != realWant || !bbr.hasSeenRTT {
+		t.Fatalf("measured BBR pacing = %v seen %t, want %v/true", bbr.pacingRate, bbr.hasSeenRTT, realWant)
+	}
+}
+
+func TestBBRInitialPacingQuantumAllowsTenSegments(t *testing.T) {
+	const mss = 1000
+	start := time.Unix(100, 0)
+	controller := newTCPCongestionController(CongestionControlBBR)
+	controller.bbr.pacingRate = 10_000
+	for segment := 0; segment < tcpPacingInitialBurst; segment++ {
+		if delay := controller.pacingDelay(start, 10*mss, uint32(segment*mss), mss, 100*time.Millisecond, ^uint32(0)); delay != 0 {
+			t.Fatalf("initial segment %d pacing delay = %v", segment+1, delay)
+		}
+		_, _ = controller.onBBRDataSend(mss, mss, start, monotonicStamp(segment+1), uint32(segment*mss), 10*mss)
+	}
+	if delay := controller.pacingDelay(start, 10*mss, 10*mss, mss, 100*time.Millisecond, ^uint32(0)); delay <= 0 {
+		t.Fatalf("post-initial-quantum pacing delay = %v", delay)
 	}
 }
 
@@ -427,16 +676,16 @@ func TestBBRProbeRTTDoesNotRetainOldRoundTarget(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlBBR)
 	controller.bbr.mode = bbrProbeBandwidth
 	controller.bbr.bandwidth = 10 * 1024 * 1024
+	controller.bbr.bandwidthFilter.reset(0, controller.bbr.bandwidth)
 	controller.bbr.minimumRTT = 10 * time.Millisecond
 	controller.bbr.minimumRTTStamp = time.Unix(1, 0)
-	controller.bbr.roundTarget = 1024 * 1024
 	start := time.Unix(100, 0)
 	window := uint32(1024 * 1024)
 	window = controller.onACK(window, mss, mss, start, 10*time.Millisecond, 10*time.Millisecond, window, false)
-	if controller.bbr.mode != bbrProbeRTT || controller.bbr.roundTarget >= 1024*1024 {
-		t.Fatalf("ProbeRTT entry = mode %v round target %d", controller.bbr.mode, controller.bbr.roundTarget)
+	if controller.bbr.mode != bbrProbeRTT {
+		t.Fatalf("ProbeRTT entry mode = %v", controller.bbr.mode)
 	}
-	flight := controller.bbr.roundTarget
+	flight := uint32(1024 * 1024)
 	now := start
 	for controller.bbr.probeDone.IsZero() && flight > 0 {
 		now = now.Add(time.Millisecond)
@@ -453,51 +702,55 @@ func TestBBRProbeRTTDoesNotRetainOldRoundTarget(t *testing.T) {
 }
 
 func TestBBRPacingDelaySaturates(t *testing.T) {
-	controller := bbrCongestionControl{bandwidth: 1e-20}
+	controller := bbrCongestionControl{pacingRate: 1e-20}
 	start := time.Unix(100, 0)
-	controller.onSend(1, 1, start, 1)
+	_, _ = controller.onSend(1, 1, start, 1, 1, 1)
 	if controller.nextSend.Before(start) {
 		t.Fatalf("overflowed BBR pacing deadline = %v", controller.nextSend)
 	}
 }
 
-func TestBBRLateWakeCatchesUpWithoutEndingStartup(t *testing.T) {
+func TestBBRLateWakeRetainsBoundedPacingDebt(t *testing.T) {
 	const mss = 1000
 	start := time.Unix(100, 0)
 	now := start.Add(100 * time.Millisecond)
 	bbr := bbrCongestionControl{
-		mode: bbrProbeBandwidth, cycleIndex: 2, bandwidth: 1_000_000,
+		mode: bbrProbeBandwidth, cycleIndex: 2, bandwidth: 1_000_000, pacingRate: 1_000_000,
 		minimumRTT: 100 * time.Millisecond, minimumRTTStamp: now, nextSend: start,
 	}
 	for segment := 0; segment < 2; segment++ {
 		bbr.advancePacing(mss, mss, now)
 	}
-	if bbr.nextSend != now || !bbr.schedulerLimited {
-		t.Fatalf("late BBR catch-up = next %v limited=%v, want now/true", bbr.nextSend, bbr.schedulerLimited)
+	if bbr.nextSend != now {
+		t.Fatalf("late BBR catch-up = next %v, want %v", bbr.nextSend, now)
 	}
 	bbr.advancePacing(mss, mss, now)
 	if bbr.nextSend != now.Add(time.Millisecond) {
 		t.Fatalf("post-catch-up BBR deadline = %v, want %v", bbr.nextSend, now.Add(time.Millisecond))
 	}
+}
 
-	bbr.mode = bbrStartup
-	bbr.fullBandwidth = bbr.bandwidth
-	bbr.fullRounds = 0
-	bbr.roundTarget = mss
-	bbr.roundBandwidth = bbr.bandwidth
-	_ = bbr.onACK(10*mss, mss, mss, now.Add(10*time.Millisecond), 100*time.Millisecond, 100*time.Millisecond, 10*mss, false)
-	if bbr.fullRounds != 0 || bbr.schedulerLimited {
-		t.Fatalf("scheduler-limited BBR round = full rounds %d limited=%v", bbr.fullRounds, bbr.schedulerLimited)
+func TestBBRLatePacingWakeMarksDeliverySampleLimited(t *testing.T) {
+	const mss = 1000
+	start := time.Unix(100, 0)
+	bbr := bbrCongestionControl{pacingRate: 1_000_000, nextSend: start, delivered: 1000}
+	snapshot, _ := bbr.onSend(mss, mss, start.Add(10*time.Millisecond), 1, 10*mss, 20*mss)
+	if !snapshot.applicationLimited() || bbr.applicationLimitedUntil != 11_000 {
+		t.Fatalf("late-wake snapshot = limited %t boundary %d", snapshot.applicationLimited(), bbr.applicationLimitedUntil)
+	}
+	bbr.markApplicationLimited(mss)
+	if bbr.applicationLimitedUntil != 2_000 {
+		t.Fatalf("refreshed application-limit boundary = %d, want 2000", bbr.applicationLimitedUntil)
 	}
 }
 
 func TestBBRRetransmissionDoesNotCatchUpPacingDebt(t *testing.T) {
 	start := time.Unix(100, 0)
 	now := start.Add(100 * time.Millisecond)
-	bbr := bbrCongestionControl{mode: bbrProbeBandwidth, cycleIndex: 2, bandwidth: 1_000_000, nextSend: start}
+	bbr := bbrCongestionControl{mode: bbrProbeBandwidth, cycleIndex: 2, bandwidth: 1_000_000, pacingRate: 1_000_000, nextSend: start}
 	bbr.advanceRetransmissionPacing(1000, 1000, now)
-	if bbr.nextSend != now.Add(time.Millisecond) || bbr.schedulerLimited {
-		t.Fatalf("retransmission BBR pacing = next %v limited=%v", bbr.nextSend, bbr.schedulerLimited)
+	if bbr.nextSend != now.Add(time.Millisecond) {
+		t.Fatalf("retransmission BBR pacing = next %v", bbr.nextSend)
 	}
 }
 
@@ -520,12 +773,12 @@ func TestBBRWaitsForValidRTTBeforeSampling(t *testing.T) {
 	start := time.Unix(100, 0)
 	window := uint32(10 * mss)
 	window = controller.onACK(window, mss, mss, start, 0, 0, window, true)
-	if !controller.bbr.sampleStart.IsZero() || controller.bbr.bandwidth != 0 {
-		t.Fatalf("BBR sampled without an RTT: start=%v bandwidth=%v", controller.bbr.sampleStart, controller.bbr.bandwidth)
+	if controller.bbr.bandwidth != 0 {
+		t.Fatalf("BBR sampled without an RTT: bandwidth=%v", controller.bbr.bandwidth)
 	}
 	controller.onACK(window, mss, mss, start.Add(time.Millisecond), 10*time.Millisecond, 10*time.Millisecond, window, true)
-	if controller.bbr.sampleStart.IsZero() || controller.bbr.bandwidth == 0 {
-		t.Fatalf("BBR did not bootstrap from the first valid RTT: start=%v bandwidth=%v", controller.bbr.sampleStart, controller.bbr.bandwidth)
+	if controller.bbr.bandwidth == 0 {
+		t.Fatal("BBR did not bootstrap from the first valid RTT")
 	}
 }
 
@@ -534,15 +787,41 @@ func TestBBRStartupIgnoresRoundsWithoutBandwidthSamples(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlBBR)
 	start := time.Unix(100, 0)
 	window := uint32(10 * mss)
-	window = controller.onACK(window, mss, mss, start, 100*time.Millisecond, 100*time.Millisecond, window, true)
-	controller.bbr.roundBandwidth = 0
+	window = controller.onACK(window, mss, mss, start, 0, 100*time.Millisecond, window, true)
 	for round := 0; round < bbrFullBandwidthRounds+1; round++ {
-		controller.bbr.roundTarget = mss
-		window = controller.onACK(window, mss, mss, start, 100*time.Millisecond, 0, window, false)
-		controller.bbr.roundBandwidth = 0
+		window = controller.onACK(window, mss, mss, start, 0, 0, window, false)
 	}
 	if controller.bbr.fullRounds != 0 || controller.bbr.mode != bbrStartup {
 		t.Fatalf("BBR counted sampleless rounds: fullRounds=%d mode=%v", controller.bbr.fullRounds, controller.bbr.mode)
+	}
+}
+
+func TestBBRStartupPublishesDrainThreshold(t *testing.T) {
+	const mss = 1000
+	controller := newTCPCongestionController(CongestionControlBBR)
+	controller.bbr.fullBandwidthReached = true
+	controller.bbr.bandwidth = 1_000_000
+	controller.bbr.minimumRTT = 10 * time.Millisecond
+	controller.bbr.minimumRTTStamp = time.Unix(100, 0)
+	want := uint32(controller.bbr.quantizeWindowAt(controller.bbr.modelWindowForBandwidth(controller.bbr.bandwidth, 1, mss), mss, false))
+	window, threshold := controller.onBBRRateSample(100*mss, mss, bbrRateSample{
+		priorInFlight: 100 * mss, inFlight: 100 * mss, ackTime: time.Unix(100, 0),
+	})
+	if controller.bbr.mode != bbrDrain || window != 100*mss || threshold != want {
+		t.Fatalf("BBR drain publication = mode %v window %d threshold %d, want DRAIN/%d/%d", controller.bbr.mode, window, threshold, 100*mss, want)
+	}
+}
+
+func TestBBRStartupProbeRTTDoesNotPublishDrainThreshold(t *testing.T) {
+	const mss = 1000
+	controller := newTCPCongestionController(CongestionControlBBR)
+	controller.bbr.minimumRTT = 10 * time.Millisecond
+	controller.bbr.minimumRTTStamp = time.Unix(100, 0)
+	_, threshold := controller.onBBRRateSample(10*mss, mss, bbrRateSample{
+		ackTime: time.Unix(100, 0).Add(bbrMinRTTWindow + time.Second),
+	})
+	if controller.bbr.mode != bbrProbeRTT || threshold != 0 {
+		t.Fatalf("Startup ProbeRTT = mode %v threshold %d", controller.bbr.mode, threshold)
 	}
 }
 
@@ -565,7 +844,7 @@ func TestBBRExpiredMinimumRTTCanIncrease(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlBBR)
 	start := time.Unix(100, 0)
 	controller.bbr.minimumRTT = 10 * time.Millisecond
-	controller.bbr.minimumRTTStamp = start.Add(-bbrMinRTTWindow)
+	controller.bbr.minimumRTTStamp = start.Add(-bbrMinRTTWindow - time.Nanosecond)
 	controller.bbr.bandwidth = 100000
 	controller.onACK(10*mss, mss, mss, start, 30*time.Millisecond, 30*time.Millisecond, 2*mss, false)
 	if controller.bbr.minimumRTT != 30*time.Millisecond || controller.bbr.mode != bbrProbeRTT {
@@ -576,16 +855,37 @@ func TestBBRExpiredMinimumRTTCanIncrease(t *testing.T) {
 	}
 }
 
+func TestBBRExpiredMinimumRTTIgnoresDelayedACK(t *testing.T) {
+	bbr := bbrCongestionControl{
+		mode: bbrProbeBandwidth, minimumRTT: 10 * time.Millisecond,
+		minimumRTTStamp: time.Unix(100, 0), idleRestart: true,
+	}
+	now := bbr.minimumRTTStamp.Add(bbrMinRTTWindow + time.Nanosecond)
+	window := bbr.updateMinimumRTT(10_000, bbrRateSample{ackTime: now, rtt: 30 * time.Millisecond, ackDelayed: true}, 1000)
+	if bbr.minimumRTT != 10*time.Millisecond || window != 10_000 {
+		t.Fatalf("delayed ACK replaced expired min RTT: min %v window %d", bbr.minimumRTT, window)
+	}
+	bbr.updateMinimumRTT(window, bbrRateSample{ackTime: now, rtt: 5 * time.Millisecond, ackDelayed: true}, 1000)
+	if bbr.minimumRTT != 5*time.Millisecond {
+		t.Fatalf("lower delayed-ACK RTT was ignored: min %v", bbr.minimumRTT)
+	}
+}
+
 func TestBBRIdleRestartResetsSamplingInterval(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlBBR)
 	controller.bbr.bandwidth = 100000
-	controller.bbr.sampleStart = time.Unix(100, 0)
-	controller.bbr.sampleBytes = 1000
+	controller.bbr.pacingRate = 100000
+	controller.bbr.firstSent = 10
+	controller.bbr.deliveredStamp = 10
 	controller.bbr.nextSend = time.Unix(200, 0)
 	now := time.Unix(150, 0)
-	controller.onDataSend(1000, 1000, now, 10000, 0, 10*time.Millisecond, ^uint32(0))
-	if !controller.bbr.sampleStart.IsZero() || controller.bbr.sampleBytes != 0 || controller.bbr.nextSend.Before(now) || !controller.bbr.idleRestart {
-		t.Fatalf("BBR idle restart state = start %v bytes %d next %v", controller.bbr.sampleStart, controller.bbr.sampleBytes, controller.bbr.nextSend)
+	stamp := monotonicStamp(20*time.Microsecond) + 1
+	snapshot, _ := controller.onBBRDataSend(1000, 1000, now, stamp, 0, 10_000)
+	if snapshot.firstSent != bbrStampAt(stamp) || snapshot.deliveredStamp != bbrStampAt(stamp) || controller.bbr.nextSend.Before(now) || !controller.bbr.idleRestart {
+		t.Fatalf("BBR idle restart state = first %d delivered %d next %v", snapshot.firstSent, snapshot.deliveredStamp, controller.bbr.nextSend)
+	}
+	if controller.bbr.ackEpochStamp != now || controller.bbr.ackEpochBytes != 0 {
+		t.Fatalf("BBR idle ACK epoch = %v/%d, want %v/0", controller.bbr.ackEpochStamp, controller.bbr.ackEpochBytes, now)
 	}
 }
 
@@ -596,11 +896,15 @@ func TestBBRIdleRestartUsesNeutralPacingAndSkipsProbeRTT(t *testing.T) {
 	controller.bbr.mode = bbrProbeBandwidth
 	controller.bbr.cycleIndex = 0
 	controller.bbr.bandwidth = 100000
+	controller.bbr.pacingRate = 100000
 	controller.bbr.minimumRTT = 10 * time.Millisecond
 	controller.bbr.minimumRTTStamp = start.Add(-bbrMinRTTWindow)
-	controller.onDataSend(mss, mss, start, 10*mss, 0, 10*time.Millisecond, ^uint32(0))
-	if gain := controller.bbr.pacingGain(); gain != 1 {
-		t.Fatalf("BBR idle restart pacing gain = %v, want 1", gain)
+	_, _ = controller.onBBRDataSend(mss, mss, start, 1, 0, 10*mss)
+	if gain := controller.bbr.pacingGain(); gain != bbrProbeBandwidthGains[0] {
+		t.Fatalf("BBR idle restart saved pacing gain = %v, want %v", gain, bbrProbeBandwidthGains[0])
+	}
+	if controller.bbr.pacingRate != controller.bbr.bandwidth*bbrPacingMargin {
+		t.Fatalf("BBR idle restart pacing rate = %v, want %v", controller.bbr.pacingRate, controller.bbr.bandwidth*bbrPacingMargin)
 	}
 	controller.onACK(10*mss, mss, mss, start.Add(10*time.Millisecond), 10*time.Millisecond, 10*time.Millisecond, mss, false)
 	if controller.bbr.mode == bbrProbeRTT || controller.bbr.idleRestart {
@@ -608,23 +912,169 @@ func TestBBRIdleRestartUsesNeutralPacingAndSkipsProbeRTT(t *testing.T) {
 	}
 }
 
-func TestBBRRecoveryACKUpdatesModelWithoutApplyingModelWindow(t *testing.T) {
+func TestBBRIdleRestartRetainsProbeBandwidthPhase(t *testing.T) {
+	const mss = 1000
+	start := time.Unix(100, 0)
+	cycleStamp := bbrStampAt(monotonicStamp(time.Millisecond) + 1)
+	bbr := bbrCongestionControl{
+		mode: bbrProbeBandwidth, cycleIndex: 0, cycleStamp: cycleStamp,
+		deliveredStamp: cycleStamp + bbrStamp(20*time.Millisecond/time.Microsecond),
+		minimumRTT:     10 * time.Millisecond, minimumRTTStamp: start,
+		bandwidth: 1_000_000, pacingRate: 1_000_000, idleRestart: true,
+	}
+	bbr.bandwidthFilter.reset(0, bbr.bandwidth)
+	sample := bbrRateSample{
+		priorDelivered: 1, delivered: mss, acked: mss,
+		priorInFlight: mss, inFlight: 0, interval: 10 * time.Millisecond,
+		rtt: 10 * time.Millisecond, smoothedRTT: 10 * time.Millisecond,
+		ackTime: start, applicationLimited: true, valid: true,
+	}
+	bbr.delivered = mss + 1
+	_, _ = bbr.onRateSample(10*mss, mss, sample)
+	if bbr.cycleIndex != 0 {
+		t.Fatalf("idle restart advanced underfilled high-gain phase to %d", bbr.cycleIndex)
+	}
+	if bbr.idleRestart {
+		t.Fatal("delivery ACK retained idle-restart state")
+	}
+}
+
+func TestBBRIdleRestartCompletesProbeRTT(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	bbr := bbrCongestionControl{
+		mode: bbrProbeRTT, fullBandwidthReached: true, priorWindow: 20 * mss,
+		probeDone: now.Add(-time.Millisecond), applicationLimitedUntil: 1,
+		bandwidth: 1_000_000, pacingRate: 1_000_000,
+	}
+	_, window := bbr.onSend(mss, mss, now, 1, 0, bbrMinimumCongestionMSS*mss)
+	if bbr.mode != bbrProbeBandwidth || window != 20*mss || bbr.minimumRTTStamp != now {
+		t.Fatalf("idle ProbeRTT exit = mode %v window %d stamp %v", bbr.mode, window, bbr.minimumRTTStamp)
+	}
+}
+
+func TestBBRPacketConservationEndsAfterOneRound(t *testing.T) {
+	const mss = 1000
+	bbr := bbrCongestionControl{
+		mode: bbrProbeBandwidth, bandwidth: 1_000_000, minimumRTT: 10 * time.Millisecond,
+		minimumRTTStamp: time.Unix(100, 0), fullBandwidthReached: true, priorWindow: 20 * mss,
+	}
+	bbr.bandwidthFilter.reset(0, bbr.bandwidth)
+	bbr.delivered = 2 * mss
+	start := time.Unix(100, 0)
+	sample := bbrRateSample{
+		priorDelivered: 0, delivered: 2 * mss, acked: 2 * mss,
+		priorInFlight: 10 * mss, inFlight: 8 * mss, interval: 10 * time.Millisecond,
+		rtt: 10 * time.Millisecond, ackTime: start, fastRecovery: true, recovery: true, valid: true,
+	}
+	window, _ := bbr.onRateSample(20*mss, mss, sample)
+	if !bbr.recovery || !bbr.packetConservation || window != 10*mss {
+		t.Fatalf("BBR recovery entry = recovery %t conservation %t window %d", bbr.recovery, bbr.packetConservation, window)
+	}
+	bbr.delivered += 2 * mss
+	sample.priorDelivered = uint32(bbr.delivered - 2*mss)
+	sample.inFlight = 6 * mss
+	sample.ackTime = start.Add(10 * time.Millisecond)
+	window, _ = bbr.onRateSample(window, mss, sample)
+	if bbr.packetConservation {
+		t.Fatal("BBR retained packet conservation after a packet-timed round")
+	}
+	sample.fastRecovery = false
+	sample.recovery = false
+	sample.acked = mss
+	sample.delivered = mss
+	sample.inFlight = 5 * mss
+	sample.ackTime = start.Add(20 * time.Millisecond)
+	window, _ = bbr.onRateSample(window, mss, sample)
+	if bbr.recovery || window != 21*mss {
+		t.Fatalf("BBR recovery exit = recovery %t window %d, want false/%d", bbr.recovery, window, 21*mss)
+	}
+}
+
+func TestBBRZeroDeliveryLossSampleDefersPacketConservation(t *testing.T) {
+	const mss = 1000
+	bbr := bbrCongestionControl{priorWindow: 20 * mss}
+	window, _ := bbr.onRateSample(20*mss, mss, bbrRateSample{
+		losses: mss, priorInFlight: 10 * mss, inFlight: 9 * mss,
+		ackTime: time.Unix(100, 0), recovery: true, fastRecovery: true,
+	})
+	if bbr.recovery || bbr.packetConservation || window != 20*mss {
+		t.Fatalf("zero-delivery loss sample recovery = %t/%t window %d", bbr.recovery, bbr.packetConservation, window)
+	}
+}
+
+func TestBBRLossSamplingSeparatesACKAndTimerEvents(t *testing.T) {
+	controller := newTCPCongestionController(CongestionControlBBR)
+	controller.noteLoss(1000, false)
+	var sample bbrRateSample
+	controller.finishBBRRateSample(&sample, 0, 0, 0, time.Unix(100, 0), 1, 0, 0, 0)
+	if sample.losses != 0 {
+		t.Fatalf("timer loss repeated on ACK as %d bytes", sample.losses)
+	}
+	controller.noteLoss(500, true)
+	controller.finishBBRRateSample(&sample, 0, 0, 0, time.Unix(101, 0), 2, 0, 0, 0)
+	if sample.losses != 500 {
+		t.Fatalf("ACK loss sample = %d, want 500", sample.losses)
+	}
+}
+
+func TestBBRTimeoutRestoresWindowOnlyAfterLossRecovery(t *testing.T) {
 	const mss = 1000
 	controller := newTCPCongestionController(CongestionControlBBR)
-	start := time.Unix(100, 0)
-	window := uint32(10 * mss)
-	controller.observeRecoveryACK(window, 2*mss, mss, start, 100*time.Millisecond, 100*time.Millisecond, window, false)
-	if controller.bbr.bandwidth == 0 || controller.bbr.minimumRTT != 100*time.Millisecond {
-		t.Fatalf("recovery ACK model = bandwidth %v min_rtt %v", controller.bbr.bandwidth, controller.bbr.minimumRTT)
+	controller.bbr.recovery = true
+	controller.bbr.packetConservation = true
+	controller.bbr.fullBandwidth = 1_000_000
+	controller.bbr.fullRounds = 2
+	now := time.Unix(100, 0)
+	if threshold := controller.onTimeout(20*mss, 10*mss, mss, now); threshold != 20*mss {
+		t.Fatalf("BBR timeout threshold = %d, want %d", threshold, 20*mss)
 	}
-	if window != 10*mss {
-		t.Fatalf("model-only recovery update changed caller window to %d", window)
+	if controller.bbr.recovery || !controller.bbr.lossRecovery || controller.bbr.packetConservation || controller.bbr.fullBandwidth != 0 || !controller.bbr.roundStart || !controller.bbr.longTermSampling {
+		t.Fatalf("BBR timeout state = recovery %t loss %t conservation %t full_bw %v round %t policer %t", controller.bbr.recovery, controller.bbr.lossRecovery, controller.bbr.packetConservation, controller.bbr.fullBandwidth, controller.bbr.roundStart, controller.bbr.longTermSampling)
 	}
+	sample := bbrRateSample{acked: mss, delivered: mss, recovery: true, ackTime: now.Add(time.Millisecond)}
+	if window := controller.bbr.setCongestionWindow(mss, sample, mss); window != bbrMinimumCongestionMSS*mss || !controller.bbr.lossRecovery {
+		t.Fatalf("BBR active loss window/state = %d/%t", window, controller.bbr.lossRecovery)
+	}
+	sample.recovery = false
+	if window := controller.bbr.setCongestionWindow(mss, sample, mss); window != 21*mss || controller.bbr.lossRecovery {
+		t.Fatalf("BBR completed loss window/state = %d/%t, want %d/false", window, controller.bbr.lossRecovery, 21*mss)
+	}
+}
 
-	reno := newTCPCongestionController(CongestionControlReno)
-	reno.observeRecoveryACK(window, mss, mss, start, 100*time.Millisecond, 100*time.Millisecond, window, false)
-	if reno.renoCredit != 0 {
-		t.Fatalf("Reno recovery observation changed credit to %v", reno.renoCredit)
+func TestBBRSpuriousRecoveryUndoRetainsDeliveryAccounting(t *testing.T) {
+	prior := newTCPCongestionController(CongestionControlBBR)
+	prior.bbr.delivered = 1000
+	var undo tcpRecoveryUndo
+	undo.begin(false, 2000, 20_000, 20_000, 10_000, prior, rttEstimator{})
+	current := prior
+	current.bbr.delivered = 5000
+	current.bbr.bandwidth = 1_000_000
+	current.bbr.fullBandwidth = 1_000_000
+	current.bbr.fullRounds = 2
+	current.bbr.longTermSampling = true
+	current.bbr.recovery = true
+	current.bbr.packetConservation = true
+	_, _, restored := undo.restore(10_000, 1000, 1000, current, time.Unix(100, 0))
+	if restored.bbr.delivered != current.bbr.delivered || restored.bbr.bandwidth != current.bbr.bandwidth {
+		t.Fatalf("BBR undo rewound delivery model: delivered %d bandwidth %v", restored.bbr.delivered, restored.bbr.bandwidth)
+	}
+	if restored.bbr.fullBandwidth != 0 || restored.bbr.fullRounds != 0 || restored.bbr.longTermSampling || restored.bbr.recovery || restored.bbr.lossRecovery || restored.bbr.packetConservation {
+		t.Fatalf("BBR undo state = full %v/%d policer %t recovery %t/%t/%t", restored.bbr.fullBandwidth, restored.bbr.fullRounds, restored.bbr.longTermSampling, restored.bbr.recovery, restored.bbr.lossRecovery, restored.bbr.packetConservation)
+	}
+}
+
+func TestBBRSaveWindowReplacesStaleOpenState(t *testing.T) {
+	bbr := bbrCongestionControl{priorWindow: 20_000}
+	bbr.saveWindow(10_000)
+	if bbr.priorWindow != 10_000 {
+		t.Fatalf("open-state prior window = %d, want 10000", bbr.priorWindow)
+	}
+	bbr.recovery = true
+	bbr.saveWindow(8_000)
+	bbr.saveWindow(12_000)
+	if bbr.priorWindow != 12_000 {
+		t.Fatalf("recovery prior window = %d, want 12000", bbr.priorWindow)
 	}
 }
 
@@ -653,6 +1103,37 @@ func TestTCPSelectableCongestionControls(t *testing.T) {
 			writeAndReadTCPEcho(t, connection, make([]byte, 64*1024))
 		})
 	}
+}
+
+func TestTCPBBRPartialCumulativeACKProducesRateSample(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.88")
+	remote := netip.MustParseAddr("192.0.2.89")
+	link, stack := newTestStack(t, local, remote)
+	defer stack.Close()
+	link.mu.Lock()
+	link.echoTCP = true
+	link.partialTCPACK = 500
+	link.delayTCPACK = 5 * time.Millisecond
+	link.mu.Unlock()
+	if err := stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+		TCP:            TCPSocketDefaults{CongestionControl: CongestionControlBBR},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 8288))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err = connection.Write(make([]byte, 1000)); err != nil {
+		t.Fatal(err)
+	}
+	tcpConnection := connection.(*TCPConn)
+	waitFor(t, time.Second, func() bool {
+		info := tcpConnection.Info()
+		return info.BytesAcknowledged == 500 && info.DeliveryRate != 0
+	})
 }
 
 func TestTCPControllerChangePreservesCongestionState(t *testing.T) {

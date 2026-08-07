@@ -517,11 +517,42 @@ func TestTCPReadDequeReleasesLargeMetadataBurst(t *testing.T) {
 		buffer.append([]byte{byte(index)})
 	}
 	destination := make([]byte, buffer.size)
-	if n := buffer.read(destination, len(destination)); n != len(destination) {
+	if n := buffer.read(destination, len(destination), nil); n != len(destination) {
 		t.Fatalf("deque read = %d, want %d", n, len(destination))
 	}
 	if buffer.chunks != nil {
 		t.Fatalf("large drained deque retained capacity %d", cap(buffer.chunks))
+	}
+}
+
+func TestTCPSegmentQueueReusesOneReceivePayload(t *testing.T) {
+	queue := newTCPSegmentQueue()
+	first := bytes.Repeat([]byte{0x31}, 1500)
+	if !queue.enqueueCopy(tcpSegment{}, first) {
+		t.Fatal("first copied segment was rejected")
+	}
+	segment, ok := queue.dequeue()
+	if !ok || !bytes.Equal(segment.payload, first) {
+		t.Fatal("first copied segment payload mismatch")
+	}
+	backing := &segment.payload[0]
+	queue.recyclePayload(segment.payload)
+	second := bytes.Repeat([]byte{0x52}, 1500)
+	if !queue.enqueueCopy(tcpSegment{}, second) {
+		t.Fatal("second copied segment was rejected")
+	}
+	segment, ok = queue.dequeue()
+	if !ok || !bytes.Equal(segment.payload, second) || &segment.payload[0] != backing {
+		t.Fatal("receive payload backing was not safely reused")
+	}
+	queue.recyclePayload(segment.payload)
+	queue.bytes = tcpInboundByteCapacity
+	if allocations := testing.AllocsPerRun(100, func() {
+		if queue.enqueueCopy(tcpSegment{}, second[:1]) {
+			t.Fatal("full actor queue accepted another payload")
+		}
+	}); allocations != 0 {
+		t.Fatalf("full-queue drop allocations = %v, want 0", allocations)
 	}
 }
 
@@ -1357,6 +1388,41 @@ func TestTCPPLPMTURequiresIsolatedLossEvidence(t *testing.T) {
 	}
 }
 
+func TestTCPProvenLossAccountingUsesTransmissionGenerations(t *testing.T) {
+	speculative := sentTCPSegment{sequence: 0, end: 1000, transmissions: 1}
+	if loss := recordTCPSegmentLoss(&speculative, false); loss != 0 || speculative.lossReported != 0 {
+		t.Fatalf("speculative retransmission loss = %d, generation %d", loss, speculative.lossReported)
+	}
+	segments := []sentTCPSegment{
+		{sequence: 0, end: 1000, transmissions: 1},
+		{sequence: 1000, end: 2000, transmissions: 1},
+		{sequence: 2000, end: 3000, transmissions: 1, sacked: true},
+		{sequence: 3000, end: 4000, transmissions: 1, sacked: true},
+		{sequence: 4000, end: 5000, transmissions: 1, sacked: true},
+	}
+	if losses := recordProvenTCPLosses(segments, 1000); losses != 2000 {
+		t.Fatalf("initial proven losses = %d, want 2000", losses)
+	}
+	if losses := recordProvenTCPLosses(segments, 1000); losses != 0 {
+		t.Fatalf("repeated proven losses = %d", losses)
+	}
+	segments[0].transmissions++
+	segments[0].sackRetried = true
+	if losses := recordProvenTCPLosses(segments, 1000); losses != 0 {
+		t.Fatalf("speculative replacement loss = %d", losses)
+	}
+	segments[0].rackLost = true
+	if losses := recordProvenTCPLosses(segments, 1000); losses != 1000 {
+		t.Fatalf("RACK-proven replacement loss = %d, want 1000", losses)
+	}
+	segments[0].transmissions = ^uint16(0)
+	segments[0].lossReported = ^uint16(0)
+	segments[0].advanceTransmissionGeneration()
+	if segments[0].transmissions != 1 || segments[0].lossReported != 0 {
+		t.Fatalf("wrapped transmission generation = %d/%d, want 1/0", segments[0].transmissions, segments[0].lossReported)
+	}
+}
+
 func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlCUBIC)
 	rtt := rttEstimator{initialized: true, srtt: 100 * time.Millisecond, variation: 20 * time.Millisecond, rto: time.Second}
@@ -1371,7 +1437,7 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 		t.Fatal("Eifel rejected conservative timestamp and prior-DSACK evidence")
 	}
 	response := eifel.eifelRTOResponse()
-	window, threshold, restoredController := eifel.restore(6000, 4000, 1000)
+	window, threshold, restoredController := eifel.restore(6000, 4000, 1000, controller, time.Unix(100, 0))
 	if window != 10000 || threshold != 10000 || restoredController.algorithm != CongestionControlCUBIC {
 		t.Fatalf("Eifel restore = cwnd %d ssthresh %d controller %q", window, threshold, restoredController.algorithm)
 	}
@@ -1384,7 +1450,7 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	}
 	var highThreshold tcpRecoveryUndo
 	highThreshold.begin(false, 4000, 12000, 18000, 10000, controller, rtt)
-	_, threshold, _ = highThreshold.restore(6000, 0, 1000)
+	_, threshold, _ = highThreshold.restore(6000, 0, 1000, controller, time.Unix(100, 0))
 	if threshold != 18000 {
 		t.Fatalf("RFC 4015 pipe_prev = %d, want max(FlightSize, ssthresh) = 18000", threshold)
 	}
@@ -2675,10 +2741,10 @@ func TestTCPOutOfOrderFINWaitsForSequenceGap(t *testing.T) {
 func TestTCPPartialACKCanLeaveFINOnly(t *testing.T) {
 	segment := sentTCPSegment{
 		sequence: 100, end: 104, flags: tcpFlagACK | tcpFlagPSH | tcpFlagFIN,
-		cwr: true,
+		cwr: true, rate: bbrRateSnapshot{deliveredStamp: 1},
 	}
 	trimAcknowledgedTCPSegment(&segment, 103)
-	if segment.sequence != 103 || segment.end != 104 || segment.dataSize() != 0 || segment.flags&tcpFlagFIN == 0 || segment.flags&tcpFlagPSH != 0 || segment.cwr {
+	if segment.sequence != 103 || segment.end != 104 || segment.dataSize() != 0 || segment.flags&tcpFlagFIN == 0 || segment.flags&tcpFlagPSH != 0 || segment.cwr || segment.rate.deliveredStamp == 0 {
 		t.Fatalf("FIN-only remainder = %+v", segment)
 	}
 }
@@ -3051,15 +3117,16 @@ func TestTCPDSACKParsing(t *testing.T) {
 // TestTCPRepeatedSACKIsNotNewInformation verifies that an unchanged SACK
 // block cannot repeatedly inflate duplicate-ACK recovery.
 func TestTCPRepeatedSACKIsNotNewInformation(t *testing.T) {
-	outstanding := []sentTCPSegment{{sequence: 100, end: 200}, {sequence: 200, end: 300}}
+	outstanding := []sentTCPSegment{{sequence: 100, end: 200}, {sequence: 200, end: 300, rate: bbrRateSnapshot{deliveredStamp: 1}}}
 	blocks := []tcpSACKBlock{{left: 200, right: 300}}
 	var present, fresh bool
-	outstanding, _, present, fresh, _, _ = applyTCPSACK(outstanding, blocks)
-	if !present || !fresh {
+	var delivered []sentTCPSegment
+	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks)
+	if !present || !fresh || len(delivered) != 1 || delivered[0].rate.deliveredStamp == 0 || outstanding[1].rate.deliveredStamp != 0 {
 		t.Fatalf("first SACK state = present %t, fresh %t; want true, true", present, fresh)
 	}
-	outstanding, _, present, fresh, _, _ = applyTCPSACK(outstanding, blocks)
-	if !present || fresh {
+	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks)
+	if !present || fresh || len(delivered) != 0 {
 		t.Fatalf("repeated SACK state = present %t, fresh %t; want true, false", present, fresh)
 	}
 }

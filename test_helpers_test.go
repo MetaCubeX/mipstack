@@ -77,6 +77,8 @@ type testPacketLink struct {
 	advertisedTCPWindow   uint16
 	markTCPCE             bool
 	sendTCPECE            bool
+	partialTCPACK         int
+	delayTCPACK           time.Duration
 
 	mu                     sync.Mutex
 	tcp                    map[uint16]*testTCPPeer
@@ -595,6 +597,17 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 	acknowledgement := peer.clientNext
 	serverSequence := peer.serverNext
 	window := uint16(65535)
+	delay := l.delayTCPACK
+	if l.partialTCPACK > 0 {
+		pendingBytes := 0
+		for _, part := range pending {
+			pendingBytes += len(part)
+		}
+		if l.partialTCPACK < pendingBytes {
+			acknowledgement -= uint32(pendingBytes - l.partialTCPACK)
+		}
+		l.partialTCPACK = 0
+	}
 	if l.useTCPWindow {
 		window = l.advertisedTCPWindow
 	}
@@ -602,6 +615,9 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 		peer.serverNext += uint32(len(part))
 	}
 	l.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	type responsePart struct {
 		sequence uint32
 		payload  []byte

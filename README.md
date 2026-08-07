@@ -299,10 +299,11 @@ delivery to the embedding device, so `SetWriteBuffer` is a validated no-op.
 `TCPConn.Info` returns a consistent live diagnostic snapshot from the
 connection actor and retains the final snapshot after close. It includes RFC
 9293 state, endpoints, negotiated extensions, RTT/RTO, congestion controller,
-cwnd and ssthresh, peer/receive windows, bytes in flight, path MTU and active
-probe state, buffer occupancy and automatic limits, byte counters, recovery
-state, inherited keepalive/Nagle/DSCP/Flow Label policies, window-scale values,
-and connection-local retransmission, PMTU-probe, and spurious-recovery counters.
+cwnd and ssthresh, peer/receive windows, bytes in flight, BBR delivery and
+pacing rates and mode, path MTU and active probe state, buffer occupancy and
+automatic limits, byte counters, recovery state, inherited
+keepalive/Nagle/DSCP/Flow Label policies, window-scale values, and
+connection-local retransmission, PMTU-probe, and spurious-recovery counters.
 It also reports the current and peak byte-bounded actor queue occupancy and
 queue drops, making scheduler or embedding-link backpressure distinguishable
 from network loss.
@@ -357,6 +358,22 @@ DSACK accounting detect spurious fast retransmits and timeouts, while the RFC
 conservative after a spurious timeout. TCP also handles overlap-aware receive
 reassembly, data-bearing zero-window probes, reset validation, deadlines,
 half-close, FIN states, and TIME_WAIT.
+
+BBR is a byte-scaled implementation of Linux BBRv1. Each original or
+retransmitted range carries a Linux-style delivery snapshot; ACK processing
+uses the longer send and acknowledgement phase, a three-candidate ten-round
+windowed maximum, and a ten-second minimum-RTT filter. Startup, Drain, ProbeBW,
+and ProbeRTT use the Linux fixed-point gains, randomized ProbeBW phase, ACK
+aggregation allowance, token-bucket policer detection, idle restart, and
+first-round packet conservation. SACK and RACK remain responsible for proving
+loss and selecting retransmissions; transmission-generation accounting keeps
+merely speculative retransmissions out of BBR's loss model until a replacement
+generation is independently proven lost, and excludes isolated PLPMTU probe
+failures. BBR owns pacing and cwnd rather than duplicating the common recovery
+machinery. Since a Go connection actor does not have kernel fq pacing, a
+materially late pacing wake is marked locally limited and bounded to one send
+quantum so scheduler delay cannot become a false low path-bandwidth sample or
+an unbounded catch-up burst.
 
 RTT sampling uses packet arrival time rather than actor scheduling time. Its
 minimum is the Linux-style three-sample running minimum over a 300-second

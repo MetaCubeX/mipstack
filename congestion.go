@@ -1,6 +1,7 @@
 package mipstack
 
 import (
+	"crypto/rand"
 	"math"
 	"time"
 )
@@ -35,16 +36,41 @@ const (
 	bbrMinRTTWindow = 10 * time.Second
 	// bbrProbeRTTDuration is the minimum time spent with a reduced flight size.
 	bbrProbeRTTDuration = 200 * time.Millisecond
-	// bbrStartupPacingGain rapidly fills an initially unknown path.
-	bbrStartupPacingGain = 2.885
-	// bbrDrainPacingGain removes the Startup queue at the reciprocal gain.
-	bbrDrainPacingGain = 1 / bbrStartupPacingGain
+	// bbrStartupPacingGain rapidly fills an initially unknown path. Linux's
+	// fixed-point BBR_UNIT representation evaluates to 739/256.
+	bbrStartupPacingGain = 739.0 / 256
+	// bbrDrainPacingGain removes the Startup queue using Linux's 88/256 value.
+	bbrDrainPacingGain = 88.0 / 256
 	// bbrCongestionWindowGain retains two estimated bandwidth-delay products.
 	bbrCongestionWindowGain = 2.0
 	// bbrFullBandwidthGrowth is the minimum meaningful round-to-round growth.
 	bbrFullBandwidthGrowth = 1.25
 	// bbrMinimumCongestionMSS is the ProbeRTT and model-target window floor.
 	bbrMinimumCongestionMSS = 4
+	// bbrInitialCongestionMSS is Linux TCP_INIT_CWND, used when BBR has no
+	// valid propagation-delay sample.
+	bbrInitialCongestionMSS = 10
+	// bbrPacingMargin keeps the average pacing rate one percent below the
+	// estimated bottleneck bandwidth, matching Linux BBRv1.
+	bbrPacingMargin = 0.99
+	// bbrLongTermMinimumRounds is the minimum policer sampling interval.
+	bbrLongTermMinimumRounds = 4
+	// bbrLongTermMaximumRounds bounds one policer sampling interval.
+	bbrLongTermMaximumRounds = 4 * bbrLongTermMinimumRounds
+	// bbrLongTermUseRounds periodically leaves policer mode to probe again.
+	bbrLongTermUseRounds = 48
+	// bbrLongTermLossRatio is Linux BBRv1's fixed-point loss threshold. Its
+	// documented 20 percent value is represented as 50/256 in the kernel.
+	bbrLongTermLossRatio = 50.0 / 256
+	// bbrLongTermBandwidthRatio accepts estimates within one eighth.
+	bbrLongTermBandwidthRatio = 1.0 / 8
+	// bbrLongTermBandwidthDifference is the absolute 4 Kbit/s allowance after
+	// Linux's one-percent rate margin is applied.
+	bbrLongTermBandwidthDifference = (4000.0 / 8) / bbrPacingMargin
+	// bbrExtraACKedWindow rotates its two aggregation maxima every five rounds.
+	bbrExtraACKedWindow = 5
+	// bbrExtraACKedMaximumInterval caps aggregation allowance at 100 ms of bw.
+	bbrExtraACKedMaximumInterval = 100 * time.Millisecond
 	// tcpPacingInitialBurst matches Linux fq's unpaced first ten segments.
 	tcpPacingInitialBurst = 10
 	// tcpUserspacePacingQuantum amortizes connection-actor timer wakes and
@@ -57,6 +83,8 @@ const (
 	// stack does not create a GSO packet, but may release this many paced bytes
 	// from one connection actor before waiting again.
 	bbrMaximumSendQuantum = 65535
+	// bbrMaximumSendSegments is Linux's per-GSO segment-count cap.
+	bbrMaximumSendSegments = 127
 )
 
 // bbrProbeBandwidthGains cycles above, below, and at the estimated bottleneck
@@ -183,7 +211,13 @@ func (h *tcpHyStart) onACK(acknowledgement, sendNext, acknowledged uint32, sampl
 
 // newTCPCongestionController constructs one per-connection controller.
 func newTCPCongestionController(algorithm CongestionControl) tcpCongestionController {
-	return tcpCongestionController{algorithm: algorithm}
+	controller := tcpCongestionController{algorithm: algorithm}
+	if algorithm == CongestionControlBBR {
+		// Linux starts with a bubble in the pipe so early samples cannot lower
+		// an established bandwidth model. A high sample is still accepted.
+		controller.bbr.applicationLimitedUntil = 1
+	}
+	return controller
 }
 
 // onCongestion computes the slow-start threshold after packet loss.
@@ -197,6 +231,7 @@ func (c *tcpCongestionController) onCongestion(window, flight uint32, mss int) u
 	case CongestionControlBBR:
 		// Linux BBR preserves ssthresh and manages recovery with packet
 		// conservation; it does not apply CUBIC's beta decrease.
+		c.bbr.saveWindow(window)
 		return window
 	default:
 		return c.cubic.onCongestion(window, mss)
@@ -212,6 +247,7 @@ func (c *tcpCongestionController) onECN(window, flight uint32, mss int) uint32 {
 	case CongestionControlReno:
 		return congestionThresholdWithFloor(flight, mss, 1, 2, 1)
 	case CongestionControlBBR:
+		c.bbr.saveWindow(window)
 		return window
 	default:
 		return c.cubic.onECN(window, mss)
@@ -221,12 +257,22 @@ func (c *tcpCongestionController) onECN(window, flight uint32, mss int) uint32 {
 // onTimeout applies the algorithm's retransmission-timeout response. CUBIC
 // starts its next congestion-avoidance epoch at K=0 as required by RFC 9438;
 // fast loss and ECN continue through onCongestion and onECN respectively.
-func (c *tcpCongestionController) onTimeout(window, flight uint32, mss int) uint32 {
+func (c *tcpCongestionController) onTimeout(window, flight uint32, mss int, now time.Time) uint32 {
 	c.renoCredit = 0
 	switch c.algorithm {
 	case CongestionControlReno:
 		return congestionThreshold(flight, mss, 1, 2)
 	case CongestionControlBBR:
+		c.bbr.saveWindow(window)
+		// Linux records TCP_CA_Loss separately from ordinary fast recovery. The
+		// window is restored only after the RTO recovery point is acknowledged.
+		c.bbr.recovery = false
+		c.bbr.lossRecovery = true
+		c.bbr.packetConservation = false
+		c.bbr.fullBandwidth = 0
+		c.bbr.roundStart = true
+		c.bbr.updateLongTermBandwidth(bbrRateSample{losses: 1, ackTime: now})
+		c.bbr.sampledLost = c.bbr.totalLost
 		return window
 	default:
 		return c.cubic.onTimeout(window, mss)
@@ -287,15 +333,41 @@ func (c *tcpCongestionController) onACKWithThreshold(window, acknowledged uint32
 	}
 }
 
-// observeRecoveryACK keeps BBR's delivery and propagation models current
-// while PRR or packet conservation owns the recovery congestion window. Linux
-// likewise runs BBR's model update for recovery ACKs before applying the
-// recovery-specific cwnd bound. Reno and CUBIC have no model-only work here.
-func (c *tcpCongestionController) observeRecoveryACK(window, acknowledged uint32, mss int, now time.Time, smoothedRTT, sampleRTT time.Duration, flight uint32, applicationLimited bool) {
-	if c.algorithm != CongestionControlBBR || window == 0 || acknowledged == 0 || mss < 1 {
+// finishBBRRateSample converts delivery snapshots selected during cumulative
+// ACK and SACK processing into one Linux-style rate sample.
+func (c *tcpCongestionController) finishBBRRateSample(sample *bbrRateSample, acknowledged uint32, priorInFlight, inFlight uint32, now time.Time, nowStamp monotonicStamp, minimumRTT, smoothedRTT, sampleRTT time.Duration) {
+	if c.algorithm != CongestionControlBBR {
 		return
 	}
-	_ = c.bbr.onACK(window, acknowledged, mss, now, smoothedRTT, sampleRTT, flight, applicationLimited)
+	c.bbr.finishRateSample(sample, acknowledged, priorInFlight, inFlight, now, nowStamp, minimumRTT, smoothedRTT, sampleRTT)
+}
+
+// onBBRRateSample applies one completed delivery sample to cwnd and pacing.
+// A nonzero threshold is Linux's one-time Startup-to-Drain ssthresh update.
+func (c *tcpCongestionController) onBBRRateSample(window uint32, mss int, sample bbrRateSample) (uint32, uint32) {
+	if c.algorithm != CongestionControlBBR {
+		return window, 0
+	}
+	return c.bbr.onRateSample(window, mss, sample)
+}
+
+// markApplicationLimited records a sender bubble for future BBR snapshots.
+func (c *tcpCongestionController) markApplicationLimited(flight uint32) {
+	if c.algorithm == CongestionControlBBR {
+		c.bbr.markApplicationLimited(flight)
+	}
+}
+
+// noteLoss records newly declared lost bytes. duringACK retains them for the
+// rate sample being assembled; timer-driven recovery has already consumed the
+// event and must not report it again on the next ACK.
+func (c *tcpCongestionController) noteLoss(bytes uint32, duringACK bool) {
+	if c.algorithm == CongestionControlBBR {
+		c.bbr.noteLoss(bytes)
+		if !duringACK {
+			c.bbr.sampledLost = c.bbr.totalLost
+		}
+	}
 }
 
 // congestionWindowLimited mirrors Linux's packet-granularity allowance: a
@@ -311,6 +383,9 @@ func congestionWindowLimited(window, flight uint32, mss int) bool {
 // its model rate; Reno and CUBIC use Linux's cwnd/SRTT pacing formula.
 func (c *tcpCongestionController) pacingDelay(now time.Time, window, flight uint32, mss int, smoothedRTT time.Duration, slowStartThreshold uint32) time.Duration {
 	if c.algorithm == CongestionControlBBR {
+		if c.pacingSegments < tcpPacingInitialBurst {
+			return 0
+		}
 		return c.bbr.pacingDelay(now, mss)
 	}
 	if c.pacingSegments < tcpPacingInitialBurst || smoothedRTT <= 0 || c.pacingNext.IsZero() || !now.Before(c.pacingNext) {
@@ -319,26 +394,32 @@ func (c *tcpCongestionController) pacingDelay(now time.Time, window, flight uint
 	return pacingTimerDelay(c.pacingNext.Sub(now), tcpUserspacePacingQuantum)
 }
 
-// onDataSend advances algorithm and pacing state after a first transmission.
+// onDataSend advances Reno/CUBIC pacing state after a first transmission.
 func (c *tcpCongestionController) onDataSend(bytes, mss int, now time.Time, window, flight uint32, smoothedRTT time.Duration, slowStartThreshold uint32) {
 	switch c.algorithm {
 	case CongestionControlCUBIC:
 		c.cubic.onSend(now, flight)
-	case CongestionControlBBR:
-		c.bbr.onSend(bytes, mss, now, flight)
-		return
 	}
 	c.advanceWindowPacing(bytes, mss, now, window, flight, smoothedRTT, slowStartThreshold, true)
 }
 
+// onBBRDataSend snapshots Linux delivery metadata, advances BBR pacing, and
+// returns any ProbeRTT window restoration caused by an idle restart.
+func (c *tcpCongestionController) onBBRDataSend(bytes, mss int, now time.Time, stamp monotonicStamp, packetsOut, window uint32) (bbrRateSnapshot, uint32) {
+	c.pacingSegments++
+	return c.bbr.onSend(bytes, mss, now, stamp, packetsOut, window)
+}
+
 // onRetransmit advances only the pacing clock. Loss recovery must not treat a
 // retransmission as new application data or a new CUBIC transmission epoch.
-func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, window, flight uint32, smoothedRTT time.Duration, slowStartThreshold uint32) {
+func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, stamp monotonicStamp, window, flight, packetsOut uint32, smoothedRTT time.Duration, slowStartThreshold uint32) bbrRateSnapshot {
 	if c.algorithm == CongestionControlBBR {
+		snapshot := c.bbr.snapshotSend(stamp, packetsOut)
 		c.bbr.advanceRetransmissionPacing(bytes, mss, now)
-		return
+		return snapshot
 	}
 	c.advanceWindowPacing(bytes, mss, now, window, flight, smoothedRTT, slowStartThreshold, false)
+	return bbrRateSnapshot{}
 }
 
 // advanceWindowPacing applies Linux tcp_update_pacing_rate semantics. Linux
@@ -390,25 +471,37 @@ func windowPacingRate(window, flight uint32, smoothedRTT time.Duration, slowStar
 }
 
 // bbrSendQuantum follows Linux BBR's send-quantum policy: one MSS below
-// 1.2 Mbit/s, two MSS above it, at least 1/1024 second of the pacing rate, and
-// never more than 65535 bytes. It amortizes userspace timer wakes without an
-// operating-system-specific timer allowance.
+// 1.2 Mbit/s, two MSS above it, and otherwise the whole-MSS portion of 1/1024
+// second of the pacing rate, bounded by 65535 bytes and 127 segments. It
+// amortizes userspace timer wakes without an operating-system-specific timer
+// allowance.
 func bbrSendQuantum(rate float64, mss int) int {
 	if rate <= 0 || mss < 1 || math.IsInf(rate, 0) || math.IsNaN(rate) {
 		return 0
 	}
-	quantum := mss
+	minimumSegments := 1
 	if rate >= bbrPacingLowRateThreshold {
-		quantum = 2 * mss
+		minimumSegments = 2
 	}
-	if rate >= float64(bbrMaximumSendQuantum*1024) {
-		return bbrMaximumSendQuantum
+	segments := bbrMaximumSendSegments
+	if candidate := rate / (1024 * float64(mss)); candidate < float64(segments) {
+		segments = int(candidate)
 	}
-	if rateQuantum := int(rate / 1024); rateQuantum > quantum {
-		quantum = rateQuantum
+	if segments < minimumSegments {
+		segments = minimumSegments
 	}
+	if segments > bbrMaximumSendSegments {
+		segments = bbrMaximumSendSegments
+	}
+	maximumSegments := bbrMaximumSendQuantum / mss
+	if maximumSegments > 0 && segments > maximumSegments {
+		segments = maximumSegments
+	}
+	quantum := segments * mss
 	if quantum > bbrMaximumSendQuantum {
-		quantum = bbrMaximumSendQuantum
+		// One valid MSS can exceed the batching limit on unusual links; Linux's
+		// minimum segment goal likewise takes precedence over its byte target.
+		return mss
 	}
 	return quantum
 }
@@ -480,7 +573,6 @@ func (c *tcpCongestionController) onMTUChange() {
 	c.pacingNext = time.Time{}
 	c.cubic = cubicCongestionControl{}
 	c.bbr.nextSend = time.Time{}
-	c.bbr.schedulerLimited = false
 }
 
 // congestionThreshold applies one multiplicative decrease with the RFC 5681
@@ -659,7 +751,109 @@ func (c *cubicCongestionControl) onACK(window, acknowledged uint32, mss int, now
 	return applyCongestionIncrease(window, &c.credit, increment)
 }
 
-// bbrMode is one phase of the BBR state machine.
+// bbrStamp is a wrapping microsecond timestamp. Every sampled interval is
+// bounded by current flight or an idle restart, so modulo subtraction remains
+// valid across its approximately 71-minute wrap interval.
+type bbrStamp uint32
+
+// bbrStampAt compacts a stack-relative nanosecond stamp.
+func bbrStampAt(stamp monotonicStamp) bbrStamp {
+	if stamp == 0 {
+		return 0
+	}
+	value := bbrStamp((uint64(stamp)-1)/uint64(time.Microsecond)) + 1
+	if value == 0 {
+		return 1
+	}
+	return value
+}
+
+// bbrStampDuration returns a modulo-safe microsecond interval.
+func bbrStampDuration(later, earlier bbrStamp) time.Duration {
+	if later == 0 || earlier == 0 {
+		return 0
+	}
+	delta := uint32(later - earlier)
+	if delta == 0 {
+		return 0
+	}
+	return time.Duration(delta) * time.Microsecond
+}
+
+const (
+	bbrRateApplicationLimited = uint32(1) << 31
+	bbrRateDeliveredMask      = bbrRateApplicationLimited - 1
+)
+
+// bbrRateSnapshot is Linux tcp_rate_skb_sent's per-transmission delivery
+// snapshot. Compact stamps and a packed flag keep it at 12 bytes.
+type bbrRateSnapshot struct {
+	firstSent      bbrStamp
+	deliveredStamp bbrStamp
+	deliveredFlags uint32
+}
+
+// delivered returns the byte counter without its packed flag.
+func (s bbrRateSnapshot) delivered() uint32 { return s.deliveredFlags & bbrRateDeliveredMask }
+
+// applicationLimited reports the packed Linux app-limited snapshot bit.
+func (s bbrRateSnapshot) applicationLimited() bool {
+	return s.deliveredFlags&bbrRateApplicationLimited != 0
+}
+
+// bbrDeliveredAfterEqual compares the 31-bit delivery counter while its
+// unambiguous half-range remains at least the maximum TCP flight size.
+func bbrDeliveredAfterEqual(value, reference uint32) bool {
+	delta := (value - reference) & bbrRateDeliveredMask
+	return delta == 0 || delta < bbrRateApplicationLimited/2
+}
+
+// bbrRateSample is one ACK's Linux-style delivery-rate observation. Rates use
+// bytes rather than packets because mipstack's SACK scoreboard is byte exact.
+type bbrRateSample struct {
+	priorDelivered     uint32
+	delivered          uint32
+	acked              uint32
+	losses             uint64
+	priorInFlight      uint32
+	inFlight           uint32
+	interval           time.Duration
+	rtt                time.Duration
+	smoothedRTT        time.Duration
+	ackTime            time.Time
+	lastSent           monotonicStamp
+	lastEnd            uint32
+	applicationLimited bool
+	retransmitted      bool
+	recovery           bool
+	fastRecovery       bool
+	ackDelayed         bool
+	valid              bool
+	firstSent          bbrStamp
+	priorStamp         bbrStamp
+}
+
+// observe retains delivery metadata from the most recently transmitted range
+// newly acknowledged by the cumulative ACK or SACK scoreboard.
+func (s *bbrRateSample) observe(segment sentTCPSegment) {
+	snapshot := segment.rate
+	if snapshot.deliveredStamp == 0 {
+		return
+	}
+	sent := segment.hostQueue.queuedAt
+	if s.priorStamp != 0 && (sent < s.lastSent || sent == s.lastSent && !tcpSequenceGreater(segment.end, s.lastEnd)) {
+		return
+	}
+	s.priorDelivered = snapshot.delivered()
+	s.priorStamp = snapshot.deliveredStamp
+	s.firstSent = snapshot.firstSent
+	s.lastSent = sent
+	s.lastEnd = segment.end
+	s.applicationLimited = snapshot.applicationLimited()
+	s.retransmitted = segment.transmissions > 1
+}
+
+// bbrMode is one phase of the Linux BBRv1 state machine.
 type bbrMode uint8
 
 const (
@@ -673,332 +867,838 @@ const (
 	bbrProbeRTT
 )
 
-// bbrCongestionControl estimates bottleneck bandwidth and propagation RTT,
-// then derives a congestion window and pacing rate from that path model.
+// String returns the conventional Linux BBR state name.
+func (m bbrMode) String() string {
+	switch m {
+	case bbrStartup:
+		return "STARTUP"
+	case bbrDrain:
+		return "DRAIN"
+	case bbrProbeBandwidth:
+		return "PROBE_BW"
+	case bbrProbeRTT:
+		return "PROBE_RTT"
+	default:
+		return ""
+	}
+}
+
+// bbrRateValue converts an internal byte rate to its diagnostic representation.
+func bbrRateValue(rate float64) uint64 {
+	if rate <= 0 || math.IsNaN(rate) {
+		return 0
+	}
+	if rate >= float64(^uint64(0)) || math.IsInf(rate, 1) {
+		return ^uint64(0)
+	}
+	return uint64(rate)
+}
+
+// bbrBandwidthSample is one candidate in Linux's constant-space windowed
+// maximum filter. Round subtraction intentionally uses uint32 wrap semantics.
+type bbrBandwidthSample struct {
+	rate  float64
+	round uint32
+}
+
+// bbrBandwidthFilter tracks the best three well-spaced samples from the last
+// bbrBandwidthWindow packet-timed rounds, matching Linux win_minmax.
+type bbrBandwidthFilter struct {
+	samples [3]bbrBandwidthSample
+}
+
+// reset replaces every candidate with one newly accepted measurement.
+func (f *bbrBandwidthFilter) reset(round uint32, rate float64) float64 {
+	sample := bbrBandwidthSample{rate: rate, round: round}
+	f.samples[0], f.samples[1], f.samples[2] = sample, sample, sample
+	return rate
+}
+
+// update applies Linux minmax_running_max and returns the current maximum.
+func (f *bbrBandwidthFilter) update(window, round uint32, rate float64) float64 {
+	sample := bbrBandwidthSample{rate: rate, round: round}
+	if sample.rate >= f.samples[0].rate || sample.round-f.samples[2].round > window {
+		return f.reset(round, rate)
+	}
+	if sample.rate >= f.samples[1].rate {
+		f.samples[1], f.samples[2] = sample, sample
+	} else if sample.rate >= f.samples[2].rate {
+		f.samples[2] = sample
+	}
+	delta := sample.round - f.samples[0].round
+	if delta > window {
+		f.samples[0], f.samples[1], f.samples[2] = f.samples[1], f.samples[2], sample
+		if sample.round-f.samples[0].round > window {
+			f.samples[0], f.samples[1], f.samples[2] = f.samples[1], f.samples[2], sample
+		}
+	} else if f.samples[1].round == f.samples[0].round && delta > window/4 {
+		f.samples[1], f.samples[2] = sample, sample
+	} else if f.samples[2].round == f.samples[1].round && delta > window/2 {
+		f.samples[2] = sample
+	}
+	return f.samples[0].rate
+}
+
+// bbrCongestionControl is a byte-scaled implementation of Linux BBRv1. It
+// retains Linux's delivery sampler, packet-timed rounds, max filters, ACK
+// aggregation compensation, policer detection, gain cycle, and ProbeRTT.
 type bbrCongestionControl struct {
 	mode bbrMode
 
-	bandwidthSamples [bbrBandwidthWindow]float64
-	bandwidthIndex   int
-	bandwidthCount   int
-	bandwidth        float64
-	roundBandwidth   float64
-	sampleStart      time.Time
-	sampleBytes      uint64
+	bandwidthFilter      bbrBandwidthFilter
+	bandwidth            float64
+	roundCount           uint32
+	nextRoundDelivered   uint32
+	roundStart           bool
+	fullBandwidth        float64
+	fullRounds           int
+	fullBandwidthReached bool
 
 	minimumRTT      time.Duration
 	minimumRTTStamp time.Time
-	roundBytes      uint32
-	roundTarget     uint32
-	roundLimited    bool
-	fullBandwidth   float64
-	fullRounds      int
+	cycleIndex      int
+	cycleStamp      bbrStamp
+	probeDone       time.Time
+	probeRound      bool
+	priorWindow     uint32
 
-	cycleIndex  int
-	cycleStamp  time.Time
-	probeDone   time.Time
-	probeRound  bool
-	priorWindow uint32
+	delivered               uint64
+	deliveredStamp          bbrStamp
+	firstSent               bbrStamp
+	applicationLimitedUntil uint64
+	totalLost               uint64
+	sampledLost             uint64
+
+	ackEpochStamp    time.Time
+	ackEpochBytes    uint64
+	extraACKed       [2]uint32
+	extraACKedIndex  int
+	extraACKedRounds int
+
+	longTermSampling      bool
+	longTermUseBandwidth  bool
+	longTermBandwidth     float64
+	longTermLastDelivered uint64
+	longTermLastLost      uint64
+	longTermLastStamp     time.Time
+	longTermRounds        int
+
+	pacingRate  float64
 	nextSend    time.Time
 	idleRestart bool
-	// schedulerLimited marks a packet-timed round whose sender was delayed by
-	// the host rather than by the modeled network path.
-	schedulerLimited bool
+	hasSeenRTT  bool
+
+	recovery           bool
+	lossRecovery       bool
+	packetConservation bool
 }
 
-// onACK updates BBR's delivery model, state machine, and congestion window.
+// onACK is retained for controller-level tests and callers without packet
+// metadata. Established TCP uses finishRateSample and onRateSample instead.
 func (b *bbrCongestionControl) onACK(window, acknowledged uint32, mss int, now time.Time, smoothedRTT, sampleRTT time.Duration, flight uint32, applicationLimited bool) uint32 {
-	idleRestart := b.idleRestart
-	b.idleRestart = false
-	minimumExpired := b.minimumRTT != 0 && now.Sub(b.minimumRTTStamp) >= bbrMinRTTWindow
-	if sampleRTT > 0 && (b.minimumRTT == 0 || sampleRTT < b.minimumRTT || minimumExpired) {
-		b.minimumRTT, b.minimumRTTStamp = sampleRTT, now
+	sample := bbrRateSample{
+		priorDelivered: uint32(b.delivered) & bbrRateDeliveredMask, delivered: acknowledged, acked: acknowledged,
+		priorInFlight: flight, inFlight: flight, interval: smoothedRTT, rtt: sampleRTT,
+		smoothedRTT: smoothedRTT, ackTime: now, applicationLimited: applicationLimited, valid: smoothedRTT > 0,
 	}
-	limited := applicationLimited || b.schedulerLimited
-	b.observeBandwidth(acknowledged, now, smoothedRTT, flight, limited)
-	roundStart := b.advanceRound(window, acknowledged, limited)
-	if roundStart {
-		b.schedulerLimited = false
+	if acknowledged < sample.inFlight {
+		sample.inFlight -= acknowledged
+	} else {
+		sample.inFlight = 0
 	}
-	if b.mode != bbrProbeRTT && minimumExpired && !idleRestart {
+	b.delivered += uint64(acknowledged)
+	if acknowledged != 0 {
+		b.deliveredStamp = bbrStampAt(monotonicStamp(now.UnixNano()) + 1)
+	}
+	window, _ = b.onRateSample(window, mss, sample)
+	return window
+}
+
+// finishRateSample advances delivery accounting and validates the sample using
+// the longer of its send and ACK phases, as Linux tcp_rate_gen does.
+func (b *bbrCongestionControl) finishRateSample(sample *bbrRateSample, acknowledged uint32, priorInFlight, inFlight uint32, now time.Time, nowStamp monotonicStamp, minimumRTT, smoothedRTT, sampleRTT time.Duration) {
+	sample.acked = acknowledged
+	sample.priorInFlight = priorInFlight
+	sample.inFlight = inFlight
+	sample.ackTime = now
+	sample.rtt = sampleRTT
+	sample.smoothedRTT = smoothedRTT
+	sample.losses = b.totalLost - b.sampledLost
+	b.sampledLost = b.totalLost
+	if acknowledged != 0 {
+		b.delivered += uint64(acknowledged)
+		b.deliveredStamp = bbrStampAt(nowStamp)
+	}
+	if b.applicationLimitedUntil != 0 && b.delivered > b.applicationLimitedUntil {
+		b.applicationLimitedUntil = 0
+	}
+	if sample.priorStamp == 0 {
+		return
+	}
+	// tcp_rate_skb_delivered advances first_tx_mstamp to the transmit time of
+	// the newest range selected for this ACK. Future packets snapshot this new
+	// boundary so their send phase does not grow from the connection's first
+	// flight forever.
+	compactNow := bbrStampAt(nowStamp)
+	compactSent := bbrStampAt(sample.lastSent)
+	b.firstSent = compactSent
+	if !sample.retransmitted {
+		if selectedRTT := bbrStampDuration(compactNow, compactSent); selectedRTT > 0 {
+			sample.rtt = selectedRTT
+		}
+	}
+	sample.delivered = (uint32(b.delivered) - sample.priorDelivered) & bbrRateDeliveredMask
+	sendInterval := bbrStampDuration(compactSent, sample.firstSent)
+	ackInterval := bbrStampDuration(compactNow, sample.priorStamp)
+	if ackInterval > sendInterval {
+		sendInterval = ackInterval
+	}
+	if sendInterval <= 0 || minimumRTT > 0 && sendInterval < minimumRTT {
+		return
+	}
+	sample.interval = sendInterval
+	sample.valid = true
+}
+
+// onRateSample updates BBR's path model, pacing rate, and congestion window.
+func (b *bbrCongestionControl) onRateSample(window uint32, mss int, sample bbrRateSample) (uint32, uint32) {
+	b.updateBandwidth(sample)
+	b.updateACKAggregation(sample, window, mss)
+	b.updateCycle(sample, mss)
+	b.checkFullBandwidth(sample)
+	threshold := b.checkDrain(sample, mss)
+	window = b.updateMinimumRTT(window, sample, mss)
+	// Linux clears idle_restart at the end of bbr_update_min_rtt, before
+	// updating gains and the pacing rate. The saved ProbeBW gain still governs
+	// cycle advancement above; only the actual rate was neutralized on restart.
+	if sample.delivered != 0 {
+		b.idleRestart = false
+	}
+	b.setPacingRate(window, sample.smoothedRTT)
+	window = b.setCongestionWindow(window, sample, mss)
+	return window, threshold
+}
+
+// updateBandwidth advances packet-timed rounds and the ten-round max filter.
+func (b *bbrCongestionControl) updateBandwidth(sample bbrRateSample) {
+	b.roundStart = false
+	if !sample.valid {
+		return
+	}
+	if bbrDeliveredAfterEqual(sample.priorDelivered, b.nextRoundDelivered) {
+		b.nextRoundDelivered = uint32(b.delivered) & bbrRateDeliveredMask
+		b.roundCount++
+		b.roundStart = true
+		b.packetConservation = false
+	}
+	b.updateLongTermBandwidth(sample)
+	rate := float64(sample.delivered) / sample.interval.Seconds()
+	if sample.applicationLimited && rate < b.bandwidth {
+		return
+	}
+	b.bandwidth = b.bandwidthFilter.update(bbrBandwidthWindow, b.roundCount, rate)
+}
+
+// updateACKAggregation tracks excess ACKed bytes over the expected delivery
+// rate in an approximate five-to-ten-round window.
+func (b *bbrCongestionControl) updateACKAggregation(sample bbrRateSample, window uint32, mss int) {
+	if !sample.valid || sample.acked == 0 || mss < 1 {
+		return
+	}
+	if b.roundStart {
+		b.extraACKedRounds++
+		if b.extraACKedRounds >= bbrExtraACKedWindow {
+			b.extraACKedRounds = 0
+			b.extraACKedIndex ^= 1
+			b.extraACKed[b.extraACKedIndex] = 0
+		}
+	}
+	if b.ackEpochStamp.IsZero() {
+		b.ackEpochStamp = sample.ackTime
+	}
+	elapsed := sample.ackTime.Sub(b.ackEpochStamp)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	expected := uint64(b.effectiveBandwidth() * elapsed.Seconds())
+	maximumEpochBytes := uint64(1<<20) * uint64(mss)
+	if b.ackEpochBytes <= expected || b.ackEpochBytes+uint64(sample.acked) >= maximumEpochBytes {
+		b.ackEpochBytes = 0
+		b.ackEpochStamp = sample.ackTime
+		expected = 0
+	}
+	b.ackEpochBytes += uint64(sample.acked)
+	if b.ackEpochBytes >= maximumEpochBytes {
+		// Linux stores ack_epoch_acked in a saturated 20-bit field. This
+		// byte-scaled equivalent keeps the same reset threshold.
+		b.ackEpochBytes = maximumEpochBytes - 1
+	}
+	extra := b.ackEpochBytes - expected
+	if extra > uint64(window) {
+		extra = uint64(window)
+	}
+	if extra > uint64(^uint32(0)) {
+		extra = uint64(^uint32(0))
+	}
+	if uint32(extra) > b.extraACKed[b.extraACKedIndex] {
+		b.extraACKed[b.extraACKedIndex] = uint32(extra)
+	}
+}
+
+// checkFullBandwidth applies Linux's 25-percent growth test for three
+// consecutive non-application-limited packet-timed rounds.
+func (b *bbrCongestionControl) checkFullBandwidth(sample bbrRateSample) {
+	if b.fullBandwidthReached || !b.roundStart || sample.applicationLimited {
+		return
+	}
+	if b.bandwidth >= b.fullBandwidth*bbrFullBandwidthGrowth {
+		b.fullBandwidth = b.bandwidth
+		b.fullRounds = 0
+		return
+	}
+	b.fullRounds++
+	b.fullBandwidthReached = b.fullRounds >= bbrFullBandwidthRounds
+}
+
+// checkDrain enters Drain after Startup and ProbeBW after the excess queue is
+// estimated to have left the network.
+func (b *bbrCongestionControl) checkDrain(sample bbrRateSample, mss int) uint32 {
+	gain := b.pacingGain()
+	inflight := b.packetsInNetwork(sample.inFlight, sample.ackTime, mss, gain)
+	var threshold uint32
+	if b.mode == bbrStartup && b.fullBandwidthReached {
+		threshold = uint32(b.quantizeWindowAt(b.modelWindowForBandwidth(b.bandwidth, 1, mss), mss, false))
+		b.mode = bbrDrain
+	}
+	// Linux drains against bbr_max_bw, even if its long-term policer estimate
+	// currently controls pacing and the normal model window.
+	drainTarget := b.quantizeWindowAt(b.modelWindowForBandwidth(b.bandwidth, 1, mss), mss, false)
+	if b.mode == bbrDrain && uint64(inflight) <= drainTarget {
+		b.resetProbeBandwidth(sample.ackTime)
+	}
+	return threshold
+}
+
+// updateCycle applies Linux BBRv1's time, inflight, and loss conditions for
+// each ProbeBW pacing-gain phase.
+func (b *bbrCongestionControl) updateCycle(sample bbrRateSample, mss int) {
+	if b.mode != bbrProbeBandwidth || b.minimumRTT <= 0 || b.cycleStamp == 0 || b.deliveredStamp == 0 {
+		return
+	}
+	fullLength := bbrStampDuration(b.deliveredStamp, b.cycleStamp) > b.minimumRTT
+	gain := b.pacingGain()
+	advance := fullLength
+	inflight := uint64(b.packetsInNetwork(sample.priorInFlight, sample.ackTime, mss, gain))
+	switch {
+	case gain > 1:
+		advance = fullLength && (sample.losses != 0 || inflight >= b.inflightTarget(gain, mss))
+	case gain < 1:
+		advance = fullLength || inflight <= b.inflightTarget(1, mss)
+	}
+	if advance {
+		b.cycleIndex = (b.cycleIndex + 1) % len(bbrProbeBandwidthGains)
+		b.cycleStamp = b.deliveredStamp
+	}
+}
+
+// updateMinimumRTT maintains the ten-second propagation filter and ProbeRTT.
+func (b *bbrCongestionControl) updateMinimumRTT(window uint32, sample bbrRateSample, mss int) uint32 {
+	expired := b.minimumRTT != 0 && sample.ackTime.Sub(b.minimumRTTStamp) > bbrMinRTTWindow
+	if sample.rtt > 0 && (b.minimumRTT == 0 || sample.rtt < b.minimumRTT || expired && !sample.ackDelayed) {
+		b.minimumRTT = sample.rtt
+		b.minimumRTTStamp = sample.ackTime
+	}
+	if expired && !b.idleRestart && b.mode != bbrProbeRTT {
 		b.mode = bbrProbeRTT
+		if sample.recovery {
+			if window > b.priorWindow {
+				b.priorWindow = window
+			}
+		} else {
+			b.priorWindow = window
+		}
 		b.probeDone = time.Time{}
 		b.probeRound = false
-		b.priorWindow = window
 		b.nextSend = time.Time{}
-		// Start packet-timed accounting at ProbeRTT entry. Reusing a target
-		// derived from the former large cwnd can keep a drained flow in
-		// ProbeRTT for hundreds of low-flight rounds.
-		remaining := flight
-		if acknowledged >= remaining {
-			remaining = uint32(mss)
-		} else {
-			remaining -= acknowledged
-		}
-		b.roundBytes = 0
-		b.roundTarget = remaining
-		b.roundLimited = false
-		b.schedulerLimited = false
-		roundStart = false
 	}
-	bdp := b.bandwidthDelayProduct()
-	switch b.mode {
-	case bbrStartup:
-		if b.fullRounds >= bbrFullBandwidthRounds {
-			b.mode = bbrDrain
-		}
-	case bbrDrain:
-		drainTarget := b.quantizedWindow(bdp, mss, 1)
-		if bdp > 0 && uint64(flight) <= drainTarget {
-			b.mode = bbrProbeBandwidth
-			b.cycleIndex = bbrInitialCycle(now)
-			b.cycleStamp = now
-		}
-	case bbrProbeBandwidth:
-		if b.minimumRTT > 0 && now.Sub(b.cycleStamp) >= b.minimumRTT {
-			b.cycleIndex = (b.cycleIndex + 1) % len(bbrProbeBandwidthGains)
-			b.cycleStamp = now
-		}
-	case bbrProbeRTT:
-		minimumFlight := uint32(bbrMinimumCongestionMSS * mss)
-		if b.probeDone.IsZero() && flight <= minimumFlight {
-			b.probeDone = now.Add(bbrProbeRTTDuration)
-			b.probeRound = false
-		} else if !b.probeDone.IsZero() && roundStart {
-			b.probeRound = true
-		}
-		if !b.probeDone.IsZero() && b.probeRound && !now.Before(b.probeDone) {
-			b.minimumRTTStamp = now
-			b.mode = bbrProbeBandwidth
-			b.cycleIndex = bbrInitialCycle(now)
-			b.cycleStamp = now
-			if window < b.priorWindow {
-				window = b.priorWindow
-			}
-		}
+	if b.mode != bbrProbeRTT {
+		return window
 	}
-	minimum := uint32(bbrMinimumCongestionMSS * mss)
-	if b.mode == bbrProbeRTT {
-		return minimum
+	b.markApplicationLimited(sample.inFlight)
+	minimumFlight := uint32(bbrMinimumCongestionMSS * mss)
+	if b.probeDone.IsZero() && sample.inFlight <= minimumFlight {
+		b.probeDone = sample.ackTime.Add(bbrProbeRTTDuration)
+		b.probeRound = false
+		b.nextRoundDelivered = uint32(b.delivered) & bbrRateDeliveredMask
+	} else if !b.probeDone.IsZero() && b.roundStart {
+		b.probeRound = true
 	}
-	target := minimum
-	if bdp > 0 {
-		gain := bbrCongestionWindowGain
-		if b.mode == bbrStartup || b.mode == bbrDrain {
-			gain = bbrStartupPacingGain
+	if !b.probeDone.IsZero() && b.probeRound && !sample.ackTime.Before(b.probeDone) {
+		b.minimumRTTStamp = sample.ackTime
+		if window < b.priorWindow {
+			window = b.priorWindow
 		}
-		modelTarget := b.quantizedWindow(bdp, mss, gain)
-		if modelTarget > uint64(tcpMaximumScaledWindow) {
-			modelTarget = uint64(tcpMaximumScaledWindow)
-		}
-		if uint32(modelTarget) > target {
-			target = uint32(modelTarget)
-		}
-	}
-	if initial := initialTCPWindow(mss); b.mode == bbrStartup && target < initial {
-		target = initial
-	}
-	if window < target {
-		window = growCongestionWindow(window, acknowledged)
-		if window > target {
-			window = target
-		}
-	} else if b.mode != bbrStartup && window > target {
-		window = target
+		b.resetMode(sample.ackTime)
 	}
 	return window
 }
 
-// observeBandwidth accumulates the largest ACK-rate sample in the current
-// packet-timed round. advanceRound installs it in the ten-round max filter.
-func (b *bbrCongestionControl) observeBandwidth(acknowledged uint32, now time.Time, rtt time.Duration, flight uint32, applicationLimited bool) {
-	sample := float64(0)
-	if b.sampleStart.IsZero() {
-		if rtt <= 0 {
-			return
+// setCongestionWindow follows Linux BBR's recovery, growth, and target-capping
+// rules. SACK/RACK still decides which ranges are retransmitted; BBR owns only
+// the congestion window used by that common recovery machinery.
+func (b *bbrCongestionControl) setCongestionWindow(window uint32, sample bbrRateSample, mss int) uint32 {
+	minimum := uint32(bbrMinimumCongestionMSS * mss)
+	if sample.acked == 0 {
+		// Linux skips recovery and growth without a newly (S)ACKed packet, but
+		// still applies the ProbeRTT cap after updating the path model.
+		if b.mode == bbrProbeRTT && window > minimum {
+			return minimum
 		}
-		// Bootstrap pacing from the initial flight. Using only the first ACK's
-		// bytes underestimates paths with delayed ACKs, then makes this simplified
-		// sampler permanently self-limit at that low rate during startup.
-		if flight > 0 {
-			sample = float64(flight) / rtt.Seconds()
+		return window
+	}
+	if sample.losses != 0 {
+		losses := sample.losses
+		if losses >= uint64(window) {
+			window = uint32(mss)
 		} else {
-			sample = float64(acknowledged) / rtt.Seconds()
-		}
-		b.sampleStart = now
-	} else {
-		b.sampleBytes += uint64(acknowledged)
-		if !now.After(b.sampleStart) {
-			return
-		}
-		interval := now.Sub(b.sampleStart)
-		minimumInterval := b.minimumRTT / 4
-		if minimumInterval < 2*time.Millisecond {
-			minimumInterval = 2 * time.Millisecond
-		} else if minimumInterval > 50*time.Millisecond {
-			minimumInterval = 50 * time.Millisecond
-		}
-		if interval >= minimumInterval {
-			sample = float64(b.sampleBytes) / interval.Seconds()
-			b.sampleStart = now
-			b.sampleBytes = 0
-			// ACK compression cannot create sustainable delivery above the
-			// sender's current exploratory pacing rate. Keep enough headroom
-			// for Startup and ProbeBW to discover additional bandwidth.
-			if b.bandwidth > 0 {
-				gain := b.pacingGain()
-				if gain < 1.25 {
-					gain = 1.25
-				}
-				upper := b.bandwidth * gain * 1.25
-				if sample > upper {
-					sample = upper
-				}
-			}
+			window -= uint32(losses)
 		}
 	}
-	// Linux BBR does not let a low application-limited delivery sample drag
-	// down the path model. Such a sample is useful only when it establishes a
-	// rate at least as high as the current filtered estimate.
-	if applicationLimited && sample < b.bandwidth {
-		return
+	if b.lossRecovery && !sample.recovery {
+		b.lossRecovery = false
+		if window < b.priorWindow {
+			window = b.priorWindow
+		}
 	}
-	if sample > b.roundBandwidth {
-		b.roundBandwidth = sample
+	switch {
+	case sample.fastRecovery && !b.recovery:
+		// Linux starts the first packet-timed recovery round by releasing one
+		// packet for each newly delivered packet.
+		b.recovery = true
+		b.packetConservation = true
+		b.nextRoundDelivered = uint32(b.delivered) & bbrRateDeliveredMask
+		window = growCongestionWindow(sample.inFlight, sample.acked)
+	case !sample.fastRecovery && b.recovery:
+		b.recovery = false
+		b.packetConservation = false
+		if window < b.priorWindow {
+			window = b.priorWindow
+		}
 	}
-	if sample > b.bandwidth {
-		b.bandwidth = sample
+	if b.packetConservation {
+		conserved := growCongestionWindow(sample.inFlight, sample.acked)
+		if window < conserved {
+			window = conserved
+		}
+		if window < minimum {
+			window = minimum
+		}
+		if b.mode == bbrProbeRTT && window > minimum {
+			window = minimum
+		}
+		return window
 	}
+	if b.mode == bbrProbeRTT {
+		if window > minimum {
+			return minimum
+		}
+		return window
+	}
+	target := b.modelWindow(b.congestionWindowGain(), mss)
+	if b.fullBandwidthReached {
+		extra := uint64(b.extraACKed[0])
+		if uint64(b.extraACKed[1]) > extra {
+			extra = uint64(b.extraACKed[1])
+		}
+		maximumExtra := uint64(b.effectiveBandwidth() * bbrExtraACKedMaximumInterval.Seconds())
+		if extra > maximumExtra {
+			extra = maximumExtra
+		}
+		target += extra
+	}
+	target = b.quantizeWindow(target, mss)
+	if b.fullBandwidthReached {
+		grown := growCongestionWindow(window, sample.acked)
+		if uint64(grown) > target {
+			window = uint32(target)
+		} else {
+			window = grown
+		}
+	} else if uint64(window) < target || b.delivered < uint64(bbrInitialCongestionMSS*mss) {
+		window = growCongestionWindow(window, sample.acked)
+	}
+	if window < minimum {
+		window = minimum
+	}
+	return window
 }
 
-// advanceRound detects BBR bandwidth plateaus once per congestion-window's
-// worth of acknowledged data.
-func (b *bbrCongestionControl) advanceRound(window, acknowledged uint32, applicationLimited bool) bool {
-	if b.roundTarget == 0 {
-		b.roundTarget = window
-	}
-	b.roundLimited = b.roundLimited || applicationLimited
-	b.roundBytes += acknowledged
-	if b.roundBytes < b.roundTarget {
-		return false
-	}
-	b.roundBytes = 0
-	b.roundTarget = window
-	roundLimited := b.roundLimited
-	b.roundLimited = false
-	if b.roundBandwidth > 0 {
-		b.bandwidthSamples[b.bandwidthIndex] = b.roundBandwidth
-		b.bandwidthIndex = (b.bandwidthIndex + 1) % len(b.bandwidthSamples)
-		if b.bandwidthCount < len(b.bandwidthSamples) {
-			b.bandwidthCount++
-		}
-		b.roundBandwidth = 0
-		b.bandwidth = 0
-		for index := 0; index < b.bandwidthCount; index++ {
-			if b.bandwidthSamples[index] > b.bandwidth {
-				b.bandwidth = b.bandwidthSamples[index]
-			}
-		}
-		// A packet-timed round without a delivery-rate sample says nothing about
-		// bandwidth growth. Counting it as a plateau can end Startup before the
-		// sampler's minimum interval has elapsed, especially on low-RTT paths.
-		if b.bandwidth >= b.fullBandwidth*bbrFullBandwidthGrowth {
-			b.fullBandwidth = b.bandwidth
-			b.fullRounds = 0
-		} else if !roundLimited {
-			b.fullRounds++
-		}
-	}
-	return true
+// modelWindow applies a gain to the effective bandwidth-delay product.
+func (b *bbrCongestionControl) modelWindow(gain float64, mss int) uint64 {
+	return b.modelWindowForBandwidth(b.effectiveBandwidth(), gain, mss)
 }
 
-// quantizedWindow applies BBR's end-system allowance in addition to the path
-// BDP. At low rates one segment stands in for each TSO/GRO scheduling slot.
-func (b *bbrCongestionControl) quantizedWindow(bdp uint64, mss int, gain float64) uint64 {
-	target := uint64(float64(bdp)*gain) + uint64(3*mss)
-	minimum := uint64(bbrMinimumCongestionMSS * mss)
-	if target < minimum {
-		target = minimum
-	}
-	return target
-}
-
-// bbrInitialCycle spreads concurrent flows over Linux's non-probing cycle
-// phases instead of synchronizing every connection on the 1.25 gain phase.
-func bbrInitialCycle(now time.Time) int {
-	return 1 + int(uint64(now.UnixNano())%uint64(len(bbrProbeBandwidthGains)-1))
-}
-
-// bandwidthDelayProduct returns the estimated bytes in flight at one minimum
-// RTT, or zero until both model inputs are known.
-func (b *bbrCongestionControl) bandwidthDelayProduct() uint64 {
-	if b.bandwidth <= 0 || b.minimumRTT <= 0 {
+// modelWindowForBandwidth matches Linux bbr_bdp, including its conservative
+// ten-segment fallback when no valid RTT sample exists.
+func (b *bbrCongestionControl) modelWindowForBandwidth(bandwidth, gain float64, mss int) uint64 {
+	if mss < 1 {
 		return 0
 	}
-	value := b.bandwidth * b.minimumRTT.Seconds()
+	if b.minimumRTT <= 0 {
+		return uint64(bbrInitialCongestionMSS * mss)
+	}
+	if bandwidth <= 0 || gain <= 0 {
+		return 0
+	}
+	value := math.Ceil(bandwidth * b.minimumRTT.Seconds() * gain)
 	if value >= float64(tcpMaximumScaledWindow) {
 		return uint64(tcpMaximumScaledWindow)
 	}
 	return uint64(value)
 }
 
+// quantizeWindow applies Linux BBR's end-system and delayed-ACK allowances.
+func (b *bbrCongestionControl) quantizeWindow(target uint64, mss int) uint64 {
+	probeHigh := b.mode == bbrProbeBandwidth && b.cycleIndex == 0
+	return b.quantizeWindowAt(target, mss, probeHigh)
+}
+
+// quantizeWindowAt applies the common end-system allowances with an explicit
+// ProbeBW high-gain flag so Startup's drain threshold remains phase-neutral.
+func (b *bbrCongestionControl) quantizeWindowAt(target uint64, mss int, probeHigh bool) uint64 {
+	if mss < 1 {
+		return 0
+	}
+	quantum := bbrSendQuantum(b.pacingRate, mss)
+	if quantum < mss {
+		quantum = mss
+	}
+	target += uint64(3 * quantum)
+	segments := (target + uint64(mss) - 1) / uint64(mss)
+	if segments&1 != 0 {
+		segments++
+	}
+	target = segments * uint64(mss)
+	if probeHigh {
+		target += uint64(2 * mss)
+	}
+	minimum := uint64(bbrMinimumCongestionMSS * mss)
+	if target < minimum {
+		target = minimum
+	}
+	if target > uint64(tcpMaximumScaledWindow) {
+		return uint64(tcpMaximumScaledWindow)
+	}
+	return target
+}
+
+// inflightTarget derives a quantized byte window from BDP and a gain.
+func (b *bbrCongestionControl) inflightTarget(gain float64, mss int) uint64 {
+	return b.quantizeWindow(b.modelWindow(gain, mss), mss)
+}
+
+// packetsInNetwork discounts bytes scheduled for future paced transmission.
+// gain is captured before a state transition because Linux updates its stored
+// gain only after finishing the model update for the ACK.
+func (b *bbrCongestionControl) packetsInNetwork(inflight uint32, now time.Time, mss int, gain float64) uint32 {
+	value := uint64(inflight)
+	if gain > 1 {
+		value += uint64(bbrSendQuantum(b.pacingRate, mss))
+	}
+	if now.Before(b.nextSend) && b.effectiveBandwidth() > 0 {
+		delivered := uint64(b.effectiveBandwidth() * b.nextSend.Sub(now).Seconds())
+		if delivered >= value {
+			return 0
+		}
+		value -= delivered
+	}
+	if value > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(value)
+}
+
+// effectiveBandwidth selects the policer estimate while long-term mode is active.
+func (b *bbrCongestionControl) effectiveBandwidth() float64 {
+	if b.longTermUseBandwidth {
+		return b.longTermBandwidth
+	}
+	return b.bandwidth
+}
+
+// updateLongTermBandwidth implements Linux BBRv1's token-bucket policer model.
+func (b *bbrCongestionControl) updateLongTermBandwidth(sample bbrRateSample) {
+	if b.longTermUseBandwidth {
+		if b.mode == bbrProbeBandwidth && b.roundStart {
+			b.longTermRounds++
+			if b.longTermRounds >= bbrLongTermUseRounds {
+				b.resetLongTermBandwidth(sample.ackTime)
+				b.resetProbeBandwidth(sample.ackTime)
+			}
+		}
+		return
+	}
+	if !b.longTermSampling {
+		if sample.losses == 0 {
+			return
+		}
+		b.resetLongTermInterval(sample.ackTime)
+		b.longTermSampling = true
+		return
+	}
+	if sample.applicationLimited {
+		b.resetLongTermBandwidth(sample.ackTime)
+		return
+	}
+	if b.roundStart {
+		b.longTermRounds++
+	}
+	if b.longTermRounds < bbrLongTermMinimumRounds {
+		return
+	}
+	if b.longTermRounds > bbrLongTermMaximumRounds {
+		b.resetLongTermBandwidth(sample.ackTime)
+		return
+	}
+	if sample.losses == 0 {
+		return
+	}
+	delivered := b.delivered - b.longTermLastDelivered
+	lost := b.totalLost - b.longTermLastLost
+	if delivered == 0 || float64(lost)/float64(delivered) < bbrLongTermLossRatio {
+		return
+	}
+	interval := sample.ackTime.Sub(b.longTermLastStamp)
+	if interval < time.Millisecond {
+		return
+	}
+	rate := float64(delivered) / interval.Seconds()
+	if b.longTermBandwidth != 0 {
+		difference := math.Abs(rate - b.longTermBandwidth)
+		if difference <= b.longTermBandwidth*bbrLongTermBandwidthRatio || difference <= bbrLongTermBandwidthDifference {
+			b.longTermBandwidth = (b.longTermBandwidth + rate) / 2
+			b.longTermUseBandwidth = true
+			b.longTermRounds = 0
+			return
+		}
+	}
+	b.longTermBandwidth = rate
+	b.resetLongTermInterval(sample.ackTime)
+}
+
+// resetLongTermInterval starts one policer measurement interval.
+func (b *bbrCongestionControl) resetLongTermInterval(now time.Time) {
+	b.longTermLastStamp = now
+	b.longTermLastDelivered = b.delivered
+	b.longTermLastLost = b.totalLost
+	b.longTermRounds = 0
+}
+
+// resetLongTermBandwidth leaves policer mode and clears its samples.
+func (b *bbrCongestionControl) resetLongTermBandwidth(now time.Time) {
+	b.longTermBandwidth = 0
+	b.longTermUseBandwidth = false
+	b.longTermSampling = false
+	b.resetLongTermInterval(now)
+}
+
+// undoRecovery applies Linux bbr_undo_cwnd without rewinding delivery
+// accounting that newer per-transmission rate snapshots already reference.
+func (b *bbrCongestionControl) undoRecovery(now time.Time) {
+	b.fullBandwidth = 0
+	b.fullRounds = 0
+	b.recovery = false
+	b.lossRecovery = false
+	b.packetConservation = false
+	b.resetLongTermBandwidth(now)
+}
+
+// noteLoss records bytes newly declared lost for the next rate sample.
+func (b *bbrCongestionControl) noteLoss(bytes uint32) {
+	b.totalLost += uint64(bytes)
+}
+
+// saveWindow remembers a usable cwnd before recovery or ProbeRTT reduction.
+func (b *bbrCongestionControl) saveWindow(window uint32) {
+	if !b.recovery && !b.lossRecovery && b.mode != bbrProbeRTT {
+		b.priorWindow = window
+		return
+	}
+	if window > b.priorWindow {
+		b.priorWindow = window
+	}
+}
+
+// markApplicationLimited records the delivery boundary that drains a sender bubble.
+func (b *bbrCongestionControl) markApplicationLimited(flight uint32) {
+	limit := b.delivered + uint64(flight)
+	if limit == 0 {
+		limit = 1
+	}
+	b.applicationLimitedUntil = limit
+}
+
+// snapshotSend captures delivery state for one original or retransmitted range.
+func (b *bbrCongestionControl) snapshotSend(stamp monotonicStamp, packetsOut uint32) bbrRateSnapshot {
+	compactStamp := bbrStampAt(stamp)
+	if packetsOut == 0 {
+		b.firstSent = compactStamp
+		b.deliveredStamp = compactStamp
+		b.nextSend = time.Time{}
+		if b.applicationLimitedUntil != 0 {
+			b.idleRestart = true
+			if b.mode == bbrProbeBandwidth && b.bandwidth > 0 {
+				b.pacingRate = b.effectiveBandwidth() * bbrPacingMargin
+			}
+		}
+	}
+	deliveredFlags := uint32(b.delivered) & bbrRateDeliveredMask
+	if b.applicationLimitedUntil != 0 {
+		deliveredFlags |= bbrRateApplicationLimited
+	}
+	return bbrRateSnapshot{firstSent: b.firstSent, deliveredStamp: b.deliveredStamp, deliveredFlags: deliveredFlags}
+}
+
+// onSend snapshots delivery state, handles Linux's idle ProbeRTT exit, and
+// advances BBR's packet pacing clock.
+func (b *bbrCongestionControl) onSend(bytes, mss int, now time.Time, stamp monotonicStamp, packetsOut, window uint32) (bbrRateSnapshot, uint32) {
+	// Kernel BBR relies on fq/high-resolution pacing. A Go actor that wakes
+	// beyond the userspace pacing allowance was locally limited, so its low
+	// delivery sample must not be mistaken for a path-bandwidth plateau.
+	if packetsOut != 0 && !b.nextSend.IsZero() && now.Sub(b.nextSend) > tcpUserspacePacingQuantum {
+		b.markApplicationLimited(packetsOut)
+	}
+	snapshot := b.snapshotSend(stamp, packetsOut)
+	if packetsOut == 0 && b.idleRestart {
+		// Mirror Linux CA_EVENT_TX_START. The first returning ACK may rotate this
+		// epoch under the normal below-expected-rate rule.
+		b.ackEpochStamp = now
+		b.ackEpochBytes = 0
+	}
+	if packetsOut == 0 && b.idleRestart && b.mode == bbrProbeRTT && !b.probeDone.IsZero() && !now.Before(b.probeDone) {
+		b.minimumRTTStamp = now
+		if window < b.priorWindow {
+			window = b.priorWindow
+		}
+		b.resetMode(now)
+	}
+	b.advancePacing(bytes, mss, now)
+	return snapshot, window
+}
+
+// resetMode returns from ProbeRTT according to whether Startup filled the pipe.
+func (b *bbrCongestionControl) resetMode(now time.Time) {
+	if b.fullBandwidthReached {
+		b.resetProbeBandwidth(now)
+	} else {
+		b.mode = bbrStartup
+	}
+}
+
+// resetProbeBandwidth starts Linux's randomized steady-state gain cycle.
+func (b *bbrCongestionControl) resetProbeBandwidth(now time.Time) {
+	b.mode = bbrProbeBandwidth
+	b.cycleIndex = bbrInitialCycle(now)
+	b.cycleStamp = b.deliveredStamp
+}
+
+// bbrInitialCycle mirrors Linux's randomized initial ProbeBW phase.
+func bbrInitialCycle(now time.Time) int {
+	const choices = byte(len(bbrProbeBandwidthGains) - 1)
+	var value [1]byte
+	for {
+		if _, err := rand.Read(value[:]); err != nil {
+			value[0] = byte(uint64(now.UnixNano()) % uint64(choices))
+			break
+		}
+		// Discard the incomplete final interval to keep all seven Linux phases
+		// equally likely.
+		if value[0] < ^byte(0)-(^byte(0)%choices) {
+			value[0] %= choices
+			break
+		}
+	}
+	return (len(bbrProbeBandwidthGains) - int(value[0])) % len(bbrProbeBandwidthGains)
+}
+
 // pacingGain returns the gain for BBR's current phase.
 func (b *bbrCongestionControl) pacingGain() float64 {
-	if b.idleRestart && b.mode == bbrProbeBandwidth {
-		return 1
-	}
 	switch b.mode {
 	case bbrStartup:
 		return bbrStartupPacingGain
 	case bbrDrain:
 		return bbrDrainPacingGain
 	case bbrProbeBandwidth:
+		if b.longTermUseBandwidth {
+			return 1
+		}
 		return bbrProbeBandwidthGains[b.cycleIndex]
 	default:
 		return 1
 	}
 }
 
-// pacingDelay reports how long the sender should wait before another new
-// data segment. BBR permits the initial window as a burst before it has a
-// delivery-rate sample.
+// congestionWindowGain returns Linux BBRv1's mode-specific cwnd gain.
+func (b *bbrCongestionControl) congestionWindowGain() float64 {
+	if b.mode == bbrStartup || b.mode == bbrDrain {
+		return bbrStartupPacingGain
+	}
+	if b.mode == bbrProbeRTT {
+		return 1
+	}
+	return bbrCongestionWindowGain
+}
+
+// initializePacingRate applies Linux's high-gain initial-window estimate. A
+// connection without an RTT sample uses the kernel's nominal one millisecond
+// RTT but remains eligible for reinitialization from its first real sample.
+func (b *bbrCongestionControl) initializePacingRate(window uint32, smoothedRTT time.Duration) {
+	roundTrip := smoothedRTT
+	if roundTrip <= 0 {
+		roundTrip = time.Millisecond
+	} else {
+		b.hasSeenRTT = true
+	}
+	b.pacingRate = float64(window) / roundTrip.Seconds() * bbrStartupPacingGain * bbrPacingMargin
+}
+
+// setPacingRate applies the mode gain and Linux's one-percent pacing margin.
+// Before Startup fills the pipe, BBR never lowers an established pacing rate.
+func (b *bbrCongestionControl) setPacingRate(window uint32, smoothedRTT time.Duration) {
+	if !b.hasSeenRTT && smoothedRTT > 0 {
+		b.initializePacingRate(window, smoothedRTT)
+	}
+	bw := b.effectiveBandwidth()
+	if bw <= 0 {
+		return
+	}
+	rate := bw * b.pacingGain() * bbrPacingMargin
+	if b.pacingRate == 0 || b.fullBandwidthReached || rate > b.pacingRate {
+		b.pacingRate = rate
+	}
+}
+
+// pacingDelay reports how long the sender should wait before new data.
 func (b *bbrCongestionControl) pacingDelay(now time.Time, mss int) time.Duration {
-	if b.bandwidth <= 0 || b.nextSend.IsZero() || !now.Before(b.nextSend) {
+	if b.pacingRate <= 0 || b.nextSend.IsZero() || !now.Before(b.nextSend) {
 		return 0
 	}
-	rate := b.bandwidth * b.pacingGain()
-	return pacingTimerDelay(b.nextSend.Sub(now), bbrTimerQuantumDuration(rate, mss))
+	return pacingTimerDelay(b.nextSend.Sub(now), bbrTimerQuantumDuration(b.pacingRate, mss))
 }
 
-// onSend advances BBR's packet pacing clock.
-func (b *bbrCongestionControl) onSend(bytes, mss int, now time.Time, flight uint32) {
-	if flight == 0 {
-		// Do not fold application idle time into the next delivery sample.
-		b.sampleStart = time.Time{}
-		b.sampleBytes = 0
-		b.nextSend = time.Time{}
-		b.idleRestart = true
-		b.schedulerLimited = false
-	}
-	b.advancePacing(bytes, mss, now)
-}
-
-// advancePacing moves BBR's new-data transmission clock and retains bounded
-// debt after a late userspace wake.
+// advancePacing moves BBR's new-data transmission clock with bounded debt.
 func (b *bbrCongestionControl) advancePacing(bytes, mss int, now time.Time) {
 	b.advancePacingAt(bytes, mss, now, true)
 }
 
-// advanceRetransmissionPacing discards expired pacing debt. A retransmission
-// caused by network loss or an RTO is not evidence of a late pacer wake and
-// must not trigger a catch-up burst.
+// advanceRetransmissionPacing discards stale debt after loss or an RTO.
 func (b *bbrCongestionControl) advanceRetransmissionPacing(bytes, mss int, now time.Time) {
 	b.advancePacingAt(bytes, mss, now, false)
 }
 
-// advancePacingAt advances the BBR clock with optional late-wake catch-up.
+// advancePacingAt advances the userspace pacing clock.
 func (b *bbrCongestionControl) advancePacingAt(bytes, mss int, now time.Time, catchUp bool) {
-	rate := b.bandwidth * b.pacingGain()
+	rate := b.pacingRate
 	if bytes <= 0 || rate <= 0 {
 		return
 	}
@@ -1012,9 +1712,6 @@ func (b *bbrCongestionControl) advancePacingAt(bytes, mss int, now time.Time, ca
 		delay = time.Microsecond
 	}
 	maximumDebt := bbrSendQuantumDuration(rate, mss)
-	base, late := pacingScheduleBase(b.nextSend, now, maximumDebt, catchUp)
-	if late {
-		b.schedulerLimited = true
-	}
+	base, _ := pacingScheduleBase(b.nextSend, now, maximumDebt, catchUp)
 	b.nextSend = base.Add(delay)
 }
