@@ -127,6 +127,30 @@ func TestTCPListenerCompletedConnectionsLeaveSYNBacklog(t *testing.T) {
 	}
 }
 
+func TestTCPStateString(t *testing.T) {
+	tests := []struct {
+		state TCPState
+		name  string
+	}{
+		{TCPStateClosed, "CLOSED"},
+		{TCPStateSYNReceived, "SYN-RECEIVED"},
+		{TCPStateSYNSent, "SYN-SENT"},
+		{TCPStateEstablished, "ESTABLISHED"},
+		{TCPStateFINWait1, "FIN-WAIT-1"},
+		{TCPStateFINWait2, "FIN-WAIT-2"},
+		{TCPStateCloseWait, "CLOSE-WAIT"},
+		{TCPStateClosing, "CLOSING"},
+		{TCPStateLastACK, "LAST-ACK"},
+		{TCPStateTimeWait, "TIME-WAIT"},
+		{TCPState(255), "CLOSED"},
+	}
+	for _, test := range tests {
+		if name := test.state.String(); name != test.name {
+			t.Errorf("TCPState(%d).String() = %q, want %q", test.state, name, test.name)
+		}
+	}
+}
+
 func TestTCPConnectionInfo(t *testing.T) {
 	clientAddress := netip.MustParseAddr("192.0.2.211")
 	serverAddress := netip.MustParseAddr("192.0.2.212")
@@ -2674,7 +2698,10 @@ func TestTCPMTUIncreaseRaisesMSS(t *testing.T) {
 	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{localPrefix}, MTU: 2000}); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(20 * time.Millisecond)
+	waitFor(t, time.Second, func() bool {
+		info := connection.(*TCPConn).Info()
+		return info.PathMTU == 2000 && info.MaximumSegmentSize == 1280
+	})
 	payload := bytes.Repeat([]byte{0x4d}, 1280)
 	writeAndReadTCPEcho(t, connection, payload)
 	link.mu.Lock()
@@ -2982,12 +3009,17 @@ func TestTCPSendBufferChunkOwnership(t *testing.T) {
 	}
 	const gather = 300
 	offset := tcpSendChunkMaximum - 100
-	snapshot, total := buffer.snapshot(offset, gather)
+	var view tcpPayloadView
+	total := buffer.view(offset, gather, &view)
+	snapshot := make([]byte, view.size)
+	view.copyTo(snapshot)
 	if total != len(payload) || !bytes.Equal(snapshot, payload[offset:offset+gather]) {
 		t.Fatalf("cross-chunk snapshot = %d/%d bytes, equal %t", len(snapshot), total, bytes.Equal(snapshot, payload[offset:offset+gather]))
 	}
 	buffer.acknowledge(tcpSendChunkMaximum)
-	remaining, total := buffer.snapshot(0, len(payload))
+	total = buffer.view(0, len(payload), &view)
+	remaining := make([]byte, view.size)
+	view.copyTo(remaining)
 	if total != 512 || !bytes.Equal(remaining, payload[tcpSendChunkMaximum:]) {
 		t.Fatalf("acknowledged send buffer = %d/%d bytes, equal %t", len(remaining), total, bytes.Equal(remaining, payload[tcpSendChunkMaximum:]))
 	}
@@ -3761,6 +3793,40 @@ func TestTCPInboundQueueHasByteCapacity(t *testing.T) {
 	}
 }
 
+func TestTCPInboundQueueOverloadUpdatesDiagnostics(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.77")
+	remote := netip.MustParseAddr("198.51.100.77")
+	_, stack := newTestStack(t, local, remote)
+	key := tcpKey{
+		local:  netip.AddrPortFrom(local, 8080),
+		remote: netip.AddrPortFrom(remote, 45000),
+	}
+	connection := newTCPConn(stack, "tcp4", key, 1400)
+	connection.inbound.mu.Lock()
+	connection.inbound.bytes = tcpInboundByteCapacity
+	connection.inbound.mu.Unlock()
+	stack.mu.Lock()
+	stack.tcp[key] = connection
+	stack.mu.Unlock()
+	t.Cleanup(func() {
+		stack.mu.Lock()
+		delete(stack.tcp, key)
+		stack.mu.Unlock()
+		connection.inbound.close()
+	})
+	packet := buildTestTCP(remote, local, 45000, 8080, 1, 1, tcpFlagACK, 65535, nil, []byte("overload"))
+	if err := writeTestPacket(stack, packet); err != nil {
+		t.Fatal(err)
+	}
+	if dropped := connection.inboundQueueDrops.Load(); dropped != 1 {
+		t.Fatalf("connection inbound queue drops = %d, want 1", dropped)
+	}
+	stats := stack.Stats()
+	if stats.TCPInboundQueueDrops != 1 || stats.InboundDroppedPackets != 1 {
+		t.Fatalf("stack overload diagnostics = %+v", stats)
+	}
+}
+
 func TestTCPInboundQueuePrependHonorsByteCapacity(t *testing.T) {
 	queue := newTCPSegmentQueue()
 	segment := tcpSegment{payload: make([]byte, 65535)}
@@ -4198,7 +4264,7 @@ func TestTCPZeroWindowProbePreservesSequenceSpace(t *testing.T) {
 	if err = link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence, acknowledgement, tcpFlagACK, 0, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(10 * time.Millisecond)
+	waitFor(t, time.Second, func() bool { return tcpConnection.Info().PeerWindow == 0 })
 	link.mu.Lock()
 	link.echoTCP = false
 	link.mu.Unlock()
@@ -4856,6 +4922,116 @@ func TestTCPKeepAliveIdleTimeoutAndSocketOptions(t *testing.T) {
 	})
 }
 
+// TestTCPTrafficClassSocketOption verifies validation, ECN masking, and the
+// traffic class emitted after a live per-connection update.
+func TestTCPTrafficClassSocketOption(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.68"), netip.MustParseAddr("198.51.100.68"))
+	link.mu.Lock()
+	link.echoTCP = true
+	link.mu.Unlock()
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8082))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConnection := connection.(*TCPConn)
+	if err = tcpConnection.SetTrafficClass(0xab); err != nil {
+		t.Fatal(err)
+	}
+	if got := tcpConnection.Info().TrafficClass; got != 0xa8 {
+		t.Fatalf("TCP traffic class = %#x, want %#x", got, 0xa8)
+	}
+	for _, invalid := range []int{-1, 256} {
+		if err = tcpConnection.SetTrafficClass(invalid); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("SetTrafficClass(%d) = %v, want EINVAL", invalid, err)
+		}
+	}
+	link.mu.Lock()
+	link.echoTCP = false
+	link.mu.Unlock()
+	if _, err = tcpConnection.Write([]byte("traffic class")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.After(time.Second)
+
+trafficClassPackets:
+	for {
+		select {
+		case packet := <-link.outbound:
+			parsed, ok := parseIPPacket(packet)
+			if !ok || parsed.protocol != protocolTCP || len(parsed.payload) < tcpHeaderSize {
+				continue
+			}
+			headerSize := int(parsed.payload[12]>>4) * 4
+			if headerSize < tcpHeaderSize || headerSize >= len(parsed.payload) {
+				continue
+			}
+			if parsed.trafficClass&0xfc != 0xa8 {
+				t.Fatalf("TCP traffic-class packet = %+v", parsed)
+			}
+			break trafficClassPackets
+		case <-deadline:
+			t.Fatal("timed out waiting for TCP traffic-class data packet")
+		}
+	}
+	if err = tcpConnection.SetLinger(0); err != nil {
+		t.Fatal(err)
+	}
+	if err = tcpConnection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = tcpConnection.SetTrafficClass(0); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("SetTrafficClass after Close = %v, want net.ErrClosed", err)
+	}
+}
+
+// TestTCPPassiveHandshakeInfoAndFailure verifies diagnostic snapshots during
+// SYN-RECEIVED and listener accounting when that handshake is aborted.
+func TestTCPPassiveHandshakeInfoAndFailure(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.69")
+	remote := netip.MustParseAddr("198.51.100.69")
+	link, stack := newTestStack(t, local, remote)
+	listener, err := stack.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(local, 8083))
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := buildTestTCP(remote, local, 45000, 8083, 100, 0, tcpFlagSYN, 65535, nil, nil)
+	if err = writeTestPacket(stack, packet); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-link.outbound:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for passive SYN-ACK")
+	}
+	listener.mu.Lock()
+	var connection *TCPConn
+	for candidate := range listener.handshaking {
+		connection = candidate
+		break
+	}
+	listener.mu.Unlock()
+	if connection == nil {
+		t.Fatal("passive handshake was not tracked")
+	}
+	info := connection.Info()
+	if info.State != TCPStateSYNReceived || info.MaximumSegmentSize == 0 || info.PathMTU != 1400 || info.RetransmissionTimeout != tcpInitialRTO {
+		t.Fatalf("passive handshake info = %+v", info)
+	}
+	if err = listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-connection.done:
+	case <-time.After(time.Second):
+		t.Fatal("passive handshake remained active after listener close")
+	}
+	waitFor(t, time.Second, func() bool { return listener.Info().HandshakeFailures == 1 })
+	closed := listener.Info()
+	if closed.HandshakeTimeouts != 0 || closed.HandshakeFailures != 1 {
+		t.Fatalf("aborted passive handshake diagnostics = %+v", closed)
+	}
+}
+
 func TestTCPCloseQueuesFIN(t *testing.T) {
 	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.70"), netip.MustParseAddr("198.51.100.70"))
 	link.mu.Lock()
@@ -5013,5 +5189,169 @@ func BenchmarkTCPSetDeadline(b *testing.B) {
 		if err := connection.SetDeadline(time.Time{}); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// TestTCPImpairedNetworkConditions exercises recovery from individual and
+// combined delay, jitter, loss, and bottleneck-queue conditions.
+func TestTCPImpairedNetworkConditions(t *testing.T) {
+	conditions := []struct {
+		name      string
+		direction testLinkCondition
+		check     func(testLinkDirectionStats, time.Duration) bool
+	}{
+		{name: "latency-jitter", direction: testLinkCondition{Latency: 50 * time.Millisecond, Jitter: 15 * time.Millisecond}, check: func(_ testLinkDirectionStats, elapsed time.Duration) bool { return elapsed >= 50*time.Millisecond }},
+		{name: "random-loss", direction: testLinkCondition{Latency: 2 * time.Millisecond, LossRate: 0.08}, check: func(stats testLinkDirectionStats, _ time.Duration) bool { return stats.RandomDrops != 0 }},
+		{name: "burst-loss", direction: testLinkCondition{Latency: 2 * time.Millisecond, BurstEnterRate: 0.04, BurstExitRate: 0.35}, check: func(stats testLinkDirectionStats, _ time.Duration) bool { return stats.MaximumDropBurst >= 2 }},
+		{name: "high-delay-loss", direction: testLinkCondition{Latency: 50 * time.Millisecond, Jitter: 15 * time.Millisecond, LossRate: 0.08, BurstEnterRate: 0.02, BurstExitRate: 0.4}, check: func(stats testLinkDirectionStats, elapsed time.Duration) bool {
+			return stats.RandomDrops >= 2 && elapsed >= 100*time.Millisecond
+		}},
+		{name: "bandwidth-queue", direction: testLinkCondition{Latency: 3 * time.Millisecond, Bandwidth: 256 * 1024, QueueBytes: 16 * 1024}, check: func(stats testLinkDirectionStats, elapsed time.Duration) bool {
+			return stats.QueueDrops != 0 && stats.MaximumQueued > 0 && elapsed >= 300*time.Millisecond
+		}},
+	}
+	for _, test := range conditions {
+		t.Run(test.name, func(t *testing.T) {
+			client, server, link := newTestTCPConnectionPair(t, CongestionControlCUBIC, testLinkConditions{
+				Seed: 9917, ClientToPeer: test.direction, PeerToClient: test.direction,
+			})
+			started := time.Now()
+			transferTestTCPPayload(t, client, server, 96*1024, 15*time.Second)
+			if test.check != nil && !test.check(link.Stats(0), time.Since(started)) {
+				t.Fatalf("client link condition was not exercised: %+v", link.Stats(0))
+			}
+		})
+	}
+}
+
+// TestTCPIPv6FullDuplexUnderAsymmetricImpairment verifies that both stream
+// directions make progress when their IPv6 paths have different conditions.
+func TestTCPIPv6FullDuplexUnderAsymmetricImpairment(t *testing.T) {
+	clientAddress := netip.MustParseAddr("2001:db8::201")
+	serverAddress := netip.MustParseAddr("2001:db8::202")
+	client, server, link := newTestTCPConnectionPairForAddresses(t, CongestionControlCUBIC, testLinkConditions{
+		Seed: 4811,
+		ClientToPeer: testLinkCondition{
+			Latency: 30 * time.Millisecond, Jitter: 8 * time.Millisecond, LossRate: 0.06,
+			BurstEnterRate: 0.01, BurstExitRate: 0.5, Bandwidth: 1024 * 1024, QueueBytes: 48 * 1024,
+		},
+		PeerToClient: testLinkCondition{
+			Latency: 5 * time.Millisecond, Jitter: 2 * time.Millisecond, LossRate: 0.04,
+			DuplicateRate: 0.03, Bandwidth: 2 * 1024 * 1024, QueueBytes: 64 * 1024,
+		},
+	}, clientAddress, serverAddress)
+	results := make(chan error, 2)
+	go func() { results <- exchangeTestTCPPayload(client, server, 128*1024, 20*time.Second, 0x11111111) }()
+	go func() { results <- exchangeTestTCPPayload(server, client, 128*1024, 20*time.Second, 0x22222222) }()
+	for direction := 0; direction < 2; direction++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientStats, serverStats := link.Stats(0), link.Stats(1)
+	if clientStats.RandomDrops == 0 || serverStats.RandomDrops == 0 || clientStats.Delivered == 0 || serverStats.Delivered == 0 {
+		t.Fatalf("asymmetric IPv6 link was not exercised: client=%+v server=%+v", clientStats, serverStats)
+	}
+}
+
+// TestTCPConnectionChurnUnderImpairment repeatedly establishes, transfers,
+// and closes concurrent flows while loss and reordering remain active.
+func TestTCPConnectionChurnUnderImpairment(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.221")
+	serverAddress := netip.MustParseAddr("192.0.2.222")
+	condition := testLinkCondition{
+		Latency: 4 * time.Millisecond, Jitter: 2 * time.Millisecond,
+		LossRate:      0.01,
+		DuplicateRate: 0.01, Bandwidth: 4 * 1024 * 1024, QueueBytes: 128 * 1024,
+	}
+	clientStack, serverStack, link := newTestImpairedStackPair(t, CongestionControlCUBIC, testLinkConditions{
+		Seed: 8179, ClientToPeer: condition, PeerToClient: condition,
+	}, clientAddress, serverAddress)
+	listener, err := serverStack.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(serverAddress, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	endpoint := listener.Addr().(*net.TCPAddr).AddrPort()
+	const waves, flows = 3, 8
+	for wave := 0; wave < waves; wave++ {
+		accepted := make(chan *TCPConn, flows)
+		acceptError := make(chan error, 1)
+		go func() {
+			for flow := 0; flow < flows; flow++ {
+				connection, acceptErr := listener.AcceptTCP()
+				if acceptErr != nil {
+					acceptError <- acceptErr
+					return
+				}
+				accepted <- connection
+			}
+		}()
+		type dialResult struct {
+			connection *TCPConn
+			err        error
+		}
+		dialed := make(chan dialResult, flows)
+		for flow := 0; flow < flows; flow++ {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				connection, dialErr := clientStack.DialTCP(ctx, "tcp4", netip.AddrPort{}, endpoint)
+				if dialErr != nil {
+					dialed <- dialResult{err: dialErr}
+					return
+				}
+				dialed <- dialResult{connection: connection.(*TCPConn)}
+			}()
+		}
+		clients := make([]*TCPConn, 0, flows)
+		for flow := 0; flow < flows; flow++ {
+			result := <-dialed
+			if result.err != nil {
+				t.Fatal(result.err)
+			}
+			clients = append(clients, result.connection)
+		}
+		servers := make(map[uint16]*TCPConn, flows)
+		acceptDeadline := time.After(15 * time.Second)
+		for len(servers) < flows {
+			select {
+			case connection := <-accepted:
+				port := connection.RemoteAddr().(*net.TCPAddr).AddrPort().Port()
+				servers[port] = connection
+			case err = <-acceptError:
+				t.Fatal(err)
+			case <-acceptDeadline:
+				t.Fatal("timed out accepting impaired TCP churn wave")
+			}
+		}
+		transfers := make(chan error, flows)
+		for flow, client := range clients {
+			server := servers[client.LocalAddr().(*net.TCPAddr).AddrPort().Port()]
+			if server == nil {
+				t.Fatalf("missing accepted connection for %v", client.LocalAddr())
+			}
+			go func(flow int, client, server *TCPConn) {
+				transfers <- exchangeTestTCPPayload(client, server, 16*1024, 10*time.Second, uint32(wave<<16|flow))
+			}(flow, client, server)
+		}
+		for flow := 0; flow < flows; flow++ {
+			if transferErr := <-transfers; transferErr != nil {
+				t.Fatal(transferErr)
+			}
+		}
+		for _, client := range clients {
+			_ = client.Close()
+		}
+		for _, server := range servers {
+			_ = server.Close()
+		}
+	}
+	info := listener.Info()
+	if info.AcceptedConnections != waves*flows || info.HandshakeCompletions != waves*flows {
+		t.Fatalf("listener churn diagnostics = %+v", info)
+	}
+	if clientStats, serverStats := link.Stats(0), link.Stats(1); clientStats.RandomDrops == 0 || serverStats.RandomDrops == 0 {
+		t.Fatalf("churn link loss was not exercised: client=%+v server=%+v", clientStats, serverStats)
 	}
 }

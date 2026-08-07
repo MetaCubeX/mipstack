@@ -603,3 +603,69 @@ func TestAutomaticTCPPortOffsetsSeparateDestinations(t *testing.T) {
 		t.Fatal("different TCP destinations received the same automatic-port offsets")
 	}
 }
+
+func TestListenAddressesOverlap(t *testing.T) {
+	any4 := netip.IPv4Unspecified()
+	any6 := netip.IPv6Unspecified()
+	first4 := netip.MustParseAddr("192.0.2.1")
+	second4 := netip.MustParseAddr("192.0.2.2")
+	first6 := netip.MustParseAddr("2001:db8::1")
+	second6 := netip.MustParseAddr("2001:db8::2")
+	for _, test := range []struct {
+		name                string
+		left, right         netip.Addr
+		leftDual, rightDual bool
+		want                bool
+	}{
+		{name: "same IPv4", left: first4, right: first4, want: true},
+		{name: "different IPv4", left: first4, right: second4},
+		{name: "IPv4 wildcard", left: any4, right: first4, want: true},
+		{name: "IPv4 wildcard and IPv6", left: any4, right: first6},
+		{name: "same IPv6", left: first6, right: first6, want: true},
+		{name: "different IPv6", left: first6, right: second6},
+		{name: "IPv6 wildcard", left: any6, right: first6, want: true},
+		{name: "IPv6-only wildcard and IPv4", left: any6, right: first4},
+		{name: "dual wildcard and IPv4", left: any6, leftDual: true, right: first4, want: true},
+		{name: "dual wildcard and IPv6", left: any6, leftDual: true, right: first6, want: true},
+		{name: "dual and IPv4 wildcards", left: any6, leftDual: true, right: any4, want: true},
+		{name: "two dual wildcards", left: any6, leftDual: true, right: any6, rightDual: true, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if overlap := listenAddressesOverlap(test.left, test.leftDual, test.right, test.rightDual); overlap != test.want {
+				t.Fatalf("listenAddressesOverlap = %t, want %t", overlap, test.want)
+			}
+			if overlap := listenAddressesOverlap(test.right, test.rightDual, test.left, test.leftDual); overlap != test.want {
+				t.Fatalf("reversed listenAddressesOverlap = %t, want %t", overlap, test.want)
+			}
+		})
+	}
+}
+
+func TestRecentDestinationCacheEvictionAndExpiry(t *testing.T) {
+	now := time.Unix(1000, 0)
+	cache := make(recentDestinationCache[int])
+	cache.remember(0, now.Add(-time.Second))
+	for destination := 1; destination < recentDestinationMaximum; destination++ {
+		cache.remember(destination, now)
+	}
+	cache.remember(recentDestinationMaximum, now)
+	if len(cache) != recentDestinationMaximum || cache.contains(0, now) || !cache.contains(recentDestinationMaximum, now) {
+		t.Fatalf("oldest-entry eviction = size %d oldest %t newest %t", len(cache), cache.contains(0, now), cache.contains(recentDestinationMaximum, now))
+	}
+	cache[1] = now.Add(-recentDestinationLifetime)
+	cache.remember(recentDestinationMaximum+1, now)
+	if len(cache) != recentDestinationMaximum || cache.contains(1, now) || !cache.contains(recentDestinationMaximum+1, now) {
+		t.Fatalf("expired-entry eviction = size %d expired %t newest %t", len(cache), cache.contains(1, now), cache.contains(recentDestinationMaximum+1, now))
+	}
+	cache.remember(2, now.Add(time.Second))
+	if updated := cache[2]; updated != now.Add(time.Second) || len(cache) != recentDestinationMaximum {
+		t.Fatalf("existing-entry update = %v, size %d", updated, len(cache))
+	}
+	cache[3] = now.Add(-recentDestinationLifetime)
+	if cache.contains(3, now) {
+		t.Fatal("expired destination remained present")
+	}
+	if _, exists := cache[3]; exists {
+		t.Fatal("contains retained expired destination")
+	}
+}

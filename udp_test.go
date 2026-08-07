@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+type testUDPStringAddress string
+
+func (a testUDPStringAddress) Network() string { return "udp" }
+func (a testUDPStringAddress) String() string  { return string(a) }
+
 // TestUDPConcurrentDemultiplexing verifies family and port based dispatch.
 func TestUDPConcurrentDemultiplexing(t *testing.T) {
 	for _, test := range []struct {
@@ -1030,6 +1035,16 @@ func TestUDPConnectedMessageMethods(t *testing.T) {
 	if _, _, err = connection.WriteMsgUDP([]byte("bad"), nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 50017))); err == nil {
 		t.Fatal("connected WriteMsgUDP accepted an explicit destination")
 	}
+	if n, oobn, writeErr := connection.WriteMsgUDPAddrPort([]byte("netip"), nil, netip.AddrPort{}); writeErr != nil || n != 5 || oobn != 0 {
+		t.Fatalf("connected WriteMsgUDPAddrPort = %d/%d, %v", n, oobn, writeErr)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.source != local || packet.target != remote || string(packet.payload[udpHeaderSize:]) != "netip" {
+		t.Fatalf("connected netip message packet = %v -> %v payload %q, parsed = %v", packet.source, packet.target, packet.payload, ok)
+	}
+	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("bad"), nil, netip.AddrPortFrom(remote, 50017)); !errors.Is(err, net.ErrWriteToConnected) {
+		t.Fatalf("connected WriteMsgUDPAddrPort with destination = %v, want net.ErrWriteToConnected", err)
+	}
 	localPort := connection.LocalAddr().(*net.UDPAddr).AddrPort().Port()
 	if err = writeTestPacket(stack, buildTestUDP(remote, local, 50017, localPort, []byte("reply"))); err != nil {
 		t.Fatal(err)
@@ -1039,6 +1054,42 @@ func TestUDPConnectedMessageMethods(t *testing.T) {
 	n, oobn, flags, source, err := connection.ReadMsgUDP(buffer, oob)
 	if err != nil || n != 5 || string(buffer[:n]) != "reply" || oobn != 80 || flags != 0 || source.AddrPort() != netip.AddrPortFrom(remote, 50017) {
 		t.Fatalf("connected ReadMsgUDP = %q/%d flags %#x from %v, %v", buffer[:n], oobn, flags, source, err)
+	}
+}
+
+func TestUDPUnconnectedMessageRequiresDestination(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.101")
+	remote := netip.MustParseAddr("198.51.100.101")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(local, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, _, err = connection.(*UDPConn).WriteMsgUDPAddrPort([]byte("missing"), nil, netip.AddrPort{}); err == nil {
+		t.Fatal("unconnected WriteMsgUDPAddrPort accepted an invalid destination")
+	} else {
+		checkNetOpError(t, err, "write", "udp4")
+	}
+	if _, err = connection.WriteTo([]byte("invalid"), testUDPStringAddress("not-an-address")); err == nil {
+		t.Fatal("unconnected WriteTo accepted an invalid generic destination")
+	} else {
+		checkNetOpError(t, err, "write", "udp4")
+	}
+	address := testUDPStringAddress(netip.AddrPortFrom(remote, 50018).String())
+	if n, writeErr := connection.WriteTo([]byte("generic"), address); writeErr != nil || n != 7 {
+		t.Fatalf("WriteTo generic UDP address = %d, %v", n, writeErr)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.source != local || packet.target != remote || string(packet.payload[udpHeaderSize:]) != "generic" {
+		t.Fatalf("generic UDP packet = %v -> %v payload %q, parsed = %v", packet.source, packet.target, packet.payload, ok)
 	}
 }
 
@@ -1253,5 +1304,69 @@ func TestUDPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
 	connection.mu.Unlock()
 	if retainedAfterClose != 0 {
 		t.Fatalf("closed socket retained receive spare capacity %d", retainedAfterClose)
+	}
+}
+
+// TestUDPImpairedLinkLatencyAndLoss verifies propagation delay, jitter-driven
+// reordering, and deterministic independent loss at the packet-device boundary.
+func TestUDPImpairedLinkLatencyAndLoss(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.211")
+	serverAddress := netip.MustParseAddr("192.0.2.212")
+	client, server := newStackPair(t, clientAddress, serverAddress, 1400)
+	link := newTestImpairedLink(t, client, server, testLinkConditions{
+		Seed:         7123,
+		ClientToPeer: testLinkCondition{Latency: 30 * time.Millisecond, Jitter: 5 * time.Millisecond, LossRate: 0.2},
+	})
+	serverSocket, err := server.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(serverAddress, 46000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSocket.Close()
+	clientSocket, err := client.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.AddrPortFrom(serverAddress, 46000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientSocket.Close()
+	started := time.Now()
+	for sequence := uint32(0); sequence < 64; sequence++ {
+		payload := make([]byte, 4)
+		binary.BigEndian.PutUint32(payload, sequence)
+		if _, err = clientSocket.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, time.Second, func() bool { return link.Stats(0).Packets == 64 })
+	scheduled := link.Stats(0)
+	wantReceived := int(scheduled.Packets - scheduled.RandomDrops - scheduled.QueueDrops)
+	_ = serverSocket.SetReadDeadline(time.Now().Add(time.Second))
+	buffer := make([]byte, 4)
+	received := 0
+	firstDelivery := time.Duration(0)
+	lastSequence := uint32(0)
+	reordered := false
+	for received < wantReceived {
+		_, _, err = serverSocket.ReadFrom(buffer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if received == 0 {
+			firstDelivery = time.Since(started)
+		}
+		sequence := binary.BigEndian.Uint32(buffer)
+		if received != 0 && sequence < lastSequence {
+			reordered = true
+		}
+		lastSequence = sequence
+		received++
+	}
+	stats := link.Stats(0)
+	if stats.RandomDrops == 0 || received == 0 || received >= 64 || stats.Delivered != uint64(received) {
+		t.Fatalf("UDP impairment = received %d, stats %+v", received, stats)
+	}
+	if firstDelivery < 20*time.Millisecond {
+		t.Fatalf("first UDP delivery after %v, want propagation delay", firstDelivery)
+	}
+	if !reordered {
+		t.Fatal("UDP jitter did not exercise packet reordering")
 	}
 }

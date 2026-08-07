@@ -192,3 +192,69 @@ func TestReusePortRejectsMixedDualStackGroups(t *testing.T) {
 		t.Fatalf("mixed dual/IPv6-only UDP group error = %v, want EADDRINUSE", err)
 	}
 }
+
+// TestReusePortConfigInvalidationClosesGroups verifies that UpdateConfig
+// enumerates and closes every member bound to a removed local address.
+func TestReusePortConfigInvalidationClosesGroups(t *testing.T) {
+	removed := netip.MustParseAddr("192.0.2.81")
+	retained := netip.MustParseAddr("192.0.2.82")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(removed, 32), netip.PrefixFrom(retained, 32),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	tcpLocal := netip.AddrPortFrom(removed, 47005)
+	tcpFirst, err := stack.ListenTCPReusePort(context.Background(), "tcp4", tcpLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpSecond, err := stack.ListenTCPReusePort(context.Background(), "tcp4", tcpLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	udpLocal := netip.AddrPortFrom(removed, 47006)
+	udpFirstPacket, err := stack.ListenUDPReusePort(context.Background(), "udp4", udpLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	udpSecondPacket, err := stack.ListenUDPReusePort(context.Background(), "udp4", udpLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	udpFirst, udpSecond := udpFirstPacket.(*UDPConn), udpSecondPacket.(*UDPConn)
+	if stats := stack.Stats(); stats.ActiveTCPListeners != 2 || stats.ActiveUDPSockets != 2 {
+		t.Fatalf("active REUSEPORT endpoints before update = %+v", stats)
+	}
+	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(retained, 32)}}); err != nil {
+		t.Fatal(err)
+	}
+	for index, listener := range []*TCPListener{tcpFirst, tcpSecond} {
+		if !listener.Info().Closed {
+			t.Fatalf("TCP REUSEPORT listener %d remained open", index)
+		}
+		if _, acceptErr := listener.Accept(); !errors.Is(acceptErr, net.ErrClosed) {
+			t.Fatalf("TCP REUSEPORT listener %d Accept = %v, want net.ErrClosed", index, acceptErr)
+		}
+	}
+	for index, connection := range []*UDPConn{udpFirst, udpSecond} {
+		if !connection.Info().Closed {
+			t.Fatalf("UDP REUSEPORT socket %d remained open", index)
+		}
+		if _, _, readErr := connection.ReadFrom(make([]byte, 1)); !errors.Is(readErr, net.ErrClosed) {
+			t.Fatalf("UDP REUSEPORT socket %d ReadFrom = %v, want net.ErrClosed", index, readErr)
+		}
+	}
+	if stats := stack.Stats(); stats.ActiveTCPListeners != 0 || stats.ActiveUDPSockets != 0 {
+		t.Fatalf("active REUSEPORT endpoints after update = %+v", stats)
+	}
+	stack.mu.RLock()
+	defer stack.mu.RUnlock()
+	if stack.tcpPassive != nil || stack.udpReuse != nil {
+		t.Fatalf("empty REUSEPORT registries retained: tcp=%T udp=%T", stack.tcpPassive, stack.udpReuse)
+	}
+}

@@ -1374,46 +1374,6 @@ func (b *tcpSendBuffer) view(offset, maximum int, result *tcpPayloadView) int {
 	return total
 }
 
-// snapshot returns up to maximum bytes at offset. A range crossing a chunk
-// boundary is gathered once so normal TCP segmentation is independent of the
-// storage layout and the gathered bytes remain valid for retransmission.
-func (b *tcpSendBuffer) snapshot(offset, maximum int) ([]byte, int) {
-	total := b.size
-	if offset < 0 || offset >= total || maximum <= 0 {
-		return nil, total
-	}
-	wanted := maximum
-	if available := total - offset; wanted > available {
-		wanted = available
-	}
-	target := b.base + uint64(offset)
-	low, high := 0, len(b.chunks)
-	for low < high {
-		middle := int(uint(low+high) >> 1)
-		chunk := &b.chunks[middle]
-		if chunk.streamStart+uint64(chunk.end-chunk.start) <= target {
-			low = middle + 1
-		} else {
-			high = middle
-		}
-	}
-	if low == len(b.chunks) {
-		return nil, total
-	}
-	chunk := &b.chunks[low]
-	start := chunk.start + int(target-chunk.streamStart)
-	if contiguous := chunk.end - start; contiguous >= wanted {
-		return chunk.storage[start : start+wanted], total
-	}
-	payload := make([]byte, wanted)
-	copied := copy(payload, chunk.storage[start:chunk.end])
-	for index := low + 1; copied < wanted && index < len(b.chunks); index++ {
-		chunk = &b.chunks[index]
-		copied += copy(payload[copied:], chunk.storage[chunk.start:chunk.end])
-	}
-	return payload[:copied], total
-}
-
 // acknowledge removes a cumulatively acknowledged prefix. Retransmission
 // metadata stores sequence ranges rather than payload slices, so released
 // storage can become reusable immediately.
@@ -2900,7 +2860,10 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 			if c.writeDeadlineTimer != nil {
 				c.writeDeadlineTimer.stop()
 			}
-			return written, c.connectionError()
+			c.mu.Lock()
+			err := c.connectionErrorLocked()
+			c.mu.Unlock()
+			return written, err
 		}
 		if c.writeDeadlineTimer != nil {
 			c.writeDeadlineTimer.stop()
@@ -3467,13 +3430,6 @@ func (c *TCPConn) resetAfterAbort() bool {
 	return c.abortRST
 }
 
-// connectionError returns the application-visible terminal error.
-func (c *TCPConn) connectionError() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.connectionErrorLocked()
-}
-
 // connectionErrorLocked returns the terminal error while c.mu is held.
 func (c *TCPConn) connectionErrorLocked() error {
 	if c.terminalErr != nil {
@@ -3510,14 +3466,6 @@ func (c *TCPConn) notifySendChangedLocked() {
 // TIME_WAIT after a positive-linger Close has returned.
 func (c *TCPConn) notifyLingerDone() {
 	c.lingerOnce.Do(func() { close(c.lingerDone) })
-}
-
-// sendSnapshot is the contiguous test and diagnostic form of sendBuffer.view.
-func (c *TCPConn) sendSnapshot(offset, maximum int) ([]byte, int, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	payload, total := c.sendBuffer.snapshot(offset, maximum)
-	return payload, total, c.writeClosed
 }
 
 // sendState returns the current logical send-buffer size and close state

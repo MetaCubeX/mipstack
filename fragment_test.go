@@ -151,6 +151,52 @@ func TestIPv6FirstFragmentRequiresCompleteHeaderChain(t *testing.T) {
 	}
 }
 
+func TestIPv6FirstFragmentHeaderCompleteness(t *testing.T) {
+	extension := func(next byte, length byte, tail []byte) []byte {
+		header := []byte{next, length, 0, 0, 0, 0, 0, 0}
+		return append(header, tail...)
+	}
+	udp := make([]byte, udpHeaderSize)
+	tcp := make([]byte, tcpHeaderSize)
+	tcp[12] = 5 << 4
+	invalidTCPSize := append([]byte(nil), tcp...)
+	invalidTCPSize[12] = 4 << 4
+	for _, test := range []struct {
+		name    string
+		next    byte
+		payload []byte
+		want    bool
+	}{
+		{name: "hop by hop to UDP", next: 0, payload: extension(protocolUDP, 0, udp), want: true},
+		{name: "routing to UDP", next: 43, payload: extension(protocolUDP, 0, udp), want: true},
+		{name: "destination to UDP", next: 60, payload: extension(protocolUDP, 0, udp), want: true},
+		{name: "mobility to UDP", next: 135, payload: extension(protocolUDP, 0, udp), want: true},
+		{name: "truncated extension", next: 60, payload: extension(protocolUDP, 1, nil)},
+		{name: "AH to UDP", next: 51, payload: extension(protocolUDP, 0, udp), want: true},
+		{name: "truncated AH", next: 51, payload: []byte{protocolUDP}},
+		{name: "nested fragment", next: 44, payload: make([]byte, 8)},
+		{name: "TCP", next: protocolTCP, payload: tcp, want: true},
+		{name: "TCP short", next: protocolTCP, payload: tcp[:tcpHeaderSize-1]},
+		{name: "TCP invalid data offset is complete", next: protocolTCP, payload: invalidTCPSize, want: true},
+		{name: "UDP", next: protocolUDP, payload: udp, want: true},
+		{name: "UDP short", next: protocolUDP, payload: udp[:udpHeaderSize-1]},
+		{name: "ESP", next: 50, payload: make([]byte, 8), want: true},
+		{name: "ESP short", next: 50, payload: make([]byte, 7)},
+		{name: "DCCP", next: 33, payload: make([]byte, 12), want: true},
+		{name: "DCCP short", next: 33, payload: make([]byte, 11)},
+		{name: "SCTP", next: 132, payload: make([]byte, 12), want: true},
+		{name: "SCTP short", next: 132, payload: make([]byte, 11)},
+		{name: "no next header", next: 59, want: true},
+		{name: "unknown raw protocol", next: 99, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if complete := ipv6FirstFragmentHeaderComplete(test.next, test.payload); complete != test.want {
+				t.Fatalf("header complete = %t, want %t", complete, test.want)
+			}
+		})
+	}
+}
+
 func TestIPv6NonFinalFragmentRequiresEightBytePayload(t *testing.T) {
 	local := netip.MustParseAddr("2001:db8::21")
 	remote := netip.MustParseAddr("2001:db8::22")
@@ -919,10 +965,60 @@ func FuzzFragmentParsing(f *testing.F) {
 	local := netip.MustParseAddr("192.0.2.32")
 	remote := netip.MustParseAddr("198.51.100.32")
 	fragments := buildIPv4Fragments(remote, local, protocolUDP, make([]byte, 2000), 1280, 1)
+	local6 := netip.MustParseAddr("2001:db8::32")
+	remote6 := netip.MustParseAddr("2001:db8:1::32")
+	fragments6 := buildIPv6FragmentsWithOptions(remote6, local6, protocolUDP, make([]byte, 2000), 1280, 1, ipPacketOptions{})
 	f.Add([]byte(nil))
 	f.Add(fragments[0])
+	f.Add(fragments6[0])
 	f.Fuzz(func(t *testing.T, packet []byte) {
 		_, _ = parseFragment(packet)
+	})
+}
+
+// FuzzFragmentReassemblyOrder exercises duplicate, missing, and reordered
+// fragments while requiring every completed datagram to remain parseable.
+func FuzzFragmentReassemblyOrder(f *testing.F) {
+	f.Add([]byte{0, 1, 2}, false)
+	f.Add([]byte{2, 1, 0}, false)
+	f.Add([]byte{0, 0, 2, 1}, true)
+	f.Fuzz(func(t *testing.T, order []byte, ipv6 bool) {
+		if len(order) > 64 {
+			order = order[:64]
+		}
+		local := netip.MustParseAddr("192.0.2.33")
+		remote := netip.MustParseAddr("198.51.100.33")
+		bits := 32
+		if ipv6 {
+			local = netip.MustParseAddr("2001:db8::33")
+			remote = netip.MustParseAddr("2001:db8:1::33")
+			bits = 128
+		}
+		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, bits)}, MTU: 1280})
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := make([]byte, 3000)
+		for index := range payload {
+			payload[index] = byte(index*31 + 7)
+		}
+		var fragments [][]byte
+		if ipv6 {
+			fragments = buildIPv6FragmentsWithOptions(remote, local, protocolUDP, payload, 1280, 77, ipPacketOptions{})
+		} else {
+			fragments = buildIPv4Fragments(remote, local, protocolUDP, payload, 1280, 77)
+		}
+		now := time.Unix(100, 0)
+		for _, selected := range order {
+			packet := stack.reassemblePacket(fragments[int(selected)%len(fragments)], now)
+			if packet == nil {
+				continue
+			}
+			parsed, ok := parseIPPacket(packet)
+			if !ok || parsed.protocol != protocolUDP || !bytes.Equal(parsed.payload, payload) {
+				t.Fatalf("reassembled fuzz datagram = protocol %d payload %d parsed %t", parsed.protocol, len(parsed.payload), ok)
+			}
+		}
 	})
 }
 

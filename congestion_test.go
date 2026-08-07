@@ -3,7 +3,11 @@ package mipstack
 import (
 	"context"
 	"math"
+	"net"
 	"net/netip"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1435,5 +1439,192 @@ func TestTCPSelectableCongestionControlsRecoverMultipleLosses(t *testing.T) {
 				t.Fatalf("SACK retransmissions = %d, want at least 2", recoveries)
 			}
 		})
+	}
+}
+
+// TestTCPAlgorithmsUnderCombinedImpairment transfers an exact stream through
+// loss, duplication, reordering, rate limiting, and a bounded queue.
+func TestTCPAlgorithmsUnderCombinedImpairment(t *testing.T) {
+	condition := testLinkCondition{
+		Latency: 5 * time.Millisecond, Jitter: 2 * time.Millisecond,
+		LossRate: 0.02, BurstEnterRate: 0.01, BurstExitRate: 0.5,
+		DuplicateRate: 0.05, Bandwidth: 2 * 1024 * 1024, QueueBytes: 64 * 1024,
+	}
+	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+		t.Run(string(algorithm), func(t *testing.T) {
+			client, server, link := newTestTCPConnectionPair(t, algorithm, testLinkConditions{
+				Seed: 3779, ClientToPeer: condition, PeerToClient: condition,
+			})
+			started := time.Now()
+			transferTestTCPPayload(t, client, server, 128*1024, 20*time.Second)
+			stats := link.Stats(0)
+			info := client.Info()
+			t.Logf("transfer=%v link=%+v rtt=%v retransmissions=%d cwnd=%d scheduler-limited=%d", time.Since(started), stats, info.RTT, info.Retransmissions, info.CongestionWindow, info.SchedulerLimitedEvents)
+			if stats.RandomDrops == 0 || stats.Duplicates == 0 {
+				t.Fatalf("combined impairment was not exercised: %+v", stats)
+			}
+		})
+	}
+}
+
+// TestTCPAlgorithmsShareBottleneckWithoutStarvation verifies bounded progress
+// for equal-sized flows sharing one drop-tail bottleneck.
+func TestTCPAlgorithmsShareBottleneckWithoutStarvation(t *testing.T) {
+	const flows, payloadSize = 8, 128 * 1024
+	condition := testLinkCondition{
+		Latency: 8 * time.Millisecond, Jitter: time.Millisecond,
+		Bandwidth: 2 * 1024 * 1024, QueueBytes: 64 * 1024,
+	}
+	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+		t.Run(string(algorithm), func(t *testing.T) {
+			clientAddress := netip.MustParseAddr("192.0.2.231")
+			serverAddress := netip.MustParseAddr("192.0.2.232")
+			clientStack, serverStack, link := newTestImpairedStackPair(t, algorithm, testLinkConditions{
+				Seed: 9341, ClientToPeer: condition, PeerToClient: condition,
+			}, clientAddress, serverAddress)
+			listener, err := serverStack.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(serverAddress, 0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			endpoint := listener.Addr().(*net.TCPAddr).AddrPort()
+			clients := make([]*TCPConn, flows)
+			servers := make([]*TCPConn, flows)
+			for flow := 0; flow < flows; flow++ {
+				accepted := make(chan *TCPConn, 1)
+				acceptError := make(chan error, 1)
+				go func() {
+					connection, acceptErr := listener.AcceptTCP()
+					if acceptErr != nil {
+						acceptError <- acceptErr
+						return
+					}
+					accepted <- connection
+				}()
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				connection, dialErr := clientStack.DialTCP(ctx, "tcp4", netip.AddrPort{}, endpoint)
+				cancel()
+				if dialErr != nil {
+					t.Fatal(dialErr)
+				}
+				clients[flow] = connection.(*TCPConn)
+				select {
+				case servers[flow] = <-accepted:
+				case acceptErr := <-acceptError:
+					t.Fatal(acceptErr)
+				case <-time.After(10 * time.Second):
+					t.Fatal("timed out accepting bottleneck test flow")
+				}
+			}
+			type flowResult struct {
+				duration time.Duration
+				err      error
+			}
+			start := make(chan struct{})
+			results := make(chan flowResult, flows)
+			for flow := 0; flow < flows; flow++ {
+				go func(flow int) {
+					<-start
+					started := time.Now()
+					err := exchangeTestTCPPayload(clients[flow], servers[flow], payloadSize, 20*time.Second, uint32(flow+1))
+					results <- flowResult{duration: time.Since(started), err: err}
+				}(flow)
+			}
+			close(start)
+			minimum, maximum := time.Duration(0), time.Duration(0)
+			for flow := 0; flow < flows; flow++ {
+				result := <-results
+				if result.err != nil {
+					t.Fatal(result.err)
+				}
+				if minimum == 0 || result.duration < minimum {
+					minimum = result.duration
+				}
+				if result.duration > maximum {
+					maximum = result.duration
+				}
+			}
+			for flow := 0; flow < flows; flow++ {
+				_ = clients[flow].Close()
+				_ = servers[flow].Close()
+			}
+			stats := link.Stats(0)
+			t.Logf("flows=%d min=%v max=%v link=%+v", flows, minimum, maximum, stats)
+			if stats.QueueDrops == 0 {
+				t.Fatalf("bottleneck queue did not drop a packet: %+v", stats)
+			}
+			if maximum > 4*minimum+250*time.Millisecond {
+				t.Fatalf("flow completion spread %v..%v indicates starvation", minimum, maximum)
+			}
+		})
+	}
+}
+
+// TestTCPAlgorithmsUnderSustainedSchedulerPressure saturates two Go scheduler
+// processors while all congestion controllers transfer through an impaired link.
+func TestTCPAlgorithmsUnderSustainedSchedulerPressure(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(2)
+	defer runtime.GOMAXPROCS(previousProcs)
+	stop := make(chan struct{})
+	var workers sync.WaitGroup
+	var work, workSink atomic.Uint64
+	for worker := 0; worker < 4; worker++ {
+		workers.Add(1)
+		go func(seed uint64) {
+			defer workers.Done()
+			value := seed
+			for {
+				for iteration := 0; iteration < 1<<16; iteration++ {
+					value = value*6364136223846793005 + 1442695040888963407
+				}
+				workSink.Store(value)
+				work.Add(1)
+				select {
+				case <-stop:
+					return
+				default:
+				}
+			}
+		}(uint64(worker + 1))
+	}
+	defer func() {
+		close(stop)
+		workers.Wait()
+	}()
+	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+		t.Run(string(algorithm), func(t *testing.T) {
+			client, server, _ := newTestTCPConnectionPair(t, algorithm, testLinkConditions{
+				Seed:         6113,
+				ClientToPeer: testLinkCondition{Latency: 3 * time.Millisecond, Jitter: time.Millisecond, LossRate: 0.01},
+				PeerToClient: testLinkCondition{Latency: 3 * time.Millisecond, Jitter: time.Millisecond, LossRate: 0.01},
+			})
+			transferTestTCPPayload(t, client, server, 128*1024, 20*time.Second)
+			info := client.Info()
+			t.Logf("scheduler pressure work=%d rtt=%v retransmissions=%d cwnd=%d scheduler-limited=%d", work.Load(), info.RTT, info.Retransmissions, info.CongestionWindow, info.SchedulerLimitedEvents)
+			if algorithm == CongestionControlBBR && info.SchedulerLimitedEvents == 0 {
+				t.Fatal("BBR did not observe scheduler pressure")
+			}
+		})
+	}
+	if work.Load() == 0 {
+		t.Fatal("CPU pressure workers did not run")
+	}
+}
+
+func TestBBRModeString(t *testing.T) {
+	tests := []struct {
+		mode bbrMode
+		name string
+	}{
+		{bbrStartup, "STARTUP"},
+		{bbrDrain, "DRAIN"},
+		{bbrProbeBandwidth, "PROBE_BW"},
+		{bbrProbeRTT, "PROBE_RTT"},
+		{bbrMode(255), ""},
+	}
+	for _, test := range tests {
+		if name := test.mode.String(); name != test.name {
+			t.Errorf("bbrMode(%d).String() = %q, want %q", test.mode, name, test.name)
+		}
 	}
 }
