@@ -360,6 +360,44 @@ and classic ECN feedback. Text and FIN carried in a stateful SYN or SYN-ACK are
 retained through the handshake and processed only after the connection enters
 ESTABLISHED. SYN-cookie mode remains stateless, so unacknowledged SYN text is
 accepted only when the peer retransmits it with or after the final ACK.
+
+Loss evidence, SACK/RACK/TLP retransmission selection, PRR inputs, and generic
+delivery-rate sampling remain owned by TCP rather than an individual
+congestion controller. Reno, CUBIC, and BBR are separate per-connection
+implementations behind the public `CongestionController` event contract; each
+owns its window policy and private model. Consequently a new controller does
+not require protocol-specific branches in the TCP actor, and delivery-rate
+controllers can reuse the common sampler without duplicating TCP sequence or
+scoreboard logic.
+
+Custom algorithms are registered process-wide with
+`RegisterCongestionControl` and selected through the existing
+`TCPSocketDefaults.CongestionControl` field. Registration is permanent and
+cannot replace an existing name, so live connections never race an unloaded
+factory. The factory creates one independent controller per connection. Its
+first callback is `CongestionEventInitialize`; later callbacks are serialized
+on that connection's actor, reuse the `CongestionEvent` storage, and must not
+block or retain it. Factories and controller instances belonging to different
+connections may run concurrently. Implementations must ignore unknown event
+types so a newer stack can add observations without changing the one-method
+controller interface.
+
+`CongestionState` supplies the Linux-style connection view. Controllers may
+change cwnd and ssthresh directly during the event types that permit those
+outputs. They may also select an explicit byte-rate for the common pacer, or
+declare `CongestionControlFeatureCustomPacing` when they need to own pacing
+deadlines and wake accounting. Declaring
+`CongestionControlFeatureDeliveryRate` enables per-transmission metadata and a
+Linux-style sample on ACK events; algorithms that do not need it pay no
+sampling cost. The sample is a callback-lifetime read-only view exposed through
+accessors, so sampler internals can evolve without changing controller code.
+`CongestionControlFeatureTransmissionEvents` opts into original send and
+retransmission callbacks and is required by custom pacers.
+`CongestionControlFeatureCustomRecovery` opts into PRR and recovery-window
+decisions. Without it TCP applies its RFC recovery defaults without dispatching
+those detailed stages; checkpoint and undo notifications remain available to
+every controller for restoring private state after spurious recovery.
+
 Validated network- and host-unreachable feedback for `SND.UNA` applies RFC
 6069 TCP-LD one-step RTO backoff reversion without turning an established
 connection's soft network error into a hard failure.

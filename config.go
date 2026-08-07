@@ -196,7 +196,7 @@ func normalizeTCPSocketDefaults(value TCPSocketDefaults) (TCPSocketDefaults, err
 		value.CongestionControl = CongestionControlCUBIC
 	}
 	if !value.CongestionControl.valid() {
-		return TCPSocketDefaults{}, errors.New("mipstack: congestion control must be cubic, reno, or bbr")
+		return TCPSocketDefaults{}, errors.New("mipstack: unsupported congestion control")
 	}
 	if value.ReceiveBuffer < 0 || value.MaximumReceiveBuffer < 0 || value.SendBuffer < 0 || value.MaximumSendBuffer < 0 ||
 		value.AcceptQueue < 0 || value.SYNBacklog < 0 || value.IdleTimeout < 0 || value.UserTimeout < 0 {

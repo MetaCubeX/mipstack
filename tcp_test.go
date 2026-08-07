@@ -1568,7 +1568,7 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlCUBIC)
 	rtt := rttEstimator{initialized: true, srtt: 100 * time.Millisecond, variation: 20 * time.Millisecond, rto: time.Second}
 	var eifel tcpRecoveryUndo
-	eifel.begin(true, 4000, 12000, 8000, 10000, controller, rtt)
+	eifel.begin(true, 4000, 12000, 8000, 10000, &controller, rtt)
 	eifel.recordRetransmission(1000, 2000, 200, false)
 	if eifel.detectEifel(199, false, false, 4000) {
 		t.Fatal("Eifel accepted an all-data ACK without prior DSACK evidence")
@@ -1578,9 +1578,9 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 		t.Fatal("Eifel rejected conservative timestamp and prior-DSACK evidence")
 	}
 	response := eifel.eifelRTOResponse()
-	window, threshold, restoredController := eifel.restore(6000, 4000, 1000, controller, time.Unix(100, 0))
-	if window != 10000 || threshold != 10000 || restoredController.algorithm != CongestionControlCUBIC {
-		t.Fatalf("Eifel restore = cwnd %d ssthresh %d controller %q", window, threshold, restoredController.algorithm)
+	window, threshold := eifel.restore(6000, 4000, 1000, &controller, time.Unix(100, 0))
+	if window != 10000 || threshold != 10000 || controller.algorithmName() != CongestionControlCUBIC {
+		t.Fatalf("Eifel restore = cwnd %d ssthresh %d controller %q", window, threshold, controller.algorithmName())
 	}
 	currentRTT := rttEstimator{initialized: true, srtt: 80 * time.Millisecond, variation: 10 * time.Millisecond, rto: tcpMinimumRTO}
 	if response.observe(4000, 300*time.Millisecond, &currentRTT) {
@@ -1590,14 +1590,14 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 		t.Fatalf("Eifel RTO response = srtt %v variation %v rto %v", currentRTT.srtt, currentRTT.variation, currentRTT.rto)
 	}
 	var highThreshold tcpRecoveryUndo
-	highThreshold.begin(false, 4000, 12000, 18000, 10000, controller, rtt)
-	_, threshold, _ = highThreshold.restore(6000, 0, 1000, controller, time.Unix(100, 0))
+	highThreshold.begin(false, 4000, 12000, 18000, 10000, &controller, rtt)
+	_, threshold = highThreshold.restore(6000, 0, 1000, &controller, time.Unix(100, 0))
 	if threshold != 18000 {
 		t.Fatalf("RFC 4015 pipe_prev = %d, want max(FlightSize, ssthresh) = 18000", threshold)
 	}
 
 	var dsack tcpRecoveryUndo
-	dsack.begin(false, 5000, 16000, 12000, 14000, controller, rtt)
+	dsack.begin(false, 5000, 16000, 12000, 14000, &controller, rtt)
 	dsack.recordRetransmission(1000, 2000, 300, false)
 	dsack.recordRetransmission(2000, 3000, 301, false)
 	if dsack.observeDSACK(tcpSACKBlock{left: 1000, right: 2000}, 3000, 1000, false) {
@@ -1608,14 +1608,14 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	}
 
 	var repeated tcpRecoveryUndo
-	repeated.begin(false, 5000, 16000, 12000, 14000, controller, rtt)
+	repeated.begin(false, 5000, 16000, 12000, 14000, &controller, rtt)
 	repeated.recordRetransmission(1000, 2000, 300, false)
 	repeated.recordRetransmission(1000, 2000, 301, true)
 	if repeated.observeDSACK(tcpSACKBlock{left: 1000, right: 2000}, 2000, 1000, false) {
 		t.Fatal("DSACK undid a range retransmitted more than once")
 	}
 	var repacketized tcpRecoveryUndo
-	repacketized.begin(false, 5000, 16000, 12000, 14000, controller, rtt)
+	repacketized.begin(false, 5000, 16000, 12000, 14000, &controller, rtt)
 	repacketized.recordRetransmission(1000, 2200, 300, false)
 	repacketized.recordRetransmission(1000, 2000, 301, true)
 	if !repacketized.dsackDisabled {
@@ -1623,7 +1623,7 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	}
 
 	var emptyScoreboard tcpRecoveryUndo
-	emptyScoreboard.begin(false, 5000, 16000, 12000, 14000, controller, rtt)
+	emptyScoreboard.begin(false, 5000, 16000, 12000, 14000, &controller, rtt)
 	emptyScoreboard.recordRetransmission(1000, 2000, 300, false)
 	if emptyScoreboard.observeDSACK(tcpSACKBlock{left: 1000, right: 2000}, 2000, 1000, true) || !emptyScoreboard.dsackDisabled {
 		t.Fatal("RFC 3708 empty-scoreboard exception did not disable undo")
@@ -2969,10 +2969,10 @@ func TestTCPOutOfOrderFINWaitsForSequenceGap(t *testing.T) {
 func TestTCPPartialACKCanLeaveFINOnly(t *testing.T) {
 	segment := sentTCPSegment{
 		sequence: 100, end: 104, flags: tcpFlagACK | tcpFlagPSH | tcpFlagFIN,
-		cwr: true, rate: bbrRateSnapshot{deliveredStamp: 1},
+		cwr: true, delivery: tcpDeliverySnapshot{deliveredStamp: 1},
 	}
 	trimAcknowledgedTCPSegment(&segment, 103)
-	if segment.sequence != 103 || segment.end != 104 || segment.dataSize() != 0 || segment.flags&tcpFlagFIN == 0 || segment.flags&tcpFlagPSH != 0 || segment.cwr || segment.rate.deliveredStamp == 0 {
+	if segment.sequence != 103 || segment.end != 104 || segment.dataSize() != 0 || segment.flags&tcpFlagFIN == 0 || segment.flags&tcpFlagPSH != 0 || segment.cwr || segment.delivery.deliveredStamp == 0 {
 		t.Fatalf("FIN-only remainder = %+v", segment)
 	}
 }
@@ -3350,12 +3350,12 @@ func TestTCPDSACKParsing(t *testing.T) {
 // TestTCPRepeatedSACKIsNotNewInformation verifies that an unchanged SACK
 // block cannot repeatedly inflate duplicate-ACK recovery.
 func TestTCPRepeatedSACKIsNotNewInformation(t *testing.T) {
-	outstanding := []sentTCPSegment{{sequence: 100, end: 200}, {sequence: 200, end: 300, rate: bbrRateSnapshot{deliveredStamp: 1}}}
+	outstanding := []sentTCPSegment{{sequence: 100, end: 200}, {sequence: 200, end: 300, delivery: tcpDeliverySnapshot{deliveredStamp: 1}}}
 	blocks := []tcpSACKBlock{{left: 200, right: 300}}
 	var present, fresh bool
 	var delivered []sentTCPSegment
 	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks)
-	if !present || !fresh || len(delivered) != 1 || delivered[0].rate.deliveredStamp == 0 || outstanding[1].rate.deliveredStamp != 0 {
+	if !present || !fresh || len(delivered) != 1 || delivered[0].delivery.deliveredStamp == 0 || outstanding[1].delivery.deliveredStamp != 0 {
 		t.Fatalf("first SACK state = present %t, fresh %t; want true, true", present, fresh)
 	}
 	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks)
