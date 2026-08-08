@@ -1,6 +1,7 @@
 package mipstack
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -872,5 +873,92 @@ func TestBBRSaveWindowReplacesStaleOpenState(t *testing.T) {
 	bbr.saveWindow(12_000)
 	if bbr.priorWindow != 12_000 {
 		t.Fatalf("recovery prior window = %d, want 12000", bbr.priorWindow)
+	}
+}
+
+func TestBBRInitialCycleUsesLinuxPhaseSet(t *testing.T) {
+	controller := bbrCongestionControl{cycleRandom: 1}
+	counts := [len(bbrProbeBandwidthGains)]int{}
+	now := time.Unix(100, 0)
+	for sample := 0; sample < 4096; sample++ {
+		controller.resetProbeBandwidth(now)
+		if controller.cycleIndex < 0 || controller.cycleIndex >= len(counts) {
+			t.Fatalf("ProbeBW cycle = %d", controller.cycleIndex)
+		}
+		counts[controller.cycleIndex]++
+	}
+	if counts[1] != 0 {
+		t.Fatalf("ProbeBW initialized in drain phase %d times", counts[1])
+	}
+	for phase, count := range counts {
+		if phase != 1 && count == 0 {
+			t.Fatalf("ProbeBW phase %d was never selected: %v", phase, counts)
+		}
+	}
+}
+
+func TestBBRCycleRandomIsControllerLocal(t *testing.T) {
+	first := bbrCongestionControl{cycleRandom: 1}
+	second := bbrCongestionControl{cycleRandom: 2}
+	now := time.Unix(100, 0)
+	equal := true
+	for sample := 0; sample < 16; sample++ {
+		if first.nextCycleRandom(now) != second.nextCycleRandom(now) {
+			equal = false
+		}
+	}
+	if equal {
+		t.Fatal("independent BBR controllers produced identical random streams")
+	}
+}
+
+func TestBBRCycleRandomConcurrentInitialization(t *testing.T) {
+	const controllers = 256
+	start := make(chan struct{})
+	cycles := make(chan int, controllers)
+	var workers sync.WaitGroup
+	workers.Add(controllers)
+	for index := 0; index < controllers; index++ {
+		go func() {
+			defer workers.Done()
+			<-start
+			controller := bbrCongestionControl{}
+			controller.resetProbeBandwidth(time.Unix(100, 0))
+			cycles <- controller.cycleIndex
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(cycles)
+	for cycle := range cycles {
+		if cycle < 0 || cycle >= len(bbrProbeBandwidthGains) || cycle == 1 {
+			t.Fatalf("concurrent ProbeBW cycle = %d", cycle)
+		}
+	}
+}
+
+func BenchmarkBBRResetProbeBandwidth(b *testing.B) {
+	controller := newBBRCongestionControl()
+	now := time.Unix(100, 0)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		controller.resetProbeBandwidth(now)
+	}
+	if controller.cycleIndex < 0 {
+		b.Fatal("invalid ProbeBW cycle")
+	}
+}
+
+func BenchmarkBBRInitializeProbeBandwidth(b *testing.B) {
+	now := time.Unix(100, 0)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		controller := bbrCongestionControl{}
+		controller.resetProbeBandwidth(now)
+		if controller.cycleIndex < 0 {
+			b.Fatal("invalid ProbeBW cycle")
+		}
 	}
 }

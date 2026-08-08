@@ -1,8 +1,9 @@
 package mipstack
 
 import (
-	"crypto/rand"
 	"math"
+	"math/bits"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,6 +34,8 @@ const (
 	// bbrPacingMargin keeps the average pacing rate one percent below the
 	// estimated bottleneck bandwidth, matching Linux BBRv1.
 	bbrPacingMargin = 0.99
+	// bbrCycleRandomIncrement is SplitMix64's Weyl-sequence increment.
+	bbrCycleRandomIncrement = uint64(0x9e3779b97f4a7c15)
 	// bbrLongTermMinimumRounds is the minimum policer sampling interval.
 	bbrLongTermMinimumRounds = 4
 	// bbrLongTermMaximumRounds bounds one policer sampling interval.
@@ -65,6 +68,11 @@ const (
 	// mipstack groups at most four such quanta to amortize that userspace cost.
 	bbrMaximumUserspaceQuanta = 4
 )
+
+// bbrCycleRandomSequence separates controllers initialized at the same clock
+// instant. ProbeBW phase selection is not a security boundary, so it uses a
+// local generator rather than reading the operating system random source.
+var bbrCycleRandomSequence atomic.Uint64
 
 // bbrProbeBandwidthGains cycles above, below, and at the estimated bottleneck
 // rate to discover more capacity without retaining a standing queue.
@@ -218,6 +226,7 @@ type bbrCongestionControl struct {
 	minimumRTTStamp time.Time
 	cycleIndex      int
 	cycleStamp      tcpDeliveryTimestamp
+	cycleRandom     uint64
 	probeDone       time.Time
 	probeRound      bool
 	priorWindow     uint32
@@ -927,27 +936,36 @@ func (b *bbrCongestionControl) resetMode(now time.Time) {
 // resetProbeBandwidth starts Linux's randomized steady-state gain cycle.
 func (b *bbrCongestionControl) resetProbeBandwidth(now time.Time) {
 	b.mode = bbrProbeBandwidth
-	b.cycleIndex = bbrInitialCycle(now)
+	b.cycleIndex = b.initialCycle(now)
 	b.cycleStamp = b.deliveredStamp
 }
 
-// bbrInitialCycle mirrors Linux's randomized initial ProbeBW phase.
-func bbrInitialCycle(now time.Time) int {
-	const choices = byte(len(bbrProbeBandwidthGains) - 1)
-	var value [1]byte
+// nextCycleRandom advances one controller-local SplitMix64 stream. The global
+// sequence only salts the first value so connections created in one clock tick
+// do not start with identical ProbeBW schedules.
+func (b *bbrCongestionControl) nextCycleRandom(now time.Time) uint64 {
+	if b.cycleRandom == 0 {
+		b.cycleRandom = uint64(now.UnixNano()) ^ bbrCycleRandomSequence.Add(bbrCycleRandomIncrement)
+	}
+	b.cycleRandom += bbrCycleRandomIncrement
+	value := b.cycleRandom
+	value = (value ^ value>>30) * 0xbf58476d1ce4e5b9
+	value = (value ^ value>>27) * 0x94d049bb133111eb
+	return value ^ value>>31
+}
+
+// initialCycle mirrors Linux's randomized initial ProbeBW phase. Reciprocal
+// multiplication and rejection keep all choices exactly uniform, matching the
+// range reduction in get_random_u32_below, and the mapping skips drain phase.
+func (b *bbrCongestionControl) initialCycle(now time.Time) int {
+	const choices = uint64(len(bbrProbeBandwidthGains) - 1)
+	const rejection = (^choices + 1) % choices
 	for {
-		if _, err := rand.Read(value[:]); err != nil {
-			value[0] = byte(uint64(now.UnixNano()) % uint64(choices))
-			break
-		}
-		// Discard the incomplete final interval to keep all seven Linux phases
-		// equally likely.
-		if value[0] < ^byte(0)-(^byte(0)%choices) {
-			value[0] %= choices
-			break
+		choice, remainder := bits.Mul64(b.nextCycleRandom(now), choices)
+		if remainder >= rejection {
+			return (len(bbrProbeBandwidthGains) - int(choice)) % len(bbrProbeBandwidthGains)
 		}
 	}
-	return (len(bbrProbeBandwidthGains) - int(value[0])) % len(bbrProbeBandwidthGains)
 }
 
 // pacingGain returns the gain for BBR's current phase.

@@ -13,14 +13,16 @@ import (
 type reuseTCPListenerBinding struct{}
 
 // tcpReuseRegistry owns flow-distributed TCP listener groups. Stack.mu
-// protects its maps and group slices.
+// protects its maps and group slices. Its unpredictable SipHash key prevents
+// a remote peer that controls flow tuples from targeting one listener.
 type tcpReuseRegistry struct {
 	key    [16]byte
 	groups map[tcpListenKey][]*TCPListener
 }
 
 // udpReuseRegistry owns flow-distributed UDP socket groups. Stack.mu protects
-// its maps and group slices.
+// its maps and group slices. Its unpredictable SipHash key prevents a remote
+// peer that controls flow tuples from targeting one socket.
 type udpReuseRegistry struct {
 	key    [16]byte
 	groups map[udpKey][]*UDPConn
