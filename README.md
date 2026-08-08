@@ -69,6 +69,14 @@ packet-device loops. They also accept a buffer slice larger than `BatchSize`
 because a composite WireGuard device may use a larger Bind batch; `Read`
 still returns no more than 64 packets.
 
+The outbound link queue uses byte-based deficit round robin modeled on the
+local-flow scheduling in Linux `sch_fq`. New flows receive a bounded initial
+allowance, active flows rotate by byte credit, and short UDP or ICMP exchanges
+therefore do not sit behind an entire queue of bulk TCP packets. TCP pacing
+remains connection-owned: the scheduler only chooses among packets that a TCP
+actor has already made eligible. Local loopback delivery remains FIFO because
+it has no serialized external-link bottleneck.
+
 For integration with userspace packet-device consumers, `Stack` also provides
 `MTU`, `Name`, and `BatchSize`. `LocalAddresses` returns an independent
 snapshot of every configured address in configuration order. Operating-system
@@ -441,8 +449,8 @@ before servicing the timer. Packets arriving during that turn are excluded, so
 host scheduling delay cannot manufacture loss and a continuous packet stream
 cannot starve retransmission, liveness, pacing, or PMTU timers. Transmission
 timestamps start when packets enter the embedding device queue, and loss
-timers defer while the original packet still occupies that FIFO, so link
-backpressure is not misclassified as network loss.
+timers defer while the original packet still occupies that outbound queue, so
+link backpressure is not misclassified as network loss.
 
 TCP user timeout follows Linux `TCP_USER_TIMEOUT`: it applies only in
 synchronized states, returns `ETIMEDOUT`, does not change retransmission or

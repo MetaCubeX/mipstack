@@ -78,7 +78,7 @@ func TestIPConnFanoutAndLinuxControl(t *testing.T) {
 			if stats := stack.Stats(); stats.ActiveIPSockets != 2 {
 				t.Fatalf("active IP sockets = %d, want 2", stats.ActiveIPSockets)
 			}
-			if len(stack.outbound.packets) != 0 {
+			if stack.outbound.len() != 0 {
 				t.Fatal("raw-consumed protocol generated Protocol Unreachable")
 			}
 		})

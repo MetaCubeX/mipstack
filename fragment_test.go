@@ -457,12 +457,18 @@ func TestDirectIPv6FragmentOutputOverwritesReusableHeader(t *testing.T) {
 	if err = stack.writeIPPayload(local, remote, protocolUDP, make([]byte, 1300), true); err != nil {
 		t.Fatal(err)
 	}
-	entry := <-stack.outbound.packets
+	entry, ok := stack.outbound.tryDequeue()
+	if !ok {
+		t.Fatal("missing first IPv6 fragment")
+	}
 	if len(entry.packet) != 1280 || entry.packet[40] != protocolUDP || entry.packet[41] != 0 {
 		t.Fatalf("reused IPv6 fragment header = %x", entry.packet[40:48])
 	}
 	stack.outbound.release(entry)
-	entry = <-stack.outbound.packets
+	entry, ok = stack.outbound.tryDequeue()
+	if !ok {
+		t.Fatal("missing second IPv6 fragment")
+	}
 	stack.outbound.release(entry)
 }
 
@@ -478,7 +484,7 @@ func TestDirectFragmentOutputPreservesPartialDeadlineEmission(t *testing.T) {
 	}
 	defer stack.Close()
 	dummy := buildIPPacket(local, remote, 99, []byte{1}, 0, true)
-	for index := 0; index < cap(stack.outbound.packets)-1; index++ {
+	for index := 0; index < cap(stack.outbound.free)-1; index++ {
 		if !stack.outbound.tryEnqueue(dummy) {
 			t.Fatalf("dummy packet %d was not queued", index)
 		}
@@ -493,8 +499,11 @@ func TestDirectFragmentOutputPreservesPartialDeadlineEmission(t *testing.T) {
 		t.Fatalf("fragmented write error = %v, want deadline exceeded", err)
 	}
 	fragments := 0
-	for len(stack.outbound.packets) != 0 {
-		entry := <-stack.outbound.packets
+	for {
+		entry, ok := stack.outbound.tryDequeue()
+		if !ok {
+			break
+		}
 		if len(entry.packet) >= 20 && entry.packet[9] == protocolUDP && binary.BigEndian.Uint16(entry.packet[6:8])&0x2000 != 0 {
 			fragments++
 			if identification := binary.BigEndian.Uint16(entry.packet[4:6]); identification != 101 {

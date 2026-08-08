@@ -247,11 +247,9 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	if err = writeTestPacket(stack, nonInitial); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := waitTestPacketEntry(&stack.outbound, 25*time.Millisecond); ok {
 		response = consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("non-initial malformed fragment produced Parameter Problem: %x", response)
-	case <-time.After(25 * time.Millisecond):
 	}
 	activeRouting := buildTestIPv6Extension(remote6, local6, 43, []byte{protocolUDP, 0, 99, 1, 0, 0, 0, 0})
 	if err = writeTestPacket(stack, activeRouting); err != nil {
@@ -276,11 +274,9 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	if err = writeTestPacket(stack, icmpErrorWithUnknownOption); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := waitTestPacketEntry(&stack.outbound, 25*time.Millisecond); ok {
 		response = consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("ICMPv6 error produced recursive Parameter Problem: %x", response)
-	case <-time.After(25 * time.Millisecond):
 	}
 	if err = writeTestPacket(stack, buildIPPacket(remote4, local4, 99, []byte{1, 2, 3, 4}, 1, true)); err != nil {
 		t.Fatal(err)
@@ -301,11 +297,9 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	if err = writeTestPacket(stack, buildIPPacket(remote6, local6, 59, nil, 0, true)); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := stack.outbound.tryDequeue(); ok {
 		response = consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("IPv6 No Next Header produced a response: %x", response)
-	default:
 	}
 }
 
@@ -371,11 +365,9 @@ func TestIPv4MappedIPv6WireSourceIsDropped(t *testing.T) {
 	if after := stack.Stats().InboundDroppedPackets; after != before+1 {
 		t.Fatalf("mapped IPv6 source drop count = %d, want %d", after, before+1)
 	}
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := stack.outbound.tryDequeue(); ok {
 		response := consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("mapped IPv6 source produced response: %x", response)
-	default:
 	}
 }
 
@@ -393,11 +385,9 @@ func TestIPv4DirectedBroadcastSourceIsDropped(t *testing.T) {
 	if err = writeTestPacket(stack, packet); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := waitTestPacketEntry(&stack.outbound, 25*time.Millisecond); ok {
 		response := consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("directed-broadcast source produced a response: %x", response)
-	case <-time.After(25 * time.Millisecond):
 	}
 	if dropped := stack.Stats().InboundDroppedPackets; dropped != 1 {
 		t.Fatalf("directed-broadcast source drops = %d, want 1", dropped)

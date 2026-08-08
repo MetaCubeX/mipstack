@@ -1481,6 +1481,7 @@ type TCPConn struct {
 	congestion         CongestionControl
 	congestionUser     bool
 	maximumPacingRate  uint64
+	outputFlowID       uint64
 	receiveWindowScale uint8
 	trafficClass       atomic.Uint32
 	flowLabel          uint32
@@ -2156,6 +2157,9 @@ func newTCPConn(stack *Stack, network string, key tcpKey, mtu int) *TCPConn {
 		idleTimeout: defaults.IdleTimeout, userTimeout: defaults.UserTimeout, congestion: defaults.CongestionControl,
 		maximumPacingRate:  defaults.MaximumPacingRate,
 		receiveWindowScale: tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer),
+	}
+	if stack != nil {
+		connection.outputFlowID = stack.nextOutputFlow.Add(1)
 	}
 	if key.local.Addr().Is6() {
 		connection.flowLabel = defaults.FlowLabel
@@ -6399,7 +6403,7 @@ func (c *TCPConn) writeTCP(sequence, acknowledgement uint32, flags byte, window 
 		queue.releaseReserved(slot)
 		return packetQueueTicket{}, err
 	}
-	hostQueue := queue.enqueueReserved(slot, built, reusable)
+	hostQueue := queue.enqueueReservedTCP(slot, built, reusable, c.outputFlowID)
 	c.stack.recordOutput(loopback)
 	return hostQueue, nil
 }

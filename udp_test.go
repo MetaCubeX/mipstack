@@ -309,7 +309,10 @@ func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
 			fragments := (udpHeaderSize + len(payload) + maximum - 1) / maximum
 			drain := func() {
 				for index := 0; index < fragments; index++ {
-					entry := <-stack.outbound.packets
+					entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+					if !ok {
+						b.Fatal("timed out waiting for UDP fragment")
+					}
 					stack.outbound.release(entry)
 				}
 			}

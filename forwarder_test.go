@@ -38,13 +38,7 @@ func newForwarderTestStack(t *testing.T, local netip.Addr, promiscuous bool) *St
 // device queue.
 func readForwarderTestPacket(t *testing.T, stack *Stack) []byte {
 	t.Helper()
-	select {
-	case entry := <-stack.outbound.packets:
-		return consumeTestPacket(&stack.outbound, entry)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for forwarded response")
-		return nil
-	}
+	return readOutboundPacket(t, stack)
 }
 
 func TestForwarderRegistrationAndCloseLifecycle(t *testing.T) {
@@ -450,11 +444,9 @@ func TestPromiscuousAdmissionDoesNotImplySourceSpoofing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := waitTestPacketEntry(&stack.outbound, 30*time.Millisecond); ok {
 		response := consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("bare promiscuous admission emitted response %x", response)
-	case <-time.After(30 * time.Millisecond):
 	}
 	if got := stack.Stats().PromiscuousInboundPackets; got != uint64(len(packets)) {
 		t.Fatalf("promiscuous packet count = %d", got)
@@ -1379,9 +1371,12 @@ func TestUDPForwarderReplyReservesAllFragments(t *testing.T) {
 	target := netip.MustParseAddr("198.51.100.110")
 	stack := newForwarderTestStack(t, owned, true)
 	fillTestPacketQueue(t, &stack.outbound, []byte{0})
-	entry := <-stack.outbound.packets
+	entry, ok := stack.outbound.tryDequeue()
+	if !ok {
+		t.Fatal("filled packet queue could not be dequeued")
+	}
 	stack.outbound.release(entry)
-	before := len(stack.outbound.packets)
+	before := stack.outbound.len()
 	result := make(chan error, 1)
 	forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
 		_, replyErr := request.Reply(bytes.Repeat([]byte{0x5a}, 1800))
@@ -1397,7 +1392,7 @@ func TestUDPForwarderReplyReservesAllFragments(t *testing.T) {
 	if err = <-result; !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("fragmented Reply with one slot = %v, want ErrResourceLimit", err)
 	}
-	if got := len(stack.outbound.packets); got != before {
+	if got := stack.outbound.len(); got != before {
 		t.Fatalf("partial UDP fragments were queued: before=%d after=%d", before, got)
 	}
 }
@@ -1620,11 +1615,9 @@ func TestUDPForwarderDetachedTerminalActions(t *testing.T) {
 				if info.Dropped != 1 || info.Rejected != 0 {
 					t.Fatalf("dropped detached UDP info = %+v", info)
 				}
-				select {
-				case packet := <-stack.outbound.packets:
+				if packet, ok := stack.outbound.tryDequeue(); ok {
 					stack.outbound.release(packet)
 					t.Fatal("detached UDP Drop emitted a packet")
-				default:
 				}
 			} else {
 				if info.Dropped != 0 || info.Rejected != 1 {
@@ -1792,8 +1785,12 @@ func TestUDPForwarderDetachedReplyCanRetry(t *testing.T) {
 	if err = responder.Drop(); !errors.Is(err, ErrForwarderReplyActive) {
 		t.Fatalf("Drop active detached UDP responder = %v", err)
 	}
-	for len(stack.outbound.packets) != 0 {
-		consumeTestPacket(&stack.outbound, <-stack.outbound.packets)
+	for {
+		entry, ok := stack.outbound.tryDequeue()
+		if !ok {
+			break
+		}
+		consumeTestPacket(&stack.outbound, entry)
 	}
 	if _, err = responder.Reply([]byte("answer")); err != nil {
 		t.Fatalf("retry detached UDP Reply: %v", err)
@@ -1821,8 +1818,12 @@ func TestUDPForwarderRequestReplyCanRetry(t *testing.T) {
 	forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
 		_, firstErr := request.Reply([]byte("answer"))
 		_, acceptErr := request.Accept()
-		for len(stack.outbound.packets) != 0 {
-			consumeTestPacket(&stack.outbound, <-stack.outbound.packets)
+		for {
+			entry, ok := stack.outbound.tryDequeue()
+			if !ok {
+				break
+			}
+			consumeTestPacket(&stack.outbound, entry)
 		}
 		_, retryErr := request.Reply([]byte("answer"))
 		results <- [3]error{firstErr, acceptErr, retryErr}
@@ -2264,11 +2265,9 @@ func TestICMPForwarderRejectsShortReply(t *testing.T) {
 			t.Fatalf("%d-byte ICMP Reply = %v", size+4, replyErr)
 		}
 	}
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := stack.outbound.tryDequeue(); ok {
 		stack.outbound.release(entry)
 		t.Fatal("short ICMP Reply emitted a packet")
-	default:
 	}
 	if info := forwarder.Info(); info.Replies != 0 || info.ReplyErrors != 4 {
 		t.Fatalf("short ICMP Reply diagnostics = %+v", info)
@@ -2311,7 +2310,11 @@ func BenchmarkUDPForwarderReply(b *testing.B) {
 		if replyErr != nil {
 			b.Fatal(replyErr)
 		}
-		stack.outbound.release(<-stack.outbound.packets)
+		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !ok {
+			b.Fatal("timed out waiting for UDP forwarder reply")
+		}
+		stack.outbound.release(entry)
 	}
 }
 
@@ -2354,7 +2357,11 @@ func BenchmarkICMPForwarderReplyEcho(b *testing.B) {
 		if replyErr != nil {
 			b.Fatal(replyErr)
 		}
-		stack.outbound.release(<-stack.outbound.packets)
+		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !ok {
+			b.Fatal("timed out waiting for ICMP forwarder reply")
+		}
+		stack.outbound.release(entry)
 	}
 }
 

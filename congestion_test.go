@@ -3,10 +3,14 @@ package mipstack
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
+	"io"
 	"math"
 	"net"
 	"net/netip"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -754,6 +758,284 @@ func TestBBRModeString(t *testing.T) {
 	for _, test := range tests {
 		if name := test.mode.String(); name != test.name {
 			t.Errorf("bbrMode(%d).String() = %q, want %q", test.mode, name, test.name)
+		}
+	}
+}
+
+// testDeviceBottleneck keeps serialization behind Stack.Read, so packets
+// accumulate in the stack's output scheduler instead of an independent test
+// link queue. The reverse direction can remain unshaped for prompt ACKs.
+type testDeviceBottleneck struct {
+	client *Stack
+	server *Stack
+	done   sync.WaitGroup
+}
+
+func newTestDeviceBottleneck(t testing.TB, algorithm CongestionControl, bytesPerSecond int, fair bool) (*Stack, *Stack) {
+	t.Helper()
+	clientAddress := netip.MustParseAddr("192.0.2.241")
+	serverAddress := netip.MustParseAddr("192.0.2.242")
+	newStack := func(address netip.Addr) *Stack {
+		stack, err := New(Config{
+			LocalAddresses: []netip.Prefix{netip.PrefixFrom(address, 32)},
+			MTU:            1400,
+			TCP:            TCPSocketDefaults{CongestionControl: algorithm},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !fair {
+			stack.outbound = newPacketQueueAt(outboundPacketQueue, stack.timestampEpoch)
+		}
+		if err = stack.Start(); err != nil {
+			t.Fatal(err)
+		}
+		return stack
+	}
+	link := &testDeviceBottleneck{client: newStack(clientAddress), server: newStack(serverAddress)}
+	link.done.Add(2)
+	go link.pump(link.client, link.server, bytesPerSecond)
+	go link.pump(link.server, link.client, 0)
+	t.Cleanup(func() {
+		_ = link.client.Close()
+		_ = link.server.Close()
+		link.done.Wait()
+	})
+	return link.client, link.server
+}
+
+func (l *testDeviceBottleneck) pump(source, target *Stack, bytesPerSecond int) {
+	defer l.done.Done()
+	// Amortize serialization waits across a small device batch. In particular,
+	// sub-millisecond per-packet sleeps are rounded heavily by older Windows Go
+	// runtimes and turn a 4 MiB/s test link into an accidental timeout.
+	const batchSize = 32
+	buffers := make([][]byte, batchSize)
+	for index := range buffers {
+		buffers[index] = make([]byte, 65535)
+	}
+	sizes := make([]int, batchSize)
+	next := time.Time{}
+	for {
+		count, err := source.Read(buffers, sizes, 0)
+		if err != nil {
+			return
+		}
+		if bytesPerSecond > 0 {
+			bytes := 0
+			for index := 0; index < count; index++ {
+				bytes += sizes[index]
+			}
+			now := time.Now()
+			if next.Before(now) {
+				next = now
+			}
+			next = next.Add(time.Duration(bytes) * time.Second / time.Duration(bytesPerSecond))
+			if delay := time.Until(next); delay > 0 {
+				time.Sleep(delay)
+			}
+		}
+		for index := 0; index < count; index++ {
+			if _, err = target.Write(buffers[index:index+1], 0); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func openTestDeviceBottleneckTCPFlows(t testing.TB, client, server *Stack, flows int) ([]*TCPConn, []*TCPConn) {
+	t.Helper()
+	serverAddress := server.LocalAddresses()[0]
+	listener, err := server.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(serverAddress, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	clients := make([]*TCPConn, flows)
+	servers := make([]*TCPConn, flows)
+	for flow := 0; flow < flows; flow++ {
+		accepted := make(chan *TCPConn, 1)
+		acceptError := make(chan error, 1)
+		go func() {
+			connection, acceptErr := listener.AcceptTCP()
+			if acceptErr != nil {
+				acceptError <- acceptErr
+				return
+			}
+			accepted <- connection
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		connection, dialErr := client.DialTCP(ctx, "tcp4", netip.AddrPort{}, listener.Addr().(*net.TCPAddr).AddrPort())
+		cancel()
+		if dialErr != nil {
+			t.Fatal(dialErr)
+		}
+		clients[flow] = connection.(*TCPConn)
+		select {
+		case servers[flow] = <-accepted:
+		case acceptErr := <-acceptError:
+			t.Fatal(acceptErr)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out accepting device-bottleneck flow")
+		}
+	}
+	t.Cleanup(func() {
+		for index := range clients {
+			_ = clients[index].Close()
+			_ = servers[index].Close()
+		}
+	})
+	return clients, servers
+}
+
+func testJainCompletionFairness(payloadBytes int, durations []time.Duration) float64 {
+	var sum, squares float64
+	for _, duration := range durations {
+		rate := float64(payloadBytes) / duration.Seconds()
+		sum += rate
+		squares += rate * rate
+	}
+	if squares == 0 {
+		return 0
+	}
+	return sum * sum / (float64(len(durations)) * squares)
+}
+
+func TestTCPAlgorithmsShareDeviceBottleneck(t *testing.T) {
+	const flows, payloadBytes = 8, 128 * 1024
+	for _, scheduler := range []struct {
+		name string
+		fair bool
+	}{{name: "fifo"}, {name: "drr", fair: true}} {
+		for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+			t.Run(scheduler.name+"/"+string(algorithm), func(t *testing.T) {
+				client, server := newTestDeviceBottleneck(t, algorithm, 4*1024*1024, scheduler.fair)
+				clients, servers := openTestDeviceBottleneckTCPFlows(t, client, server, flows)
+				start := make(chan struct{})
+				durations := make([]time.Duration, flows)
+				errorsCh := make(chan error, flows)
+				var workers sync.WaitGroup
+				for flow := 0; flow < flows; flow++ {
+					workers.Add(1)
+					go func(flow int) {
+						defer workers.Done()
+						<-start
+						started := time.Now()
+						err := exchangeTestTCPPayload(clients[flow], servers[flow], payloadBytes, 10*time.Second, uint32(flow+1))
+						durations[flow] = time.Since(started)
+						errorsCh <- err
+					}(flow)
+				}
+				close(start)
+				workers.Wait()
+				close(errorsCh)
+				for err := range errorsCh {
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				sorted := append([]time.Duration(nil), durations...)
+				sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+				fairness := testJainCompletionFairness(payloadBytes, durations)
+				ratio := float64(sorted[len(sorted)-1]) / float64(sorted[0])
+				t.Logf("device bottleneck fairness=%.4f ratio=%.3f min=%v median=%v max=%v", fairness, ratio, sorted[0], sorted[len(sorted)/2], sorted[len(sorted)-1])
+				if math.IsNaN(fairness) || fairness < 0.5 {
+					t.Fatalf("device-bottleneck fairness = %f", fairness)
+				}
+				if scheduler.fair && (fairness < 0.995 || ratio >= 1.1) {
+					t.Fatalf("DRR fairness regression: fairness=%.4f ratio=%.3f", fairness, ratio)
+				}
+			})
+		}
+	}
+}
+
+// testUDPLatencyDuringTCPDeviceBottleneck measures latency rather than merely
+// checking eventual delivery, so FIFO and fair schedulers can be compared with
+// the same transport implementation.
+func testUDPLatencyDuringTCPDeviceBottleneck(t *testing.T, algorithm CongestionControl, fair bool) []time.Duration {
+	t.Helper()
+	client, server := newTestDeviceBottleneck(t, algorithm, 4*1024*1024, fair)
+	clients, servers := openTestDeviceBottleneckTCPFlows(t, client, server, 4)
+	serverAddress := server.LocalAddresses()[0]
+	listener, err := server.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(serverAddress, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	echoDone := make(chan struct{})
+	go func() {
+		defer close(echoDone)
+		buffer := make([]byte, 64)
+		for {
+			n, address, readErr := listener.ReadFrom(buffer)
+			if readErr != nil {
+				return
+			}
+			if _, writeErr := listener.WriteTo(buffer[:n], address); writeErr != nil {
+				return
+			}
+		}
+	}()
+	udpConnection, err := client.DialUDP(context.Background(), "udp4", netip.AddrPort{}, listener.LocalAddr().(*net.UDPAddr).AddrPort())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = udpConnection.Close()
+		_ = listener.Close()
+		<-echoDone
+	})
+	start := make(chan struct{})
+	bulkErrors := make(chan error, len(clients))
+	for flow := range clients {
+		go func(flow int) {
+			<-start
+			bulkErrors <- exchangeTestTCPPayload(clients[flow], servers[flow], 512*1024, 15*time.Second, uint32(flow+100))
+		}(flow)
+	}
+	close(start)
+	time.Sleep(20 * time.Millisecond)
+	latencies := make([]time.Duration, 0, 32)
+	request := make([]byte, 8)
+	response := make([]byte, len(request))
+	for sequence := 0; sequence < 32; sequence++ {
+		binary.BigEndian.PutUint64(request, uint64(sequence))
+		started := time.Now()
+		_ = udpConnection.SetDeadline(started.Add(5 * time.Second))
+		if _, err = udpConnection.Write(request); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = io.ReadFull(udpConnection, response); err != nil {
+			t.Fatal(err)
+		}
+		if binary.BigEndian.Uint64(response) != uint64(sequence) {
+			t.Fatal("UDP bottleneck response mismatch")
+		}
+		latencies = append(latencies, time.Since(started))
+	}
+	for range clients {
+		if err = <-bulkErrors; err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Fatal(err)
+		}
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	return latencies
+}
+
+func TestUDPLatencyDuringTCPDeviceBottleneck(t *testing.T) {
+	for _, scheduler := range []struct {
+		name string
+		fair bool
+	}{{name: "fifo"}, {name: "drr", fair: true}} {
+		for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+			t.Run(scheduler.name+"/"+string(algorithm), func(t *testing.T) {
+				latencies := testUDPLatencyDuringTCPDeviceBottleneck(t, algorithm, scheduler.fair)
+				t.Logf("UDP latency min=%v median=%v p95=%v max=%v", latencies[0], latencies[len(latencies)/2], latencies[len(latencies)*95/100], latencies[len(latencies)-1])
+				if scheduler.fair && latencies[len(latencies)*95/100] >= 50*time.Millisecond {
+					t.Fatalf("DRR UDP p95 latency = %v, want < 50ms", latencies[len(latencies)*95/100])
+				}
+			})
 		}
 	}
 }

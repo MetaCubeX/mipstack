@@ -4011,11 +4011,9 @@ func TestTCPSegmentTimestampOptionsUseFixedWorkspace(t *testing.T) {
 	if _, _, err = connection.sendSegmentForMTU(100, 200, tcpFlagACK, 32768, make([]byte, 29), nil, false, 1500); err == nil || err.Error() != "mipstack: invalid TCP options" {
 		t.Fatalf("oversized timestamp options error = %v", err)
 	}
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := stack.outbound.tryDequeue(); ok {
 		stack.outbound.release(entry)
 		t.Fatal("oversized timestamp options emitted a packet")
-	default:
 	}
 }
 
@@ -4661,14 +4659,13 @@ func TestTCPReservedHeaderBitsAreIgnored(t *testing.T) {
 	if dropped := stack.Stats().InboundDroppedPackets; dropped != 0 {
 		t.Fatalf("reserved TCP header bits dropped packets = %d, want 0", dropped)
 	}
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := waitTestPacketEntry(&stack.outbound, time.Second); ok {
 		response := consumeTestPacket(&stack.outbound, entry)
 		parsed, ok := parseIPPacket(response)
 		if !ok || len(parsed.payload) < tcpHeaderSize || parsed.payload[13] != tcpFlagRST|tcpFlagACK {
 			t.Fatalf("reserved TCP header response = %x", response)
 		}
-	case <-time.After(time.Second):
+	} else {
 		t.Fatal("reserved TCP header was not processed")
 	}
 }
@@ -4823,11 +4820,9 @@ func TestExplicitTCPSourceAndLocalLoopback(t *testing.T) {
 	if stack.Stats().LoopbackPackets == 0 {
 		t.Fatal("local traffic did not use the loopback path")
 	}
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := stack.outbound.tryDequeue(); ok {
 		packet := consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("local traffic escaped to the link: %x", packet)
-	default:
 	}
 }
 

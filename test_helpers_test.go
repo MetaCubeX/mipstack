@@ -110,6 +110,19 @@ func consumeTestPacket(queue *packetQueue, entry packetQueueEntry) []byte {
 	return packet
 }
 
+// waitTestPacketEntry receives from either packetQueue implementation while
+// retaining a deterministic timeout for tests that intentionally expect no
+// output.
+func waitTestPacketEntry(queue *packetQueue, timeout time.Duration) (packetQueueEntry, bool) {
+	cancel := make(chan struct{})
+	timer := time.AfterFunc(timeout, func() { close(cancel) })
+	entry, ok := queue.dequeue(cancel)
+	if timer.Stop() {
+		close(cancel)
+	}
+	return entry, ok
+}
+
 // stackBridge connects two Stack packet devices for fragmentation tests.
 type stackBridge struct {
 	client, peer  *Stack
@@ -775,20 +788,18 @@ func wildcardUDP(address netip.Addr) netip.AddrPort {
 // readOutboundPacket receives one packet directly from the test device queue.
 func readOutboundPacket(t *testing.T, stack *Stack) []byte {
 	t.Helper()
-	select {
-	case entry := <-stack.outbound.packets:
+	if entry, ok := waitTestPacketEntry(&stack.outbound, time.Second); ok {
 		return consumeTestPacket(&stack.outbound, entry)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for outbound packet")
-		return nil
 	}
+	t.Fatal("timed out waiting for outbound packet")
+	return nil
 }
 
 func fillTestPacketQueue(t *testing.T, queue *packetQueue, packet []byte) {
 	t.Helper()
-	for len(queue.packets) < cap(queue.packets) {
+	for queue.len() < cap(queue.free) {
 		if !queue.tryEnqueue(packet) {
-			t.Fatal("packet queue became full before its channel capacity")
+			t.Fatal("packet queue became full before its configured capacity")
 		}
 	}
 }

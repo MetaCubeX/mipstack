@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math/bits"
 	"net"
 	"net/netip"
 	"os"
@@ -209,6 +210,7 @@ type Stack struct {
 
 	ipv4ID          atomic.Uint32
 	ipv6FragmentID  atomic.Uint32
+	nextOutputFlow  atomic.Uint64
 	closeCh         chan struct{}
 	timestampEpoch  time.Time
 	tcpISNSecret    [16]byte
@@ -516,6 +518,418 @@ type automaticPortCursor struct {
 	secret       [16]byte
 }
 
+const (
+	outputFlowDetached = iota
+	outputFlowNew
+	outputFlowOld
+	outputFlowUnused
+)
+
+// outputFlowRefillDelay matches sch_fq's delay before an idle flow recovers a
+// full service quantum. Retaining negative credit across short idle gaps stops
+// bursty writers from repeatedly presenting themselves as new flows.
+const outputFlowRefillDelay = 40 * time.Millisecond
+
+// outputPacketNode occupies the same fixed index as its packetQueue slot, so
+// fair scheduling adds no per-packet allocation.
+type outputPacketNode struct {
+	entry packetQueueEntry
+	next  int
+}
+
+// outputFlow is one bounded scheduler flow. Ready and detached lists share the
+// intrusive links because a flow belongs to exactly one list at a time.
+type outputFlow struct {
+	key        outputFlowKey
+	head       int
+	tail       int
+	credit     int
+	state      uint8
+	previous   *outputFlow
+	next       *outputFlow
+	detachedAt time.Time
+}
+
+// outputFlowKey uses a TCP connection's stack-local identity when available
+// and a keyed packet hash for connectionless traffic.
+type outputFlowKey struct {
+	tcp  uint64
+	hash uint64
+}
+
+type outputFlowList struct {
+	first *outputFlow
+	last  *outputFlow
+}
+
+func (l *outputFlowList) append(flow *outputFlow) {
+	flow.previous = l.last
+	flow.next = nil
+	if l.last == nil {
+		l.first = flow
+	} else {
+		l.last.next = flow
+	}
+	l.last = flow
+}
+
+func (l *outputFlowList) remove(flow *outputFlow) {
+	if flow.previous == nil {
+		l.first = flow.next
+	} else {
+		flow.previous.next = flow.next
+	}
+	if flow.next == nil {
+		l.last = flow.previous
+	} else {
+		flow.next.previous = flow.previous
+	}
+	flow.previous, flow.next = nil, nil
+}
+
+// fairPacketScheduler implements the local-flow portion of Linux sch_fq: new
+// and old flow lists, byte credit, an initial burst allowance, and bounded
+// retention of idle flow state. TCP owns pacing; this scheduler only chooses
+// among packets the transport has already made eligible.
+type fairPacketScheduler struct {
+	mu sync.Mutex
+
+	ready chan struct{}
+	nodes []outputPacketNode
+	flows map[outputFlowKey]*outputFlow
+	store []outputFlow
+	free  *outputFlow
+
+	newFlows outputFlowList
+	oldFlows outputFlowList
+	detached outputFlowList
+	queued   int
+	quantum  int
+	initial  int
+	secret   [16]byte
+	lastFlow *outputFlow
+}
+
+func newFairPacketScheduler(capacity, mtu int, secret [16]byte) *fairPacketScheduler {
+	if mtu < 1 {
+		mtu = defaultMTU
+	}
+	scheduler := &fairPacketScheduler{
+		ready:  make(chan struct{}, 1),
+		nodes:  make([]outputPacketNode, capacity),
+		flows:  make(map[outputFlowKey]*outputFlow, capacity),
+		store:  make([]outputFlow, capacity),
+		secret: secret,
+	}
+	scheduler.setMTULocked(mtu)
+	for index := len(scheduler.store) - 1; index >= 0; index-- {
+		flow := &scheduler.store[index]
+		flow.state = outputFlowUnused
+		flow.next = scheduler.free
+		scheduler.free = flow
+	}
+	return scheduler
+}
+
+func (s *fairPacketScheduler) setMTU(mtu int) {
+	if mtu < 1 {
+		mtu = defaultMTU
+	}
+	s.mu.Lock()
+	s.setMTULocked(mtu)
+	s.mu.Unlock()
+}
+
+func (s *fairPacketScheduler) setMTULocked(mtu int) {
+	s.quantum = 2 * mtu
+	s.initial = 10 * mtu
+}
+
+func (s *fairPacketScheduler) signal() {
+	select {
+	case s.ready <- struct{}{}:
+	default:
+	}
+}
+
+func (s *fairPacketScheduler) acquireFlow(key outputFlowKey) *outputFlow {
+	if s.free == nil {
+		// An empty new flow takes one pass through old_flows before detaching,
+		// matching sch_fq's starvation prevention. A stream of one-packet flows
+		// can consume every fixed flow object before dequeue makes that pass, so
+		// allocation also retires one empty old flow when necessary.
+		for flow := s.oldFlows.first; flow != nil && s.detached.first == nil; flow = flow.next {
+			if flow.head < 0 {
+				s.oldFlows.remove(flow)
+				s.detachFlow(flow)
+				break
+			}
+		}
+		// At most one active flow exists per queued packet. If every fixed flow
+		// object is in use while a reserved slot is being published, at least
+		// one retained detached flow is available for eviction.
+		flow := s.detached.first
+		if flow == nil {
+			panic("mipstack: output flow capacity invariant violated")
+		}
+		s.detached.remove(flow)
+		delete(s.flows, flow.key)
+		if s.lastFlow == flow {
+			s.lastFlow = nil
+		}
+		flow.state = outputFlowUnused
+		flow.next = s.free
+		s.free = flow
+	}
+	flow := s.free
+	s.free = flow.next
+	*flow = outputFlow{key: key, head: -1, tail: -1, credit: s.initial, state: outputFlowNew}
+	s.flows[key] = flow
+	s.newFlows.append(flow)
+	return flow
+}
+
+func (s *fairPacketScheduler) reactivateFlow(flow *outputFlow) {
+	s.detached.remove(flow)
+	if time.Since(flow.detachedAt) >= outputFlowRefillDelay && flow.credit < s.quantum {
+		flow.credit = s.quantum
+	}
+	flow.state = outputFlowNew
+	flow.detachedAt = time.Time{}
+	s.newFlows.append(flow)
+}
+
+func (s *fairPacketScheduler) enqueue(entry packetQueueEntry, flowID uint64) {
+	key := outputFlowKey{tcp: flowID}
+	if flowID == 0 {
+		key.hash = outputPacketFlowHash(s.secret, entry.packet)
+	}
+	s.mu.Lock()
+	flow := s.lastFlow
+	if flow == nil || flow.key != key || flow.state == outputFlowUnused {
+		flow = s.flows[key]
+	}
+	if flow == nil {
+		flow = s.acquireFlow(key)
+	} else if flow.state == outputFlowDetached {
+		s.reactivateFlow(flow)
+	}
+	s.lastFlow = flow
+	node := &s.nodes[entry.slot]
+	node.entry, node.next = entry, -1
+	if flow.tail < 0 {
+		flow.head = int(entry.slot)
+	} else {
+		s.nodes[flow.tail].next = int(entry.slot)
+	}
+	flow.tail = int(entry.slot)
+	s.queued++
+	if s.queued == 1 {
+		s.signal()
+	}
+	s.mu.Unlock()
+}
+
+func (s *fairPacketScheduler) detachFlow(flow *outputFlow) {
+	flow.state = outputFlowDetached
+	flow.detachedAt = time.Now()
+	s.detached.append(flow)
+}
+
+func (s *fairPacketScheduler) selectList() (*outputFlowList, uint8) {
+	if s.newFlows.first != nil {
+		return &s.newFlows, outputFlowNew
+	}
+	if s.oldFlows.first != nil {
+		return &s.oldFlows, outputFlowOld
+	}
+	return nil, outputFlowDetached
+}
+
+func (s *fairPacketScheduler) tryDequeue() (packetQueueEntry, bool) {
+	return s.tryDequeueAndSignal(false)
+}
+
+// tryDequeueAndSignal optionally hands readiness to another blocking reader.
+// Batch drains use tryDequeue and avoid one channel operation per packet.
+func (s *fairPacketScheduler) tryDequeueAndSignal(signalRemaining bool) (packetQueueEntry, bool) {
+	s.mu.Lock()
+	for s.queued != 0 {
+		list, state := s.selectList()
+		if list == nil {
+			s.mu.Unlock()
+			return packetQueueEntry{}, false
+		}
+		flow := list.first
+		if flow.head < 0 {
+			list.remove(flow)
+			if state == outputFlowNew {
+				flow.state = outputFlowOld
+				s.oldFlows.append(flow)
+			} else {
+				s.detachFlow(flow)
+			}
+			continue
+		}
+		if flow.credit <= 0 {
+			flow.credit += s.quantum
+			list.remove(flow)
+			flow.state = outputFlowOld
+			s.oldFlows.append(flow)
+			continue
+		}
+		slot := flow.head
+		node := &s.nodes[slot]
+		flow.head = node.next
+		if flow.head < 0 {
+			flow.tail = -1
+		}
+		entry := node.entry
+		node.entry, node.next = packetQueueEntry{}, -1
+		flow.credit -= len(entry.packet)
+		s.queued--
+		if flow.head < 0 {
+			list.remove(flow)
+			if state == outputFlowNew {
+				flow.state = outputFlowOld
+				s.oldFlows.append(flow)
+			} else {
+				s.detachFlow(flow)
+			}
+		} else if flow.credit <= 0 {
+			flow.credit += s.quantum
+			list.remove(flow)
+			flow.state = outputFlowOld
+			s.oldFlows.append(flow)
+		}
+		if signalRemaining && s.queued != 0 {
+			// Keep readiness level-triggered when callers read only one packet at
+			// a time. Batch readers signal only after their blocking first packet.
+			s.signal()
+		}
+		s.mu.Unlock()
+		return entry, true
+	}
+	s.mu.Unlock()
+	return packetQueueEntry{}, false
+}
+
+func (s *fairPacketScheduler) dequeue(closeCh <-chan struct{}) (packetQueueEntry, bool) {
+	for {
+		if entry, ok := s.tryDequeueAndSignal(true); ok {
+			return entry, true
+		}
+		select {
+		case <-s.ready:
+		case <-closeCh:
+			return packetQueueEntry{}, false
+		}
+	}
+}
+
+func (s *fairPacketScheduler) len() int {
+	s.mu.Lock()
+	queued := s.queued
+	s.mu.Unlock()
+	return queued
+}
+
+// outputHashWord applies a keyed, non-cryptographic avalanche to one flow-key
+// word. Flow hashes are internal and never exposed; the random per-stack seed
+// prevents an external endpoint from constructing deliberate collisions while
+// avoiding a cryptographic hash in the packet hot path.
+func outputHashWord(hash, value uint64) uint64 {
+	hash ^= bits.RotateLeft64(value+0x9e3779b97f4a7c15, 23)
+	hash *= 0xbf58476d1ce4e5b9
+	hash ^= hash >> 29
+	return hash
+}
+
+// outputTransportSelector extracts the stable four-byte discriminator used by
+// locally generated TCP, UDP, and ICMP traffic. ICMP checksums and echo
+// sequence numbers vary per message; type, code, and identifier do not.
+func outputTransportSelector(protocol byte, payload []byte) uint32 {
+	if protocol == protocolICMPv4 || protocol == protocolICMPv6 {
+		var selector [4]byte
+		if len(payload) >= 2 {
+			selector[0], selector[1] = payload[0], payload[1]
+		}
+		if len(payload) >= 6 {
+			copy(selector[2:4], payload[4:6])
+		}
+		return binary.BigEndian.Uint32(selector[:])
+	}
+	if len(payload) >= 4 {
+		return binary.BigEndian.Uint32(payload[:4])
+	}
+	return 0
+}
+
+// outputPacketFlowHash classifies locally generated traffic without fully
+// parsing or validating a packet that the stack has just constructed.
+func outputPacketFlowHash(secret [16]byte, packet []byte) uint64 {
+	hash := binary.LittleEndian.Uint64(secret[0:8]) ^ 0x6a09e667f3bcc909
+	seed := binary.LittleEndian.Uint64(secret[8:16])
+	if len(packet) == 0 {
+		return outputHashWord(hash, seed)
+	}
+	version := packet[0] >> 4
+	hash = outputHashWord(hash, uint64(version)^seed)
+	switch version {
+	case 4:
+		if len(packet) < 20 {
+			for index, value := range packet {
+				hash = outputHashWord(hash, uint64(value)<<uint((index&7)*8))
+			}
+			return hash
+		}
+		addresses := binary.BigEndian.Uint64(packet[12:20])
+		hash = outputHashWord(hash, addresses)
+		protocol := packet[9]
+		hash = outputHashWord(hash, uint64(protocol))
+		headerSize := int(packet[0]&0x0f) * 4
+		fragment := binary.BigEndian.Uint16(packet[6:8])
+		if fragment&0x3fff != 0 {
+			hash = outputHashWord(hash, uint64(binary.BigEndian.Uint16(packet[4:6])))
+		} else if headerSize >= 20 && headerSize < len(packet) {
+			hash = outputHashWord(hash, uint64(outputTransportSelector(protocol, packet[headerSize:])))
+		}
+	case 6:
+		if len(packet) < 40 {
+			for index, value := range packet {
+				hash = outputHashWord(hash, uint64(value)<<uint((index&7)*8))
+			}
+			return hash
+		}
+		for offset := 8; offset < 40; offset += 8 {
+			hash = outputHashWord(hash, binary.BigEndian.Uint64(packet[offset:offset+8]))
+		}
+		protocol := packet[6]
+		hash = outputHashWord(hash, uint64(protocol))
+		flowLabel := uint32(packet[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(packet[2:4]))
+		if flowLabel != 0 {
+			hash = outputHashWord(hash, uint64(flowLabel))
+		} else if protocol == 44 && len(packet) >= 48 {
+			// Locally fragmented packets carry the Fragment header directly
+			// after the IPv6 header. Offset and M differ between fragments, so
+			// use Next Header and Identification to keep one datagram ordered.
+			hash = outputHashWord(hash, uint64(packet[40]))
+			hash = outputHashWord(hash, uint64(binary.BigEndian.Uint32(packet[44:48])))
+		} else if len(packet) > 40 {
+			hash = outputHashWord(hash, uint64(outputTransportSelector(protocol, packet[40:])))
+		}
+	default:
+		limit := len(packet)
+		if limit > 40 {
+			limit = 40
+		}
+		for offset := 0; offset < limit; offset++ {
+			hash = outputHashWord(hash, uint64(packet[offset])<<uint((offset&7)*8))
+		}
+	}
+	return hash
+}
+
 // packetQueueEntry couples one packet with its fixed queue slot. The entry is
 // stored inline in the bounded channel and does not allocate per packet.
 type packetQueueEntry struct {
@@ -524,16 +938,18 @@ type packetQueueEntry struct {
 	reusable bool
 }
 
-// packetQueue uses one reusable slot per channel position. The free-slot
-// channel is both a capacity semaphore and a one-producer wakeup mechanism;
-// releasing one consumed packet cannot wake every writer waiting on a full
-// host queue.
+// packetQueue uses one reusable slot per queue position. The free-slot channel
+// is both a capacity semaphore and a one-producer wakeup mechanism; releasing
+// one consumed packet cannot wake every writer waiting on a full host queue.
+// scheduler is nil for FIFO queues such as loopback and non-nil for the link's
+// byte-fair flow scheduler.
 type packetQueue struct {
-	packets chan packetQueueEntry
-	free    chan uint16
-	slots   []atomic.Uint64
-	buffers chan []byte
-	epoch   time.Time
+	packets   chan packetQueueEntry
+	free      chan uint16
+	slots     []atomic.Uint64
+	buffers   chan []byte
+	epoch     time.Time
+	scheduler *fairPacketScheduler
 }
 
 // monotonicStamp stores an exact monotonic duration relative to one stack
@@ -577,10 +993,17 @@ func newPacketQueue(capacity int) packetQueue {
 
 // newPacketQueueAt constructs a queue sharing its stack's monotonic epoch.
 func newPacketQueueAt(capacity int, epoch time.Time) packetQueue {
+	queue := newPacketQueueStorageAt(capacity, epoch)
+	queue.packets = make(chan packetQueueEntry, capacity)
+	return queue
+}
+
+// newPacketQueueStorageAt constructs the fixed slot and buffer storage shared
+// by FIFO and fair queues without allocating an unused second packet queue.
+func newPacketQueueStorageAt(capacity int, epoch time.Time) packetQueue {
 	queue := packetQueue{
-		packets: make(chan packetQueueEntry, capacity),
-		free:    make(chan uint16, capacity),
-		slots:   make([]atomic.Uint64, capacity),
+		free:  make(chan uint16, capacity),
+		slots: make([]atomic.Uint64, capacity),
 		// A full queue may legitimately own one buffer per position. Retaining no
 		// more than that avoids reallocating after a burst while the per-buffer
 		// limit keeps the cache below 512 KiB for the standard queue size.
@@ -589,6 +1012,15 @@ func newPacketQueueAt(capacity int, epoch time.Time) packetQueue {
 	for slot := range queue.slots {
 		queue.free <- uint16(slot)
 	}
+	return queue
+}
+
+// newFairPacketQueueAt constructs a bounded per-flow output queue while
+// retaining the same fixed packet slots and host-queue ticket semantics as the
+// FIFO implementation.
+func newFairPacketQueueAt(capacity int, epoch time.Time, mtu int, secret [16]byte) packetQueue {
+	queue := newPacketQueueStorageAt(capacity, epoch)
+	queue.scheduler = newFairPacketScheduler(capacity, mtu, secret)
 	return queue
 }
 
@@ -626,23 +1058,75 @@ func (q *packetQueue) releaseReserved(slot uint16) { q.free <- slot }
 // reserved slot always has a corresponding channel position.
 func (q *packetQueue) enqueueReserved(slot uint16, packet []byte, reusable bool) packetQueueTicket {
 	queuedAt := monotonicStampAt(q.epoch, time.Now())
-	generation := q.publishReserved(slot, packet, reusable)
+	generation := q.publishReserved(slot, packet, reusable, 0)
+	return packetQueueTicket{queue: q, slot: slot, generation: generation, queuedAt: queuedAt}
+}
+
+// enqueueReservedTCP publishes a connection-owned packet without hashing its
+// serialized headers to rediscover an identity TCP already has.
+func (q *packetQueue) enqueueReservedTCP(slot uint16, packet []byte, reusable bool, flowID uint64) packetQueueTicket {
+	queuedAt := monotonicStampAt(q.epoch, time.Now())
+	generation := q.publishReserved(slot, packet, reusable, flowID)
 	return packetQueueTicket{queue: q, slot: slot, generation: generation, queuedAt: queuedAt}
 }
 
 // enqueueReservedPacket publishes a packet that does not need TCP host-queue
 // loss tracking and therefore avoids reading the clock.
 func (q *packetQueue) enqueueReservedPacket(slot uint16, packet []byte, reusable bool) {
-	q.publishReserved(slot, packet, reusable)
+	q.publishReserved(slot, packet, reusable, 0)
 }
 
 // publishReserved marks and publishes one already-reserved slot.
-func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool) uint64 {
+func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool, flowID uint64) uint64 {
 	state := q.slots[slot].Load()
 	generation := state>>1 + 1
 	q.slots[slot].Store(generation<<1 | 1)
-	q.packets <- packetQueueEntry{packet: packet, slot: slot, reusable: reusable}
+	entry := packetQueueEntry{packet: packet, slot: slot, reusable: reusable}
+	if q.scheduler == nil {
+		q.packets <- entry
+	} else {
+		q.scheduler.enqueue(entry, flowID)
+	}
 	return generation
+}
+
+// dequeue waits for one schedulable packet or stack closure.
+func (q *packetQueue) dequeue(closeCh <-chan struct{}) (packetQueueEntry, bool) {
+	if q.scheduler != nil {
+		return q.scheduler.dequeue(closeCh)
+	}
+	select {
+	case entry := <-q.packets:
+		return entry, true
+	case <-closeCh:
+		return packetQueueEntry{}, false
+	}
+}
+
+// tryDequeue returns one immediately schedulable packet without blocking.
+func (q *packetQueue) tryDequeue() (packetQueueEntry, bool) {
+	if q.scheduler != nil {
+		return q.scheduler.tryDequeue()
+	}
+	select {
+	case entry := <-q.packets:
+		return entry, true
+	default:
+		return packetQueueEntry{}, false
+	}
+}
+
+func (q *packetQueue) len() int {
+	if q.scheduler != nil {
+		return q.scheduler.len()
+	}
+	return len(q.packets)
+}
+
+func (q *packetQueue) setMTU(mtu int) {
+	if q.scheduler != nil {
+		q.scheduler.setMTU(mtu)
+	}
 }
 
 // tryEnqueue publishes one packet only when a queue slot is immediately
@@ -698,9 +1182,10 @@ func New(config Config) (*Stack, error) {
 	if err != nil {
 		return nil, err
 	}
-	// One OS-random read seeds independent port, fragment-ID, and RFC 6528
-	// sequence spaces. Per-connection ISNs are derived from tcpISNSecret.
-	var seed [88]byte
+	// One OS-random read seeds independent port, fragment-ID, RFC 6528,
+	// flow-label, and output-flow spaces. Per-connection ISNs are derived from
+	// tcpISNSecret.
+	var seed [104]byte
 	if _, err = rand.Read(seed[:]); err != nil {
 		return nil, err
 	}
@@ -717,14 +1202,18 @@ func New(config Config) (*Stack, error) {
 	ipv4ID := binary.BigEndian.Uint32(seed[16:20])
 	ipv6FragmentID := binary.BigEndian.Uint32(seed[20:24])
 	timestampEpoch := time.Now()
+	var flowLabelSecret [16]byte
+	copy(flowLabelSecret[:], seed[72:88])
+	var outputFlowSecret [16]byte
+	copy(outputFlowSecret[:], seed[88:104])
 	stack := &Stack{
-		outbound: newPacketQueueAt(outboundPacketQueue, timestampEpoch), loopback: newPacketQueueAt(loopbackPacketQueue, timestampEpoch),
+		outbound: newFairPacketQueueAt(outboundPacketQueue, timestampEpoch, state.mtu, outputFlowSecret), loopback: newPacketQueueAt(loopbackPacketQueue, timestampEpoch),
 		tcp: make(map[tcpKey]*TCPConn), udp: make(map[udpKey]*UDPConn),
 		nextPort: [2]automaticPortCursor{ports4, ports6}, pathMTU: make(map[netip.Addr]pathMTUEntry),
 		closeCh: make(chan struct{}), timestampEpoch: timestampEpoch, fragments: make(map[fragmentKey]*fragmentSet), fragmentWake: make(chan struct{}, 1),
 	}
 	copy(stack.tcpISNSecret[:], seed[24:40])
-	copy(stack.flowLabelSecret[:], seed[72:88])
+	stack.flowLabelSecret = flowLabelSecret
 	stack.ipv4ID.Store(ipv4ID)
 	stack.ipv6FragmentID.Store(ipv6FragmentID)
 	stack.network.Store(state)
@@ -754,6 +1243,7 @@ func (s *Stack) UpdateConfig(config Config) error {
 	} else {
 		s.network.Store(state)
 	}
+	s.outbound.setMTU(state.mtu)
 	tcpConnections := make([]*TCPConn, 0, len(s.tcp))
 	for _, connection := range s.tcp {
 		tcpConnections = append(tcpConnections, connection)
@@ -1636,10 +2126,8 @@ func (s *Stack) Read(buffers [][]byte, sizes []int, offset int) (int, error) {
 		s.outbound.release(entry)
 		return nil
 	}
-	var first packetQueueEntry
-	select {
-	case first = <-s.outbound.packets:
-	case <-s.closeCh:
+	first, ok := s.outbound.dequeue(s.closeCh)
+	if !ok {
 		return 0, os.ErrClosed
 	}
 	if err := readPacket(0, first); err != nil {
@@ -1647,15 +2135,14 @@ func (s *Stack) Read(buffers [][]byte, sizes []int, offset int) (int, error) {
 	}
 	count := 1
 	for count < limit {
-		select {
-		case entry := <-s.outbound.packets:
-			if err := readPacket(count, entry); err != nil {
-				return count, err
-			}
-			count++
-		default:
+		entry, available := s.outbound.tryDequeue()
+		if !available {
 			return count, nil
 		}
+		if err := readPacket(count, entry); err != nil {
+			return count, err
+		}
+		count++
 	}
 	return count, nil
 }

@@ -2,6 +2,7 @@ package mipstack
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -407,8 +408,8 @@ func TestPacketQueueConcurrentWritersMakeBoundedProgress(t *testing.T) {
 			t.Fatal(writeErr)
 		}
 	}
-	if len(stack.outbound.packets) != 0 || len(stack.outbound.free) != cap(stack.outbound.free) {
-		t.Fatalf("queue did not release every slot: packets=%d free=%d", len(stack.outbound.packets), len(stack.outbound.free))
+	if stack.outbound.len() != 0 || len(stack.outbound.free) != cap(stack.outbound.free) {
+		t.Fatalf("queue did not release every slot: packets=%d free=%d", stack.outbound.len(), len(stack.outbound.free))
 	}
 }
 
@@ -667,5 +668,264 @@ func TestRecentDestinationCacheEvictionAndExpiry(t *testing.T) {
 	}
 	if _, exists := cache[3]; exists {
 		t.Fatal("contains retained expired destination")
+	}
+}
+
+func testOutputUDPPacket(source, target netip.Addr, sourcePort, targetPort uint16, size int) []byte {
+	if size < udpHeaderSize {
+		size = udpHeaderSize
+	}
+	payload := make([]byte, size)
+	binary.BigEndian.PutUint16(payload[0:2], sourcePort)
+	binary.BigEndian.PutUint16(payload[2:4], targetPort)
+	return buildIPPacket(source, target, protocolUDP, payload, 0, true)
+}
+
+func enqueueTestOutputPacket(t *testing.T, queue *packetQueue, packet []byte) {
+	t.Helper()
+	slot, ok := queue.tryReserve()
+	if !ok {
+		t.Fatal("output queue has no free slot")
+	}
+	queue.enqueueReservedPacket(slot, packet, false)
+}
+
+func TestFairPacketQueueRotatesAfterInitialByteCredit(t *testing.T) {
+	source := netip.MustParseAddr("192.0.2.1")
+	target := netip.MustParseAddr("198.51.100.1")
+	first := testOutputUDPPacket(source, target, 10000, 53, 80)
+	second := testOutputUDPPacket(source, target, 10001, 53, 80)
+	queue := newFairPacketQueueAt(16, time.Now(), len(first), [16]byte{1})
+	for index := 0; index < 12; index++ {
+		enqueueTestOutputPacket(t, &queue, first)
+	}
+	enqueueTestOutputPacket(t, &queue, second)
+	for index := 0; index < 10; index++ {
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			t.Fatalf("packet %d was not schedulable", index)
+		}
+		if got := binary.BigEndian.Uint16(entry.packet[20:22]); got != 10000 {
+			t.Fatalf("packet %d source port = %d, want first flow", index, got)
+		}
+		queue.release(entry)
+	}
+	entry, ok := queue.tryDequeue()
+	if !ok {
+		t.Fatal("second flow was not scheduled after the initial quantum")
+	}
+	if got := binary.BigEndian.Uint16(entry.packet[20:22]); got != 10001 {
+		t.Fatalf("packet after initial quantum source port = %d, want second flow", got)
+	}
+	queue.release(entry)
+}
+
+func TestFairPacketQueueUsesByteCredit(t *testing.T) {
+	source := netip.MustParseAddr("192.0.2.2")
+	target := netip.MustParseAddr("198.51.100.2")
+	large := testOutputUDPPacket(source, target, 11000, 53, 1400)
+	small := testOutputUDPPacket(source, target, 11001, 53, 200)
+	queue := newFairPacketQueueAt(128, time.Now(), 1500, [16]byte{2})
+	for index := 0; index < 64; index++ {
+		enqueueTestOutputPacket(t, &queue, large)
+		enqueueTestOutputPacket(t, &queue, small)
+	}
+	bytesByPort := map[uint16]int{}
+	// Both flows receive the same initial 10-MTU byte allowance. The small
+	// flow needs more packets to consume it, so compare after that allowance
+	// rather than after an equal packet count.
+	for index := 0; index < 75; index++ {
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			t.Fatalf("packet %d was not schedulable", index)
+		}
+		bytesByPort[binary.BigEndian.Uint16(entry.packet[20:22])] += len(entry.packet)
+		queue.release(entry)
+	}
+	difference := bytesByPort[11000] - bytesByPort[11001]
+	if difference < 0 {
+		difference = -difference
+	}
+	if difference > 2*1500 {
+		t.Fatalf("byte-fair service differs by %d bytes: %v", difference, bytesByPort)
+	}
+}
+
+func TestOutputPacketFlowHashSeparatesTransportTuples(t *testing.T) {
+	secret := [16]byte{3}
+	for _, addresses := range [][2]netip.Addr{
+		{netip.MustParseAddr("192.0.2.3"), netip.MustParseAddr("198.51.100.3")},
+		{netip.MustParseAddr("2001:db8::3"), netip.MustParseAddr("2001:db8:1::3")},
+	} {
+		first := testOutputUDPPacket(addresses[0], addresses[1], 12000, 53, 64)
+		second := testOutputUDPPacket(addresses[0], addresses[1], 12001, 53, 64)
+		if firstHash, secondHash := outputPacketFlowHash(secret, first), outputPacketFlowHash(secret, second); firstHash == secondHash {
+			t.Fatalf("%s flow hashes collide: %x", addresses[0], firstHash)
+		}
+		if got, want := outputPacketFlowHash(secret, first), outputPacketFlowHash(secret, append([]byte(nil), first...)); got != want {
+			t.Fatalf("%s stable flow hash = %x, want %x", addresses[0], got, want)
+		}
+		longer := testOutputUDPPacket(addresses[0], addresses[1], 12000, 53, 1400)
+		if got, want := outputPacketFlowHash(secret, longer), outputPacketFlowHash(secret, first); got != want {
+			t.Fatalf("%s differently sized packets hash to %x and %x", addresses[0], got, want)
+		}
+	}
+}
+
+func TestOutputPacketFlowHashKeepsIPv6FragmentsTogether(t *testing.T) {
+	source := netip.MustParseAddr("2001:db8::4")
+	target := netip.MustParseAddr("2001:db8:1::4")
+	secret := [16]byte{4}
+	fragments := buildIPv6FragmentsWithOptions(source, target, protocolUDP, make([]byte, 3000), 1280, 0x12345678, ipPacketOptions{})
+	if len(fragments) < 2 {
+		t.Fatal("test datagram was not fragmented")
+	}
+	want := outputPacketFlowHash(secret, fragments[0])
+	for index, fragment := range fragments[1:] {
+		if got := outputPacketFlowHash(secret, fragment); got != want {
+			t.Fatalf("fragment %d hash = %x, want %x", index+1, got, want)
+		}
+	}
+	other := buildIPv6FragmentsWithOptions(source, target, protocolUDP, make([]byte, 3000), 1280, 0x12345679, ipPacketOptions{})
+	if got := outputPacketFlowHash(secret, other[0]); got == want {
+		t.Fatalf("different fragment identifications share hash %x", got)
+	}
+}
+
+func TestOutputPacketFlowHashKeepsICMPEchoSequenceTogether(t *testing.T) {
+	secret := [16]byte{5}
+	for _, addresses := range [][2]netip.Addr{
+		{netip.MustParseAddr("192.0.2.5"), netip.MustParseAddr("198.51.100.5")},
+		{netip.MustParseAddr("2001:db8::5"), netip.MustParseAddr("2001:db8:1::5")},
+	} {
+		protocol, echoType := protocolICMPv4, byte(8)
+		if addresses[0].Is6() {
+			protocol, echoType = protocolICMPv6, 128
+		}
+		makeEcho := func(identifier, sequence uint16) []byte {
+			message := make([]byte, 12)
+			message[0] = echoType
+			binary.BigEndian.PutUint16(message[4:6], identifier)
+			binary.BigEndian.PutUint16(message[6:8], sequence)
+			if protocol == protocolICMPv4 {
+				binary.BigEndian.PutUint16(message[2:4], checksum(message))
+			} else {
+				binary.BigEndian.PutUint16(message[2:4], transportChecksum(addresses[0], addresses[1], protocol, message))
+			}
+			return buildIPPacketWithOptions(addresses[0], addresses[1], protocol, message, 0, true, ipPacketOptions{hopLimit: 64})
+		}
+		first := makeEcho(0x1234, 1)
+		second := makeEcho(0x1234, 2)
+		if got, want := outputPacketFlowHash(secret, second), outputPacketFlowHash(secret, first); got != want {
+			t.Fatalf("%s echo sequences hash to %x and %x", addresses[0], want, got)
+		}
+		other := makeEcho(0x1235, 1)
+		if got, want := outputPacketFlowHash(secret, other), outputPacketFlowHash(secret, first); got == want {
+			t.Fatalf("%s echo identifiers share hash %x", addresses[0], got)
+		}
+	}
+}
+
+func TestFairPacketQueueReusesBoundedFlowStorage(t *testing.T) {
+	source := netip.MustParseAddr("192.0.2.4")
+	target := netip.MustParseAddr("198.51.100.4")
+	queue := newFairPacketQueueAt(4, time.Now(), 1500, [16]byte{4})
+	for round := 0; round < 128; round++ {
+		packet := testOutputUDPPacket(source, target, uint16(13000+round), 53, 64)
+		enqueueTestOutputPacket(t, &queue, packet)
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			t.Fatalf("round %d packet was not schedulable", round)
+		}
+		queue.release(entry)
+	}
+	if got := len(queue.scheduler.store); got != 4 {
+		t.Fatalf("flow storage grew to %d, want 4", got)
+	}
+	if got := len(queue.scheduler.flows); got > 4 {
+		t.Fatalf("retained flow map grew to %d, want <= 4", got)
+	}
+}
+
+func TestFairPacketQueueWakesConcurrentSinglePacketReaders(t *testing.T) {
+	source := netip.MustParseAddr("192.0.2.6")
+	target := netip.MustParseAddr("198.51.100.6")
+	queue := newFairPacketQueueAt(4, time.Now(), 1500, [16]byte{6})
+	packet := testOutputUDPPacket(source, target, 15000, 53, 64)
+	closed := make(chan struct{})
+	started := make(chan struct{}, 2)
+	results := make(chan bool, 2)
+	for index := 0; index < 2; index++ {
+		go func() {
+			started <- struct{}{}
+			entry, ok := queue.dequeue(closed)
+			if ok {
+				queue.release(entry)
+			}
+			results <- ok
+		}()
+	}
+	<-started
+	<-started
+	time.Sleep(10 * time.Millisecond)
+	for index := 0; index < 2; index++ {
+		enqueueTestOutputPacket(t, &queue, packet)
+	}
+	for index := 0; index < 2; index++ {
+		select {
+		case ok := <-results:
+			if !ok {
+				t.Fatalf("single-packet reader %d was closed", index)
+			}
+		case <-time.After(time.Second):
+			close(closed)
+			t.Fatalf("single-packet reader %d was not woken", index)
+		}
+	}
+}
+
+func BenchmarkPacketQueueScheduling(b *testing.B) {
+	source := netip.MustParseAddr("192.0.2.5")
+	target := netip.MustParseAddr("198.51.100.5")
+	packet := testOutputUDPPacket(source, target, 14000, 443, 1400)
+	const capacity = 256
+	for _, benchmark := range []struct {
+		name  string
+		fair  bool
+		flows int
+	}{
+		{name: "fifo", flows: 1},
+		{name: "drr-single", fair: true, flows: 1},
+		{name: "drr-64", fair: true, flows: 64},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			queue := newPacketQueue(capacity)
+			if benchmark.fair {
+				queue = newFairPacketQueueAt(capacity, time.Now(), 1500, [16]byte{5})
+			}
+			flowIDs := make([]uint64, benchmark.flows)
+			for index := range flowIDs {
+				flowIDs[index] = uint64(index + 1)
+			}
+			b.SetBytes(int64(capacity * len(packet)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				for index := 0; index < capacity; index++ {
+					slot, ok := queue.tryReserve()
+					if !ok {
+						b.Fatal("output queue unexpectedly full")
+					}
+					queue.enqueueReservedTCP(slot, packet, false, flowIDs[index%len(flowIDs)])
+				}
+				for index := 0; index < capacity; index++ {
+					entry, ok := queue.tryDequeue()
+					if !ok {
+						b.Fatal("output queue unexpectedly empty")
+					}
+					queue.release(entry)
+				}
+			}
+		})
 	}
 }
