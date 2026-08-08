@@ -748,7 +748,7 @@ func (s *Stack) ipPayloadPacketsForMTU(source, target netip.Addr, protocol byte,
 
 // writeIPPayloadUntilOptionsForMTU emits output against an explicit packet
 // ceiling while preserving socket deadline and closure behavior.
-func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, mtu int, state func() (time.Time, <-chan struct{}, bool)) error {
+func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, mtu int, state socketWriteState) error {
 	if source.Is6() && !options.flowLabelSet {
 		options.flowLabel = s.automaticFlowLabel(source, target, protocol, payload)
 		options.flowLabelSet = true
@@ -795,14 +795,14 @@ func (s *Stack) writeIPPayload(source, target netip.Addr, protocol byte, payload
 }
 
 // writeIPPayloadUntilOptions emits raw IP output with mutable deadline state.
-func (s *Stack) writeIPPayloadUntilOptions(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, state func() (time.Time, <-chan struct{}, bool)) error {
+func (s *Stack) writeIPPayloadUntilOptions(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, state socketWriteState) error {
 	return s.writeIPPayloadUntilOptionsForMTU(source, target, protocol, payload, allowFragment, options, s.mtuFor(target), state)
 }
 
 // writeIPFragmentsUntilOptionsForMTU writes fragments directly into reserved
 // queue storage. first and second are adjacent logical payload regions; this
 // lets UDP prepend its virtual header without gathering the complete datagram.
-func (s *Stack) writeIPFragmentsUntilOptionsForMTU(source, target netip.Addr, protocol byte, first, second []byte, options ipPacketOptions, mtu int, state func() (time.Time, <-chan struct{}, bool)) error {
+func (s *Stack) writeIPFragmentsUntilOptionsForMTU(source, target netip.Addr, protocol byte, first, second []byte, options ipPacketOptions, mtu int, state socketWriteState) error {
 	payloadSize := len(first) + len(second)
 	maximum := (mtu - 20) &^ 7
 	headerSize := 20

@@ -96,11 +96,8 @@ type IPConn struct {
 	receiveNotify   chan struct{}
 	receiveCapacity int
 	queuedBytes     int
-	readDeadline    time.Time
-	writeDeadline   time.Time
-	readChanged     chan struct{}
-	writeChanged    chan struct{}
-	readTimers      deadlineTimerCache
+	readDeadline    socketDeadline
+	writeDeadline   socketDeadline
 	errors          chan error
 	recentTargets   recentDestinationCache[netip.Addr]
 	defaultOptions  ipPacketOptions
@@ -278,7 +275,6 @@ func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.
 	connection := &IPConn{
 		stack: stack, net: network, protocol: protocol, v6: local.Is6(), local: local, remote: remote,
 		closed: make(chan struct{}), receiveNotify: make(chan struct{}, 1), receiveCapacity: defaults.ReceiveBuffer,
-		readChanged: make(chan struct{}), writeChanged: make(chan struct{}),
 		errors: make(chan error, 8),
 		defaultOptions: ipPacketOptions{
 			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
@@ -561,6 +557,13 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 			return 0, ipDatagram{}, false, net.ErrClosed
 		default:
 		}
+		timeout := c.readDeadline.wait()
+		select {
+		case <-timeout:
+			c.mu.Unlock()
+			return 0, ipDatagram{}, false, os.ErrDeadlineExceeded
+		default:
+		}
 		if queued, ok := c.receive.pop(); ok {
 			datagram = queued
 			c.queuedBytes -= ipDatagramMetadataSize + len(datagram.payload)
@@ -580,30 +583,15 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 			}
 			return n, datagram, n < len(datagram.payload), nil
 		}
-		deadline, changed, notified := c.readDeadline, c.readChanged, c.receiveNotify
+		notified := c.receiveNotify
 		c.mu.Unlock()
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			select {
-			case <-changed:
-				continue
-			default:
-				return 0, ipDatagram{}, false, os.ErrDeadlineExceeded
-			}
-		}
-		timer, timeout := c.readTimers.timer(deadline)
 		select {
 		case <-notified:
-			c.readTimers.release(timer, false)
 		case err = <-c.errors:
-			c.readTimers.release(timer, false)
 			return 0, ipDatagram{}, false, err
 		case <-timeout:
-			c.readTimers.release(timer, true)
 			return 0, ipDatagram{}, false, os.ErrDeadlineExceeded
-		case <-changed:
-			c.readTimers.release(timer, false)
 		case <-c.closed:
-			c.readTimers.release(timer, false)
 			return 0, ipDatagram{}, false, net.ErrClosed
 		}
 	}
@@ -736,12 +724,9 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource
 	if !target.IsValid() || target.IsUnspecified() || target.IsMulticast() || !c.dual && target.Is6() != c.v6 || target.Zone() != "" {
 		return 0, syscall.EINVAL
 	}
-	deadline, _, closed, options := c.writeStateAndOptions(options)
-	if closed {
-		return 0, net.ErrClosed
-	}
-	if !deadline.IsZero() && !time.Now().Before(deadline) {
-		return 0, os.ErrDeadlineExceeded
+	state, options := c.writeStateAndOptions(options)
+	if err := state.err(); err != nil {
+		return 0, err
 	}
 	requestedSource := c.local
 	packetInfoSource = packetInfoSource.Unmap()
@@ -775,13 +760,15 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource
 // writePayload emits ordinary output against the confirmed path MTU and
 // permits source fragmentation.
 func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
-	return c.stack.writeIPPayloadUntilOptions(source, target, c.protocol, payload, true, options, c.writeState)
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+	return c.stack.writeIPPayloadUntilOptions(source, target, c.protocol, payload, true, options, state)
 }
 
 // writePathMTUProbePayload emits explicitly unfragmented output against the
 // first-hop MTU.
 func (c *IPConn) writePathMTUProbePayload(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
-	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, false, options, c.stack.network.Load().mtu, c.writeState)
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, false, options, c.stack.network.Load().mtu, state)
 }
 
 // Close unregisters the protocol socket and wakes blocked operations.
@@ -796,6 +783,8 @@ func (c *IPConn) Close() error {
 func (c *IPConn) closeFromStack() {
 	c.once.Do(func() {
 		c.mu.Lock()
+		c.readDeadline.stop()
+		c.writeDeadline.stop()
 		c.receive.clear()
 		c.receiveSpare = nil
 		c.queuedBytes = 0
@@ -858,12 +847,9 @@ func (c *IPConn) SetDeadline(deadline time.Time) error {
 		return c.setOperationError(net.ErrClosed)
 	default:
 	}
-	readChanged, writeChanged := c.readChanged, c.writeChanged
-	c.readDeadline, c.writeDeadline = deadline, deadline
-	c.readChanged, c.writeChanged = make(chan struct{}), make(chan struct{})
+	c.readDeadline.set(deadline)
+	c.writeDeadline.set(deadline)
 	c.mu.Unlock()
-	close(readChanged)
-	close(writeChanged)
 	return nil
 }
 
@@ -876,10 +862,8 @@ func (c *IPConn) SetReadDeadline(deadline time.Time) error {
 		return c.setOperationError(net.ErrClosed)
 	default:
 	}
-	changed := c.readChanged
-	c.readDeadline, c.readChanged = deadline, make(chan struct{})
+	c.readDeadline.set(deadline)
 	c.mu.Unlock()
-	close(changed)
 	return nil
 }
 
@@ -892,10 +876,8 @@ func (c *IPConn) SetWriteDeadline(deadline time.Time) error {
 		return c.setOperationError(net.ErrClosed)
 	default:
 	}
-	changed := c.writeChanged
-	c.writeDeadline, c.writeChanged = deadline, make(chan struct{})
+	c.writeDeadline.set(deadline)
 	c.mu.Unlock()
-	close(changed)
 	return nil
 }
 
@@ -1032,30 +1014,13 @@ func (c *IPConn) deliverError(target netip.Addr, err error) {
 	}
 }
 
-// writeState snapshots the write deadline and closure notification.
-func (c *IPConn) writeState() (time.Time, <-chan struct{}, bool) {
+// writeStateAndOptions reads the output defaults and returns the independent
+// deadline and close signals observed by a blocked host-queue write.
+func (c *IPConn) writeStateAndOptions(options ipPacketOptions) (socketWriteState, ipPacketOptions) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	select {
-	case <-c.closed:
-		return c.writeDeadline, c.writeChanged, true
-	default:
-		return c.writeDeadline, c.writeChanged, false
-	}
-}
-
-// writeStateAndOptions reads the initial deadline and output defaults under
-// one socket lock. A blocked host-queue write still rechecks writeState.
-func (c *IPConn) writeStateAndOptions(options ipPacketOptions) (time.Time, <-chan struct{}, bool, ipPacketOptions) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	options = options.withDefaults(c.defaultOptions)
-	select {
-	case <-c.closed:
-		return c.writeDeadline, c.writeChanged, true, options
-	default:
-		return c.writeDeadline, c.writeChanged, false, options
-	}
+	c.mu.Unlock()
+	return socketWriteState{deadline: &c.writeDeadline, closed: c.closed}, options
 }
 
 // operationError wraps an error for the bound or connected socket.

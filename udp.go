@@ -98,11 +98,8 @@ type UDPConn struct {
 	receiveNotify   chan struct{}
 	receiveCapacity int
 	queuedBytes     int
-	readDeadline    time.Time
-	writeDeadline   time.Time
-	readChanged     chan struct{}
-	writeChanged    chan struct{}
-	readTimers      deadlineTimerCache
+	readDeadline    socketDeadline
+	writeDeadline   socketDeadline
 	recentTargets   recentDestinationCache[netip.AddrPort]
 	defaultOptions  ipPacketOptions
 	automaticLabel  uint32
@@ -124,7 +121,6 @@ func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.
 	connection := &UDPConn{
 		stack: stack, net: network, port: port, v6: v6, local: local, remote: remote,
 		errors: make(chan error, 8), closed: make(chan struct{}), receiveNotify: make(chan struct{}, 1), receiveCapacity: defaults.ReceiveBuffer,
-		readChanged: make(chan struct{}), writeChanged: make(chan struct{}),
 		defaultOptions: ipPacketOptions{
 			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
 			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
@@ -532,6 +528,13 @@ func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, tar
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, net.ErrClosed
 		default:
 		}
+		timeout := c.readDeadline.wait()
+		select {
+		case <-timeout:
+			c.mu.Unlock()
+			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
+		default:
+		}
 		if datagram, ok := c.receive.pop(); ok {
 			c.queuedBytes -= udpDatagramSize(datagram.payload)
 			c.notifyReceiveLocked()
@@ -550,31 +553,15 @@ func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, tar
 			}
 			return n, datagram.source, datagram.target, datagram.options, n < len(datagram.payload), nil
 		}
-		deadline, changed, notified := c.readDeadline, c.readChanged, c.receiveNotify
+		notified := c.receiveNotify
 		c.mu.Unlock()
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			select {
-			case <-changed:
-				continue
-			default:
-				return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
-			}
-		}
-		timer, timeout := c.readTimers.timer(deadline)
 		select {
 		case <-notified:
-			c.readTimers.release(timer, false)
 		case err := <-c.errors:
-			c.readTimers.release(timer, false)
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, err
 		case <-timeout:
-			c.readTimers.release(timer, true)
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
-		case <-changed:
-			c.readTimers.release(timer, false)
-			continue
 		case <-c.closed:
-			c.readTimers.release(timer, false)
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, net.ErrClosed
 		}
 	}
@@ -757,12 +744,9 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetI
 	if target.Addr().Is6() != c.v6 && !c.dual || target.Addr().IsUnspecified() {
 		return 0, errors.New("mipstack: invalid UDP destination")
 	}
-	deadline, _, closed, options := c.writeStateAndOptions(options)
-	if closed {
-		return 0, net.ErrClosed
-	}
-	if !deadline.IsZero() && !time.Now().Before(deadline) {
-		return 0, os.ErrDeadlineExceeded
+	state, options := c.writeStateAndOptions(options)
+	if err := state.err(); err != nil {
+		return 0, err
 	}
 	requestedSource := c.local
 	packetInfoSource = packetInfoSource.Unmap()
@@ -863,7 +847,8 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 			identification = uint16(c.stack.ipv4ID.Add(1))
 		}
 		queue, loopback := c.stack.outputQueueFor(target)
-		slot, err := c.stack.reservePacketUntil(queue, loopback, c.writeState)
+		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+		slot, err := c.stack.reservePacketUntil(queue, loopback, state)
 		if err != nil {
 			return err
 		}
@@ -891,7 +876,8 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 		value = 0xffff
 	}
 	binary.BigEndian.PutUint16(udpHeader[6:8], value)
-	return c.stack.writeIPFragmentsUntilOptionsForMTU(source, target, protocolUDP, udpHeader[:], payload, options, mtu, c.writeState)
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+	return c.stack.writeIPFragmentsUntilOptionsForMTU(source, target, protocolUDP, udpHeader[:], payload, options, mtu, state)
 }
 
 // marshalUDPDatagram writes one UDP header, payload, and checksum into dst.
@@ -976,6 +962,8 @@ func (c *UDPConn) Close() error {
 func (c *UDPConn) closeFromStack() {
 	c.once.Do(func() {
 		c.mu.Lock()
+		c.readDeadline.stop()
+		c.writeDeadline.stop()
 		c.receive.clear()
 		c.receiveSpare = nil
 		c.queuedBytes = 0
@@ -1042,12 +1030,9 @@ func (c *UDPConn) SetDeadline(deadline time.Time) error {
 		return c.setOperationError(net.ErrClosed)
 	default:
 	}
-	readChanged, writeChanged := c.readChanged, c.writeChanged
-	c.readDeadline, c.writeDeadline = deadline, deadline
-	c.readChanged, c.writeChanged = make(chan struct{}), make(chan struct{})
+	c.readDeadline.set(deadline)
+	c.writeDeadline.set(deadline)
 	c.mu.Unlock()
-	close(readChanged)
-	close(writeChanged)
 	return nil
 }
 
@@ -1060,10 +1045,8 @@ func (c *UDPConn) SetReadDeadline(deadline time.Time) error {
 		return c.setOperationError(net.ErrClosed)
 	default:
 	}
-	changed := c.readChanged
-	c.readDeadline, c.readChanged = deadline, make(chan struct{})
+	c.readDeadline.set(deadline)
 	c.mu.Unlock()
-	close(changed)
 	return nil
 }
 
@@ -1076,10 +1059,8 @@ func (c *UDPConn) SetWriteDeadline(deadline time.Time) error {
 		return c.setOperationError(net.ErrClosed)
 	default:
 	}
-	changed := c.writeChanged
-	c.writeDeadline, c.writeChanged = deadline, make(chan struct{})
+	c.writeDeadline.set(deadline)
 	c.mu.Unlock()
-	close(changed)
 	return nil
 }
 
@@ -1181,30 +1162,13 @@ func (c *UDPConn) SetFlowLabel(label uint32) error {
 	}
 }
 
-// writeState snapshots the write deadline, notification, and closure state.
-func (c *UDPConn) writeState() (time.Time, <-chan struct{}, bool) {
+// writeStateAndOptions reads the output defaults and returns the independent
+// deadline and close signals observed by a blocked host-queue write.
+func (c *UDPConn) writeStateAndOptions(options ipPacketOptions) (socketWriteState, ipPacketOptions) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	select {
-	case <-c.closed:
-		return c.writeDeadline, c.writeChanged, true
-	default:
-		return c.writeDeadline, c.writeChanged, false
-	}
-}
-
-// writeStateAndOptions reads the initial deadline and output defaults under
-// one socket lock. A blocked host-queue write still rechecks writeState.
-func (c *UDPConn) writeStateAndOptions(options ipPacketOptions) (time.Time, <-chan struct{}, bool, ipPacketOptions) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	options = options.withDefaults(c.defaultOptions)
-	select {
-	case <-c.closed:
-		return c.writeDeadline, c.writeChanged, true, options
-	default:
-		return c.writeDeadline, c.writeChanged, false, options
-	}
+	c.mu.Unlock()
+	return socketWriteState{deadline: &c.writeDeadline, closed: c.closed}, options
 }
 
 // operationError wraps a UDP socket failure in the same public shape used by

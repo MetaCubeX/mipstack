@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -41,23 +40,19 @@ func TestPacketQueueWaitDoesNotSerializeWriteDeadlines(t *testing.T) {
 	}
 	firstStarted := make(chan struct{})
 	firstDone := make(chan error, 1)
-	firstChanged := make(chan struct{})
-	var firstOnce sync.Once
+	firstClosed := make(chan struct{})
 	go func() {
-		writeErr := stack.writePacketUntil(packet, func() (time.Time, <-chan struct{}, bool) {
-			firstOnce.Do(func() { close(firstStarted) })
-			return time.Time{}, firstChanged, false
-		})
+		close(firstStarted)
+		writeErr := stack.writePacketUntil(packet, socketWriteState{closed: firstClosed})
 		firstDone <- writeErr
 	}()
 	<-firstStarted
 
 	deadline := time.Now().Add(25 * time.Millisecond)
-	secondChanged := make(chan struct{})
+	var secondDeadline socketDeadline
+	secondDeadline.set(deadline)
 	startedAt := time.Now()
-	err = stack.writePacketUntil(packet, func() (time.Time, <-chan struct{}, bool) {
-		return deadline, secondChanged, false
-	})
+	err = stack.writePacketUntil(packet, socketWriteState{deadline: &secondDeadline, closed: make(chan struct{})})
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("second queue write = %v, want deadline exceeded", err)
 	}
@@ -299,9 +294,7 @@ func TestFullLoopbackQueueDoesNotBlock(t *testing.T) {
 	if err = stack.writePacket(packet); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("writePacket to full loopback queue = %v, want ErrResourceLimit", err)
 	}
-	if err = stack.writePacketUntil(packet, func() (time.Time, <-chan struct{}, bool) {
-		return time.Time{}, make(chan struct{}), false
-	}); !errors.Is(err, ErrResourceLimit) {
+	if err = stack.writePacketUntil(packet, socketWriteState{closed: make(chan struct{})}); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("writePacketUntil to full loopback queue = %v, want ErrResourceLimit", err)
 	}
 }
@@ -468,51 +461,497 @@ func TestDatagramQueueRetainsOnlySmallBacking(t *testing.T) {
 	}
 }
 
-func TestDeadlineTimerCacheIsConcurrentAndBounded(t *testing.T) {
-	var cache deadlineTimerCache
-	timers := make([]*time.Timer, 2*deadlineTimerCacheLimit)
-	for index := range timers {
-		timer, _ := cache.timer(time.Now().Add(time.Hour))
-		timers[index] = timer
+func TestSocketDeadlineRefreshAndClear(t *testing.T) {
+	var deadline socketDeadline
+	initial := deadline.wait()
+	deadline.set(time.Now().Add(20 * time.Millisecond).Round(0))
+	deadline.set(time.Now().Add(time.Hour).Round(0))
+	if current := deadline.wait(); current != initial {
+		t.Fatal("live deadline update replaced the waiter channel")
 	}
-	var wait sync.WaitGroup
-	wait.Add(len(timers))
-	for _, timer := range timers {
-		go func(timer *time.Timer) {
-			defer wait.Done()
-			cache.release(timer, false)
-		}(timer)
+	wait := time.NewTimer(40 * time.Millisecond)
+	select {
+	case <-initial:
+		wait.Stop()
+		t.Fatal("superseded deadline closed the waiter channel")
+	case <-wait.C:
 	}
-	wait.Wait()
-	cache.mu.Lock()
-	cached := len(cache.timers)
-	cache.mu.Unlock()
-	if cached != deadlineTimerCacheLimit {
-		t.Fatalf("cached deadline timers = %d, want %d", cached, deadlineTimerCacheLimit)
+	deadline.set(time.Time{})
+	if current := deadline.wait(); current != initial {
+		t.Fatal("clearing a live deadline replaced the waiter channel")
+	}
+	deadline.set(time.Now().Add(-time.Second))
+	select {
+	case <-initial:
+	default:
+		t.Fatal("expired deadline did not close the waiter channel")
+	}
+	deadline.set(time.Now().Add(time.Hour))
+	refreshed := deadline.wait()
+	if refreshed == initial {
+		t.Fatal("refreshing an expired deadline retained its closed channel")
+	}
+	select {
+	case <-refreshed:
+		t.Fatal("refreshed deadline channel is already closed")
+	default:
+	}
+	deadline.stop()
+	deadline.mu.Lock()
+	armed := deadline.timer != nil
+	deadline.mu.Unlock()
+	if armed {
+		t.Fatal("stopped deadline retained its timer")
 	}
 }
 
-func TestDeadlineTimerCacheResetHasNoStaleTick(t *testing.T) {
-	var cache deadlineTimerCache
-	for _, consume := range []bool{false, true} {
-		timer, timeout := cache.timer(time.Now().Add(time.Millisecond))
-		if consume {
-			<-timeout
-		} else {
-			time.Sleep(10 * time.Millisecond)
-		}
-		cache.release(timer, consume)
+type deadlineOperationResult struct {
+	bytes int
+	err   error
+}
 
-		reused, next := cache.timer(time.Now().Add(time.Hour))
-		if reused != timer {
-			t.Fatal("deadline timer cache did not reuse the released timer")
+// testMutableDeadline exercises the standard pending-I/O contract shared by
+// net.Conn, net.PacketConn, and net.Listener.
+func testMutableDeadline(t *testing.T, set func(time.Time) error, operation func() (int, error)) {
+	t.Helper()
+	checkTimeout := func(result deadlineOperationResult) {
+		t.Helper()
+		if result.bytes != 0 || !errors.Is(result.err, os.ErrDeadlineExceeded) {
+			t.Fatalf("operation = %d, %v, want 0, os.ErrDeadlineExceeded", result.bytes, result.err)
+		}
+		var netErr net.Error
+		if !errors.As(result.err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("operation error = %v, want net.Error with Timeout", result.err)
+		}
+	}
+	start := func() <-chan deadlineOperationResult {
+		done := make(chan deadlineOperationResult, 1)
+		started := make(chan struct{})
+		go func() {
+			close(started)
+			bytes, err := operation()
+			done <- deadlineOperationResult{bytes: bytes, err: err}
+		}()
+		<-started
+		return done
+	}
+	waitUntil := func(deadline time.Time, done <-chan deadlineOperationResult, message string) {
+		t.Helper()
+		wait := time.NewTimer(time.Until(deadline) + 25*time.Millisecond)
+		defer wait.Stop()
+		select {
+		case result := <-done:
+			t.Fatalf("%s: %d, %v", message, result.bytes, result.err)
+		case <-wait.C:
+		}
+	}
+
+	if err := set(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	done := start()
+	time.Sleep(10 * time.Millisecond)
+	earlier := time.Now().Add(50 * time.Millisecond).Round(0)
+	if err := set(earlier); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		if time.Now().Before(earlier) {
+			t.Fatalf("operation returned before wall-only deadline %v", earlier)
+		}
+		checkTimeout(result)
+	case <-time.After(time.Second):
+		t.Fatal("operation did not observe an earlier deadline")
+	}
+
+	oldDeadline := time.Now().Add(75 * time.Millisecond)
+	if err := set(oldDeadline); err != nil {
+		t.Fatal(err)
+	}
+	done = start()
+	time.Sleep(10 * time.Millisecond)
+	later := time.Now().Add(175 * time.Millisecond)
+	if err := set(later); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(oldDeadline, done, "operation retained the superseded deadline")
+	select {
+	case result := <-done:
+		if time.Now().Before(later) {
+			t.Fatalf("operation returned before extended deadline %v", later)
+		}
+		checkTimeout(result)
+	case <-time.After(time.Second):
+		t.Fatal("operation did not observe an extended deadline")
+	}
+
+	clearedDeadline := time.Now().Add(75 * time.Millisecond)
+	if err := set(clearedDeadline); err != nil {
+		t.Fatal(err)
+	}
+	done = start()
+	time.Sleep(10 * time.Millisecond)
+	if err := set(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(clearedDeadline, done, "operation retained a cleared deadline")
+	if err := set(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		checkTimeout(result)
+	case <-time.After(time.Second):
+		t.Fatal("operation did not observe a deadline after clearing")
+	}
+}
+
+func TestPendingReadDeadlineUpdates(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.1")
+	remote := netip.MustParseAddr("192.0.2.2")
+	link, stack := newTestStack(t, local, remote)
+	defer stack.Close()
+	link.echoTCP = true
+
+	tcpConnection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(remote, 8080))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcpConnection.Close()
+	udpConnection, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(local, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpConnection.Close()
+	ipConnection, err := stack.ListenIP(context.Background(), "ip4:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ipConnection.Close()
+	listener, err := stack.ListenTCP(context.Background(), "tcp", netip.AddrPortFrom(local, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	tests := []struct {
+		name      string
+		set       func(time.Time) error
+		operation func() (int, error)
+	}{
+		{name: "TCP read", set: tcpConnection.SetReadDeadline, operation: func() (int, error) { return tcpConnection.Read(make([]byte, 1)) }},
+		{name: "UDP read", set: udpConnection.SetReadDeadline, operation: func() (int, error) {
+			n, _, readErr := udpConnection.ReadFrom(make([]byte, 1))
+			return n, readErr
+		}},
+		{name: "IP read", set: ipConnection.SetReadDeadline, operation: func() (int, error) {
+			n, _, readErr := ipConnection.ReadFrom(make([]byte, 1))
+			return n, readErr
+		}},
+		{name: "TCP accept", set: listener.SetDeadline, operation: func() (int, error) {
+			_, acceptErr := listener.Accept()
+			return 0, acceptErr
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) { testMutableDeadline(t, test.set, test.operation) })
+	}
+}
+
+// TestExpiredDeadlinePrecedesQueuedIO matches the standard network poller:
+// an expired deadline rejects a new operation without consuming data or an
+// accepted connection that was already ready.
+func TestExpiredDeadlinePrecedesQueuedIO(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.31")
+	remote := netip.MustParseAddr("192.0.2.32")
+	link, stack := newTestStack(t, local, remote)
+	link.echoTCP = true
+	past := time.Now().Add(-time.Second)
+
+	t.Run("TCP read", func(t *testing.T) {
+		connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(remote, 8031))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer connection.Close()
+		if _, err = connection.Write([]byte("t")); err != nil {
+			t.Fatal(err)
+		}
+		tcpConnection := connection.(*TCPConn)
+		waitFor(t, time.Second, func() bool {
+			tcpConnection.mu.Lock()
+			ready := tcpConnection.readBuffer.size != 0
+			tcpConnection.mu.Unlock()
+			return ready
+		})
+		if err = connection.SetReadDeadline(past); err != nil {
+			t.Fatal(err)
+		}
+		if n, readErr := connection.Read(make([]byte, 1)); n != 0 || !errors.Is(readErr, os.ErrDeadlineExceeded) {
+			t.Fatalf("expired TCP Read = %d, %v", n, readErr)
+		}
+		if err = connection.SetReadDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		buffer := make([]byte, 1)
+		if n, readErr := connection.Read(buffer); n != 1 || readErr != nil || buffer[0] != 't' {
+			t.Fatalf("TCP Read after clearing deadline = %d, %q, %v", n, buffer[:n], readErr)
+		}
+	})
+
+	t.Run("UDP read", func(t *testing.T) {
+		packetConnection, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(local, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer packetConnection.Close()
+		connection := packetConnection.(*UDPConn)
+		source := netip.AddrPortFrom(remote, 5300)
+		connection.enqueue([]byte("u"), source, local, ipPacketOptions{})
+		if err = connection.SetReadDeadline(past); err != nil {
+			t.Fatal(err)
+		}
+		if n, _, readErr := connection.ReadFrom(make([]byte, 1)); n != 0 || !errors.Is(readErr, os.ErrDeadlineExceeded) {
+			t.Fatalf("expired UDP ReadFrom = %d, %v", n, readErr)
+		}
+		if err = connection.SetReadDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		buffer := make([]byte, 1)
+		n, address, readErr := connection.ReadFrom(buffer)
+		if n != 1 || readErr != nil || buffer[0] != 'u' || address.(*net.UDPAddr).AddrPort() != source {
+			t.Fatalf("UDP ReadFrom after clearing deadline = %d, %q, %v, %v", n, buffer[:n], address, readErr)
+		}
+	})
+
+	t.Run("IP read", func(t *testing.T) {
+		connection, err := stack.ListenIP(context.Background(), "ip4:99", local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer connection.Close()
+		connection.enqueue([]byte("i"), remote, local, ipPacketOptions{})
+		if err = connection.SetReadDeadline(past); err != nil {
+			t.Fatal(err)
+		}
+		if n, _, readErr := connection.ReadFrom(make([]byte, 1)); n != 0 || !errors.Is(readErr, os.ErrDeadlineExceeded) {
+			t.Fatalf("expired IP ReadFrom = %d, %v", n, readErr)
+		}
+		if err = connection.SetReadDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		buffer := make([]byte, 1)
+		n, address, readErr := connection.ReadFrom(buffer)
+		if n != 1 || readErr != nil || buffer[0] != 'i' || address.(*net.IPAddr).String() != remote.String() {
+			t.Fatalf("IP ReadFrom after clearing deadline = %d, %q, %v, %v", n, buffer[:n], address, readErr)
+		}
+	})
+
+	t.Run("TCP accept", func(t *testing.T) {
+		listener, err := stack.ListenTCP(context.Background(), "tcp", netip.AddrPortFrom(local, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		client, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, listener.local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		waitFor(t, time.Second, func() bool { return listener.Info().AcceptQueueConnections == 1 })
+		if err = listener.SetDeadline(past); err != nil {
+			t.Fatal(err)
+		}
+		if connection, acceptErr := listener.Accept(); connection != nil || !errors.Is(acceptErr, os.ErrDeadlineExceeded) {
+			t.Fatalf("expired TCP Accept = %v, %v", connection, acceptErr)
+		}
+		if err = listener.SetDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		server, err := listener.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = server.Close()
+	})
+}
+
+func TestPendingDatagramWriteDeadlineUpdates(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.1")
+	remote := netip.MustParseAddr("192.0.2.2")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	udpConnection, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(local, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpConnection.Close()
+	ipConnection, err := stack.ListenIP(context.Background(), "ip4:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ipConnection.Close()
+	fillTestPacketQueue(t, &stack.outbound, []byte{0})
+
+	t.Run("UDP write", func(t *testing.T) {
+		testMutableDeadline(t, udpConnection.SetWriteDeadline, func() (int, error) {
+			return udpConnection.WriteTo([]byte("query"), net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 53)))
+		})
+	})
+	t.Run("IP write", func(t *testing.T) {
+		testMutableDeadline(t, ipConnection.SetWriteDeadline, func() (int, error) {
+			return ipConnection.WriteTo([]byte("query"), ipNetAddr(remote))
+		})
+	})
+}
+
+func TestDatagramCloseWakesBlockedWrite(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.41")
+	remote := netip.MustParseAddr("192.0.2.42")
+
+	t.Run("UDP", func(t *testing.T) {
+		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stack.Close()
+		if err = stack.Start(); err != nil {
+			t.Fatal(err)
+		}
+		packetConnection, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(local, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		connection := packetConnection.(*UDPConn)
+		fillTestPacketQueue(t, &stack.outbound, []byte{0})
+		done := make(chan error, 1)
+		started := make(chan struct{})
+		go func() {
+			close(started)
+			_, writeErr := connection.WriteTo([]byte("query"), net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 53)))
+			done <- writeErr
+		}()
+		<-started
+		select {
+		case writeErr := <-done:
+			t.Fatalf("UDP WriteTo did not block on the full queue: %v", writeErr)
+		case <-time.After(20 * time.Millisecond):
+		}
+		if err = connection.Close(); err != nil {
+			t.Fatal(err)
 		}
 		select {
-		case <-next:
-			t.Fatalf("deadline timer cache exposed a stale tick after consumed=%v", consume)
-		default:
+		case writeErr := <-done:
+			if !errors.Is(writeErr, net.ErrClosed) {
+				t.Fatalf("UDP WriteTo after Close = %v", writeErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("UDP Close did not wake blocked WriteTo")
 		}
-		cache.release(reused, false)
+	})
+
+	t.Run("IP", func(t *testing.T) {
+		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stack.Close()
+		if err = stack.Start(); err != nil {
+			t.Fatal(err)
+		}
+		connection, err := stack.ListenIP(context.Background(), "ip4:99", local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fillTestPacketQueue(t, &stack.outbound, []byte{0})
+		done := make(chan error, 1)
+		started := make(chan struct{})
+		go func() {
+			close(started)
+			_, writeErr := connection.WriteTo([]byte("query"), ipNetAddr(remote))
+			done <- writeErr
+		}()
+		<-started
+		select {
+		case writeErr := <-done:
+			t.Fatalf("IP WriteTo did not block on the full queue: %v", writeErr)
+		case <-time.After(20 * time.Millisecond):
+		}
+		if err = connection.Close(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case writeErr := <-done:
+			if !errors.Is(writeErr, net.ErrClosed) {
+				t.Fatalf("IP WriteTo after Close = %v", writeErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("IP Close did not wake blocked WriteTo")
+		}
+	})
+}
+
+func TestPendingTCPWriteDeadlineUpdates(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
+	defer stack.Close()
+	link.echoTCP = true
+	link.dropTCPData = 1000
+	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8086))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+
+	oldDeadline := time.Now().Add(100 * time.Millisecond)
+	if err = connection.SetWriteDeadline(oldDeadline); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan deadlineOperationResult, 1)
+	go func() {
+		bytes, writeErr := connection.Write(make([]byte, tcpSendCapacity+1))
+		done <- deadlineOperationResult{bytes: bytes, err: writeErr}
+	}()
+	time.Sleep(10 * time.Millisecond)
+	later := time.Now().Add(200 * time.Millisecond)
+	if err = connection.SetWriteDeadline(later); err != nil {
+		t.Fatal(err)
+	}
+	wait := time.NewTimer(time.Until(oldDeadline) + 25*time.Millisecond)
+	select {
+	case result := <-done:
+		wait.Stop()
+		t.Fatalf("TCP Write retained the superseded deadline: %d, %v", result.bytes, result.err)
+	case <-wait.C:
+	}
+	if err = connection.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	wait = time.NewTimer(time.Until(later) + 25*time.Millisecond)
+	select {
+	case result := <-done:
+		wait.Stop()
+		t.Fatalf("TCP Write retained the cleared deadline: %d, %v", result.bytes, result.err)
+	case <-wait.C:
+	}
+	finalDeadline := time.Now().Add(50 * time.Millisecond).Round(0)
+	if err = connection.SetWriteDeadline(finalDeadline); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		if result.bytes != tcpSendCapacity || !errors.Is(result.err, os.ErrDeadlineExceeded) {
+			t.Fatalf("TCP Write = %d, %v, want %d, os.ErrDeadlineExceeded", result.bytes, result.err, tcpSendCapacity)
+		}
+		checkNetOpError(t, result.err, "write", "tcp")
+	case <-time.After(time.Second):
+		t.Fatal("TCP Write did not observe the final deadline")
 	}
 }
 

@@ -1525,29 +1525,27 @@ type TCPConn struct {
 	// enabled.
 	forwarded bool
 
-	inbound            tcpSegmentQueue
-	networkError       chan error
-	actorWake          chan struct{}
-	actorWakeFlags     atomic.Uint32
-	abortCh            chan struct{}
-	done               chan struct{}
-	connected          chan error
-	lingerDone         chan struct{}
-	infoRequest        chan chan TCPInfo
-	abortOnce          sync.Once
-	closeOnce          sync.Once
-	lingerOnce         sync.Once
-	readCallMu         sync.Mutex
-	writeCallMu        sync.Mutex
-	readDeadlineTimer  *ownedTimer
-	writeDeadlineTimer *ownedTimer
-	icmpSequence       atomic.Uint64
-	applicationReads   atomic.Uint64
-	outOfOrderUnread   atomic.Int64
-	retransmissions    atomic.Uint64
-	inboundQueueDrops  atomic.Uint64
-	lastInfo           atomic.Pointer[TCPInfo]
-	sendCapacityHint   atomic.Int64
+	inbound           tcpSegmentQueue
+	networkError      chan error
+	actorWake         chan struct{}
+	actorWakeFlags    atomic.Uint32
+	abortCh           chan struct{}
+	done              chan struct{}
+	connected         chan error
+	lingerDone        chan struct{}
+	infoRequest       chan chan TCPInfo
+	abortOnce         sync.Once
+	closeOnce         sync.Once
+	lingerOnce        sync.Once
+	readCallMu        sync.Mutex
+	writeCallMu       sync.Mutex
+	icmpSequence      atomic.Uint64
+	applicationReads  atomic.Uint64
+	outOfOrderUnread  atomic.Int64
+	retransmissions   atomic.Uint64
+	inboundQueueDrops atomic.Uint64
+	lastInfo          atomic.Pointer[TCPInfo]
+	sendCapacityHint  atomic.Int64
 
 	abortMu  sync.Mutex
 	abortErr error
@@ -1560,10 +1558,8 @@ type TCPConn struct {
 	userClosed         bool
 	readClosed         bool
 	writeClosed        bool
-	readDeadline       time.Time
-	writeDeadline      time.Time
-	readChanged        chan struct{}
-	writeChanged       chan struct{}
+	readDeadline       socketDeadline
+	writeDeadline      socketDeadline
 	readNotify         chan struct{}
 	sendChanged        chan struct{}
 	sendBuffer         tcpSendBuffer
@@ -1701,8 +1697,7 @@ type TCPListener struct {
 	backlog int
 
 	mu          sync.Mutex
-	deadline    time.Time
-	changed     chan struct{}
+	deadline    socketDeadline
 	pending     map[*TCPConn]struct{}
 	handshaking map[*TCPConn]struct{}
 	acceptPeak  int
@@ -1784,7 +1779,7 @@ func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrP
 	key := tcpListenKey{address: address, port: port}
 	listener := &TCPListener{
 		stack: s, key: key, local: local, dual: dual, net: network, accept: make(chan *TCPConn, state.tcpDefaults.AcceptQueue), backlog: state.tcpDefaults.SYNBacklog,
-		closed: make(chan struct{}), changed: make(chan struct{}), pending: make(map[*TCPConn]struct{}), handshaking: make(map[*TCPConn]struct{}),
+		closed: make(chan struct{}), pending: make(map[*TCPConn]struct{}), handshaking: make(map[*TCPConn]struct{}),
 	}
 	if err = binding.register(passive, listener); err != nil {
 		return wrap(err)
@@ -1958,45 +1953,48 @@ func (state *tcpPassiveState) remove(listener *TCPListener) bool {
 }
 
 // Accept waits for and returns the next completed passive connection.
-func (l *TCPListener) Accept() (net.Conn, error) { return l.AcceptTCP() }
+func (l *TCPListener) Accept() (net.Conn, error) {
+	connection, err := l.AcceptTCP()
+	if err != nil {
+		return nil, err
+	}
+	return connection, nil
+}
 
 // AcceptTCP waits for and returns the next completed passive connection.
 func (l *TCPListener) AcceptTCP() (*TCPConn, error) {
-	for {
-		l.mu.Lock()
-		deadline, changed := l.deadline, l.changed
+	l.mu.Lock()
+	select {
+	case <-l.closed:
 		l.mu.Unlock()
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			select {
-			case <-changed:
-				continue
-			default:
-				return nil, l.operationError("accept", os.ErrDeadlineExceeded)
-			}
-		}
-		timer, timeout := deadlineTimer(deadline)
+		return nil, l.operationError("accept", net.ErrClosed)
+	default:
+	}
+	timeout := l.deadline.wait()
+	select {
+	case <-timeout:
+		l.mu.Unlock()
+		return nil, l.operationError("accept", os.ErrDeadlineExceeded)
+	default:
+	}
+	l.mu.Unlock()
+	select {
+	case connection := <-l.accept:
+		l.mu.Lock()
 		select {
-		case connection := <-l.accept:
-			stopTimer(timer)
-			l.mu.Lock()
-			select {
-			case <-l.closed:
-				l.mu.Unlock()
-				return nil, l.operationError("accept", net.ErrClosed)
-			default:
-			}
-			delete(l.pending, connection)
-			l.mu.Unlock()
-			l.acceptedConnections.Add(1)
-			return connection, nil
-		case <-changed:
-			stopTimer(timer)
-		case <-timeout:
-			return nil, l.operationError("accept", os.ErrDeadlineExceeded)
 		case <-l.closed:
-			stopTimer(timer)
+			l.mu.Unlock()
 			return nil, l.operationError("accept", net.ErrClosed)
+		default:
 		}
+		delete(l.pending, connection)
+		l.mu.Unlock()
+		l.acceptedConnections.Add(1)
+		return connection, nil
+	case <-timeout:
+		return nil, l.operationError("accept", os.ErrDeadlineExceeded)
+	case <-l.closed:
+		return nil, l.operationError("accept", net.ErrClosed)
 	}
 }
 
@@ -2049,10 +2047,8 @@ func (l *TCPListener) SetDeadline(deadline time.Time) error {
 		return l.operationError("set", net.ErrClosed)
 	default:
 	}
-	changed := l.changed
-	l.deadline, l.changed = deadline, make(chan struct{})
+	l.deadline.set(deadline)
 	l.mu.Unlock()
-	close(changed)
 	return nil
 }
 
@@ -2141,6 +2137,7 @@ func (l *TCPListener) noteHandshakeFailure(err error) {
 func (l *TCPListener) closeFromStack() {
 	l.once.Do(func() {
 		l.mu.Lock()
+		l.deadline.stop()
 		close(l.closed)
 		pending := make([]*TCPConn, 0, len(l.pending))
 		for connection := range l.pending {
@@ -2247,7 +2244,7 @@ func newTCPConn(stack *Stack, network string, key tcpKey, mtu int) *TCPConn {
 		inbound: newTCPSegmentQueue(), networkError: make(chan error, 8), actorWake: make(chan struct{}, 1),
 		abortCh: make(chan struct{}), done: make(chan struct{}), lingerDone: make(chan struct{}),
 		infoRequest: make(chan chan TCPInfo),
-		readChanged: make(chan struct{}, 1), writeChanged: make(chan struct{}, 1), readNotify: make(chan struct{}, 1), sendChanged: make(chan struct{}, 1),
+		readNotify:  make(chan struct{}, 1), sendChanged: make(chan struct{}, 1),
 		noDelay: !defaults.DisableNoDelay, linger: -1,
 		receiveCapacity: defaults.ReceiveBuffer, sendCapacity: defaults.SendBuffer,
 		receiveMaximum: defaults.MaximumReceiveBuffer, sendMaximum: defaults.MaximumSendBuffer,
@@ -2784,6 +2781,13 @@ func (c *TCPConn) readChunk(destination []byte, maximum int) ([]byte, int, bool,
 			c.mu.Unlock()
 			return nil, 0, false, net.ErrClosed
 		}
+		timeout := c.readDeadline.wait()
+		select {
+		case <-timeout:
+			c.mu.Unlock()
+			return nil, 0, false, os.ErrDeadlineExceeded
+		default:
+		}
 		if c.readBuffer.size != 0 {
 			var payload []byte
 			recyclable := false
@@ -2804,33 +2808,13 @@ func (c *TCPConn) readChunk(destination []byte, maximum int) ([]byte, int, bool,
 			c.mu.Unlock()
 			return nil, 0, false, err
 		}
-		deadline, changed, notified := c.readDeadline, c.readChanged, c.readNotify
+		notified := c.readNotify
 		c.mu.Unlock()
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			select {
-			case <-changed:
-				continue
-			default:
-				return nil, 0, false, os.ErrDeadlineExceeded
-			}
-		}
-		var timeout <-chan time.Time
-		if !deadline.IsZero() {
-			if c.readDeadlineTimer == nil {
-				c.readDeadlineTimer = newOwnedTimer()
-			}
-			timeout = c.readDeadlineTimer.reset(time.Until(deadline))
-		}
 		select {
 		case <-notified:
-		case <-changed:
 		case <-timeout:
-			c.readDeadlineTimer.consumed()
 			return nil, 0, false, os.ErrDeadlineExceeded
 		case <-c.done:
-		}
-		if c.readDeadlineTimer != nil {
-			c.readDeadlineTimer.stop()
 		}
 	}
 }
@@ -2924,9 +2908,12 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 			c.mu.Unlock()
 			return written, err
 		}
-		if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
+		timeout := c.writeDeadline.wait()
+		select {
+		case <-timeout:
 			c.mu.Unlock()
 			return written, os.ErrDeadlineExceeded
+		default:
 		}
 		available := c.sendCapacity - c.sendBuffer.size
 		if available > len(payload)-written {
@@ -2936,7 +2923,7 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 			c.sendBuffer.append(payload[written : written+available])
 			written += available
 		}
-		deadline, deadlineChanged, sendChanged := c.writeDeadline, c.writeChanged, c.sendChanged
+		sendChanged := c.sendChanged
 		c.mu.Unlock()
 		if available > 0 {
 			c.notifySend()
@@ -2944,30 +2931,15 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 		if written == len(payload) {
 			return written, nil
 		}
-		var timeout <-chan time.Time
-		if !deadline.IsZero() {
-			if c.writeDeadlineTimer == nil {
-				c.writeDeadlineTimer = newOwnedTimer()
-			}
-			timeout = c.writeDeadlineTimer.reset(time.Until(deadline))
-		}
 		select {
 		case <-sendChanged:
-		case <-deadlineChanged:
 		case <-timeout:
-			c.writeDeadlineTimer.consumed()
 			return written, os.ErrDeadlineExceeded
 		case <-c.done:
-			if c.writeDeadlineTimer != nil {
-				c.writeDeadlineTimer.stop()
-			}
 			c.mu.Lock()
 			err := c.connectionErrorLocked()
 			c.mu.Unlock()
 			return written, err
-		}
-		if c.writeDeadlineTimer != nil {
-			c.writeDeadlineTimer.stop()
 		}
 	}
 	return written, nil
@@ -3062,6 +3034,8 @@ func (c *TCPConn) Close() error {
 	c.closeOnce.Do(func() {
 		closedNow = true
 		c.mu.Lock()
+		c.readDeadline.stop()
+		c.writeDeadline.stop()
 		if !c.writeClosed {
 			c.writeClosed = true
 		}
@@ -3072,8 +3046,8 @@ func (c *TCPConn) Close() error {
 		c.readBuffer.reset()
 		if abortive {
 			c.sendBuffer.clear()
-			c.notifySendChangedLocked()
 		}
+		c.notifySendChangedLocked()
 		c.notifyReadLocked()
 		c.mu.Unlock()
 	})
@@ -3201,10 +3175,9 @@ func (c *TCPConn) SetDeadline(deadline time.Time) error {
 		c.mu.Unlock()
 		return c.setOperationError(net.ErrClosed)
 	}
-	c.readDeadline, c.writeDeadline = deadline, deadline
+	c.readDeadline.set(deadline)
+	c.writeDeadline.set(deadline)
 	c.mu.Unlock()
-	notifyTCPDeadlineChanged(c.readChanged)
-	notifyTCPDeadlineChanged(c.writeChanged)
 	return nil
 }
 
@@ -3215,9 +3188,8 @@ func (c *TCPConn) SetReadDeadline(deadline time.Time) error {
 		c.mu.Unlock()
 		return c.setOperationError(net.ErrClosed)
 	}
-	c.readDeadline = deadline
+	c.readDeadline.set(deadline)
 	c.mu.Unlock()
-	notifyTCPDeadlineChanged(c.readChanged)
 	return nil
 }
 
@@ -3228,20 +3200,9 @@ func (c *TCPConn) SetWriteDeadline(deadline time.Time) error {
 		c.mu.Unlock()
 		return c.setOperationError(net.ErrClosed)
 	}
-	c.writeDeadline = deadline
+	c.writeDeadline.set(deadline)
 	c.mu.Unlock()
-	notifyTCPDeadlineChanged(c.writeChanged)
 	return nil
-}
-
-// notifyTCPDeadlineChanged coalesces deadline changes. TCP serializes reads
-// and writes independently, so one edge per direction wakes the only waiter;
-// that waiter always re-reads the final deadline under c.mu.
-func notifyTCPDeadlineChanged(changed chan struct{}) {
-	select {
-	case changed <- struct{}{}:
-	default:
-	}
 }
 
 // SetKeepAlive enables or disables TCP keepalive probes.
@@ -3711,6 +3672,8 @@ func (c *TCPConn) finish(err error) {
 	}
 	c.mu.Lock()
 	c.terminalErr = err
+	c.readDeadline.stop()
+	c.writeDeadline.stop()
 	if c.readErr == nil {
 		c.readErr = err
 	}
@@ -6514,7 +6477,10 @@ func (c *TCPConn) writeTCP(sequence, acknowledgement uint32, flags byte, window 
 		return packetQueueTicket{}, err
 	}
 	queue, loopback := c.stack.outputQueueFor(c.key.remote.Addr())
-	slot, err := c.stack.reservePacketUntil(queue, loopback, c.packetWriteState)
+	// A graceful Close deliberately leaves protocol output active so already
+	// accepted bytes and FIN can still be transmitted; only abort cancels it.
+	state := socketWriteState{closed: c.abortCh}
+	slot, err := c.stack.reservePacketUntil(queue, loopback, state)
 	if err != nil {
 		if errors.Is(err, net.ErrClosed) {
 			select {
@@ -6539,18 +6505,6 @@ func (c *TCPConn) writeTCP(sequence, acknowledgement uint32, flags byte, window 
 	hostQueue := queue.enqueueReservedTCP(slot, built, reusable, c.outputFlowID, loopback)
 	c.stack.recordOutput(loopback)
 	return hostQueue, nil
-}
-
-// packetWriteState exposes actor cancellation to a blocked packet-queue write.
-// A graceful Close deliberately leaves it open so already accepted bytes and
-// FIN can still be transmitted.
-func (c *TCPConn) packetWriteState() (time.Time, <-chan struct{}, bool) {
-	select {
-	case <-c.abortCh:
-		return time.Time{}, c.abortCh, true
-	default:
-		return time.Time{}, c.abortCh, false
-	}
 }
 
 // rttEstimator implements the RFC 6298 smoothed RTT and variance calculation.

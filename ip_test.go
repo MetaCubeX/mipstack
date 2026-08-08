@@ -634,7 +634,7 @@ func TestIPConnReceiveCapacity(t *testing.T) {
 	}
 }
 
-func TestIPConcurrentReadersReuseBoundedTimers(t *testing.T) {
+func TestIPConcurrentReadersShareDeadline(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.121")
 	remote := netip.MustParseAddr("198.51.100.121")
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
@@ -679,12 +679,6 @@ func TestIPConcurrentReadersReuseBoundedTimers(t *testing.T) {
 	}
 	if len(seen) != readers {
 		t.Fatalf("concurrent IP reads received %d distinct datagrams", len(seen))
-	}
-	connection.readTimers.mu.Lock()
-	cached := len(connection.readTimers.timers)
-	connection.readTimers.mu.Unlock()
-	if cached > deadlineTimerCacheLimit {
-		t.Fatalf("cached IP read timers = %d, limit %d", cached, deadlineTimerCacheLimit)
 	}
 }
 

@@ -333,7 +333,7 @@ func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
 	}
 }
 
-func TestUDPConcurrentReadersReuseBoundedTimers(t *testing.T) {
+func TestUDPConcurrentReadersShareDeadline(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.242")
 	remote := netip.MustParseAddrPort("198.51.100.242:5353")
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})

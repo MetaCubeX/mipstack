@@ -69,10 +69,6 @@ const (
 	// datagramReusablePayloadLimit keeps one common MTU payload backing per
 	// active socket while allowing jumbo datagrams to be collected after Read.
 	datagramReusablePayloadLimit = 2048
-	// deadlineTimerCacheLimit bounds stopped timers retained by concurrent
-	// datagram readers. Additional readers allocate transient timers rather than
-	// making one unusually concurrent socket retain them indefinitely.
-	deadlineTimerCacheLimit = 4
 )
 
 var (
@@ -2330,7 +2326,7 @@ func (s *Stack) tryWritePackets(packets [][]byte) error {
 
 // writePacketUntil queues a packet while observing a socket's mutable write
 // deadline. The fast path allocates no timer when the packet queue has room.
-func (s *Stack) writePacketUntil(packet []byte, state func() (time.Time, <-chan struct{}, bool)) error {
+func (s *Stack) writePacketUntil(packet []byte, state socketWriteState) error {
 	queue, loopback := s.outputQueue(packet)
 	slot, err := s.reservePacketUntil(queue, loopback, state)
 	if err != nil {
@@ -2344,59 +2340,38 @@ func (s *Stack) writePacketUntil(packet []byte, state func() (time.Time, <-chan 
 // reservePacketUntil acquires one queue slot while observing a socket's
 // mutable write deadline. Callers must release the slot if packet construction
 // fails before enqueueReserved publishes it.
-func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, state func() (time.Time, <-chan struct{}, bool)) (uint16, error) {
-	for {
-		deadline, changed, closed := state()
-		if closed {
-			return 0, net.ErrClosed
-		}
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			select {
-			case <-changed:
-				continue
-			default:
-				return 0, os.ErrDeadlineExceeded
-			}
-		}
-		if slot, reserved := queue.tryReserve(); reserved {
-			return slot, nil
-		}
-		if loopback {
-			select {
-			case <-s.closeCh:
-				return 0, ErrClosed
-			default:
-				return 0, ErrResourceLimit
-			}
-		}
-		timer, timeout := deadlineTimer(deadline)
+func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, state socketWriteState) (uint16, error) {
+	if err := state.err(); err != nil {
+		return 0, err
+	}
+	if slot, reserved := queue.tryReserve(); reserved {
+		return slot, nil
+	}
+	if loopback {
 		select {
-		case slot := <-queue.free:
-			stopTimer(timer)
-			deadline, changed, closed = state()
-			if closed {
-				queue.releaseReserved(slot)
-				return 0, net.ErrClosed
-			}
-			if !deadline.IsZero() && !time.Now().Before(deadline) {
-				select {
-				case <-changed:
-					queue.releaseReserved(slot)
-					continue
-				default:
-					queue.releaseReserved(slot)
-					return 0, os.ErrDeadlineExceeded
-				}
-			}
-			return slot, nil
-		case <-changed:
-			stopTimer(timer)
-		case <-timeout:
-			return 0, os.ErrDeadlineExceeded
 		case <-s.closeCh:
-			stopTimer(timer)
 			return 0, ErrClosed
+		default:
+			return 0, ErrResourceLimit
 		}
+	}
+	var timeout <-chan struct{}
+	if state.deadline != nil {
+		timeout = state.deadline.wait()
+	}
+	select {
+	case slot := <-queue.free:
+		if err := state.err(); err != nil {
+			queue.releaseReserved(slot)
+			return 0, err
+		}
+		return slot, nil
+	case <-timeout:
+		return 0, os.ErrDeadlineExceeded
+	case <-state.closed:
+		return 0, net.ErrClosed
+	case <-s.closeCh:
+		return 0, ErrClosed
 	}
 }
 
@@ -2423,55 +2398,112 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-// deadlineTimerCache reuses a bounded number of stopped one-shot timers for a
-// datagram socket. Each acquire returns a distinct timer, preserving the net
-// package's concurrent Read guarantee without a process-wide pool.
-type deadlineTimerCache struct {
+// socketDeadline follows the channel-generation model used by net.Pipe. One
+// timer closes the current wait channel to wake every blocked operation;
+// extending or clearing a live deadline keeps that channel stable, so existing
+// waiters observe the update without allocating their own timers. The zero
+// value is ready for use.
+type socketDeadline struct {
 	mu     sync.Mutex
-	timers []*time.Timer
+	timer  *time.Timer
+	waiter atomic.Pointer[socketDeadlineWaiter]
 }
 
-func (c *deadlineTimerCache) timer(deadline time.Time) (*time.Timer, <-chan time.Time) {
+// socketDeadlineWaiter is one immutable channel generation. Publishing a new
+// pointer lets the I/O fast path obtain the current channel without a lock.
+type socketDeadlineWaiter struct {
+	done chan struct{}
+}
+
+// set replaces the deadline. A zero time disables it, and an expired deadline
+// closes the current generation immediately.
+func (d *socketDeadline) set(deadline time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	waiter := d.waiter.Load()
+	if waiter == nil {
+		waiter = &socketDeadlineWaiter{done: make(chan struct{})}
+		d.waiter.Store(waiter)
+	}
+	if d.timer != nil && !d.timer.Stop() {
+		<-waiter.done
+	}
+	d.timer = nil
+	closed := false
+	select {
+	case <-waiter.done:
+		closed = true
+	default:
+	}
 	if deadline.IsZero() {
-		return nil, nil
-	}
-	duration := time.Until(deadline)
-	if duration < 0 {
-		duration = 0
-	}
-	c.mu.Lock()
-	last := len(c.timers) - 1
-	if last < 0 {
-		c.mu.Unlock()
-		timer := time.NewTimer(duration)
-		return timer, timer.C
-	}
-	timer := c.timers[last]
-	c.timers[last] = nil
-	c.timers = c.timers[:last]
-	c.mu.Unlock()
-	timer.Reset(duration)
-	return timer, timer.C
-}
-
-func (c *deadlineTimerCache) release(timer *time.Timer, consumed bool) {
-	if timer == nil {
+		if closed {
+			d.waiter.Store(&socketDeadlineWaiter{done: make(chan struct{})})
+		}
 		return
 	}
-	if consumed {
-		// The select received this generation's value, so the channel is
-		// already empty even though Stop reports an expired timer.
-		timer.Stop()
-	} else if !timer.Stop() {
-		// Go 1.20 requires an expired value to be drained before Reset. This
-		// timer belongs exclusively to the current read until it is cached.
-		<-timer.C
+	if duration := time.Until(deadline); duration > 0 {
+		if closed {
+			waiter = &socketDeadlineWaiter{done: make(chan struct{})}
+			d.waiter.Store(waiter)
+		}
+		done := waiter.done
+		d.timer = time.AfterFunc(duration, func() { close(done) })
+		return
 	}
-	c.mu.Lock()
-	if len(c.timers) < deadlineTimerCacheLimit {
-		c.timers = append(c.timers, timer)
+	if !closed {
+		close(waiter.done)
 	}
-	c.mu.Unlock()
+}
+
+// wait returns the channel closed by the current deadline generation.
+func (d *socketDeadline) wait() <-chan struct{} {
+	if waiter := d.waiter.Load(); waiter != nil {
+		return waiter.done
+	}
+	d.mu.Lock()
+	waiter := d.waiter.Load()
+	if waiter == nil {
+		waiter = &socketDeadlineWaiter{done: make(chan struct{})}
+		d.waiter.Store(waiter)
+	}
+	d.mu.Unlock()
+	return waiter.done
+}
+
+// stop releases an armed timer when its owning socket can no longer perform
+// I/O. A callback that has already started may still close its private channel.
+func (d *socketDeadline) stop() {
+	d.mu.Lock()
+	if d.timer != nil {
+		d.timer.Stop()
+		d.timer = nil
+	}
+	d.mu.Unlock()
+}
+
+// socketWriteState carries the two independent events that can interrupt a
+// write blocked on the stack's bounded packet queue.
+type socketWriteState struct {
+	deadline *socketDeadline
+	closed   <-chan struct{}
+}
+
+// err reports an already-observable close before a deadline, matching socket
+// methods that reject operations after Close even when a deadline also fired.
+func (s socketWriteState) err() error {
+	select {
+	case <-s.closed:
+		return net.ErrClosed
+	default:
+	}
+	if s.deadline != nil {
+		select {
+		case <-s.deadline.wait():
+			return os.ErrDeadlineExceeded
+		default:
+		}
+	}
+	return nil
 }
 
 // ownedTimer is a reusable timer consumed by exactly one actor goroutine. Its

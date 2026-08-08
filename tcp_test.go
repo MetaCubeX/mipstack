@@ -111,7 +111,7 @@ func TestTCPDestinationPortZeroUsesProtocolPath(t *testing.T) {
 
 func TestTCPListenerCompletedConnectionsLeaveSYNBacklog(t *testing.T) {
 	listener := &TCPListener{
-		accept: make(chan *TCPConn, 2), closed: make(chan struct{}), changed: make(chan struct{}), backlog: 1,
+		accept: make(chan *TCPConn, 2), closed: make(chan struct{}), backlog: 1,
 		pending: make(map[*TCPConn]struct{}), handshaking: make(map[*TCPConn]struct{}),
 	}
 	first, second := &TCPConn{}, &TCPConn{}
@@ -1209,7 +1209,7 @@ func TestTCPStandardOperationErrors(t *testing.T) {
 // TestTCPCloseReadKeepsReceiveWindow verifies that shutting down application
 // reads still consumes and acknowledges peer sequence space.
 func TestTCPCloseReadKeepsReceiveWindow(t *testing.T) {
-	connection := &TCPConn{readChanged: make(chan struct{}), writeChanged: make(chan struct{}), readNotify: make(chan struct{}), receiveCapacity: tcpReceiveCapacity}
+	connection := &TCPConn{readNotify: make(chan struct{}), receiveCapacity: tcpReceiveCapacity}
 	if err := connection.CloseRead(); err != nil {
 		t.Fatal(err)
 	}
@@ -1680,7 +1680,7 @@ func TestTCPReceiveWindowAvoidsSillyWindowGrowth(t *testing.T) {
 // RCV.NXT while the application buffer was full is exposed after a read.
 func TestTCPWindowUpdatePromotesContiguousData(t *testing.T) {
 	connection := &TCPConn{
-		readChanged: make(chan struct{}), readNotify: make(chan struct{}),
+		readNotify:      make(chan struct{}),
 		receiveCapacity: 4,
 	}
 	connection.readBuffer.append([]byte("full"))
@@ -2926,7 +2926,6 @@ func TestTCPOutOfOrderFINCompactsTruncatedRange(t *testing.T) {
 func TestTCPOutOfOrderFINWaitsForSequenceGap(t *testing.T) {
 	connection := &TCPConn{
 		receiveCapacity: 32,
-		readChanged:     make(chan struct{}),
 		readNotify:      make(chan struct{}),
 	}
 	receiveNext := uint32(100)
@@ -3625,7 +3624,7 @@ func TestTCPDSACKGeneration(t *testing.T) {
 // TestTCPOutOfOrderOverlapPreservesFirstData verifies overlap handling while
 // queued payloads remain independently allocated.
 func TestTCPOutOfOrderOverlapPreservesFirstData(t *testing.T) {
-	connection := &TCPConn{receiveCapacity: 32, readChanged: make(chan struct{}), readNotify: make(chan struct{})}
+	connection := &TCPConn{receiveCapacity: 32, readNotify: make(chan struct{})}
 	receiveNext := uint32(100)
 	outOfOrder := []tcpReceivedPiece{{sequence: 104, payload: []byte("old")}}
 	outOfOrderBytes := 3
@@ -3645,7 +3644,7 @@ func TestTCPOutOfOrderOverlapPreservesFirstData(t *testing.T) {
 }
 
 func TestTCPOutOfOrderAdoptsCompleteOwnedRange(t *testing.T) {
-	connection := &TCPConn{receiveCapacity: 32, readChanged: make(chan struct{}), readNotify: make(chan struct{})}
+	connection := &TCPConn{receiveCapacity: 32, readNotify: make(chan struct{})}
 	payload := []byte("owned")
 	payload = payload[:len(payload):len(payload)]
 	var pieces []tcpReceivedPiece
@@ -3659,7 +3658,7 @@ func TestTCPOutOfOrderAdoptsCompleteOwnedRange(t *testing.T) {
 }
 
 func TestTCPOutOfOrderCompactsPartialOwnedRange(t *testing.T) {
-	connection := &TCPConn{receiveCapacity: 32, readChanged: make(chan struct{}), readNotify: make(chan struct{})}
+	connection := &TCPConn{receiveCapacity: 32, readNotify: make(chan struct{})}
 	owner := make([]byte, 32)
 	copy(owner[28:], "tail")
 	payload := owner[28:]
@@ -3674,7 +3673,7 @@ func TestTCPOutOfOrderCompactsPartialOwnedRange(t *testing.T) {
 }
 
 func TestTCPPromoteCompactsPartiallyDeliveredRange(t *testing.T) {
-	connection := &TCPConn{receiveCapacity: 2, readChanged: make(chan struct{}), readNotify: make(chan struct{})}
+	connection := &TCPConn{receiveCapacity: 2, readNotify: make(chan struct{})}
 	owner := make([]byte, 32)
 	copy(owner, "data")
 	pieces := []tcpReceivedPiece{{sequence: 100, payload: owner[:4]}}
@@ -3692,7 +3691,7 @@ func TestTCPPromoteCompactsPartiallyDeliveredRange(t *testing.T) {
 // TestTCPOutOfOrderUsesPromisedWindow verifies that sparse data near the
 // advertised right edge remains admissible after another range uses memory.
 func TestTCPOutOfOrderUsesPromisedWindow(t *testing.T) {
-	connection := &TCPConn{receiveCapacity: 32, readChanged: make(chan struct{}), readNotify: make(chan struct{})}
+	connection := &TCPConn{receiveCapacity: 32, readNotify: make(chan struct{})}
 	receiveNext := uint32(100)
 	var outOfOrder []tcpReceivedPiece
 	outOfOrderBytes := 0
