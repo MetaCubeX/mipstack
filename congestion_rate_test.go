@@ -12,7 +12,7 @@ func TestTCPDeliveryRateSampleUsesLongerPipelinePhase(t *testing.T) {
 		firstSent:      tcpDeliveryTimestampAt(stamp(10 * time.Millisecond)),
 	}
 	segment := sentTCPSegment{
-		sequence: 1, end: 1001, transmissions: 1,
+		sequence: 1, end: 1001, state: sentTCPSegmentTransmitted,
 		hostQueue: packetQueueTicket{queuedAt: stamp(20 * time.Millisecond)},
 		delivery:  tcpDeliverySnapshot{firstSent: tcpDeliveryTimestampAt(stamp(10 * time.Millisecond)), deliveredStamp: tcpDeliveryTimestampAt(stamp(10 * time.Millisecond))},
 	}

@@ -328,14 +328,14 @@ func TestPacketQueueTicketTracksDeviceDequeue(t *testing.T) {
 	}
 	ticket := queue.enqueueReserved(slot, packet, false)
 	stack.recordOutput(false)
-	if !ticket.pending() {
+	if !ticket.pendingIn(queue) {
 		t.Fatal("new packet queue ticket is not pending")
 	}
 	buffer := make([]byte, 1500)
 	if count, readErr := stack.Read([][]byte{buffer}, []int{0}, 0); readErr != nil || count != 1 {
 		t.Fatalf("device Read = %d, %v", count, readErr)
 	}
-	if ticket.pending() {
+	if ticket.pendingIn(queue) {
 		t.Fatal("packet queue ticket remained pending after device Read")
 	}
 }
@@ -347,12 +347,12 @@ func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
 		t.Fatal("first queue slot was not available")
 	}
 	first := queue.enqueueReserved(firstSlot, []byte{1}, false)
-	if !first.pending() {
+	if !first.pendingIn(&queue) {
 		t.Fatal("first queue ticket was not pending")
 	}
 	entry := <-queue.packets
 	queue.release(entry)
-	if first.pending() {
+	if first.pendingIn(&queue) {
 		t.Fatal("consumed queue ticket remained pending")
 	}
 	secondSlot, reserved := queue.tryReserve()
@@ -360,16 +360,43 @@ func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
 		t.Fatal("reused queue slot was not available")
 	}
 	second := queue.enqueueReserved(secondSlot, []byte{2}, false)
-	if !second.pending() {
+	if !second.pendingIn(&queue) {
 		t.Fatal("reused queue slot was not pending")
 	}
-	if first.pending() || first.generation() == second.generation() {
+	if first.pendingIn(&queue) || first.generation() == second.generation() {
 		t.Fatalf("slot reuse revived generation %d as %d", first.generation(), second.generation())
 	}
 	entry = <-queue.packets
 	queue.release(entry)
-	if second.pending() {
+	if second.pendingIn(&queue) {
 		t.Fatal("second queue ticket remained pending")
+	}
+}
+
+// TestPacketQueueTicketSelectsItsQueue verifies that compact tickets retain
+// outbound-versus-loopback identity without storing a queue pointer.
+func TestPacketQueueTicketSelectsItsQueue(t *testing.T) {
+	epoch := time.Now()
+	stack := &Stack{outbound: newPacketQueueAt(1, epoch), loopback: newPacketQueueAt(1, epoch)}
+	outboundSlot, outboundReserved := stack.outbound.tryReserve()
+	loopbackSlot, loopbackReserved := stack.loopback.tryReserve()
+	if !outboundReserved || !loopbackReserved {
+		t.Fatal("packet queue slots were not available")
+	}
+	outbound := stack.outbound.enqueueReservedTCP(outboundSlot, []byte{1}, false, 1, false)
+	loopback := stack.loopback.enqueueReservedTCP(loopbackSlot, []byte{2}, false, 1, true)
+	if outbound.loopback() || !loopback.loopback() || !outbound.pending(stack) || !loopback.pending(stack) {
+		t.Fatal("packet queue tickets did not retain their queue identity")
+	}
+	entry := <-stack.outbound.packets
+	stack.outbound.release(entry)
+	if outbound.pending(stack) || !loopback.pending(stack) {
+		t.Fatal("consuming outbound packet changed the wrong ticket")
+	}
+	entry = <-stack.loopback.packets
+	stack.loopback.release(entry)
+	if loopback.pending(stack) {
+		t.Fatal("loopback ticket remained pending after consumption")
 	}
 }
 
@@ -916,7 +943,7 @@ func BenchmarkPacketQueueScheduling(b *testing.B) {
 					if !ok {
 						b.Fatal("output queue unexpectedly full")
 					}
-					queue.enqueueReservedTCP(slot, packet, false, flowIDs[index%len(flowIDs)])
+					queue.enqueueReservedTCP(slot, packet, false, flowIDs[index%len(flowIDs)], false)
 				}
 				for index := 0; index < capacity; index++ {
 					entry, ok := queue.tryDequeue()

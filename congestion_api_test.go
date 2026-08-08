@@ -159,39 +159,61 @@ func TestCongestionPacketStateFollowsTransmissionGeneration(t *testing.T) {
 	now := time.Unix(100, 0)
 	controller.initialize(now, 10*time.Millisecond, 20*time.Millisecond, 20_000, 40_000, 1000, 1)
 	_, _ = controller.onDataSend(1000, 1000, now, 2, 0, 20_000, 0, 20*time.Millisecond, 40_000)
-	segment := sentTCPSegment{sequence: 1, end: 1001, congestionState: controller.transmissionState()}
-	if segment.congestionState != 1 {
-		t.Fatalf("original packet state = %d, want 1", segment.congestionState)
+	segment := sentTCPSegment{sequence: 1, end: 1001, congestionPacketState: controller.transmissionState()}
+	if segment.congestionPacketState != 1 {
+		t.Fatalf("original packet state = %d, want 1", segment.congestionPacketState)
 	}
 	controller.notePacketLoss(&segment, 1000, false, now.Add(time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
 	if recorder.lostState != 1 || recorder.lostBytes != 1000 || recorder.totalLost != 1000 {
 		t.Fatalf("first loss = state %d bytes %d total %d", recorder.lostState, recorder.lostBytes, recorder.totalLost)
 	}
-	segment.congestionState = 0
+	segment.congestionPacketState = 0
 	segment.delivery = controller.onRetransmit(1000, 1000, now.Add(time.Millisecond), 3, 20_000, 1000, 1000, 20*time.Millisecond, 40_000)
-	segment.congestionState = controller.transmissionState()
-	if segment.congestionState != 2 {
-		t.Fatalf("retransmission packet state = %d, want 2", segment.congestionState)
+	segment.congestionPacketState = controller.transmissionState()
+	if segment.congestionPacketState != 2 {
+		t.Fatalf("retransmission packet state = %d, want 2", segment.congestionPacketState)
 	}
 	controller.notePacketLoss(&segment, 1000, true, now.Add(2*time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
 	if recorder.lostState != 2 || recorder.totalLost != 2000 {
 		t.Fatalf("retransmission loss = state %d total %d", recorder.lostState, recorder.totalLost)
 	}
-	controller.onTailLossProbeRecovered(now.Add(3*time.Millisecond), 1000, segment.congestionState, 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
+	controller.onTailLossProbeRecovered(now.Add(3*time.Millisecond), 1000, segment.congestionPacketState, 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
 	if !recorder.tailRecovered {
 		t.Fatal("tail-loss-probe recovery event was not delivered")
 	}
 }
 
-func TestCongestionPacketMetadataDoesNotGrowOutstandingRange(t *testing.T) {
+// TestSentTCPSegmentLayout locks the hot retransmission record and its compact
+// host-queue ticket to the intended 64-bit memory layout.
+func TestSentTCPSegmentLayout(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
 		t.Skip("64-bit layout assertion")
 	}
-	if size := unsafe.Sizeof(packetQueueTicket{}); size != 24 {
-		t.Fatalf("packet queue ticket size = %d, want 24", size)
+	if size := unsafe.Sizeof(packetQueueTicket{}); size != 16 {
+		t.Fatalf("packet queue ticket size = %d, want 16", size)
 	}
-	if size := unsafe.Sizeof(sentTCPSegment{}); size != 80 {
-		t.Fatalf("sent TCP segment size = %d, want 80", size)
+	if size := unsafe.Sizeof(sentTCPSegment{}); size != 64 {
+		t.Fatalf("sent TCP segment size = %d, want 64", size)
+	}
+	segment := sentTCPSegment{}
+	if offset := unsafe.Offsetof(segment.state); offset != 12 {
+		t.Fatalf("range state offset = %d, want 12", offset)
+	}
+	if offset := unsafe.Offsetof(segment.firstSent); offset != 16 {
+		t.Fatalf("first-send timestamp offset = %d, want 16", offset)
+	}
+	if offset := unsafe.Offsetof(segment.hostQueue); offset != 24 {
+		t.Fatalf("host queue ticket offset = %d, want 24", offset)
+	}
+	if offset := unsafe.Offsetof(segment.delivery); offset != 48 {
+		t.Fatalf("delivery snapshot offset = %d, want 48", offset)
+	}
+	if offset := unsafe.Offsetof(segment.congestionPacketState); offset != 40 {
+		t.Fatalf("congestion packet state offset = %d, want 40", offset)
+	}
+	tailSlack := unsafe.Sizeof(segment) - unsafe.Offsetof(segment.delivery) - unsafe.Sizeof(segment.delivery)
+	if tailSlack != 4 {
+		t.Fatalf("sent TCP segment tail slack = %d, want 4", tailSlack)
 	}
 }
 

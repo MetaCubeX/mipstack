@@ -203,9 +203,9 @@ func (s *tcpDeliveryRateSample) observe(segment sentTCPSegment) {
 	s.lastSent = sent
 	s.lastEnd = segment.end
 	s.applicationLimited = snapshot.applicationLimited()
-	s.schedulerLimited = segment.deliverySchedulerLimited
-	s.retransmitted = segment.transmissions > 1
-	s.packetState = segment.congestionState
+	s.schedulerLimited = segment.state.has(sentTCPSegmentDeliverySchedulerLimited)
+	s.retransmitted = segment.isRetransmitted()
+	s.packetState = segment.congestionPacketState
 }
 
 // finishRateSample advances delivery accounting and validates the sample using

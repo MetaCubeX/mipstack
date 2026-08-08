@@ -16,8 +16,7 @@ import (
 // testPacketQueueTicketAt constructs host-queue timing evidence without a
 // live packet queue.
 func testPacketQueueTicketAt(epoch, value time.Time) packetQueueTicket {
-	queue := &packetQueue{epoch: epoch}
-	return packetQueueTicket{queue: queue, queuedAt: monotonicStampAt(epoch, value)}
+	return packetQueueTicket{queuedAt: monotonicStampAt(epoch, value)}
 }
 
 func testTCPReadBufferBytes(buffer *tcpReadBuffer) []byte {

@@ -1513,33 +1513,33 @@ func TestTCPPLPMTUProbeHeadway(t *testing.T) {
 func TestTCPPLPMTURequiresIsolatedLossEvidence(t *testing.T) {
 	segments := []sentTCPSegment{
 		{sequence: 1000, end: 2200},
-		{sequence: 2200, end: 3200, sacked: true},
-		{sequence: 3200, end: 4200, sacked: true},
+		{sequence: 2200, end: 3200, state: sentTCPSegmentSACKed},
+		{sequence: 3200, end: 4200, state: sentTCPSegmentSACKed},
 	}
 	if isolatedPLPMTUProbeLoss(segments, 1000, 4200, 1000) {
 		t.Fatal("PLPMTU accepted fewer than DupThresh SACKed ranges")
 	}
-	segments = append(segments, sentTCPSegment{sequence: 4200, end: 5200, sacked: true})
+	segments = append(segments, sentTCPSegment{sequence: 4200, end: 5200, state: sentTCPSegmentSACKed})
 	if !isolatedPLPMTUProbeLoss(segments, 1000, 5200, 1000) {
 		t.Fatal("PLPMTU rejected an isolated probe with ordinary loss evidence")
 	}
-	segments[2].sacked = false
+	segments[2].state.set(sentTCPSegmentSACKed, false)
 	if isolatedPLPMTUProbeLoss(segments, 1000, 5200, 1000) {
 		t.Fatal("PLPMTU suppressed congestion with a second hole below HighSACK")
 	}
 }
 
 func TestTCPProvenLossAccountingUsesTransmissionGenerations(t *testing.T) {
-	speculative := sentTCPSegment{sequence: 0, end: 1000, transmissions: 1}
-	if loss := recordTCPSegmentLoss(&speculative, false); loss != 0 || speculative.lossReported != 0 {
-		t.Fatalf("speculative retransmission loss = %d, generation %d", loss, speculative.lossReported)
+	speculative := sentTCPSegment{sequence: 0, end: 1000, state: sentTCPSegmentTransmitted}
+	if loss := recordTCPSegmentLoss(&speculative, false); loss != 0 || speculative.lossAlreadyReported() {
+		t.Fatalf("speculative retransmission loss = %d, reported %t", loss, speculative.lossAlreadyReported())
 	}
 	segments := []sentTCPSegment{
-		{sequence: 0, end: 1000, transmissions: 1},
-		{sequence: 1000, end: 2000, transmissions: 1},
-		{sequence: 2000, end: 3000, transmissions: 1, sacked: true},
-		{sequence: 3000, end: 4000, transmissions: 1, sacked: true},
-		{sequence: 4000, end: 5000, transmissions: 1, sacked: true},
+		{sequence: 0, end: 1000, state: sentTCPSegmentTransmitted},
+		{sequence: 1000, end: 2000, state: sentTCPSegmentTransmitted},
+		{sequence: 2000, end: 3000, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+		{sequence: 3000, end: 4000, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+		{sequence: 4000, end: 5000, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
 	}
 	if losses := recordProvenTCPLosses(segments, 1000); losses != 2000 {
 		t.Fatalf("initial proven losses = %d, want 2000", losses)
@@ -1547,20 +1547,19 @@ func TestTCPProvenLossAccountingUsesTransmissionGenerations(t *testing.T) {
 	if losses := recordProvenTCPLosses(segments, 1000); losses != 0 {
 		t.Fatalf("repeated proven losses = %d", losses)
 	}
-	segments[0].transmissions++
-	segments[0].sackRetried = true
+	segments[0].advanceTransmissionGeneration()
+	segments[0].state.set(sentTCPSegmentSACKRetried, true)
 	if losses := recordProvenTCPLosses(segments, 1000); losses != 0 {
 		t.Fatalf("speculative replacement loss = %d", losses)
 	}
-	segments[0].rackLost = true
+	segments[0].state.set(sentTCPSegmentRACKLost, true)
 	if losses := recordProvenTCPLosses(segments, 1000); losses != 1000 {
 		t.Fatalf("RACK-proven replacement loss = %d, want 1000", losses)
 	}
-	segments[0].transmissions = ^uint16(0)
-	segments[0].lossReported = ^uint16(0)
+	segments[0].state |= sentTCPSegmentLossReported
 	segments[0].advanceTransmissionGeneration()
-	if segments[0].transmissions != 1 || segments[0].lossReported != 0 {
-		t.Fatalf("wrapped transmission generation = %d/%d, want 1/0", segments[0].transmissions, segments[0].lossReported)
+	if !segments[0].isTransmitted() || !segments[0].isRetransmitted() || segments[0].lossAlreadyReported() {
+		t.Fatalf("replacement generation state = %#x", segments[0].state)
 	}
 }
 
@@ -1821,8 +1820,8 @@ func TestTCPTooOldACKDropsData(t *testing.T) {
 
 func TestTCPACKRTTAmbiguity(t *testing.T) {
 	segments := []sentTCPSegment{
-		{sequence: 100, end: 200, transmissions: 2},
-		{sequence: 200, end: 300, transmissions: 1},
+		{sequence: 100, end: 200, state: sentTCPSegmentTransmitted | sentTCPSegmentRetransmitted},
+		{sequence: 200, end: 300, state: sentTCPSegmentTransmitted},
 	}
 	if !tcpACKRTTAmbiguous(segments, 300) {
 		t.Fatal("cumulative ACK covering a retransmission was treated as an RTT sample")
@@ -1830,7 +1829,7 @@ func TestTCPACKRTTAmbiguity(t *testing.T) {
 	if tcpACKRTTAmbiguous(segments, 100) {
 		t.Fatal("ACK covering no new range was treated as ambiguous")
 	}
-	segments[0].transmissions = 1
+	segments[0].state &^= sentTCPSegmentRetransmitted
 	if tcpACKRTTAmbiguous(segments, 300) {
 		t.Fatal("ACK covering only original transmissions was treated as ambiguous")
 	}
@@ -2486,8 +2485,8 @@ func TestTCPRACKTimerRecoversSingleSACKHole(t *testing.T) {
 func TestTCPLimitedTransmitIsExcludedFromRecoveryFlight(t *testing.T) {
 	outstanding := []sentTCPSegment{
 		{sequence: 100, end: 200},
-		{sequence: 200, end: 300, limited: true},
-		{sequence: 300, end: 400, sacked: true},
+		{sequence: 200, end: 300, state: sentTCPSegmentLimited},
+		{sequence: 300, end: 400, state: sentTCPSegmentSACKed},
 	}
 	if flight := lossRecoveryFlightSize(outstanding); flight != 100 {
 		t.Fatalf("Limited Transmit recovery flight = %d, want 100", flight)
@@ -2497,15 +2496,15 @@ func TestTCPLimitedTransmitIsExcludedFromRecoveryFlight(t *testing.T) {
 func TestTCPRateApplicationLimitedWaitsForKnownLoss(t *testing.T) {
 	const mss = 1000
 	outstanding := []sentTCPSegment{
-		{sequence: 0, end: mss, transmissions: 1},
-		{sequence: mss, end: 2 * mss, sacked: true, transmissions: 1},
-		{sequence: 2 * mss, end: 3 * mss, sacked: true, transmissions: 1},
-		{sequence: 3 * mss, end: 4 * mss, sacked: true, transmissions: 1},
+		{sequence: 0, end: mss, state: sentTCPSegmentTransmitted},
+		{sequence: mss, end: 2 * mss, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+		{sequence: 2 * mss, end: 3 * mss, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
+		{sequence: 3 * mss, end: 4 * mss, state: sentTCPSegmentTransmitted | sentTCPSegmentSACKed},
 	}
 	if tcpRateApplicationLimited(0, false, mss, 10*mss, true, true, outstanding, mss) {
 		t.Fatal("known unretransmitted SACK loss was classified as application limited")
 	}
-	outstanding[0].sackRetried = true
+	outstanding[0].state.set(sentTCPSegmentSACKRetried, true)
 	if !tcpRateApplicationLimited(0, false, mss, 10*mss, true, true, outstanding, mss) {
 		t.Fatal("drained application queue after retransmitting known losses was not classified as application limited")
 	}
@@ -2958,10 +2957,10 @@ func TestTCPOutOfOrderFINWaitsForSequenceGap(t *testing.T) {
 func TestTCPPartialACKCanLeaveFINOnly(t *testing.T) {
 	segment := sentTCPSegment{
 		sequence: 100, end: 104, flags: tcpFlagACK | tcpFlagPSH | tcpFlagFIN,
-		cwr: true, delivery: tcpDeliverySnapshot{deliveredStamp: 1},
+		state: sentTCPSegmentCWR, delivery: tcpDeliverySnapshot{deliveredStamp: 1},
 	}
 	trimAcknowledgedTCPSegment(&segment, 103)
-	if segment.sequence != 103 || segment.end != 104 || segment.dataSize() != 0 || segment.flags&tcpFlagFIN == 0 || segment.flags&tcpFlagPSH != 0 || segment.cwr || segment.delivery.deliveredStamp == 0 {
+	if segment.sequence != 103 || segment.end != 104 || segment.dataSize() != 0 || segment.flags&tcpFlagFIN == 0 || segment.flags&tcpFlagPSH != 0 || segment.state.has(sentTCPSegmentCWR) || segment.delivery.deliveredStamp == 0 {
 		t.Fatalf("FIN-only remainder = %+v", segment)
 	}
 }
@@ -3058,11 +3057,11 @@ func TestRACKMarksOlderTransmission(t *testing.T) {
 		{sequence: 200, end: 300, hostQueue: testPacketQueueTicketAt(base, base.Add(20*time.Millisecond))},
 	}
 	var latest tcpRACKSample
-	outstanding, _, _, _, latest, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 200, right: 300}})
+	outstanding, _, _, _, latest, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 200, right: 300}}, base)
 	latest.rtt = 5 * time.Millisecond
-	markRACKLoss(outstanding, latest, base.Add(20*time.Millisecond), 10*time.Millisecond)
-	if !outstanding[0].rackLost || outstanding[1].rackLost {
-		t.Fatalf("RACK loss state = [%v %v]", outstanding[0].rackLost, outstanding[1].rackLost)
+	markRACKLoss(outstanding, latest, base.Add(20*time.Millisecond), 10*time.Millisecond, base)
+	if !outstanding[0].state.has(sentTCPSegmentRACKLost) || outstanding[1].state.has(sentTCPSegmentRACKLost) {
+		t.Fatalf("RACK loss state = [%v %v]", outstanding[0].state.has(sentTCPSegmentRACKLost), outstanding[1].state.has(sentTCPSegmentRACKLost))
 	}
 }
 
@@ -3073,21 +3072,21 @@ func TestRACKWaitsFromCurrentTime(t *testing.T) {
 	base := time.Unix(100, 0)
 	outstanding := []sentTCPSegment{
 		{sequence: 100, end: 200, hostQueue: testPacketQueueTicketAt(base, base)},
-		{sequence: 200, end: 300, hostQueue: testPacketQueueTicketAt(base, base.Add(time.Millisecond)), sacked: true},
+		{sequence: 200, end: 300, hostQueue: testPacketQueueTicketAt(base, base.Add(time.Millisecond)), state: sentTCPSegmentSACKed},
 	}
-	delivered := tcpRACKSample{sentAt: outstanding[1].transmittedAt(), end: outstanding[1].end, rtt: 10 * time.Millisecond}
-	if delay, ok := rackLossDelay(outstanding, delivered, base.Add(15*time.Millisecond), 10*time.Millisecond); !ok || delay != 5*time.Millisecond {
+	delivered := tcpRACKSample{sentAt: outstanding[1].transmittedAt(base), end: outstanding[1].end, rtt: 10 * time.Millisecond}
+	if delay, ok := rackLossDelay(outstanding, delivered, base.Add(15*time.Millisecond), 10*time.Millisecond, base); !ok || delay != 5*time.Millisecond {
 		t.Fatalf("RACK loss delay = %v, %t; want 5ms, true", delay, ok)
 	}
-	markRACKLoss(outstanding, delivered, base.Add(19*time.Millisecond), 10*time.Millisecond)
-	if outstanding[0].rackLost {
+	markRACKLoss(outstanding, delivered, base.Add(19*time.Millisecond), 10*time.Millisecond, base)
+	if outstanding[0].state.has(sentTCPSegmentRACKLost) {
 		t.Fatal("RACK declared loss before the reordering timer expired")
 	}
-	markRACKLoss(outstanding, delivered, base.Add(20*time.Millisecond), 10*time.Millisecond)
-	if !outstanding[0].rackLost {
+	markRACKLoss(outstanding, delivered, base.Add(20*time.Millisecond), 10*time.Millisecond, base)
+	if !outstanding[0].state.has(sentTCPSegmentRACKLost) {
 		t.Fatal("RACK did not declare loss when the reordering timer expired")
 	}
-	if delay, ok := rackLossDelay(outstanding, delivered, base.Add(20*time.Millisecond), 10*time.Millisecond); ok {
+	if delay, ok := rackLossDelay(outstanding, delivered, base.Add(20*time.Millisecond), 10*time.Millisecond, base); ok {
 		t.Fatalf("RACK rearmed an already declared loss with delay %v", delay)
 	}
 }
@@ -3097,13 +3096,13 @@ func TestRACKWaitsFromCurrentTime(t *testing.T) {
 func TestRACKCanDetectLostRetransmission(t *testing.T) {
 	base := time.Unix(100, 0)
 	outstanding := []sentTCPSegment{
-		{sequence: 100, end: 200, sackRetried: true, hostQueue: testPacketQueueTicketAt(base, base)},
-		{sequence: 200, end: 300, sacked: true, hostQueue: testPacketQueueTicketAt(base, base.Add(time.Millisecond))},
+		{sequence: 100, end: 200, state: sentTCPSegmentSACKRetried, hostQueue: testPacketQueueTicketAt(base, base)},
+		{sequence: 200, end: 300, state: sentTCPSegmentSACKed, hostQueue: testPacketQueueTicketAt(base, base.Add(time.Millisecond))},
 	}
-	delivered := tcpRACKSample{sentAt: outstanding[1].transmittedAt(), end: outstanding[1].end, rtt: 5 * time.Millisecond}
-	markRACKLoss(outstanding, delivered, base.Add(15*time.Millisecond), 10*time.Millisecond)
-	if !outstanding[0].rackLost || outstanding[0].sackRetried {
-		t.Fatalf("lost retransmission state = lost %t retried %t", outstanding[0].rackLost, outstanding[0].sackRetried)
+	delivered := tcpRACKSample{sentAt: outstanding[1].transmittedAt(base), end: outstanding[1].end, rtt: 5 * time.Millisecond}
+	markRACKLoss(outstanding, delivered, base.Add(15*time.Millisecond), 10*time.Millisecond, base)
+	if !outstanding[0].state.has(sentTCPSegmentRACKLost) || outstanding[0].state.has(sentTCPSegmentSACKRetried) {
+		t.Fatalf("lost retransmission state = lost %t retried %t", outstanding[0].state.has(sentTCPSegmentRACKLost), outstanding[0].state.has(sentTCPSegmentSACKRetried))
 	}
 }
 
@@ -3112,10 +3111,10 @@ func TestRACKUsesMaximumRemainingWait(t *testing.T) {
 	outstanding := []sentTCPSegment{
 		{sequence: 100, end: 200, hostQueue: testPacketQueueTicketAt(base, base)},
 		{sequence: 200, end: 300, hostQueue: testPacketQueueTicketAt(base, base.Add(3*time.Millisecond))},
-		{sequence: 300, end: 400, sacked: true, hostQueue: testPacketQueueTicketAt(base, base.Add(5*time.Millisecond))},
+		{sequence: 300, end: 400, state: sentTCPSegmentSACKed, hostQueue: testPacketQueueTicketAt(base, base.Add(5*time.Millisecond))},
 	}
-	delivered := tcpRACKSample{sentAt: outstanding[2].transmittedAt(), end: outstanding[2].end, rtt: 10 * time.Millisecond}
-	if delay, ok := rackLossDelay(outstanding, delivered, base.Add(10*time.Millisecond), 5*time.Millisecond); !ok || delay != 8*time.Millisecond {
+	delivered := tcpRACKSample{sentAt: outstanding[2].transmittedAt(base), end: outstanding[2].end, rtt: 10 * time.Millisecond}
+	if delay, ok := rackLossDelay(outstanding, delivered, base.Add(10*time.Millisecond), 5*time.Millisecond, base); !ok || delay != 8*time.Millisecond {
 		t.Fatalf("RACK maximum loss delay = %v, %t; want 8ms, true", delay, ok)
 	}
 }
@@ -3141,11 +3140,11 @@ func TestRACKRejectsAmbiguousRetransmissionRTT(t *testing.T) {
 func TestRACKRepeatedSACKIsNotNewDelivery(t *testing.T) {
 	base := time.Unix(100, 0)
 	outstanding := []sentTCPSegment{{sequence: 100, end: 200, timestamp: 10, hostQueue: testPacketQueueTicketAt(base, base)}}
-	outstanding, _, _, newInformation, latest, _ := applyTCPSACK(outstanding, []tcpSACKBlock{{left: 100, right: 200}})
+	outstanding, _, _, newInformation, latest, _ := applyTCPSACK(outstanding, []tcpSACKBlock{{left: 100, right: 200}}, base)
 	if !newInformation || latest.sentAt != base {
 		t.Fatalf("initial SACK = new %t latest %+v", newInformation, latest)
 	}
-	_, _, _, newInformation, latest, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 100, right: 200}})
+	_, _, _, newInformation, latest, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 100, right: 200}}, base)
 	if newInformation || !latest.sentAt.IsZero() {
 		t.Fatalf("repeated SACK = new %t latest %+v", newInformation, latest)
 	}
@@ -3154,13 +3153,13 @@ func TestRACKRepeatedSACKIsNotNewDelivery(t *testing.T) {
 func TestFirstRACKLossRequiresTimeBasedEvidence(t *testing.T) {
 	outstanding := []sentTCPSegment{
 		{sequence: 100, end: 200},
-		{sequence: 200, end: 300, rackLost: true, sacked: true},
-		{sequence: 300, end: 400, rackLost: true},
+		{sequence: 200, end: 300, state: sentTCPSegmentRACKLost | sentTCPSegmentSACKed},
+		{sequence: 300, end: 400, state: sentTCPSegmentRACKLost},
 	}
 	if index := firstRACKLoss(outstanding); index != 2 {
 		t.Fatalf("first RACK loss = %d, want 2", index)
 	}
-	outstanding[2].rackLost = false
+	outstanding[2].state.set(sentTCPSegmentRACKLost, false)
 	if index := firstRACKLoss(outstanding); index != -1 {
 		t.Fatalf("RACK loss without evidence = %d, want -1", index)
 	}
@@ -3343,11 +3342,11 @@ func TestTCPRepeatedSACKIsNotNewInformation(t *testing.T) {
 	blocks := []tcpSACKBlock{{left: 200, right: 300}}
 	var present, fresh bool
 	var delivered []sentTCPSegment
-	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks)
+	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks, time.Time{})
 	if !present || !fresh || len(delivered) != 1 || delivered[0].delivery.deliveredStamp == 0 || outstanding[1].delivery.deliveredStamp != 0 {
 		t.Fatalf("first SACK state = present %t, fresh %t; want true, true", present, fresh)
 	}
-	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks)
+	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks, time.Time{})
 	if !present || fresh || len(delivered) != 0 {
 		t.Fatalf("repeated SACK state = present %t, fresh %t; want true, false", present, fresh)
 	}
@@ -3356,10 +3355,10 @@ func TestTCPRepeatedSACKIsNotNewInformation(t *testing.T) {
 // TestTCPPartialSACKSplitsScoreboard verifies byte-accurate RFC 6675 state
 // when a valid SACK block covers only the middle of one transmission.
 func TestTCPPartialSACKSplitsScoreboard(t *testing.T) {
-	outstanding := []sentTCPSegment{{sequence: 100, end: 400, flags: tcpFlagACK | tcpFlagPSH, transmissions: 1}}
+	outstanding := []sentTCPSegment{{sequence: 100, end: 400, flags: tcpFlagACK | tcpFlagPSH, state: sentTCPSegmentTransmitted}}
 	var present, fresh bool
 	var delivered []sentTCPSegment
-	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 200, right: 300}})
+	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 200, right: 300}}, time.Time{})
 	if !present || !fresh || len(delivered) != 1 || len(outstanding) != 3 {
 		t.Fatalf("partial SACK state = present %t fresh %t delivered %d segments %d", present, fresh, len(delivered), len(outstanding))
 	}
@@ -3370,8 +3369,8 @@ func TestTCPPartialSACKSplitsScoreboard(t *testing.T) {
 		push       bool
 	}{{100, 200, false, 100, false}, {200, 300, true, 100, false}, {300, 400, false, 100, true}} {
 		segment := outstanding[index]
-		if segment.sequence != want.start || segment.end != want.end || segment.sacked != want.sacked || segment.dataSize() != want.payload || segment.flags&tcpFlagPSH != 0 != want.push {
-			t.Fatalf("segment %d = [%d,%d) sacked=%t payload=%d flags=%#x", index, segment.sequence, segment.end, segment.sacked, segment.dataSize(), segment.flags)
+		if segment.sequence != want.start || segment.end != want.end || segment.state.has(sentTCPSegmentSACKed) != want.sacked || segment.dataSize() != want.payload || segment.flags&tcpFlagPSH != 0 != want.push {
+			t.Fatalf("segment %d = [%d,%d) sacked=%t payload=%d flags=%#x", index, segment.sequence, segment.end, segment.state.has(sentTCPSegmentSACKed), segment.dataSize(), segment.flags)
 		}
 	}
 	if ranges, bytes := tcpSACKedState(outstanding); ranges != 1 || bytes != 100 {
@@ -3381,13 +3380,13 @@ func TestTCPPartialSACKSplitsScoreboard(t *testing.T) {
 
 func TestTCPSACKSplitMetadataIsBounded(t *testing.T) {
 	payloadSize := uint32(4 * tcpMaximumSACKSplitRanges)
-	outstanding := []sentTCPSegment{{sequence: 0, end: payloadSize, transmissions: 1}}
+	outstanding := []sentTCPSegment{{sequence: 0, end: payloadSize, state: sentTCPSegmentTransmitted}}
 	for offset := uint32(1); offset+1 < payloadSize; offset += 2 {
-		outstanding, _, _, _, _, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: offset, right: offset + 1}})
+		outstanding, _, _, _, _, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: offset, right: offset + 1}}, time.Time{})
 	}
 	splitRanges := 0
 	for _, segment := range outstanding {
-		if segment.sackSplit {
+		if segment.state.has(sentTCPSegmentSACKSplit) {
 			splitRanges++
 		}
 	}
@@ -3426,14 +3425,14 @@ func TestTCPPeerMSSHasLinuxSafetyFloor(t *testing.T) {
 func TestTCPSACKIsLostAndPipe(t *testing.T) {
 	byRanges := []sentTCPSegment{
 		{sequence: 0, end: 100},
-		{sequence: 100, end: 150, sacked: true},
-		{sequence: 150, end: 200, sacked: true},
-		{sequence: 200, end: 250, sacked: true},
+		{sequence: 100, end: 150, state: sentTCPSegmentSACKed},
+		{sequence: 150, end: 200, state: sentTCPSegmentSACKed},
+		{sequence: 200, end: 250, state: sentTCPSegmentSACKed},
 	}
 	if !sackSegmentLost(byRanges, 0, 100) {
 		t.Fatal("three SACKed transmitted ranges did not satisfy IsLost")
 	}
-	byBytes := []sentTCPSegment{{sequence: 0, end: 100}, {sequence: 100, end: 201, sacked: true}, {sequence: 201, end: 302, sacked: true}}
+	byBytes := []sentTCPSegment{{sequence: 0, end: 100}, {sequence: 100, end: 201, state: sentTCPSegmentSACKed}, {sequence: 201, end: 302, state: sentTCPSegmentSACKed}}
 	if !sackSegmentLost(byBytes, 0, 100) {
 		t.Fatal("more than 2*SMSS SACKed bytes did not satisfy IsLost")
 	}
@@ -3441,15 +3440,15 @@ func TestTCPSACKIsLostAndPipe(t *testing.T) {
 	if sackSegmentLost(byBytes, 0, 100) {
 		t.Fatal("exactly 2*SMSS SACKed bytes satisfied strict IsLost byte test")
 	}
-	speculative := []sentTCPSegment{{sequence: 0, end: 100, sackRetried: true}}
+	speculative := []sentTCPSegment{{sequence: 0, end: 100, state: sentTCPSegmentSACKRetried}}
 	if pipe := sackRecoveryPipe(speculative, 100); pipe != 200 {
 		t.Fatalf("speculative retransmission pipe = %d, want 200", pipe)
 	}
-	lost := []sentTCPSegment{{sequence: 0, end: 100, rackLost: true}}
+	lost := []sentTCPSegment{{sequence: 0, end: 100, state: sentTCPSegmentRACKLost}}
 	if pipe := sackRecoveryPipe(lost, 100); pipe != 0 {
 		t.Fatalf("unretransmitted lost range pipe = %d, want 0", pipe)
 	}
-	lost[0].sackRetried = true
+	lost[0].state.set(sentTCPSegmentSACKRetried, true)
 	if pipe := sackRecoveryPipe(lost, 100); pipe != 100 {
 		t.Fatalf("retransmitted RACK loss pipe = %d, want 100", pipe)
 	}
@@ -3468,7 +3467,7 @@ func TestTCPSACKIsLostAndPipe(t *testing.T) {
 	if !sackRecoveryCanSend(true, 900, 100, 1000) {
 		t.Fatal("RFC 6675 rejected a retransmission with exactly one segment of space")
 	}
-	wrappedSACK := []sentTCPSegment{{sequence: 0xfffffff0, end: 0x10, sacked: true}, {sequence: 0x10, end: 0x30, sacked: true}}
+	wrappedSACK := []sentTCPSegment{{sequence: 0xfffffff0, end: 0x10, state: sentTCPSegmentSACKed}, {sequence: 0x10, end: 0x30, state: sentTCPSegmentSACKed}}
 	if highest := highestSACKedSequence(wrappedSACK); highest != 0x30 {
 		t.Fatalf("wrapped HighSACK = %#x, want 0x30", highest)
 	}
@@ -3476,7 +3475,7 @@ func TestTCPSACKIsLostAndPipe(t *testing.T) {
 
 func TestTCPPRRDeliveryAndSendCount(t *testing.T) {
 	outstanding := []sentTCPSegment{
-		{sequence: 100, end: 200, sacked: true},
+		{sequence: 100, end: 200, state: sentTCPSegmentSACKed},
 		{sequence: 200, end: 300},
 		{sequence: 300, end: 400},
 	}

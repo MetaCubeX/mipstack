@@ -956,6 +956,9 @@ type packetQueue struct {
 // epoch. Zero remains the unset value used by zero-initialized protocol state.
 type monotonicStamp int64
 
+// monotonicStampAt converts value to a compact duration relative to epoch.
+// One is added so the exact epoch remains distinguishable from an unset stamp;
+// values before epoch are defensively clamped to it.
 func monotonicStampAt(epoch, value time.Time) monotonicStamp {
 	if value.IsZero() {
 		return 0
@@ -969,6 +972,8 @@ func monotonicStampAt(epoch, value time.Time) monotonicStamp {
 	return monotonicStamp(elapsed) + 1
 }
 
+// time reconstructs a timestamp from the same epoch used by monotonicStampAt.
+// An unset stamp reconstructs as the zero time.
 func (s monotonicStamp) time(epoch time.Time) time.Time {
 	if s == 0 {
 		return time.Time{}
@@ -979,23 +984,46 @@ func (s monotonicStamp) time(epoch time.Time) time.Time {
 // packetQueueTicket identifies one generation of a fixed queue slot. TCP uses
 // it to avoid treating scheduler or embedding-link backpressure as packet
 // loss, matching Linux's skb_still_in_host_queue check.
+//
+// token uses bits 0..15 for the slot, bit 16 for the loopback queue, and bits
+// 17..63 for a 47-bit generation. An old ticket can therefore alias only after
+// 2^47 reuses of the same slot.
 type packetQueueTicket struct {
-	queue    *packetQueue
 	token    uint64
 	queuedAt monotonicStamp
 }
 
-const packetQueueTicketGenerationMask = uint64(1)<<48 - 1
+const (
+	// packetQueueTicketLoopback distinguishes stack.loopback from the ordinary
+	// outbound queue without retaining a queue pointer in every TCP range.
+	packetQueueTicketLoopback = uint64(1) << 16
+	// packetQueueTicketGenerationShift is the first bit occupied by the reuse
+	// generation after the slot and queue-identity fields.
+	packetQueueTicketGenerationShift = 17
+	// packetQueueTicketGenerationMask bounds the generation to its 47-bit token
+	// field before a slot is published again.
+	packetQueueTicketGenerationMask = uint64(1)<<47 - 1
+)
 
-// packetQueueTicketToken packs the bounded 16-bit slot with a 48-bit reuse
-// generation. Aliasing requires 2^48 reuses of the same slot, an 8.9-year
-// period even at one million reuses of that individual slot per second.
-func packetQueueTicketToken(slot uint16, generation uint64) uint64 {
-	return generation<<16 | uint64(slot)
+// packetQueueTicketToken packs the bounded 16-bit slot, its queue identity,
+// and a 47-bit reuse generation.
+func packetQueueTicketToken(slot uint16, generation uint64, loopback bool) uint64 {
+	token := generation<<packetQueueTicketGenerationShift | uint64(slot)
+	if loopback {
+		token |= packetQueueTicketLoopback
+	}
+	return token
 }
 
-func (t packetQueueTicket) slot() uint16       { return uint16(t.token) }
-func (t packetQueueTicket) generation() uint64 { return t.token >> 16 }
+// slot returns the fixed queue position encoded in the low 16 token bits.
+func (t packetQueueTicket) slot() uint16 { return uint16(t.token) }
+
+// generation returns the slot reuse generation encoded in the ticket.
+func (t packetQueueTicket) generation() uint64 { return t.token >> packetQueueTicketGenerationShift }
+
+// loopback reports whether the ticket belongs to stack.loopback rather than
+// stack.outbound.
+func (t packetQueueTicket) loopback() bool { return t.token&packetQueueTicketLoopback != 0 }
 
 // newPacketQueue constructs a bounded queue with every slot initially free.
 func newPacketQueue(capacity int) packetQueue {
@@ -1035,21 +1063,32 @@ func newFairPacketQueueAt(capacity int, epoch time.Time, mtu int, secret [16]byt
 	return queue
 }
 
-func (t packetQueueTicket) queuedTime() time.Time {
-	if t.queue == nil {
-		return time.Time{}
-	}
-	return t.queuedAt.time(t.queue.epoch)
-}
+// queuedTime reconstructs the queue-admission time from the owning stack's
+// monotonic epoch.
+func (t packetQueueTicket) queuedTime(epoch time.Time) time.Time { return t.queuedAt.time(epoch) }
 
-// pending reports whether Read or local delivery has not consumed this exact
-// slot generation. Reuse of the same bounded slot cannot revive an old ticket.
-func (t packetQueueTicket) pending() bool {
+// pendingIn reports whether queue still owns this exact slot generation. Read
+// or local delivery clears that ownership, and later reuse of the bounded slot
+// cannot revive an old ticket.
+func (t packetQueueTicket) pendingIn(queue *packetQueue) bool {
 	slot := t.slot()
-	if t.queue == nil || int(slot) >= len(t.queue.slots) {
+	if queue == nil || int(slot) >= len(queue.slots) {
 		return false
 	}
-	return t.queue.slots[slot].Load() == t.generation()<<1|1
+	return queue.slots[slot].Load() == t.generation()<<1|1
+}
+
+// pending selects the ticket's encoded outbound or loopback queue and reports
+// whether that queue still owns its exact slot generation.
+func (t packetQueueTicket) pending(stack *Stack) bool {
+	if stack == nil {
+		return false
+	}
+	queue := &stack.outbound
+	if t.loopback() {
+		queue = &stack.loopback
+	}
+	return t.pendingIn(queue)
 }
 
 // tryReserve acquires one queue position without blocking.
@@ -1071,15 +1110,17 @@ func (q *packetQueue) releaseReserved(slot uint16) { q.free <- slot }
 func (q *packetQueue) enqueueReserved(slot uint16, packet []byte, reusable bool) packetQueueTicket {
 	queuedAt := monotonicStampAt(q.epoch, time.Now())
 	generation := q.publishReserved(slot, packet, reusable, 0)
-	return packetQueueTicket{queue: q, token: packetQueueTicketToken(slot, generation), queuedAt: queuedAt}
+	return packetQueueTicket{token: packetQueueTicketToken(slot, generation, false), queuedAt: queuedAt}
 }
 
 // enqueueReservedTCP publishes a connection-owned packet without hashing its
-// serialized headers to rediscover an identity TCP already has.
-func (q *packetQueue) enqueueReservedTCP(slot uint16, packet []byte, reusable bool, flowID uint64) packetQueueTicket {
+// serialized headers to rediscover an identity TCP already has. loopback must
+// be true exactly when q is stack.loopback because the returned ticket uses
+// that bit to find its queue without retaining a pointer.
+func (q *packetQueue) enqueueReservedTCP(slot uint16, packet []byte, reusable bool, flowID uint64, loopback bool) packetQueueTicket {
 	queuedAt := monotonicStampAt(q.epoch, time.Now())
 	generation := q.publishReserved(slot, packet, reusable, flowID)
-	return packetQueueTicket{queue: q, token: packetQueueTicketToken(slot, generation), queuedAt: queuedAt}
+	return packetQueueTicket{token: packetQueueTicketToken(slot, generation, loopback), queuedAt: queuedAt}
 }
 
 // enqueueReservedPacket publishes a packet that does not need TCP host-queue

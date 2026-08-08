@@ -445,7 +445,7 @@ func (c *tcpCongestionController) notePacketLoss(segment *sentTCPSegment, bytes 
 	event := c.prepareEvent(CongestionEventPacketLost, now)
 	event.PacketBytes = int(bytes)
 	if segment != nil {
-		event.PacketState = segment.congestionState
+		event.PacketState = segment.congestionPacketState
 	}
 	c.handleEvent()
 }
