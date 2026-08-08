@@ -94,11 +94,13 @@ func TestCongestionControllerFactoryProvidesIndependentImplementations(t *testin
 		transmissionEvents bool
 		customPacing       bool
 		customRecovery     bool
+		lossEvents         bool
 		sendBufferMultiple uint32
 	}{
 		{name: CongestionControlReno},
 		{name: CongestionControlCUBIC, transmissionEvents: true},
 		{name: CongestionControlBBR, deliveryRate: true, transmissionEvents: true, customPacing: true, customRecovery: true, sendBufferMultiple: 3},
+		{name: CongestionControlBBR3, deliveryRate: true, transmissionEvents: true, customPacing: true, customRecovery: true, lossEvents: true, sendBufferMultiple: 3},
 	}
 	for _, test := range tests {
 		t.Run(string(test.name), func(t *testing.T) {
@@ -108,6 +110,9 @@ func TestCongestionControllerFactoryProvidesIndependentImplementations(t *testin
 			}
 			if controller.usesTransmissionEvents() != test.transmissionEvents || controller.customPacing() != test.customPacing || controller.customRecovery() != test.customRecovery {
 				t.Fatalf("controller features = transmission %t pacing %t recovery %t", controller.usesTransmissionEvents(), controller.customPacing(), controller.customRecovery())
+			}
+			if controller.usesLossEvents() != test.lossEvents {
+				t.Fatalf("controller loss events = %t, want %t", controller.usesLossEvents(), test.lossEvents)
 			}
 			if multiplier := controller.sendBufferMultiplier(); multiplier != test.sendBufferMultiple {
 				t.Fatalf("send-buffer multiplier = %d, want %d", multiplier, test.sendBufferMultiple)
@@ -200,7 +205,7 @@ func TestMaximumPacingRateLimitsEveryController(t *testing.T) {
 		mss   = 1000
 		limit = uint64(50_000)
 	)
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		controller := newTCPCongestionController(algorithm)
 		controller.setMaximumPacingRate(limit)
 		controller.initialize(time.Unix(99, 0), 0, time.Millisecond, 10*mss, 20*mss, mss, 1)
@@ -214,6 +219,18 @@ func TestMaximumPacingRateLimitsEveryController(t *testing.T) {
 			}
 			controller.setMaximumPacingRate(0)
 			if rate := bbrState(t, &controller).effectivePacingRate(); rate != 1_000_000 {
+				t.Fatalf("%s restored pacing rate = %v, want 1000000", algorithm, rate)
+			}
+			continue
+		}
+		if algorithm == CongestionControlBBR3 {
+			state := controller.algorithm.(*bbr3CongestionControl)
+			state.pacingRate = 1_000_000
+			if rate := state.effectivePacingRate(); rate != float64(limit) {
+				t.Fatalf("%s limited pacing rate = %v, want %d", algorithm, rate, limit)
+			}
+			controller.setMaximumPacingRate(0)
+			if rate := state.effectivePacingRate(); rate != 1_000_000 {
 				t.Fatalf("%s restored pacing rate = %v, want 1000000", algorithm, rate)
 			}
 			continue
@@ -390,7 +407,7 @@ func TestSlowStartReturnsExcessACKCreditToCongestionAvoidance(t *testing.T) {
 }
 
 func TestTCPSelectableCongestionControls(t *testing.T) {
-	for index, algorithm := range []CongestionControl{CongestionControlCUBIC, CongestionControlReno, CongestionControlBBR} {
+	for index, algorithm := range []CongestionControl{CongestionControlCUBIC, CongestionControlReno, CongestionControlBBR, CongestionControlBBR3} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			local := netip.AddrFrom4([4]byte{192, 0, 2, byte(50 + index*2)})
 			remote := netip.AddrFrom4([4]byte{192, 0, 2, byte(51 + index*2)})
@@ -480,7 +497,7 @@ func TestTCPControllerChangePreservesCongestionState(t *testing.T) {
 }
 
 func TestTCPSelectableCongestionControlsRecoverMultipleLosses(t *testing.T) {
-	for index, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+	for index, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			local := netip.AddrFrom4([4]byte{192, 0, 2, byte(70 + index*2)})
 			remote := netip.AddrFrom4([4]byte{192, 0, 2, byte(71 + index*2)})
@@ -507,7 +524,7 @@ func TestTCPSelectableCongestionControlsRecoverMultipleLosses(t *testing.T) {
 			if recoveries := stack.Stats().TCPSACKRetransmissions; recoveries < 2 {
 				t.Fatalf("SACK retransmissions = %d, want at least 2", recoveries)
 			}
-			if algorithm == CongestionControlBBR {
+			if algorithm == CongestionControlBBR || algorithm == CongestionControlBBR3 {
 				info := connection.(*TCPConn).Info()
 				if info.CongestionWindow >= tcpMaximumScaledWindow {
 					t.Fatalf("BBR recovery window = %d after ssthresh %d", info.CongestionWindow, info.SlowStartThreshold)
@@ -575,7 +592,7 @@ func TestTCPAlgorithmsUnderCombinedImpairment(t *testing.T) {
 		LossRate: 0.02, BurstEnterRate: 0.01, BurstExitRate: 0.5,
 		DuplicateRate: 0.05, Bandwidth: 2 * 1024 * 1024, QueueBytes: 64 * 1024,
 	}
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			client, server, link := newTestTCPConnectionPair(t, algorithm, testLinkConditions{
 				Seed: 3779, ClientToPeer: condition, PeerToClient: condition,
@@ -602,7 +619,7 @@ func TestTCPAlgorithmsShareBottleneckWithoutStarvation(t *testing.T) {
 	}
 	fairCompletion := time.Duration(payloadSize*flows) * time.Second / time.Duration(condition.Bandwidth)
 	maximumCompletion := 4*fairCompletion + 250*time.Millisecond
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			clientAddress := netip.MustParseAddr("192.0.2.231")
 			serverAddress := netip.MustParseAddr("192.0.2.232")
@@ -724,7 +741,7 @@ func TestTCPAlgorithmsUnderSustainedSchedulerPressure(t *testing.T) {
 		close(stop)
 		workers.Wait()
 	}()
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			client, server, _ := newTestTCPConnectionPair(t, algorithm, testLinkConditions{
 				Seed:         6113,
@@ -734,7 +751,7 @@ func TestTCPAlgorithmsUnderSustainedSchedulerPressure(t *testing.T) {
 			transferTestTCPPayload(t, client, server, 128*1024, 20*time.Second)
 			info := client.Info()
 			t.Logf("scheduler pressure work=%d rtt=%v retransmissions=%d cwnd=%d scheduler-limited=%d", work.Load(), info.RTT, info.Retransmissions, info.CongestionWindow, info.SchedulerLimitedEvents)
-			if algorithm == CongestionControlBBR && info.SchedulerLimitedEvents == 0 {
+			if (algorithm == CongestionControlBBR || algorithm == CongestionControlBBR3) && info.SchedulerLimitedEvents == 0 {
 				t.Fatal("BBR did not observe scheduler pressure")
 			}
 		})
@@ -907,7 +924,7 @@ func TestTCPAlgorithmsShareDeviceBottleneck(t *testing.T) {
 		name string
 		fair bool
 	}{{name: "fifo"}, {name: "drr", fair: true}} {
-		for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+		for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 			t.Run(scheduler.name+"/"+string(algorithm), func(t *testing.T) {
 				client, server := newTestDeviceBottleneck(t, algorithm, 4*1024*1024, scheduler.fair)
 				clients, servers := openTestDeviceBottleneckTCPFlows(t, client, server, flows)
@@ -1028,7 +1045,7 @@ func TestUDPLatencyDuringTCPDeviceBottleneck(t *testing.T) {
 		name string
 		fair bool
 	}{{name: "fifo"}, {name: "drr", fair: true}} {
-		for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+		for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 			t.Run(scheduler.name+"/"+string(algorithm), func(t *testing.T) {
 				latencies := testUDPLatencyDuringTCPDeviceBottleneck(t, algorithm, scheduler.fair)
 				t.Logf("UDP latency min=%v median=%v p95=%v max=%v", latencies[0], latencies[len(latencies)/2], latencies[len(latencies)*95/100], latencies[len(latencies)-1])

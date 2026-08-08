@@ -273,7 +273,8 @@ maximum pacing rate is unlimited; nonzero values cap paced data in bytes per
 second. The initial data burst and control packets are not strictly shaped, so
 this policy is not a byte-exact traffic shaper.
 Congestion control accepts
-`CongestionControlCUBIC`, `CongestionControlReno`, or `CongestionControlBBR`;
+`CongestionControlCUBIC`, `CongestionControlReno`, `CongestionControlBBR`, or
+`CongestionControlBBR3`;
 its zero value selects CUBIC. `UpdateConfig` applies a changed congestion
 controller to established connections without an explicit per-connection
 override. Existing sockets retain the other inherited policies. Receive window
@@ -361,7 +362,7 @@ an arbitrary segment count. Initial sequence numbers follow RFC 6528: a
 four-microsecond monotonic counter is added to a SipHash-derived per-four-tuple
 offset under a 128-bit per-stack secret. Its data path includes bounded
 send and receive buffers, adaptive RTO with exponential backoff, selectable
-CUBIC, Reno, and paced model-based BBR congestion control, window scaling,
+CUBIC, Reno, BBRv1, and BBRv3 congestion control, window scaling,
 delayed ACKs, SACK multi-hole recovery with Proportional Rate Reduction, RACK
 time-based loss detection, tail-loss probes, timestamp negotiation with PAWS,
 and classic ECN feedback. Text and FIN carried in a stateful SYN or SYN-ACK are
@@ -371,7 +372,7 @@ accepted only when the peer retransmits it with or after the final ACK.
 
 Loss evidence, SACK/RACK/TLP retransmission selection, PRR inputs, and generic
 delivery-rate sampling remain owned by TCP rather than an individual
-congestion controller. Reno, CUBIC, and BBR are separate per-connection
+congestion controller. Reno, CUBIC, BBRv1, and BBRv3 are separate per-connection
 implementations behind the public `CongestionController` event contract; each
 owns its window policy and private model. Consequently a new controller does
 not require protocol-specific branches in the TCP actor, and delivery-rate
@@ -400,7 +401,15 @@ Linux-style sample on ACK events; algorithms that do not need it pay no
 sampling cost. The sample is a callback-lifetime read-only view exposed through
 accessors, so sampler internals can evolve without changing controller code.
 `CongestionControlFeatureTransmissionEvents` opts into original send and
-retransmission callbacks and is required by custom pacers.
+retransmission callbacks and is required by custom pacers. A controller may
+attach a 64-bit `PacketState` value to each transmission generation; TCP
+returns it unchanged through the selected delivery-rate sample.
+`CongestionControlFeatureLossEvents` additionally retains that value until the
+generation is proven lost and reports per-generation SACK, RACK, RTO, and
+tail-loss-probe recovery events. `CongestionRateSample.TailLossProbeACK`
+identifies the Linux-style ambiguous ACK that exactly covers a retransmitted
+TLP range, allowing a model to preserve delivery signals until later ACK or
+DSACK evidence resolves the loss.
 `CongestionControlFeatureCustomRecovery` opts into PRR and recovery-window
 decisions. Without it TCP applies its RFC recovery defaults without dispatching
 those detailed stages; checkpoint and undo notifications remain available to
@@ -439,6 +448,28 @@ from trapping the connection in Startup. Pacing retains at most one send
 quantum of overdue debt, groups at most four whole quanta per actor turn, and
 credits at most one bounded group ahead of the pacing clock, preventing an
 unbounded catch-up burst.
+
+BBR3 is an independent byte-scaled implementation of Google's public Linux
+BBRv3 model. It retains STARTUP, DRAIN, PROBE_BW, and PROBE_RTT; PROBE_BW uses
+the DOWN, CRUISE, REFILL, and UP phases and the corresponding ACK-feedback
+state machine. Its path model includes a two-cycle `bw_hi` maximum, short-term
+`bw_lo` and `inflight_lo` bounds, the robust `inflight_hi` bound, loss-prefix
+reconstruction from each transmission generation, loss-based Startup exit,
+Reno-coexistence and randomized wall-clock probe intervals, ACK aggregation,
+and the independent five-second ProbeRTT trigger with a ten-second global
+minimum-RTT window. Recovery undo restores the less restrictive pre-recovery
+model bounds.
+
+MIPS does not enable BBRv3's low-latency ECN model: classic RFC 3168 ECE does
+not provide the precise homogeneous CE counts and route-level low-latency ECN
+eligibility that Linux requires for that model. Classic ECN still uses TCP's
+ordinary congestion-recovery path. Protective Load Balancing is also absent because
+an endpoint stack with one embedding link has no kernel route rehash operation.
+MIPS sends individual TCP segments rather than kernel TSO/GSO skbs, and its
+connection actor supplies bounded pacing groups in place of Linux fq/EDT.
+Consequently kernel offload-specific burst sizing is not reproduced, while
+send-time flight/loss snapshots and all model-visible pacing deadlines remain
+per connection.
 
 RTT sampling uses packet arrival time rather than actor scheduling time. Its
 minimum is the Linux-style three-sample running minimum over a 300-second

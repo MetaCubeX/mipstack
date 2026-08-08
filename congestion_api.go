@@ -17,6 +17,8 @@ const (
 	CongestionControlReno CongestionControl = "reno"
 	// CongestionControlBBR selects model-based BBR congestion control.
 	CongestionControlBBR CongestionControl = "bbr"
+	// CongestionControlBBR3 selects Google's loss-bounded BBRv3 model.
+	CongestionControlBBR3 CongestionControl = "bbr3"
 )
 
 // CongestionController is one connection's congestion-control policy.
@@ -55,12 +57,19 @@ const (
 	// selection, PRR, partial-ACK, duplicate-ACK, and exit decisions. TCP applies
 	// its RFC defaults when this feature is absent.
 	CongestionControlFeatureCustomRecovery
+	// CongestionControlFeatureLossEvents asks TCP to retain the opaque packet
+	// state returned by transmission events and report each transmission
+	// generation that is proven lost. It also enables tail-loss-probe recovery
+	// notifications. Transmission events are required so a controller can seed
+	// the state associated with each generation.
+	CongestionControlFeatureLossEvents
 )
 
 const congestionControlKnownFeatures = CongestionControlFeatureDeliveryRate |
 	CongestionControlFeatureCustomPacing |
 	CongestionControlFeatureTransmissionEvents |
-	CongestionControlFeatureCustomRecovery
+	CongestionControlFeatureCustomRecovery |
+	CongestionControlFeatureLossEvents
 
 // CongestionControlDefinition describes an algorithm registered with the
 // package. New may be called concurrently, must return promptly, and must
@@ -93,6 +102,15 @@ var congestionControlRegistry = struct {
 			CongestionControlFeatureCustomRecovery,
 		SendBufferMultiplier: 3,
 	},
+	CongestionControlBBR3: {
+		New: func() CongestionController { return newBBR3CongestionControl() },
+		Features: CongestionControlFeatureDeliveryRate |
+			CongestionControlFeatureCustomPacing |
+			CongestionControlFeatureTransmissionEvents |
+			CongestionControlFeatureCustomRecovery |
+			CongestionControlFeatureLossEvents,
+		SendBufferMultiplier: 3,
+	},
 }}
 
 // RegisterCongestionControl makes definition available to future stack
@@ -111,6 +129,9 @@ func RegisterCongestionControl(name CongestionControl, definition CongestionCont
 	}
 	if definition.Features&CongestionControlFeatureCustomPacing != 0 && definition.Features&CongestionControlFeatureTransmissionEvents == 0 {
 		return fmt.Errorf("mipstack: congestion control %q custom pacing requires transmission events", name)
+	}
+	if definition.Features&CongestionControlFeatureLossEvents != 0 && definition.Features&CongestionControlFeatureTransmissionEvents == 0 {
+		return fmt.Errorf("mipstack: congestion control %q loss events require transmission events", name)
 	}
 	congestionControlRegistry.Lock()
 	defer congestionControlRegistry.Unlock()
@@ -197,6 +218,16 @@ const (
 	// CongestionEventDiagnostics asks the controller for current diagnostics
 	// without changing transport state.
 	CongestionEventDiagnostics
+	// CongestionEventPacketLost reports one transmission generation newly
+	// proven lost by SACK, RACK, or an RTO. PacketBytes and PacketState describe
+	// that generation. State is observational.
+	CongestionEventPacketLost
+	// CongestionEventTailLossProbeRecovered corresponds to Linux
+	// CA_EVENT_TLP_RECOVERY: a retransmitted tail-loss probe repaired genuine
+	// tail loss rather than merely recovering a lost ACK. PacketBytes describes
+	// the repaired range and PacketState is its pre-probe transmission state.
+	// State is observational.
+	CongestionEventTailLossProbeRecovered
 )
 
 // CongestionPhase is TCP's high-level congestion state, corresponding to the
@@ -365,9 +396,12 @@ type CongestionDiagnostics struct {
 // stage and State.CongestionWindow in custom window stages are outputs. During
 // pacing, only Delay and MarkSchedulerLimited are outputs. Diagnostics is an
 // output only during diagnostic events. RateSample, when non-nil, is a
-// callback-lifetime read-only view and must not be retained. A delivery-rate
-// controller may set MarkApplicationLimited during an ACK event to ask TCP to
-// mark the current flight as locally application limited.
+// callback-lifetime read-only view and must not be retained. PacketState is an
+// opaque controller output during original-transmission and retransmission
+// events; TCP returns the value unchanged if that generation is selected for a
+// delivery-rate sample, later reported lost, or repaired by a tail-loss probe.
+// A delivery-rate controller may set MarkApplicationLimited during an ACK
+// event to ask TCP to mark the current flight as locally application limited.
 type CongestionEvent struct {
 	// Type identifies the valid event payload and permitted outputs.
 	Type CongestionEventType
@@ -385,6 +419,10 @@ type CongestionEvent struct {
 	RateSample *CongestionRateSample
 	// PacketBytes is the transmission size for packet events.
 	PacketBytes int
+	// PacketState is controller-owned per-generation state. It is writable only
+	// during packet transmission events and read-only during packet-loss and
+	// tail-loss-probe events.
+	PacketState uint64
 	// OutstandingBytes is sequence-space still outstanding before a packet event.
 	OutstandingBytes uint32
 	// PreviousMaximumSegmentSize is the sender MSS before an MTU event.

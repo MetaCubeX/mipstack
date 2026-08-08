@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 var congestionAPITestName atomic.Uint64
@@ -35,6 +36,30 @@ type congestionAPILifecycle struct {
 	maximumRate uint64
 	previousMSS int
 	currentMSS  int
+}
+
+type congestionAPILossRecorder struct {
+	events        []CongestionEventType
+	lostState     uint64
+	lostBytes     int
+	totalLost     uint64
+	tailRecovered bool
+	nextState     uint64
+}
+
+func (c *congestionAPILossRecorder) HandleCongestionEvent(event *CongestionEvent) {
+	c.events = append(c.events, event.Type)
+	switch event.Type {
+	case CongestionEventPacketSent, CongestionEventPacketRetransmitted:
+		c.nextState++
+		event.PacketState = c.nextState
+	case CongestionEventPacketLost:
+		c.lostState = event.PacketState
+		c.lostBytes = event.PacketBytes
+		c.totalLost = event.State.LostBytes
+	case CongestionEventTailLossProbeRecovered:
+		c.tailRecovered = true
+	}
 }
 
 func (c *congestionAPILifecycle) HandleCongestionEvent(event *CongestionEvent) {
@@ -79,7 +104,7 @@ func TestCongestionControlRegistry(t *testing.T) {
 	if !sort.SliceIsSorted(controls, func(i, j int) bool { return controls[i] < controls[j] }) {
 		t.Fatalf("available congestion controls are not sorted: %v", controls)
 	}
-	for _, builtin := range []CongestionControl{CongestionControlBBR, CongestionControlCUBIC, CongestionControlReno} {
+	for _, builtin := range []CongestionControl{CongestionControlBBR, CongestionControlBBR3, CongestionControlCUBIC, CongestionControlReno} {
 		index := sort.Search(len(controls), func(index int) bool { return controls[index] >= builtin })
 		if index == len(controls) || controls[index] != builtin {
 			t.Fatalf("built-in congestion control %q is unavailable: %v", builtin, controls)
@@ -104,6 +129,12 @@ func TestCongestionControlRegistry(t *testing.T) {
 	}); err == nil {
 		t.Fatal("custom pacing without transmission events was accepted")
 	}
+	if err := RegisterCongestionControl(nextCongestionAPITestName(), CongestionControlDefinition{
+		New:      func() CongestionController { return &congestionAPIRecorder{} },
+		Features: CongestionControlFeatureLossEvents,
+	}); err == nil {
+		t.Fatal("loss events without transmission events were accepted")
+	}
 
 	name := nextCongestionAPITestName()
 	definition := CongestionControlDefinition{New: func() CongestionController { return &congestionAPIRecorder{} }}
@@ -115,6 +146,52 @@ func TestCongestionControlRegistry(t *testing.T) {
 	}
 	if _, err := normalizeTCPSocketDefaults(TCPSocketDefaults{CongestionControl: name}); err != nil {
 		t.Fatalf("registered congestion control was rejected by socket defaults: %v", err)
+	}
+}
+
+func TestCongestionPacketStateFollowsTransmissionGeneration(t *testing.T) {
+	recorder := &congestionAPILossRecorder{}
+	controller := newTCPCongestionControllerFromDefinition("loss-events", CongestionControlDefinition{
+		New: func() CongestionController { return recorder },
+		Features: CongestionControlFeatureTransmissionEvents |
+			CongestionControlFeatureLossEvents,
+	})
+	now := time.Unix(100, 0)
+	controller.initialize(now, 10*time.Millisecond, 20*time.Millisecond, 20_000, 40_000, 1000, 1)
+	_, _ = controller.onDataSend(1000, 1000, now, 2, 0, 20_000, 0, 20*time.Millisecond, 40_000)
+	segment := sentTCPSegment{sequence: 1, end: 1001, congestionState: controller.transmissionState()}
+	if segment.congestionState != 1 {
+		t.Fatalf("original packet state = %d, want 1", segment.congestionState)
+	}
+	controller.notePacketLoss(&segment, 1000, false, now.Add(time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
+	if recorder.lostState != 1 || recorder.lostBytes != 1000 || recorder.totalLost != 1000 {
+		t.Fatalf("first loss = state %d bytes %d total %d", recorder.lostState, recorder.lostBytes, recorder.totalLost)
+	}
+	segment.congestionState = 0
+	segment.delivery = controller.onRetransmit(1000, 1000, now.Add(time.Millisecond), 3, 20_000, 1000, 1000, 20*time.Millisecond, 40_000)
+	segment.congestionState = controller.transmissionState()
+	if segment.congestionState != 2 {
+		t.Fatalf("retransmission packet state = %d, want 2", segment.congestionState)
+	}
+	controller.notePacketLoss(&segment, 1000, true, now.Add(2*time.Millisecond), 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
+	if recorder.lostState != 2 || recorder.totalLost != 2000 {
+		t.Fatalf("retransmission loss = state %d total %d", recorder.lostState, recorder.totalLost)
+	}
+	controller.onTailLossProbeRecovered(now.Add(3*time.Millisecond), 1000, segment.congestionState, 20_000, 40_000, 1000, 1000, 20*time.Millisecond)
+	if !recorder.tailRecovered {
+		t.Fatal("tail-loss-probe recovery event was not delivered")
+	}
+}
+
+func TestCongestionPacketMetadataDoesNotGrowOutstandingRange(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("64-bit layout assertion")
+	}
+	if size := unsafe.Sizeof(packetQueueTicket{}); size != 24 {
+		t.Fatalf("packet queue ticket size = %d, want 24", size)
+	}
+	if size := unsafe.Sizeof(sentTCPSegment{}); size != 80 {
+		t.Fatalf("sent TCP segment size = %d, want 80", size)
 	}
 }
 
@@ -219,7 +296,7 @@ func TestRegisteredCongestionControllerRunsOnTCPConnection(t *testing.T) {
 }
 
 func TestCongestionControllerIgnoresUnknownEvents(t *testing.T) {
-	for _, name := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR} {
+	for _, name := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		controller := newTCPCongestionController(name)
 		before := controller.algorithm
 		state := CongestionState{CongestionWindow: 12345, DeliveredBytes: 6789}

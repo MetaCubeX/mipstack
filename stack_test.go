@@ -363,8 +363,8 @@ func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
 	if !second.pending() {
 		t.Fatal("reused queue slot was not pending")
 	}
-	if first.pending() || first.generation == second.generation {
-		t.Fatalf("slot reuse revived generation %d as %d", first.generation, second.generation)
+	if first.pending() || first.generation() == second.generation() {
+		t.Fatalf("slot reuse revived generation %d as %d", first.generation(), second.generation())
 	}
 	entry = <-queue.packets
 	queue.release(entry)

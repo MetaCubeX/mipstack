@@ -2519,8 +2519,8 @@ func TestTCPRateApplicationLimitedWaitsForKnownLoss(t *testing.T) {
 	}
 }
 
-// TestTCPTailLossProbe verifies that a lone lost tail is retried before RTO
-// once the connection has an RTT sample.
+// TestTCPTailLossProbe verifies that a lost tail is retried by an RFC 8985
+// probe, rather than merely by the later retransmission timeout.
 func TestTCPTailLossProbe(t *testing.T) {
 	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
 	defer stack.Close()
@@ -2531,28 +2531,17 @@ func TestTCPTailLossProbe(t *testing.T) {
 	}
 	defer connection.Close()
 	_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
-	for _, payload := range [][]byte{[]byte("warmup"), []byte("lost tail")} {
-		if bytes.Equal(payload, []byte("lost tail")) {
-			link.mu.Lock()
-			link.dropTCPData = 1
-			link.mu.Unlock()
-		}
-		if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
-			t.Fatalf("Write = %d, %v", n, writeErr)
-		}
-		response := make([]byte, len(payload))
-		if _, err = io.ReadFull(connection, response); err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(response, payload) {
-			t.Fatal("tail-loss response mismatch")
-		}
-	}
+	writeAndReadTCPEcho(t, connection, []byte("warmup"))
+	link.mu.Lock()
+	link.holdTCPACKs = 2
+	link.dropTCPOrdinals = map[int]bool{3: true}
+	link.mu.Unlock()
+	writeAndReadTCPEcho(t, connection, make([]byte, 2000))
 	link.mu.Lock()
 	retransmitted, delay := link.tailRetransmission, link.tailRecoveryDelay
 	link.mu.Unlock()
-	if !retransmitted || delay >= tcpInitialRTO {
-		t.Fatalf("tail retransmission = %v after %v, want before initial RTO %v", retransmitted, delay, tcpInitialRTO)
+	if probes := stack.Stats().TCPTailLossProbes; !retransmitted || probes == 0 || delay >= tcpInitialRTO {
+		t.Fatalf("tail retransmission = %v after %v with %d probes, want an RFC 8985 probe before initial RTO %v", retransmitted, delay, probes, tcpInitialRTO)
 	}
 }
 

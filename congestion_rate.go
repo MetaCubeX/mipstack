@@ -90,7 +90,9 @@ type CongestionRateSample struct {
 	recovery            bool
 	fastRecovery        bool
 	ackDelayed          bool
+	tailLossProbeACK    bool
 	valid               bool
+	packetState         uint64
 	firstSent           tcpDeliveryTimestamp
 	priorStamp          tcpDeliveryTimestamp
 }
@@ -150,8 +152,19 @@ func (s *CongestionRateSample) InFastRecovery() bool { return s.fastRecovery }
 // ACKDelayed reports a lone runt sample likely delayed by the receiver.
 func (s *CongestionRateSample) ACKDelayed() bool { return s.ackDelayed }
 
+// TailLossProbeACK reports that this ACK exactly covers a retransmitted
+// tail-loss probe whose original and probe deliveries cannot yet be
+// distinguished. Model-based controllers can use it to retain round-local
+// delivery signals, matching Linux rate_sample.is_acking_tlp_retrans_seq.
+func (s *CongestionRateSample) TailLossProbeACK() bool { return s.tailLossProbeACK }
+
 // Valid reports whether DeliveredBytes divided by Interval is a usable rate.
 func (s *CongestionRateSample) Valid() bool { return s.valid }
+
+// PacketState returns the opaque state produced by the transmission event for
+// the range selected to form this sample. It is zero when the controller did
+// not request transmission events or the range predates a controller change.
+func (s *CongestionRateSample) PacketState() uint64 { return s.packetState }
 
 // tcpDeliveryRateEstimator owns Linux-style connection delivery accounting.
 // Model-based controllers embed it so the TCP actor can build one common rate
@@ -192,6 +205,7 @@ func (s *tcpDeliveryRateSample) observe(segment sentTCPSegment) {
 	s.applicationLimited = snapshot.applicationLimited()
 	s.schedulerLimited = segment.deliverySchedulerLimited
 	s.retransmitted = segment.transmissions > 1
+	s.packetState = segment.congestionState
 }
 
 // finishRateSample advances delivery accounting and validates the sample using

@@ -38,6 +38,7 @@ type tcpCongestionController struct {
 	pacingSegments     uint64
 	pacingRate         float64
 	maximumPacingRate  uint64
+	packetState        uint64
 }
 
 // setMaximumPacingRate updates the socket policy without discarding the
@@ -216,6 +217,7 @@ func (c *tcpCongestionController) prepareEvent(eventType CongestionEventType, no
 	c.event.State = &c.state
 	c.event.RateSample = nil
 	c.event.MarkApplicationLimited = false
+	c.event.PacketState = 0
 	c.event.Pacing.MarkSchedulerLimited = false
 	return &c.event
 }
@@ -257,7 +259,7 @@ func (c *tcpCongestionController) syncTransportState(window, slowStartThreshold,
 
 // syncDeliveryState publishes transport-owned rate-accounting state.
 func (c *tcpCongestionController) syncDeliveryState() {
-	if !c.usesDeliveryRate() {
+	if !c.usesDeliveryRate() && !c.usesLossEvents() {
 		return
 	}
 	c.state.DeliveredBytes = c.delivery.delivered
@@ -422,10 +424,43 @@ func (c *tcpCongestionController) markApplicationLimited(flight uint32) {
 // rate sample being assembled; timer-driven recovery has already consumed the
 // event and must not report it again on the next ACK.
 func (c *tcpCongestionController) noteLoss(bytes uint32, duringACK bool) {
-	if c.usesDeliveryRate() {
+	if c.usesDeliveryRate() || c.usesLossEvents() {
 		c.delivery.recordLoss(bytes, duringACK)
 		c.syncDeliveryState()
 	}
+}
+
+// notePacketLoss records one newly proven transmission generation and, when
+// requested, returns the controller-owned state captured for that generation.
+// The event follows delivery accounting so State.LostBytes includes this loss.
+func (c *tcpCongestionController) notePacketLoss(segment *sentTCPSegment, bytes uint32, duringACK bool, now time.Time, window, slowStartThreshold, flight uint32, mss int, smoothedRTT time.Duration) {
+	if bytes == 0 {
+		return
+	}
+	c.noteLoss(bytes, duringACK)
+	if !c.usesLossEvents() {
+		return
+	}
+	c.syncTransportState(window, slowStartThreshold, flight, mss, smoothedRTT)
+	event := c.prepareEvent(CongestionEventPacketLost, now)
+	event.PacketBytes = int(bytes)
+	if segment != nil {
+		event.PacketState = segment.congestionState
+	}
+	c.handleEvent()
+}
+
+// onTailLossProbeRecovered reports Linux CA_EVENT_TLP_RECOVERY after a
+// retransmitted tail probe is proven to have repaired data loss.
+func (c *tcpCongestionController) onTailLossProbeRecovered(now time.Time, packetBytes int, packetState uint64, window, slowStartThreshold, flight uint32, mss int, smoothedRTT time.Duration) {
+	if !c.usesLossEvents() {
+		return
+	}
+	c.syncTransportState(window, slowStartThreshold, flight, mss, smoothedRTT)
+	event := c.prepareEvent(CongestionEventTailLossProbeRecovered, now)
+	event.PacketBytes = packetBytes
+	event.PacketState = packetState
+	c.handleEvent()
 }
 
 // congestionWindowLimited mirrors Linux's packet-granularity allowance: a
@@ -481,6 +516,7 @@ func (c *tcpCongestionController) cancelPacingWake() {
 // by TCP until cumulative ACK or SACK processing selects it.
 func (c *tcpCongestionController) onDataSend(bytes, mss int, now time.Time, stamp monotonicStamp, packetsOut, window, flight uint32, smoothedRTT time.Duration, slowStartThreshold uint32) (tcpDeliverySnapshot, uint32) {
 	snapshot := tcpDeliverySnapshot{}
+	c.packetState = 0
 	if c.usesDeliveryRate() {
 		snapshot, window = c.delivery.onDeliveryDataSent(bytes, mss, now, stamp, packetsOut, window)
 	}
@@ -491,6 +527,7 @@ func (c *tcpCongestionController) onDataSend(bytes, mss int, now time.Time, stam
 		event.PacketBytes = bytes
 		event.OutstandingBytes = packetsOut
 		c.handleEvent()
+		c.packetState = event.PacketState
 		window = c.state.CongestionWindow
 	}
 	if c.customPacing() {
@@ -506,6 +543,7 @@ func (c *tcpCongestionController) onDataSend(bytes, mss int, now time.Time, stam
 // congestion-avoidance epoch.
 func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, stamp monotonicStamp, window, flight, packetsOut uint32, smoothedRTT time.Duration, slowStartThreshold uint32) tcpDeliverySnapshot {
 	snapshot := tcpDeliverySnapshot{}
+	c.packetState = 0
 	if c.usesDeliveryRate() {
 		snapshot = c.delivery.onDeliveryRetransmit(bytes, mss, now, stamp, packetsOut)
 	}
@@ -516,6 +554,7 @@ func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, st
 		event.PacketBytes = bytes
 		event.OutstandingBytes = packetsOut
 		c.handleEvent()
+		c.packetState = event.PacketState
 	}
 	if c.customPacing() {
 		return snapshot
@@ -523,6 +562,10 @@ func (c *tcpCongestionController) onRetransmit(bytes, mss int, now time.Time, st
 	c.advanceWindowPacing(bytes, mss, now, window, flight, smoothedRTT, slowStartThreshold, false)
 	return snapshot
 }
+
+// transmissionState returns the opaque state produced by the immediately
+// preceding original-transmission or retransmission callback.
+func (c *tcpCongestionController) transmissionState() uint64 { return c.packetState }
 
 // advanceWindowPacing applies Linux tcp_update_pacing_rate semantics. Linux
 // uses 200% of max(cwnd, packets_out)/SRTT in early slow start and 120% while
@@ -652,6 +695,11 @@ func (c *tcpCongestionController) customPacing() bool {
 // usesTransmissionEvents reports whether the controller observes sends.
 func (c *tcpCongestionController) usesTransmissionEvents() bool {
 	return c.features&CongestionControlFeatureTransmissionEvents != 0
+}
+
+// usesLossEvents reports whether per-generation losses must be dispatched.
+func (c *tcpCongestionController) usesLossEvents() bool {
+	return c.features&CongestionControlFeatureLossEvents != 0
 }
 
 // customRecovery reports whether the controller overrides RFC recovery windows.

@@ -181,7 +181,7 @@ func TestCongestionControlConfiguration(t *testing.T) {
 	if got := stack.network.Load().tcpDefaults.CongestionControl; got != CongestionControlCUBIC {
 		t.Fatalf("default congestion control = %q, want %q", got, CongestionControlCUBIC)
 	}
-	for _, algorithm := range []CongestionControl{CongestionControlCUBIC, CongestionControlReno, CongestionControlBBR} {
+	for _, algorithm := range []CongestionControl{CongestionControlCUBIC, CongestionControlReno, CongestionControlBBR, CongestionControlBBR3} {
 		if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{local}, TCP: TCPSocketDefaults{CongestionControl: algorithm}}); err != nil {
 			t.Fatalf("UpdateConfig(%q): %v", algorithm, err)
 		}

@@ -980,11 +980,22 @@ func (s monotonicStamp) time(epoch time.Time) time.Time {
 // it to avoid treating scheduler or embedding-link backpressure as packet
 // loss, matching Linux's skb_still_in_host_queue check.
 type packetQueueTicket struct {
-	queue      *packetQueue
-	slot       uint16
-	generation uint64
-	queuedAt   monotonicStamp
+	queue    *packetQueue
+	token    uint64
+	queuedAt monotonicStamp
 }
+
+const packetQueueTicketGenerationMask = uint64(1)<<48 - 1
+
+// packetQueueTicketToken packs the bounded 16-bit slot with a 48-bit reuse
+// generation. Aliasing requires 2^48 reuses of the same slot, an 8.9-year
+// period even at one million reuses of that individual slot per second.
+func packetQueueTicketToken(slot uint16, generation uint64) uint64 {
+	return generation<<16 | uint64(slot)
+}
+
+func (t packetQueueTicket) slot() uint16       { return uint16(t.token) }
+func (t packetQueueTicket) generation() uint64 { return t.token >> 16 }
 
 // newPacketQueue constructs a bounded queue with every slot initially free.
 func newPacketQueue(capacity int) packetQueue {
@@ -1034,10 +1045,11 @@ func (t packetQueueTicket) queuedTime() time.Time {
 // pending reports whether Read or local delivery has not consumed this exact
 // slot generation. Reuse of the same bounded slot cannot revive an old ticket.
 func (t packetQueueTicket) pending() bool {
-	if t.queue == nil || int(t.slot) >= len(t.queue.slots) {
+	slot := t.slot()
+	if t.queue == nil || int(slot) >= len(t.queue.slots) {
 		return false
 	}
-	return t.queue.slots[t.slot].Load() == t.generation<<1|1
+	return t.queue.slots[slot].Load() == t.generation()<<1|1
 }
 
 // tryReserve acquires one queue position without blocking.
@@ -1059,7 +1071,7 @@ func (q *packetQueue) releaseReserved(slot uint16) { q.free <- slot }
 func (q *packetQueue) enqueueReserved(slot uint16, packet []byte, reusable bool) packetQueueTicket {
 	queuedAt := monotonicStampAt(q.epoch, time.Now())
 	generation := q.publishReserved(slot, packet, reusable, 0)
-	return packetQueueTicket{queue: q, slot: slot, generation: generation, queuedAt: queuedAt}
+	return packetQueueTicket{queue: q, token: packetQueueTicketToken(slot, generation), queuedAt: queuedAt}
 }
 
 // enqueueReservedTCP publishes a connection-owned packet without hashing its
@@ -1067,7 +1079,7 @@ func (q *packetQueue) enqueueReserved(slot uint16, packet []byte, reusable bool)
 func (q *packetQueue) enqueueReservedTCP(slot uint16, packet []byte, reusable bool, flowID uint64) packetQueueTicket {
 	queuedAt := monotonicStampAt(q.epoch, time.Now())
 	generation := q.publishReserved(slot, packet, reusable, flowID)
-	return packetQueueTicket{queue: q, slot: slot, generation: generation, queuedAt: queuedAt}
+	return packetQueueTicket{queue: q, token: packetQueueTicketToken(slot, generation), queuedAt: queuedAt}
 }
 
 // enqueueReservedPacket publishes a packet that does not need TCP host-queue
@@ -1079,7 +1091,10 @@ func (q *packetQueue) enqueueReservedPacket(slot uint16, packet []byte, reusable
 // publishReserved marks and publishes one already-reserved slot.
 func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool, flowID uint64) uint64 {
 	state := q.slots[slot].Load()
-	generation := state>>1 + 1
+	generation := (state>>1 + 1) & packetQueueTicketGenerationMask
+	if generation == 0 {
+		generation = 1
+	}
 	q.slots[slot].Store(generation<<1 | 1)
 	entry := packetQueueEntry{packet: packet, slot: slot, reusable: reusable}
 	if q.scheduler == nil {

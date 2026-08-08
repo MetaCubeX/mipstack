@@ -741,6 +741,7 @@ type sentTCPSegment struct {
 	lossReported             uint16
 	delivery                 tcpDeliverySnapshot
 	hostQueue                packetQueueTicket
+	congestionState          uint64
 }
 
 // dataSize returns the application bytes covered by this sequence range.
@@ -4143,6 +4144,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		tailProbeActive     bool
 		tailProbeEnd        uint32
 		tailProbeRetransmit bool
+		tailProbeBytes      int
+		tailProbeState      uint64
 		tailProbeRTTSamples uint64
 		rtoAttempts         int
 		rtoRecovery         bool
@@ -4274,8 +4277,21 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 	recountSACK := func() {
 		sackedRanges, sackedBytes = tcpSACKedState(outstanding)
 	}
+	lossObservationTime := func() time.Time {
+		if processingDeliveryACK && deliverySample != nil && !deliverySample.ackTime.IsZero() {
+			return deliverySample.ackTime
+		}
+		return time.Now()
+	}
 	recordProvenLosses := func() {
-		controller.noteLoss(recordProvenTCPLosses(outstanding, peerMSS), processingDeliveryACK)
+		if !controller.usesLossEvents() {
+			controller.noteLoss(recordProvenTCPLosses(outstanding, peerMSS), processingDeliveryACK)
+			return
+		}
+		now := lossObservationTime()
+		recordProvenTCPLossesWith(outstanding, peerMSS, func(segment *sentTCPSegment, bytes uint32) {
+			controller.notePacketLoss(segment, bytes, processingDeliveryACK, now, congestionWindow, slowStartThreshold, congestionFlight(), peerMSS, rtt.srtt)
+		})
 	}
 	connectionState := func() TCPState {
 		switch {
@@ -4763,7 +4779,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		// argument even when it is no longer congestion flight.
 		rate, updatedWindow := controller.onDataSend(payload.size, peerMSS, sentAt, hostQueue.queuedAt, windowFlight, congestionWindow, congestionFlight, rtt.srtt, slowStartThreshold)
 		congestionWindow = updatedWindow
-		appendOutstanding(sentTCPSegment{sequence: sendNext, end: next, flags: flags, timestamp: timestamp, firstSent: sentAt.Sub(c.stack.timestampEpoch), transmissions: 1, limited: limitedTransmit, cwr: carriesCWR, mtuProbe: probe, deliveryPending: processingDeliveryACK, deliverySchedulerLimited: controller.schedulerLimited(), hostQueue: hostQueue, delivery: rate})
+		appendOutstanding(sentTCPSegment{sequence: sendNext, end: next, flags: flags, timestamp: timestamp, firstSent: sentAt.Sub(c.stack.timestampEpoch), transmissions: 1, limited: limitedTransmit, cwr: carriesCWR, mtuProbe: probe, deliveryPending: processingDeliveryACK, deliverySchedulerLimited: controller.schedulerLimited(), hostQueue: hostQueue, delivery: rate, congestionState: controller.transmissionState()})
 		if processingDeliveryACK {
 			deliveryACKAddedFlight = growCongestionWindow(deliveryACKAddedFlight, uint32(payload.size))
 			deliveryACKPendingSnapshots = true
@@ -4913,7 +4929,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		oldest.timestamp = retransmitTimestamp
 		oldest.hostQueue = hostQueue
 		lossProven := timeout || !peerSACK || sackSegmentLost(outstanding, index, peerMSS)
-		controller.noteLoss(recordTCPSegmentLoss(oldest, lossProven), processingDeliveryACK)
+		controller.notePacketLoss(oldest, recordTCPSegmentLoss(oldest, lossProven), processingDeliveryACK, lossObservationTime(), congestionWindow, slowStartThreshold, congestionFlight(), peerMSS, rtt.srtt)
 		oldest.advanceTransmissionGeneration()
 		oldest.sackRetried = !timeout
 		oldest.rackLost = false
@@ -5004,6 +5020,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			armRetransmission()
 		}
 		oldest.delivery = controller.onRetransmit(oldest.dataSize(), peerMSS, oldest.transmittedAt(), oldest.hostQueue.queuedAt, congestionWindow, congestionFlight(), sendNext-sendUnacknowledged, rtt.srtt, slowStartThreshold)
+		oldest.congestionState = controller.transmissionState()
 		oldest.deliverySchedulerLimited = controller.schedulerLimited()
 		oldest.deliveryPending = processingDeliveryACK
 		if processingDeliveryACK && peerSACK && fastRecovery {
@@ -5035,7 +5052,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		segment.cwr = false
 		segment.timestamp = retransmitTimestamp
 		segment.hostQueue = hostQueue
-		controller.noteLoss(recordTCPSegmentLoss(segment, true), processingDeliveryACK)
+		controller.notePacketLoss(segment, recordTCPSegmentLoss(segment, true), processingDeliveryACK, lossObservationTime(), congestionWindow, slowStartThreshold, ordinaryFlight(), peerMSS, rtt.srtt)
 		segment.advanceTransmissionGeneration()
 		segment.sackRetried = false
 		rackLost := segment.rackLost
@@ -5047,6 +5064,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		tailProbeRetransmit = false
 		c.noteRetransmission()
 		segment.delivery = controller.onRetransmit(segment.dataSize(), peerMSS, segment.transmittedAt(), segment.hostQueue.queuedAt, congestionWindow, ordinaryFlight(), sendNext-sendUnacknowledged, rtt.srtt, slowStartThreshold)
+		segment.congestionState = controller.transmissionState()
 		segment.deliverySchedulerLimited = controller.schedulerLimited()
 		segment.deliveryPending = processingDeliveryACK
 		deliveryACKPendingSnapshots = deliveryACKPendingSnapshots || processingDeliveryACK
@@ -5101,6 +5119,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		pathMTUFailures++
 		c.stack.stats.pathMTUProbeFailures.Add(1)
 		segment.delivery = controller.onRetransmit(segment.dataSize(), peerMSS, segment.transmittedAt(), segment.hostQueue.queuedAt, congestionWindow, congestionFlight(), sendNext-sendUnacknowledged, rtt.srtt, slowStartThreshold)
+		segment.congestionState = controller.transmissionState()
 		segment.deliverySchedulerLimited = controller.schedulerLimited()
 		segment.deliveryPending = processingDeliveryACK
 		if processingDeliveryACK && peerSACK && fastRecovery {
@@ -5152,6 +5171,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		undo.active = false
 		for index := range outstanding {
 			outstanding[index].delivery = tcpDeliverySnapshot{}
+			outstanding[index].congestionState = 0
 		}
 		now := time.Now()
 		congestionWindow, slowStartThreshold = controller.initialize(now, rtt.minimum, rtt.srtt, congestionWindow, slowStartThreshold, peerMSS, monotonicStampAt(c.stack.timestampEpoch, now))
@@ -5217,6 +5237,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			segment.advanceTransmissionGeneration()
 			c.noteRetransmission()
 			segment.delivery = controller.onRetransmit(segment.dataSize(), peerMSS, segment.transmittedAt(), segment.hostQueue.queuedAt, congestionWindow, congestionFlight(), sendNext-sendUnacknowledged, rtt.srtt, slowStartThreshold)
+			segment.congestionState = controller.transmissionState()
 			segment.deliverySchedulerLimited = controller.schedulerLimited()
 			segment.deliveryPending = processingDeliveryACK
 			deliveryACKPendingSnapshots = deliveryACKPendingSnapshots || processingDeliveryACK
@@ -5465,6 +5486,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					} else {
 						*deliverySample = tcpDeliveryRateSample{}
 					}
+					deliverySample.ackTime = receivedAt
 				}
 				if ecnRecoveryActive && controller.state.Phase == CongestionPhaseCWR && tcpSequenceGreaterEqual(ack, ecnRecoveryPoint) {
 					controller.setCongestionPhase(CongestionPhaseOpen, receivedAt)
@@ -5594,6 +5616,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 						if !tailProbeRetransmit {
 							tailProbeActive = false
 						} else if tcpSequenceGreater(ack, tailProbeEnd) {
+							controller.onTailLossProbeRecovered(receivedAt, tailProbeBytes, tailProbeState, congestionWindow, slowStartThreshold, flightBeforeACK, peerMSS, rtt.srtt)
 							if !fastRecovery {
 								if tcpECNStartsRecovery(ecnRecoveryActive, sendUnacknowledged, ecnRecoveryPoint) {
 									hyStart.disable()
@@ -5783,6 +5806,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				if tailProbeActive && tailProbeRetransmit && !ackAdvanced && ack == tailProbeEnd && previousWindow == peerWindow && !hasSACK && len(segment.payload) == 0 && segment.flags&tcpFlagFIN == 0 {
 					tailProbeActive = false
 					tailProbeRetransmit = false
+				}
+				if deliveryACK && tailProbeActive && tailProbeRetransmit && ack == tailProbeEnd {
+					deliverySample.tailLossProbeACK = true
 				}
 				if rtoPartialACK {
 					index := firstUnsackedSegment(outstanding)
@@ -6064,9 +6090,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					probeSentAt = outstanding[len(outstanding)-1].transmittedAt()
 				}
 				tailProbeRetransmit = !sent
+				tailProbeBytes = 0
+				tailProbeState = 0
 				if !sent {
 					index := lastUnsackedSegment(outstanding)
 					segment := &outstanding[index]
+					originalCongestionState := segment.congestionState
 					window := advertisedReceiveWindow()
 					timestamp, hostQueue, err := c.sendBufferedSegmentForMTU(sendUnacknowledged, *segment, receiveNext, window, nil, false, c.mtu)
 					if err != nil {
@@ -6082,6 +6111,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					segment.advanceTransmissionGeneration()
 					c.noteRetransmission()
 					segment.delivery = controller.onRetransmit(segment.dataSize(), peerMSS, segment.transmittedAt(), segment.hostQueue.queuedAt, congestionWindow, congestionFlight(), sendNext-sendUnacknowledged, rtt.srtt, slowStartThreshold)
+					segment.congestionState = controller.transmissionState()
+					tailProbeBytes = segment.dataSize()
+					tailProbeState = originalCongestionState
 					segment.deliverySchedulerLimited = controller.schedulerLimited()
 					segment.deliveryPending = processingDeliveryACK
 					deliveryACKPendingSnapshots = deliveryACKPendingSnapshots || processingDeliveryACK
@@ -7337,6 +7369,13 @@ func recordTCPSegmentLoss(segment *sentTCPSegment, proven bool) uint32 {
 // and an already retransmitted range needs new RACK evidence or an RTO before
 // its replacement generation can be reported.
 func recordProvenTCPLosses(outstanding []sentTCPSegment, mss int) uint32 {
+	return recordProvenTCPLossesWith(outstanding, mss, nil)
+}
+
+// recordProvenTCPLossesWith additionally reports every newly lost generation
+// without allocating a temporary slice. report runs synchronously while the
+// connection actor owns outstanding.
+func recordProvenTCPLossesWith(outstanding []sentTCPSegment, mss int, report func(*sentTCPSegment, uint32)) uint32 {
 	var losses uint32
 	var sackedRanges, sackedBytes int
 	for index := len(outstanding) - 1; index >= 0; index-- {
@@ -7352,7 +7391,11 @@ func recordProvenTCPLosses(outstanding []sentTCPSegment, mss int) uint32 {
 		// current replacement generation.
 		lost := segment.rackLost || !segment.sackRetried && (sackedRanges >= tcpDuplicateACKThreshold || mss > 0 && sackedBytes > (tcpDuplicateACKThreshold-1)*mss)
 		if lost {
-			losses = growCongestionWindow(losses, recordTCPSegmentLoss(segment, true))
+			bytes := recordTCPSegmentLoss(segment, true)
+			losses = growCongestionWindow(losses, bytes)
+			if bytes != 0 && report != nil {
+				report(segment, bytes)
+			}
 		}
 	}
 	return losses
