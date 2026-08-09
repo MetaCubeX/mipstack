@@ -612,6 +612,31 @@ func TestDuplicateFragmentPreservesReassembly(t *testing.T) {
 	}
 }
 
+func TestFragmentReassemblySeparatesLoopbackAndDeviceInput(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.70")
+	remote := netip.MustParseAddr("192.0.2.71")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 24)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	first := buildIPv4Fragments(remote, local, protocolUDP, make([]byte, 32), 36, 0x7071)[0]
+	if packet, pending := stack.reassemblePacketStatus(first, time.Now(), false); packet != nil || !pending {
+		t.Fatalf("device fragment = packet %v pending %v", packet != nil, pending)
+	}
+	if packet, pending := stack.reassemblePacketStatus(first, time.Now(), true); packet != nil || !pending {
+		t.Fatalf("loopback fragment = packet %v pending %v", packet != nil, pending)
+	}
+	stack.fragmentMu.Lock()
+	sets := len(stack.fragments)
+	_, device := stack.fragments[fragmentKey{source: remote, target: local, identification: 0x7071, protocol: protocolUDP}]
+	_, loopback := stack.fragments[fragmentKey{source: remote, target: local, identification: 0x7071, protocol: protocolUDP, loopback: true}]
+	stack.fragmentMu.Unlock()
+	if sets != 2 || !device || !loopback {
+		t.Fatalf("fragment ingress domains = sets %d device %t loopback %t", sets, device, loopback)
+	}
+}
+
 func TestDuplicateFragmentAtPieceLimitPreservesQueue(t *testing.T) {
 	_, stack := newTestStack(t, netip.MustParseAddr("192.0.2.73"), netip.MustParseAddr("192.0.2.74"))
 	key := fragmentKey{
@@ -632,7 +657,7 @@ func TestDuplicateFragmentAtPieceLimitPreservesQueue(t *testing.T) {
 	stack.fragmentBytes = fragmentMaximumPieces * 8
 	stack.fragmentMu.Unlock()
 	duplicate := buildIPv4Fragments(key.source, key.target, key.protocol, make([]byte, 16), 28, uint16(key.identification))[0]
-	if packet, pending := stack.reassemblePacketStatus(duplicate, time.Now()); packet != nil || !pending {
+	if packet, pending := stack.reassemblePacketStatus(duplicate, time.Now(), false); packet != nil || !pending {
 		t.Fatalf("duplicate at piece limit = packet %v pending %v", packet != nil, pending)
 	}
 	stack.fragmentMu.Lock()
@@ -851,10 +876,10 @@ func TestFragmentTimesDoNotFollowLockAcquisitionOrder(t *testing.T) {
 		t.Fatalf("fragment count = %d, want at least 3", len(fragments))
 	}
 	base := time.Unix(100, 0)
-	if packet, pending := stack.reassemblePacketStatus(fragments[1], base.Add(time.Second)); packet != nil || !pending {
+	if packet, pending := stack.reassemblePacketStatus(fragments[1], base.Add(time.Second), false); packet != nil || !pending {
 		t.Fatalf("later fragment = packet %x pending %t", packet, pending)
 	}
-	if packet, pending := stack.reassemblePacketStatus(fragments[2], base); packet != nil || !pending {
+	if packet, pending := stack.reassemblePacketStatus(fragments[2], base, false); packet != nil || !pending {
 		t.Fatalf("earlier fragment = packet %x pending %t", packet, pending)
 	}
 	parsed, ok := parseFragment(fragments[1])

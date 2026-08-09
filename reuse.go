@@ -26,6 +26,7 @@ type tcpReuseRegistry struct {
 type udpReuseRegistry struct {
 	key    [16]byte
 	groups map[udpKey][]*UDPConn
+	all    []*UDPConn
 }
 
 // ListenTCPReusePort creates a passive TCP endpoint that may share its
@@ -160,13 +161,20 @@ func (reuseUDPSocketBinding) register(stack *Stack, connection *UDPConn) error {
 // empty reports whether no UDP REUSEPORT groups remain.
 func (registry *udpReuseRegistry) empty() bool { return len(registry.groups) == 0 }
 
-// connections returns all UDP REUSEPORT sockets while Stack.mu is held.
-func (registry *udpReuseRegistry) connections() []*UDPConn {
-	var connections []*UDPConn
-	for _, group := range registry.groups {
-		connections = append(connections, group...)
+// connections returns the registry-owned flat socket list. The caller holds
+// Stack.mu and must not retain or modify the returned slice.
+func (registry *udpReuseRegistry) connections() []*UDPConn { return registry.all }
+
+// contains reports whether connection is still registered in its exact
+// REUSEPORT group. The caller holds Stack.mu.
+func (registry *udpReuseRegistry) contains(connection *UDPConn) bool {
+	key := udpKey{address: connection.local, port: connection.port}
+	for _, candidate := range registry.groups[key] {
+		if candidate == connection {
+			return true
+		}
 	}
-	return connections
+	return false
 }
 
 // overlaps reports whether a UDP REUSEPORT binding covers an endpoint.
@@ -192,6 +200,7 @@ func (registry *udpReuseRegistry) connection(binding, local, remote netip.AddrPo
 func (registry *udpReuseRegistry) add(connection *UDPConn) {
 	key := udpKey{address: connection.local, port: connection.port}
 	registry.groups[key] = append(registry.groups[key], connection)
+	registry.all = append(registry.all, connection)
 }
 
 // remove deletes one UDP socket without disturbing unrelated groups.
@@ -209,6 +218,16 @@ func (registry *udpReuseRegistry) remove(connection *UDPConn) bool {
 			delete(registry.groups, key)
 		} else {
 			registry.groups[key] = group[:last]
+		}
+		for flatIndex, flatConnection := range registry.all {
+			if flatConnection != connection {
+				continue
+			}
+			flatLast := len(registry.all) - 1
+			registry.all[flatIndex] = registry.all[flatLast]
+			registry.all[flatLast] = nil
+			registry.all = registry.all[:flatLast]
+			break
 		}
 		return true
 	}

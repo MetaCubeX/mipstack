@@ -40,7 +40,7 @@ func buildIPv4Fragments(source, target netip.Addr, protocol byte, payload []byte
 // reassemblePacket hides pending-state bookkeeping in tests concerned only
 // with completed reassembly.
 func (s *Stack) reassemblePacket(packet []byte, now time.Time) []byte {
-	result, _ := s.reassemblePacketStatus(packet, now)
+	result, _ := s.reassemblePacketStatus(packet, now, false)
 	return result
 }
 

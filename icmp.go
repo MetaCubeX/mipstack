@@ -119,6 +119,26 @@ func (s *Stack) handleICMP(packet ipPacket, localDestination bool) error {
 	return nil
 }
 
+// handleMulticastICMPv6 implements RFC 4443's Echo exception. The reply uses
+// a unicast interface address rather than the request's multicast target.
+func (s *Stack) handleMulticastICMPv6(packet ipPacket) error {
+	icmp := packet.payload
+	if len(icmp) < 8 || transportChecksum(packet.source, packet.target, protocolICMPv6, icmp) != 0 {
+		return nil
+	}
+	reply, echoRequest := makeICMPEchoReply(protocolICMPv6, icmp)
+	if !echoRequest || !s.allowControlResponse(controlResponseEchoReply) {
+		return nil
+	}
+	source, err := s.sourceForRequested(packet.source, netip.Addr{})
+	if err != nil {
+		return nil
+	}
+	binary.BigEndian.PutUint16(reply[2:4], transportChecksum(source, packet.source, protocolICMPv6, reply))
+	_ = s.writeIPPayload(source, packet.source, protocolICMPv6, reply, true)
+	return nil
+}
+
 // deliverICMPError correlates one validated network error with an ordinary or
 // forwarded socket. It reports whether a transport or raw endpoint accepted
 // the error.

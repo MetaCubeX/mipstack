@@ -33,25 +33,61 @@ type ipDatagram struct {
 }
 
 // IPInfo is a point-in-time diagnostic snapshot of one IP protocol socket.
+// Traffic byte counters measure protocol payload; receive-queue byte values
+// also include the stack's per-datagram accounting overhead.
 type IPInfo struct {
-	LocalAddress         netip.Addr
-	RemoteAddress        netip.Addr
-	Protocol             uint8
-	Closed               bool
-	ReceiveQueuePackets  int
-	ReceiveQueueBytes    int
+	// LocalAddress is the bound local address; an unspecified address denotes
+	// a wildcard binding.
+	LocalAddress netip.Addr
+	// RemoteAddress is the connected peer, or an invalid address for an
+	// unconnected socket.
+	RemoteAddress netip.Addr
+	// Protocol is the IANA IP protocol number carried by the socket.
+	Protocol uint8
+	// Closed reports whether the socket was closed when the snapshot was taken.
+	Closed bool
+	// ReceiveQueuePackets is the number of complete payloads awaiting a read.
+	ReceiveQueuePackets int
+	// ReceiveQueueBytes is the accounted payload and metadata retained by the
+	// receive queue.
+	ReceiveQueueBytes int
+	// ReceiveQueueCapacity is the configured accounting-byte limit of the
+	// receive queue, not an exact heap-allocation limit.
 	ReceiveQueueCapacity int
-	PacketsSent          uint64
-	BytesSent            uint64
-	PacketsReceived      uint64
-	BytesReceived        uint64
-	PacketsDropped       uint64
-	ICMPErrors           uint64
-	PathMTU              int
-	HopLimit             int
-	TrafficClass         uint8
-	FlowLabel            uint32
-	LastError            error
+	// PacketsSent counts successfully emitted protocol payloads.
+	PacketsSent uint64
+	// BytesSent counts successfully emitted protocol payload bytes.
+	BytesSent uint64
+	// PacketsReceived counts protocol payloads accepted into the receive queue.
+	PacketsReceived uint64
+	// BytesReceived counts protocol payload bytes accepted into the receive
+	// queue.
+	BytesReceived uint64
+	// PacketsDropped counts payloads rejected because the socket was closed or
+	// its receive queue lacked capacity.
+	PacketsDropped uint64
+	// ICMPErrors counts matching asynchronous ICMP errors delivered to the
+	// socket.
+	ICMPErrors uint64
+	// PathMTU is the complete-IP-packet PMTU for a connected unicast peer, or
+	// zero when no such path exists.
+	PathMTU int
+	// HopLimit is the default unicast IPv4 TTL or IPv6 Hop Limit.
+	HopLimit int
+	// MulticastHopLimit is the default multicast IPv4 TTL or IPv6 Hop Limit.
+	MulticastHopLimit int
+	// MulticastLoopback reports whether transmitted multicast is delivered to
+	// matching local memberships.
+	MulticastLoopback bool
+	// Broadcast reports whether IPv4 broadcast output is permitted.
+	Broadcast bool
+	// TrafficClass is the default IPv4 TOS or IPv6 Traffic Class byte.
+	TrafficClass uint8
+	// FlowLabel is the effective IPv6 Flow Label; it is zero for IPv4 sockets.
+	FlowLabel uint32
+	// LastError is the most recently recorded socket operation or asynchronous
+	// network error.
+	LastError error
 }
 
 // ipKey identifies one specific or wildcard raw protocol binding.
@@ -90,24 +126,27 @@ type IPConn struct {
 	closed chan struct{}
 	once   sync.Once
 
-	mu              sync.Mutex
-	receive         datagramQueue[ipDatagram]
-	receiveSpare    []byte
-	receiveNotify   chan struct{}
-	receiveCapacity int
-	queuedBytes     int
-	readDeadline    socketDeadline
-	writeDeadline   socketDeadline
-	errors          chan error
-	recentTargets   recentDestinationCache[netip.Addr]
-	defaultOptions  ipPacketOptions
-	lastError       error
-	packetsSent     atomic.Uint64
-	bytesSent       atomic.Uint64
-	packetsReceived atomic.Uint64
-	bytesReceived   atomic.Uint64
-	packetsDropped  atomic.Uint64
-	icmpErrors      atomic.Uint64
+	mu                sync.Mutex
+	receive           datagramQueue[ipDatagram]
+	receiveSpare      []byte
+	receiveNotify     chan struct{}
+	receiveCapacity   int
+	queuedBytes       int
+	readDeadline      socketDeadline
+	writeDeadline     socketDeadline
+	errors            chan error
+	recentTargets     recentDestinationCache[netip.Addr]
+	defaultOptions    ipPacketOptions
+	multicastHopLimit byte
+	multicastLoopback bool
+	broadcast         bool
+	lastError         error
+	packetsSent       atomic.Uint64
+	bytesSent         atomic.Uint64
+	packetsReceived   atomic.Uint64
+	bytesReceived     atomic.Uint64
+	packetsDropped    atomic.Uint64
+	icmpErrors        atomic.Uint64
 }
 
 // ListenIP creates an unconnected IPv4 or IPv6 protocol socket. Network must
@@ -171,7 +210,7 @@ func (s *Stack) DialIP(ctx context.Context, network string, source, remote netip
 	if err != nil {
 		return wrap(nil, err)
 	}
-	if !remote.IsValid() || remote.IsUnspecified() || remote.IsMulticast() || remote.Zone() != "" {
+	if !remote.IsValid() || remote.IsUnspecified() || remote.Zone() != "" {
 		return wrap(nil, errors.New("mipstack: invalid IP destination"))
 	}
 	if err := ctx.Err(); err != nil {
@@ -268,7 +307,7 @@ func validateIPProtocol(protocol byte) error {
 
 // newIPConn allocates one unregistered protocol socket.
 func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.Addr) *IPConn {
-	defaults := DatagramSocketDefaults{ReceiveBuffer: ipDefaultReceiveCapacity, HopLimit: 64}
+	defaults := DatagramSocketDefaults{ReceiveBuffer: ipDefaultReceiveCapacity, HopLimit: 64, MulticastHopLimit: 1}
 	if stack != nil {
 		defaults = stack.network.Load().ipDefaults
 	}
@@ -280,6 +319,8 @@ func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.
 			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
 			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
 		},
+		multicastHopLimit: byte(defaults.MulticastHopLimit), multicastLoopback: !defaults.DisableMulticastLoopback,
+		broadcast: !defaults.DisableBroadcast,
 	}
 	return connection
 }
@@ -408,7 +449,7 @@ func (state *ipEndpointState) updateConfig(stack *Stack, network *networkState) 
 			continue
 		}
 		if connection.remote.IsValid() {
-			if _, routed := network.routeFor(connection.remote); !routed {
+			if !network.hasOutputPath(connection.remote) {
 				stack.closeIP(connection)
 			}
 		}
@@ -641,6 +682,9 @@ func (c *IPConn) WritePathMTUProbe(payload []byte) (int, error) {
 	if !c.remote.IsValid() {
 		return 0, c.operationError("write", errors.New("mipstack: IP socket is not connected"))
 	}
+	if c.remote.IsMulticast() || c.stack.network.Load().broadcastDestination(c.remote) {
+		return 0, c.operationError("write", syscall.EOPNOTSUPP)
+	}
 	n, err := c.writeToWith(payload, c.remote, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
 	if err != nil {
 		return n, c.operationError("write", err)
@@ -652,6 +696,9 @@ func (c *IPConn) WritePathMTUProbe(payload []byte) (int, error) {
 func (c *IPConn) WritePathMTUProbeTo(payload []byte, target netip.Addr) (int, error) {
 	if c.remote.IsValid() {
 		return 0, c.operationErrorTo("write", ipNetAddr(target), net.ErrWriteToConnected)
+	}
+	if target.IsMulticast() || c.stack.network.Load().broadcastDestination(target) {
+		return 0, c.operationErrorTo("write", ipNetAddr(target), syscall.EOPNOTSUPP)
 	}
 	n, err := c.writeToWith(payload, target, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
 	if err != nil {
@@ -719,9 +766,9 @@ func (c *IPConn) writeTo(payload []byte, target netip.Addr, packetInfoSource net
 
 // writeToWith keeps routing, checksums, deadlines, accounting, and ICMP
 // correlation shared between ordinary writes and PLPMTUD probes.
-func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, []byte, ipPacketOptions) error) (int, error) {
+func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, []byte, ipPacketOptions, bool) error) (int, error) {
 	target = target.Unmap()
-	if !target.IsValid() || target.IsUnspecified() || target.IsMulticast() || !c.dual && target.Is6() != c.v6 || target.Zone() != "" {
+	if !target.IsValid() || target.IsUnspecified() || !c.dual && target.Is6() != c.v6 || target.Zone() != "" {
 		return 0, syscall.EINVAL
 	}
 	state, options := c.writeStateAndOptions(options)
@@ -736,7 +783,7 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource
 		}
 		requestedSource = packetInfoSource
 	}
-	source, err := c.stack.sourceForRequested(target, requestedSource)
+	source, nonUnicast, err := c.stack.sourceForOutput(target, requestedSource)
 	if err != nil {
 		return 0, err
 	}
@@ -745,13 +792,15 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource
 		payload[2], payload[3] = 0, 0
 		binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, protocolICMPv6, payload))
 	}
-	if err = write(source, target, payload, options); err != nil {
+	if err = write(source, target, payload, options, nonUnicast); err != nil {
 		if errors.Is(err, syscall.EMSGSIZE) {
 			return 0, syscall.EMSGSIZE
 		}
 		return 0, err
 	}
-	c.rememberTarget(target)
+	if !nonUnicast {
+		c.rememberTarget(target)
+	}
 	c.packetsSent.Add(1)
 	c.bytesSent.Add(uint64(len(payload)))
 	return len(payload), nil
@@ -759,14 +808,17 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource
 
 // writePayload emits ordinary output against the confirmed path MTU and
 // permits source fragmentation.
-func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
+func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, nonUnicast bool) error {
+	if nonUnicast {
+		return c.writeNonUnicastPayload(source, target, payload, options)
+	}
 	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
 	return c.stack.writeIPPayloadUntilOptions(source, target, c.protocol, payload, true, options, state)
 }
 
 // writePathMTUProbePayload emits explicitly unfragmented output against the
 // first-hop MTU.
-func (c *IPConn) writePathMTUProbePayload(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
+func (c *IPConn) writePathMTUProbePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, _ bool) error {
 	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
 	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, false, options, c.stack.network.Load().mtu, state)
 }
@@ -811,6 +863,7 @@ func (c *IPConn) Info() IPInfo {
 		LocalAddress: c.local, RemoteAddress: c.remote, Protocol: c.protocol,
 		ReceiveQueuePackets: c.receive.len(), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
 		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass,
+		MulticastHopLimit: int(c.multicastHopLimit), MulticastLoopback: c.multicastLoopback, Broadcast: c.broadcast,
 		FlowLabel: flowLabel,
 		LastError: c.lastError,
 	}
@@ -823,7 +876,7 @@ func (c *IPConn) Info() IPInfo {
 	info.PacketsSent, info.BytesSent = c.packetsSent.Load(), c.bytesSent.Load()
 	info.PacketsReceived, info.BytesReceived = c.packetsReceived.Load(), c.bytesReceived.Load()
 	info.PacketsDropped, info.ICMPErrors = c.packetsDropped.Load(), c.icmpErrors.Load()
-	if c.remote.IsValid() {
+	if c.remote.IsValid() && !c.remote.IsMulticast() && !c.stack.network.Load().broadcastDestination(c.remote) {
 		info.PathMTU = c.stack.mtuFor(c.remote)
 	}
 	return info
@@ -1056,7 +1109,7 @@ func ipAddr(address *net.IPAddr) (netip.Addr, error) {
 		return netip.Addr{}, syscall.EINVAL
 	}
 	result = result.Unmap()
-	if !result.IsValid() || result.IsUnspecified() || result.IsMulticast() {
+	if !result.IsValid() || result.IsUnspecified() {
 		return netip.Addr{}, syscall.EINVAL
 	}
 	return result, nil

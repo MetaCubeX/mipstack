@@ -32,25 +32,59 @@ type udpDatagram struct {
 	options ipPacketOptions
 }
 
-// UDPInfo is a point-in-time diagnostic snapshot of one UDP socket.
+// UDPInfo is a point-in-time diagnostic snapshot of one UDP socket. Traffic
+// byte counters measure UDP payload; receive-queue byte values also include
+// the stack's per-datagram accounting overhead.
 type UDPInfo struct {
-	LocalAddress         netip.AddrPort
-	RemoteAddress        netip.AddrPort
-	Closed               bool
-	ReceiveQueuePackets  int
-	ReceiveQueueBytes    int
+	// LocalAddress is the bound local endpoint; an unspecified address denotes
+	// a wildcard binding.
+	LocalAddress netip.AddrPort
+	// RemoteAddress is the connected peer, or an invalid endpoint for an
+	// unconnected socket.
+	RemoteAddress netip.AddrPort
+	// Closed reports whether the socket was closed when the snapshot was taken.
+	Closed bool
+	// ReceiveQueuePackets is the number of complete datagrams awaiting a read.
+	ReceiveQueuePackets int
+	// ReceiveQueueBytes is the accounted payload and metadata retained by the
+	// receive queue.
+	ReceiveQueueBytes int
+	// ReceiveQueueCapacity is the configured accounting-byte limit of the
+	// receive queue, not an exact heap-allocation limit.
 	ReceiveQueueCapacity int
-	PacketsSent          uint64
-	BytesSent            uint64
-	PacketsReceived      uint64
-	BytesReceived        uint64
-	PacketsDropped       uint64
-	ICMPErrors           uint64
-	PathMTU              int
-	HopLimit             int
-	TrafficClass         uint8
-	FlowLabel            uint32
-	LastError            error
+	// PacketsSent counts successfully emitted UDP datagrams.
+	PacketsSent uint64
+	// BytesSent counts successfully emitted UDP payload bytes.
+	BytesSent uint64
+	// PacketsReceived counts datagrams accepted into the receive queue.
+	PacketsReceived uint64
+	// BytesReceived counts UDP payload bytes accepted into the receive queue.
+	BytesReceived uint64
+	// PacketsDropped counts datagrams rejected because the socket was closed or
+	// its receive queue lacked capacity.
+	PacketsDropped uint64
+	// ICMPErrors counts matching asynchronous ICMP errors delivered to the
+	// socket.
+	ICMPErrors uint64
+	// PathMTU is the complete-IP-packet PMTU for a connected unicast peer, or
+	// zero when no such path exists.
+	PathMTU int
+	// HopLimit is the default unicast IPv4 TTL or IPv6 Hop Limit.
+	HopLimit int
+	// MulticastHopLimit is the default multicast IPv4 TTL or IPv6 Hop Limit.
+	MulticastHopLimit int
+	// MulticastLoopback reports whether transmitted multicast is delivered to
+	// matching local memberships.
+	MulticastLoopback bool
+	// Broadcast reports whether IPv4 broadcast output is permitted.
+	Broadcast bool
+	// TrafficClass is the default IPv4 TOS or IPv6 Traffic Class byte.
+	TrafficClass uint8
+	// FlowLabel is the effective IPv6 Flow Label; it is zero for IPv4 sockets.
+	FlowLabel uint32
+	// LastError is the most recently recorded socket operation or asynchronous
+	// network error.
+	LastError error
 }
 
 // udpReuseEndpoints is the optional REUSEPORT dispatcher retained by Stack.
@@ -59,6 +93,7 @@ type UDPInfo struct {
 type udpReuseEndpoints interface {
 	empty() bool
 	connections() []*UDPConn
+	contains(connection *UDPConn) bool
 	overlaps(address netip.Addr, port uint16, dual bool) bool
 	connection(binding, local, remote netip.AddrPort) *UDPConn
 	add(connection *UDPConn)
@@ -92,29 +127,32 @@ type UDPConn struct {
 	closed chan struct{}
 	once   sync.Once
 
-	mu              sync.Mutex
-	receive         datagramQueue[udpDatagram]
-	receiveSpare    []byte
-	receiveNotify   chan struct{}
-	receiveCapacity int
-	queuedBytes     int
-	readDeadline    socketDeadline
-	writeDeadline   socketDeadline
-	recentTargets   recentDestinationCache[netip.AddrPort]
-	defaultOptions  ipPacketOptions
-	automaticLabel  uint32
-	lastError       error
-	packetsSent     atomic.Uint64
-	bytesSent       atomic.Uint64
-	packetsReceived atomic.Uint64
-	bytesReceived   atomic.Uint64
-	packetsDropped  atomic.Uint64
-	icmpErrors      atomic.Uint64
+	mu                sync.Mutex
+	receive           datagramQueue[udpDatagram]
+	receiveSpare      []byte
+	receiveNotify     chan struct{}
+	receiveCapacity   int
+	queuedBytes       int
+	readDeadline      socketDeadline
+	writeDeadline     socketDeadline
+	recentTargets     recentDestinationCache[netip.AddrPort]
+	defaultOptions    ipPacketOptions
+	multicastHopLimit byte
+	multicastLoopback bool
+	broadcast         bool
+	automaticLabel    uint32
+	lastError         error
+	packetsSent       atomic.Uint64
+	bytesSent         atomic.Uint64
+	packetsReceived   atomic.Uint64
+	bytesReceived     atomic.Uint64
+	packetsDropped    atomic.Uint64
+	icmpErrors        atomic.Uint64
 }
 
 // newUDPConn creates an unregistered UDP socket.
 func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.Addr, remote netip.AddrPort) *UDPConn {
-	defaults := DatagramSocketDefaults{ReceiveBuffer: udpDefaultReceiveCapacity, HopLimit: 64}
+	defaults := DatagramSocketDefaults{ReceiveBuffer: udpDefaultReceiveCapacity, HopLimit: 64, MulticastHopLimit: 1}
 	if stack != nil {
 		defaults = stack.network.Load().udpDefaults
 	}
@@ -125,6 +163,8 @@ func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.
 			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
 			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
 		},
+		multicastHopLimit: byte(defaults.MulticastHopLimit), multicastLoopback: !defaults.DisableMulticastLoopback,
+		broadcast: !defaults.DisableBroadcast,
 	}
 	if remote.IsValid() && stack != nil && local.Is6() && remote.Addr().Is6() && defaults.FlowLabel == 0 {
 		connection.automaticLabel = stack.automaticTransportFlowLabel(local, remote.Addr(), protocolUDP, port, remote.Port())
@@ -143,8 +183,9 @@ func (exclusiveUDPSocketBinding) register(stack *Stack, connection *UDPConn) err
 	return nil
 }
 
-// handleUDP validates and dispatches one UDP datagram.
-func (s *Stack) handleUDP(packet ipPacket, localDestination bool) error {
+// handleUDP validates and dispatches one unicast, broadcast, or multicast UDP
+// datagram according to its already classified IP destination.
+func (s *Stack) handleUDP(packet ipPacket, destination inboundDestinationClass) error {
 	udp := packet.payload
 	if len(udp) < udpHeaderSize {
 		s.stats.inboundDroppedPackets.Add(1)
@@ -164,6 +205,21 @@ func (s *Stack) handleUDP(packet ipPacket, localDestination bool) error {
 	targetPort := binary.BigEndian.Uint16(udp[2:4])
 	source := netip.AddrPortFrom(packet.source, sourcePort)
 	target := netip.AddrPortFrom(packet.target, targetPort)
+	packet.payload = udp[:length]
+	if destination == inboundDestinationMulticast {
+		s.mu.RLock()
+		multicast := s.multicast
+		s.mu.RUnlock()
+		if multicast != nil {
+			multicast.deliverUDP(packet, sourcePort, targetPort)
+		}
+		return nil
+	}
+	if destination == inboundDestinationBroadcast {
+		s.deliverBroadcastUDP(packet, source, targetPort)
+		return nil
+	}
+	localDestination := destination == inboundDestinationLocalUnicast
 	s.mu.RLock()
 	connection := s.udpForwardedConnectionLocked(target, source)
 	if connection == nil && localDestination {
@@ -172,7 +228,6 @@ func (s *Stack) handleUDP(packet ipPacket, localDestination bool) error {
 	forwarder := s.udpForwarder
 	s.mu.RUnlock()
 	if connection == nil {
-		packet.payload = udp[:length]
 		options := ipPacketOptions{hopLimit: packet.hopLimit, trafficClass: packet.trafficClass, flowLabel: packet.flowLabel}
 		if forwarder != nil && forwarder.handlePacket(packet, TransportFlow{Source: source, Destination: target}, options) {
 			return nil
@@ -191,6 +246,36 @@ func (s *Stack) handleUDP(packet ipPacket, localDestination bool) error {
 		hopLimit: packet.hopLimit, trafficClass: packet.trafficClass, flowLabel: packet.flowLabel,
 	})
 	return nil
+}
+
+// deliverBroadcastUDP copies one IPv4 broadcast to every eligible wildcard
+// binding. Unlike unicast REUSEPORT dispatch, Linux fans a broadcast out to
+// every member of a matching reuse group.
+func (s *Stack) deliverBroadcastUDP(packet ipPacket, source netip.AddrPort, targetPort uint16) {
+	s.mu.RLock()
+	var matchedStorage [8]*UDPConn
+	matched := matchedStorage[:0]
+	consider := func(connection *UDPConn) {
+		if connection.forwarded || connection.port != targetPort || !connection.local.IsUnspecified() ||
+			connection.local.Is6() && !connection.dual ||
+			connection.remote.IsValid() && connection.remote != source {
+			return
+		}
+		matched = append(matched, connection)
+	}
+	for _, connection := range s.udp {
+		consider(connection)
+	}
+	if s.udpReuse != nil {
+		for _, connection := range s.udpReuse.connections() {
+			consider(connection)
+		}
+	}
+	s.mu.RUnlock()
+	options := ipPacketOptions{hopLimit: packet.hopLimit, trafficClass: packet.trafficClass, flowLabel: packet.flowLabel}
+	for _, connection := range matched {
+		connection.enqueue(packet.payload[udpHeaderSize:], source, packet.target, options)
+	}
 }
 
 // udpConnectionLocked selects an exact binding before a family wildcard and
@@ -593,8 +678,15 @@ func (c *UDPConn) WriteToUDP(payload []byte, address *net.UDPAddr) (int, error) 
 
 // WriteToUDPAddrPort acts like WriteTo but accepts a netip.AddrPort directly.
 func (c *UDPConn) WriteToUDPAddrPort(payload []byte, address netip.AddrPort) (int, error) {
-	netAddress := net.UDPAddrFromAddrPort(address)
-	return c.writeToUDPAddrPort(payload, address, netAddress)
+	if c.remote.IsValid() {
+		return 0, c.operationError("write", net.UDPAddrFromAddrPort(address), net.ErrWriteToConnected)
+	}
+	target := netip.AddrPortFrom(address.Addr().Unmap(), address.Port())
+	n, err := c.writeTo(payload, target)
+	if err != nil {
+		return n, c.operationError("write", net.UDPAddrFromAddrPort(address), err)
+	}
+	return n, nil
 }
 
 // writeToUDPAddrPort applies unconnected-socket validation and the public
@@ -630,6 +722,9 @@ func (c *UDPConn) WritePathMTUProbe(payload []byte) (int, error) {
 	if !c.remote.IsValid() {
 		return 0, c.operationError("write", nil, errors.New("mipstack: UDP socket is not connected"))
 	}
+	if c.remote.Addr().IsMulticast() || c.stack.network.Load().broadcastDestination(c.remote.Addr()) {
+		return 0, c.operationError("write", c.remoteAddr(), syscall.EOPNOTSUPP)
+	}
 	n, err := c.writeToFromWith(payload, c.remote, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram)
 	if err != nil {
 		return n, c.operationError("write", c.remoteAddr(), err)
@@ -639,13 +734,15 @@ func (c *UDPConn) WritePathMTUProbe(payload []byte) (int, error) {
 
 // WritePathMTUProbeTo is the unconnected netip form of WritePathMTUProbe.
 func (c *UDPConn) WritePathMTUProbeTo(payload []byte, target netip.AddrPort) (int, error) {
-	address := net.UDPAddrFromAddrPort(target)
 	if c.remote.IsValid() {
-		return 0, c.operationError("write", address, net.ErrWriteToConnected)
+		return 0, c.operationError("write", net.UDPAddrFromAddrPort(target), net.ErrWriteToConnected)
+	}
+	if target.Addr().IsMulticast() || c.stack.network.Load().broadcastDestination(target.Addr()) {
+		return 0, c.operationError("write", net.UDPAddrFromAddrPort(target), syscall.EOPNOTSUPP)
 	}
 	n, err := c.writeToFromWith(payload, target, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram)
 	if err != nil {
-		return n, c.operationError("write", address, err)
+		return n, c.operationError("write", net.UDPAddrFromAddrPort(target), err)
 	}
 	return n, nil
 }
@@ -677,51 +774,60 @@ func (c *UDPConn) ConfirmPathMTUFor(target netip.Addr, mtu int) error {
 // data. A connected socket requires a nil address.
 func (c *UDPConn) WriteMsgUDP(payload, oob []byte, address *net.UDPAddr) (n, oobn int, err error) {
 	var target netip.AddrPort
-	var netAddress net.Addr
 	if c.remote.IsValid() {
 		if address != nil {
 			return 0, 0, c.operationError("write", address, net.ErrWriteToConnected)
 		}
-		target, netAddress = c.remote, c.remoteAddr()
+		target = c.remote
 	} else {
 		if address == nil {
 			return 0, 0, c.operationError("write", nil, errors.New("mipstack: UDP destination is required"))
 		}
-		target, netAddress = address.AddrPort(), address
+		target = address.AddrPort()
 	}
-	return c.writeMsgUDPAddrPort(payload, oob, target, netAddress)
+	n, oobn, err = c.writeMsgUDPAddrPort(payload, oob, target)
+	if err != nil {
+		var netAddress net.Addr = address
+		if netAddress == nil {
+			netAddress = c.remoteAddr()
+		}
+		return n, oobn, c.operationError("write", netAddress, err)
+	}
+	return n, oobn, nil
 }
 
 // WriteMsgUDPAddrPort is the netip.AddrPort form of WriteMsgUDP. A connected
 // socket requires an invalid address.
 func (c *UDPConn) WriteMsgUDPAddrPort(payload, oob []byte, address netip.AddrPort) (n, oobn int, err error) {
-	var netAddress net.Addr
 	if c.remote.IsValid() {
 		if address.IsValid() {
-			netAddress = net.UDPAddrFromAddrPort(address)
-			return 0, 0, c.operationError("write", netAddress, net.ErrWriteToConnected)
+			return 0, 0, c.operationError("write", net.UDPAddrFromAddrPort(address), net.ErrWriteToConnected)
 		}
-		address, netAddress = c.remote, c.remoteAddr()
+		address = c.remote
 	} else {
 		if !address.IsValid() {
 			return 0, 0, c.operationError("write", nil, errors.New("mipstack: UDP destination is required"))
 		}
-		netAddress = net.UDPAddrFromAddrPort(address)
 	}
-	return c.writeMsgUDPAddrPort(payload, oob, address, netAddress)
+	n, oobn, err = c.writeMsgUDPAddrPort(payload, oob, address)
+	if err != nil {
+		return n, oobn, c.operationError("write", net.UDPAddrFromAddrPort(address), err)
+	}
+	return n, oobn, nil
 }
 
 // writeMsgUDPAddrPort parses packet-info source selection and sends one
-// datagram. oobn is reported only when the complete message was accepted.
-func (c *UDPConn) writeMsgUDPAddrPort(payload, oob []byte, target netip.AddrPort, address net.Addr) (n, oobn int, err error) {
+// datagram without wrapping errors. oobn is reported only when the complete
+// message was accepted.
+func (c *UDPConn) writeMsgUDPAddrPort(payload, oob []byte, target netip.AddrPort) (n, oobn int, err error) {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
 	source, options, err := parseControlMessageForWrite(oob, target.Addr().Is6())
 	if err != nil {
-		return 0, 0, c.operationError("write", address, err)
+		return 0, 0, err
 	}
 	n, err = c.writeToFrom(payload, target, source, options)
 	if err != nil {
-		return n, 0, c.operationError("write", address, err)
+		return n, 0, err
 	}
 	return n, len(oob), nil
 }
@@ -739,9 +845,9 @@ func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, packetInfoS
 // writeToFromWith keeps source selection, checksums, deadlines, accounting,
 // and ICMP correlation shared while leaving optional output policies
 // independently reachable by the linker.
-func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, uint16, uint16, []byte, ipPacketOptions) error) (int, error) {
+func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, uint16, uint16, []byte, ipPacketOptions, bool) error) (int, error) {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
-	if target.Addr().Is6() != c.v6 && !c.dual || target.Addr().IsUnspecified() {
+	if !target.IsValid() || target.Addr().Is6() != c.v6 && !c.dual || target.Addr().IsUnspecified() {
 		return 0, errors.New("mipstack: invalid UDP destination")
 	}
 	state, options := c.writeStateAndOptions(options)
@@ -757,6 +863,7 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetI
 		requestedSource = packetInfoSource
 	}
 	var source netip.Addr
+	nonUnicast := false
 	if c.forwarded {
 		if packetInfoSource.IsValid() && !packetInfoSource.IsUnspecified() && packetInfoSource != c.local {
 			return 0, syscall.EADDRNOTAVAIL
@@ -771,7 +878,7 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetI
 		source = c.local
 	} else {
 		var err error
-		source, err = c.stack.sourceForRequested(target.Addr(), requestedSource)
+		source, nonUnicast, err = c.stack.sourceForOutput(target.Addr(), requestedSource)
 		if err != nil {
 			return 0, err
 		}
@@ -784,14 +891,16 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetI
 	if len(payload) > maximumPayload {
 		return 0, syscall.EMSGSIZE
 	}
-	writeErr := write(source, target.Addr(), c.port, target.Port(), payload, options)
+	writeErr := write(source, target.Addr(), c.port, target.Port(), payload, options, nonUnicast)
 	if writeErr != nil {
 		if errors.Is(writeErr, syscall.EMSGSIZE) {
 			return 0, syscall.EMSGSIZE
 		}
 		return 0, writeErr
 	}
-	c.rememberTarget(target)
+	if !nonUnicast {
+		c.rememberTarget(target)
+	}
 	c.packetsSent.Add(1)
 	c.bytesSent.Add(uint64(len(payload)))
 	return len(payload), nil
@@ -799,7 +908,10 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetI
 
 // writeDatagram emits ordinary UDP output against the confirmed path MTU and
 // permits source fragmentation.
-func (c *UDPConn) writeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions) error {
+func (c *UDPConn) writeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, nonUnicast bool) error {
+	if nonUnicast {
+		return c.writeNonUnicastDatagram(source, target, sourcePort, targetPort, payload, options)
+	}
 	return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, true, c.stack.mtuFor(target))
 }
 
@@ -821,7 +933,7 @@ func (s *Stack) tryWriteUDPDatagram(source, target netip.Addr, sourcePort, targe
 
 // writePathMTUProbeDatagram is retained only when an application references
 // the UDP packetization-layer probing API.
-func (c *UDPConn) writePathMTUProbeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions) error {
+func (c *UDPConn) writePathMTUProbeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, _ bool) error {
 	return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, false, c.stack.network.Load().mtu)
 }
 
@@ -993,6 +1105,7 @@ func (c *UDPConn) Info() UDPInfo {
 		LocalAddress: netip.AddrPortFrom(c.local, c.port), RemoteAddress: c.remote,
 		ReceiveQueuePackets: c.receive.len(), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
 		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass,
+		MulticastHopLimit: int(c.multicastHopLimit), MulticastLoopback: c.multicastLoopback, Broadcast: c.broadcast,
 		FlowLabel: flowLabel, LastError: c.lastError,
 	}
 	select {
@@ -1004,7 +1117,7 @@ func (c *UDPConn) Info() UDPInfo {
 	info.PacketsSent, info.BytesSent = c.packetsSent.Load(), c.bytesSent.Load()
 	info.PacketsReceived, info.BytesReceived = c.packetsReceived.Load(), c.bytesReceived.Load()
 	info.PacketsDropped, info.ICMPErrors = c.packetsDropped.Load(), c.icmpErrors.Load()
-	if c.remote.IsValid() {
+	if c.remote.IsValid() && !c.remote.Addr().IsMulticast() && !c.stack.network.Load().broadcastDestination(c.remote.Addr()) {
 		info.PathMTU = c.stack.mtuFor(c.remote.Addr())
 		if c.remote.Addr().Is6() && automaticFlowLabel {
 			info.FlowLabel = c.stack.automaticTransportFlowLabel(c.local, c.remote.Addr(), protocolUDP, c.port, c.remote.Port())

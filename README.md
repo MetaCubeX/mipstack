@@ -93,6 +93,8 @@ MIPS provides:
 - `DialUDP` for connected UDP sockets;
 - `ListenUDP` for unconnected UDP packet sockets;
 - `ListenUDPReusePort` for flow-distributed shared UDP bindings;
+- `ListenMulticastUDP` for a reusable wildcard UDP binding joined to one IPv4
+  or IPv6 multicast group;
 - `DialIP` and `ListenIP` for connected and unconnected IPv4 or IPv6 protocol
   payload sockets, using standard network names such as `ip4:icmp`,
   `ip6:ipv6-icmp`, and `ip:99`;
@@ -125,6 +127,47 @@ bindings take precedence over wildcard bindings, and a per-registry keyed hash
 keeps each TCP or UDP flow on one group member. Closing a TCP listener permits
 an immediate rebind while its already accepted connections remain active,
 matching the `SO_REUSEADDR` behavior used by standard Go listeners.
+
+UDP and raw IP sockets expose the single-interface equivalents of Go's
+`x/net/ipv4` and `x/net/ipv6` multicast controls: `JoinGroup`, `LeaveGroup`,
+the source-specific join/leave and include/exclude operations, and atomic
+`SetMulticastSourceFilter` snapshots for previously joined groups.
+`MulticastSourceFilterExclude` and
+`MulticastSourceFilterInclude` use Linux's `MCAST_EXCLUDE=0` and
+`MCAST_INCLUDE=1` values. No interface argument is needed because one Stack
+represents exactly one embedding interface.
+
+Memberships belong to the socket that created them and are removed when that
+socket is closed. While the Stack remains operational, removing its final
+membership schedules the applicable state-change Report, Leave, or Done on a
+best-effort basis. `Stack.Close` is terminal: it cancels pending reports and
+packet I/O without attempting a final leave because the embedding link may no
+longer be usable. `JoinSourceSpecificGroup` creates an INCLUDE membership for
+its first source, and removing its final source leaves the group. The
+include/exclude delta operations require an existing membership in the
+corresponding mode. Closing one reusable listener does not affect memberships
+owned by the other listeners on that port.
+
+As an RFC 4604 SSM-aware host, MIPS requires source-specific INCLUDE
+memberships for IPv4 232/8 and IPv6 FF3x::/32. Any-source joins, EXCLUDE
+filters, and EXCLUDE delta operations in those ranges return `EINVAL`; an
+older IGMPv1/v2 or MLDv1 Report cannot suppress a pending SSM report.
+
+`SetMulticastHopLimit` and `SetMulticastLoopback` control output independently
+from ordinary unicast hop limits. `ListenMulticastUDP` disables loopback on
+the returned sending socket like `net.ListenMulticastUDP`; other sockets keep
+the standard enabled default. IPv4 limited and configured-subnet broadcasts
+are delivered to eligible wildcard UDP and raw sockets. `SetBroadcast`
+controls output permission and starts enabled, matching Go's default UDP and
+raw sockets on supported operating systems.
+
+The stack maintains the RFC 9776 and RFC 3810 aggregate interface filter and
+emits IGMPv1/v2/v3 or MLDv1/v2 reports according to the active querier
+compatibility mode. Reports include the required Router Alert, fit the link
+MTU, and preserve source-filter state across socket and address changes.
+IPv6 interface-local multicast and an explicit multicast hop limit of zero
+remain inside the host; multicast loopback still obeys each sending socket's
+setting.
 
 ## Transparent interception
 
@@ -559,7 +602,7 @@ these APIs alive.
 MIPS is an endpoint stack, not a general host network stack. `IPConn`
 exchanges protocol payloads while MIPS owns the IP header; header-included
 raw packets and operating-system file descriptors are deliberately absent. It
-also does not implement forwarding, NAT, multicast sockets, TCP urgent data,
+also does not implement forwarding, NAT, multicast routing, TCP urgent data,
 or next-hop routing. `LocalAddresses` controls endpoint ownership and source
 selection. `Routes` provides destination admission, longest-prefix selection,
 metrics, and optional preferred sources, while the lower link remains

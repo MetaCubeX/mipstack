@@ -189,14 +189,17 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 		}
 		source := netip.AddrFrom4([4]byte(packet[12:16]))
 		target := netip.AddrFrom4([4]byte(packet[16:20]))
-		if optionAt, malformed := malformedIPv4Option(packet[20:headerSize]); malformed {
-			return ipPacket{
-				source: source, target: target, original: packet[:totalSize],
-				parameterError: true, parameterCode: 0, parameterAt: uint32(20 + optionAt),
-			}, true
-		}
-		if !validateIPv4Options(packet[20:headerSize]) {
-			return ipPacket{}, false
+		if headerSize > 20 {
+			options := packet[20:headerSize]
+			if optionAt, malformed := malformedIPv4Option(options); malformed {
+				return ipPacket{
+					source: source, target: target, original: packet[:totalSize],
+					parameterError: true, parameterCode: 0, parameterAt: uint32(20 + optionAt),
+				}, true
+			}
+			if !validateIPv4Options(options) {
+				return ipPacket{}, false
+			}
 		}
 		return ipPacket{
 			source: source, target: target,
@@ -292,12 +295,93 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 	return ipPacket{}, false
 }
 
+// hasRouterAlert reports the zero-valued Router Alert required by IGMP and
+// MLD. Keeping this uncommon policy check out of parseIPPacket avoids adding
+// work to every ordinary IPv4 and IPv6 packet.
+func (p ipPacket) hasRouterAlert() bool {
+	if p.source.Is4() {
+		if len(p.original) < 20 {
+			return false
+		}
+		headerSize := int(p.original[0]&0x0f) * 4
+		return headerSize >= 20 && headerSize <= len(p.original) && ipv4RouterAlert(p.original[20:headerSize])
+	}
+	if !p.source.Is6() || len(p.original) < 48 || p.original[6] != 0 {
+		return false
+	}
+	length := (int(p.original[41]) + 1) * 8
+	return length <= len(p.original)-40 && ipv6RouterAlert(p.original[40:40+length])
+}
+
+// ipv4RouterAlert reports a well-formed, zero-valued RFC 2113 option.
+func ipv4RouterAlert(options []byte) bool {
+	found := false
+	for offset := 0; offset < len(options); {
+		kind := options[offset]
+		if kind == 0 {
+			for _, padding := range options[offset+1:] {
+				if padding != 0 {
+					return false
+				}
+			}
+			return found
+		}
+		if kind == 1 {
+			offset++
+			continue
+		}
+		if len(options)-offset < 2 {
+			return false
+		}
+		length := int(options[offset+1])
+		if length < 2 || length > len(options)-offset {
+			return false
+		}
+		if kind == 148 {
+			if found || length != 4 || options[offset+2] != 0 || options[offset+3] != 0 {
+				return false
+			}
+			found = true
+		}
+		offset += length
+	}
+	return found
+}
+
+// ipv6RouterAlert reports a zero-valued RFC 2711 option in one validated
+// Hop-by-Hop header.
+func ipv6RouterAlert(header []byte) bool {
+	found := false
+	for offset := 2; offset < len(header); {
+		kind := header[offset]
+		if kind == 0 {
+			offset++
+			continue
+		}
+		if len(header)-offset < 2 {
+			return false
+		}
+		length := int(header[offset+1]) + 2
+		if length > len(header)-offset {
+			return false
+		}
+		if kind == 5 {
+			if found || length != 4 || header[offset+2] != 0 || header[offset+3] != 0 {
+				return false
+			}
+			found = true
+		}
+		offset += length
+	}
+	return found
+}
+
 // malformedIPv4Option returns the byte that Linux reports in an ICMP
 // Parameter Problem for malformed option framing or fields. Policy rejection
 // of a well-formed option, such as source routing, is left to
 // validateIPv4Options and is not misreported as a syntax error.
 func malformedIPv4Option(options []byte) (int, bool) {
-	var sourceRoute, recordRoute, timestamp bool
+	var sourceRoute, recordRoute, timestamp, routerAlert bool
 	for offset := 0; offset < len(options); {
 		kind := options[offset]
 		switch kind {
@@ -371,9 +455,13 @@ func malformedIPv4Option(options []byte) (int, bool) {
 				return offset + 3, true
 			}
 		case 148: // Router Alert.
-			if length < 4 {
+			if length != 4 {
 				return offset + 1, true
 			}
+			if routerAlert {
+				return offset, true
+			}
+			routerAlert = true
 		}
 		offset += length
 	}

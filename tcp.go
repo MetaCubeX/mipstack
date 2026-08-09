@@ -2170,6 +2170,9 @@ func (s *Stack) DialTCP(ctx context.Context, network string, source, remote neti
 	if !remote.IsValid() || remote.Addr().IsUnspecified() || remote.Addr().IsMulticast() || remote.Addr().Zone() != "" {
 		return wrap(nil, errors.New("mipstack: invalid TCP destination"))
 	}
+	if s.network.Load().broadcastDestination(remote.Addr()) {
+		return wrap(nil, syscall.EACCES)
+	}
 	if err := ctx.Err(); err != nil {
 		return wrap(nil, err)
 	}

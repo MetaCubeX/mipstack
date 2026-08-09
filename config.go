@@ -25,6 +25,7 @@ type networkState struct {
 	udpDefaults       DatagramSocketDefaults
 	ipDefaults        DatagramSocketDefaults
 	local             map[netip.Addr]struct{}
+	broadcast         map[netip.Addr]struct{}
 	sources           []netip.Addr
 	localPrefixes     []netip.Prefix
 	routes            []Route
@@ -51,6 +52,25 @@ func (state *networkState) samePathConfiguration(other *networkState) bool {
 	}
 	for index := range state.routes {
 		if state.routes[index] != other.routes[index] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameMulticastConfiguration reports whether family availability, report
+// source selection, and IPv4 directed-broadcast classification are unchanged.
+func (state *networkState) sameMulticastConfiguration(other *networkState) bool {
+	if state == nil || other == nil || len(state.sources) != len(other.sources) || len(state.localPrefixes) != len(other.localPrefixes) {
+		return false
+	}
+	for index := range state.sources {
+		if state.sources[index] != other.sources[index] {
+			return false
+		}
+	}
+	for index := range state.localPrefixes {
+		if state.localPrefixes[index] != other.localPrefixes[index] {
 			return false
 		}
 	}
@@ -106,7 +126,19 @@ func buildNetworkState(config Config) (*networkState, error) {
 			state.local[address] = struct{}{}
 			state.sources = append(state.sources, address)
 		}
-		state.localPrefixes = append(state.localPrefixes, netip.PrefixFrom(address, bits).Masked())
+		masked := netip.PrefixFrom(address, bits).Masked()
+		state.localPrefixes = append(state.localPrefixes, masked)
+		if broadcast, ok := ipv4BroadcastAddress(masked); ok {
+			if state.broadcast == nil {
+				state.broadcast = make(map[netip.Addr]struct{}, len(config.LocalAddresses))
+			}
+			state.broadcast[broadcast] = struct{}{}
+		}
+	}
+	for address := range state.local {
+		if _, broadcast := state.broadcast[address]; broadcast {
+			return nil, errors.New("mipstack: IPv4 broadcast address cannot be local")
+		}
 	}
 	if len(state.local) == 0 {
 		return nil, errors.New("mipstack: at least one local address is required")
@@ -247,7 +279,7 @@ func normalizeTCPSocketDefaults(value TCPSocketDefaults) (TCPSocketDefaults, err
 
 // normalizeDatagramSocketDefaults validates one UDP or IP default policy.
 func normalizeDatagramSocketDefaults(value DatagramSocketDefaults, defaultReceiveBuffer, minimumReceiveBuffer int) (DatagramSocketDefaults, error) {
-	if value.ReceiveBuffer < 0 || value.HopLimit < 0 || value.HopLimit > 255 {
+	if value.ReceiveBuffer < 0 || value.HopLimit < 0 || value.HopLimit > 255 || value.MulticastHopLimit < 0 || value.MulticastHopLimit > 255 {
 		return DatagramSocketDefaults{}, errors.New("receive buffer and hop limit must be valid")
 	}
 	if value.FlowLabel > ipv6MaximumFlowLabel {
@@ -261,6 +293,9 @@ func normalizeDatagramSocketDefaults(value DatagramSocketDefaults, defaultReceiv
 	if value.HopLimit == 0 {
 		value.HopLimit = 64
 	}
+	if value.MulticastHopLimit == 0 {
+		value.MulticastHopLimit = 1
+	}
 	return value, nil
 }
 
@@ -269,52 +304,37 @@ func normalizeDatagramSocketDefaults(value DatagramSocketDefaults, defaultReceiv
 // checks are performed by the caller; this method recognizes a directed
 // broadcast on one of the stack's configured IPv4 subnets.
 func (state *networkState) invalidInboundSource(address netip.Addr) bool {
-	address = address.Unmap()
-	if !address.Is4() {
-		return false
-	}
-	addressBytes := address.As4()
-	value := binary.BigEndian.Uint32(addressBytes[:])
-	for _, prefix := range state.localPrefixes {
-		if !prefix.Addr().Is4() || prefix.Bits() >= 31 || !prefix.Contains(address) {
-			continue
-		}
-		networkBytes := prefix.Addr().As4()
-		network := binary.BigEndian.Uint32(networkBytes[:])
-		hostMask := uint32((uint64(1) << (32 - prefix.Bits())) - 1)
-		if value == network|hostMask {
-			return true
-		}
-	}
-	return false
+	_, broadcast := state.broadcast[address.Unmap()]
+	return broadcast
 }
 
 // broadcastDestination reports limited broadcast and directed broadcast for
-// one of the configured IPv4 prefixes. Mipstack exposes unicast sockets and
-// has no SO_BROADCAST option, so these addresses cannot be used as ordinary
-// transport destinations.
+// one of the configured IPv4 prefixes.
 func (state *networkState) broadcastDestination(address netip.Addr) bool {
 	address = address.Unmap()
 	if !address.Is4() {
 		return false
 	}
-	addressBytes := address.As4()
-	value := binary.BigEndian.Uint32(addressBytes[:])
-	if value == ^uint32(0) {
+	if address == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
 		return true
 	}
-	for _, prefix := range state.localPrefixes {
-		if !prefix.Addr().Is4() || prefix.Bits() >= 31 || !prefix.Contains(address) {
-			continue
-		}
-		networkBytes := prefix.Addr().As4()
-		network := binary.BigEndian.Uint32(networkBytes[:])
-		hostMask := uint32((uint64(1) << (32 - prefix.Bits())) - 1)
-		if value == network|hostMask {
-			return true
-		}
+	_, broadcast := state.broadcast[address]
+	return broadcast
+}
+
+// ipv4BroadcastAddress returns the directed broadcast for prefixes that have
+// a host field. RFC 3021 /31 and host /32 prefixes have no broadcast address;
+// RFC 1122 loopback space must never select the embedding link.
+func ipv4BroadcastAddress(prefix netip.Prefix) (netip.Addr, bool) {
+	if !prefix.IsValid() || !prefix.Addr().Is4() || prefix.Addr().IsLoopback() || prefix.Bits() >= 31 {
+		return netip.Addr{}, false
 	}
-	return false
+	networkBytes := prefix.Masked().Addr().As4()
+	network := binary.BigEndian.Uint32(networkBytes[:])
+	hostMask := uint32((uint64(1) << (32 - prefix.Bits())) - 1)
+	var address [4]byte
+	binary.BigEndian.PutUint32(address[:], network|hostMask)
+	return netip.AddrFrom4(address), true
 }
 
 // isIPv4Broadcast reports limited broadcast and subnet broadcast addresses.
@@ -371,15 +391,13 @@ func (state *networkState) routeFor(destination netip.Addr) (Route, bool) {
 	return selected, selectedIndex >= 0
 }
 
-// sourceFor selects a route-admitted local address using the applicable RFC
-// 6724 rules for a single interface with preferred, non-temporary addresses.
-func (state *networkState) sourceFor(destination, requested netip.Addr) (netip.Addr, error) {
+// sourceForUnicast selects a route-admitted local address using the applicable
+// RFC 6724 rules for a single interface with preferred, non-temporary
+// addresses. The caller has already excluded multicast and broadcast.
+func (state *networkState) sourceForUnicast(destination, requested netip.Addr) (netip.Addr, error) {
 	destination = destination.Unmap()
 	if !destination.IsValid() || destination.IsUnspecified() || destination.IsMulticast() || destination.Zone() != "" {
 		return netip.Addr{}, syscall.EINVAL
-	}
-	if state.broadcastDestination(destination) {
-		return netip.Addr{}, syscall.EACCES
 	}
 	route, exists := state.routeFor(destination)
 	if !exists {
@@ -418,6 +436,95 @@ func (state *networkState) sourceFor(destination, requested netip.Addr) (netip.A
 	return selected, nil
 }
 
+// sourceForNonUnicast selects the source of output constrained to mipstack's
+// single embedding interface. Broadcast and multicast do not use the unicast
+// route table: Linux represents their selected output interface separately,
+// while mipstack has exactly one such interface.
+func (state *networkState) sourceForNonUnicast(destination, requested netip.Addr) (netip.Addr, error) {
+	destination = destination.Unmap()
+	if !destination.IsValid() || destination.IsUnspecified() || destination.Zone() != "" ||
+		!destination.IsMulticast() && !state.broadcastDestination(destination) {
+		return netip.Addr{}, syscall.EINVAL
+	}
+	if destination.IsMulticast() && !validMulticastGroup(destination) {
+		return netip.Addr{}, syscall.EINVAL
+	}
+	requested = requested.Unmap()
+	if requested.IsValid() && !requested.IsUnspecified() {
+		if requested.Zone() != "" || requested.IsMulticast() || requested.Is6() != destination.Is6() {
+			return netip.Addr{}, syscall.EAFNOSUPPORT
+		}
+		if _, local := state.local[requested]; !local {
+			return netip.Addr{}, syscall.EADDRNOTAVAIL
+		}
+		if state.broadcastDestination(destination) && requested.IsLoopback() {
+			return netip.Addr{}, syscall.ENETUNREACH
+		}
+		if destination.IsMulticast() && !sourceScopeUsable(requested, destination) {
+			return netip.Addr{}, syscall.ENETUNREACH
+		}
+		return requested, nil
+	}
+	if state.broadcastDestination(destination) {
+		// Prefer an address from the directed-broadcast subnet. Limited
+		// broadcast falls through to the first configured IPv4 address.
+		if destination != netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
+			for _, prefix := range state.localPrefixes {
+				if !prefix.Addr().Is4() || !isIPv4Broadcast(prefix, destination, prefix.Bits()) {
+					continue
+				}
+				for _, candidate := range state.sources {
+					if candidate.Is4() && !candidate.IsLoopback() && prefix.Contains(candidate) {
+						return candidate, nil
+					}
+				}
+			}
+		}
+		for _, candidate := range state.sources {
+			if candidate.Is4() && !candidate.IsLoopback() {
+				return candidate, nil
+			}
+		}
+		return netip.Addr{}, syscall.EADDRNOTAVAIL
+	}
+	if destination.Is4() {
+		// Without IP_MULTICAST_IF, Linux uses the selected interface's
+		// primary IPv4 address. Configuration order defines that primary
+		// address for mipstack's single interface.
+		for _, candidate := range state.sources {
+			if candidate.Is4() && !candidate.IsLoopback() && sourceScopeUsable(candidate, destination) {
+				return candidate, nil
+			}
+		}
+		return netip.Addr{}, syscall.EADDRNOTAVAIL
+	}
+	var selected netip.Addr
+	for _, candidate := range state.sources {
+		if candidate.Is6() != destination.Is6() || !sourceScopeUsable(candidate, destination) {
+			continue
+		}
+		if !selected.IsValid() || preferSource(candidate, selected, destination) {
+			selected = candidate
+		}
+	}
+	if !selected.IsValid() {
+		return netip.Addr{}, syscall.EADDRNOTAVAIL
+	}
+	return selected, nil
+}
+
+// hasOutputPath reports whether an established connectionless socket can
+// still select this stack's only output interface after a configuration
+// change. Non-unicast interface selection is independent of unicast routes.
+func (state *networkState) hasOutputPath(destination netip.Addr) bool {
+	destination = destination.Unmap()
+	if destination.IsMulticast() || state.broadcastDestination(destination) {
+		return networkStateHasFamily(state, destination.Is6())
+	}
+	_, routed := state.routeFor(destination)
+	return routed
+}
+
 // preferSource applies same-address, matching-scope, matching-label, and
 // longest-prefix rules. Stable configuration order resolves complete ties.
 func preferSource(candidate, current, destination netip.Addr) bool {
@@ -439,11 +546,61 @@ func sourceScopeUsable(source, destination netip.Addr) bool {
 	return addressScope(source) >= addressScope(destination) || destination.IsLoopback()
 }
 
+// validMulticastGroup rejects malformed group addresses that netip still
+// classifies by prefix. It applies RFC 4291's reserved flag/scope rules and
+// the RFC 3306/RFC 3956 dependencies between R, P, and T. Embedded fields are
+// deliberately not validated here because RFC 3956 requires receivers to
+// ignore some sender-reserved values.
+func validMulticastGroup(address netip.Addr) bool {
+	address = address.Unmap()
+	if !address.IsValid() || !address.IsMulticast() || address.Zone() != "" {
+		return false
+	}
+	if address.Is4() {
+		return true
+	}
+	raw := address.As16()
+	flags, scope := raw[1]>>4, raw[1]&0x0f
+	if scope == 0 || flags&8 != 0 {
+		return false
+	}
+	transient, prefixBased, embeddedRP := flags&1 != 0, flags&2 != 0, flags&4 != 0
+	if prefixBased && !transient || embeddedRP && !prefixBased {
+		return false
+	}
+	return true
+}
+
+// isInterfaceLocalMulticast identifies IPv6 scope one, which may traverse
+// mipstack's internal loopback path but must never arrive from or leave via
+// the embedding link.
+func isInterfaceLocalMulticast(address netip.Addr) bool {
+	address = address.Unmap()
+	return address.Is6() && address.IsMulticast() && address.As16()[1]&0x0f == 1
+}
+
 // addressScope returns an ordered subset of the RFC 6724 scope classes.
 func addressScope(address netip.Addr) uint8 {
 	address = address.Unmap()
 	if address.IsLoopback() {
 		return 0
+	}
+	if address.IsMulticast() {
+		if address.Is4() {
+			value := address.As4()
+			if value[0] == 224 && value[1] == 0 && value[2] == 0 {
+				return 1
+			}
+			return 2
+		}
+		scope := address.As16()[1] & 0x0f
+		if scope <= 1 {
+			return 0
+		}
+		if scope == 2 {
+			return 1
+		}
+		return 2
 	}
 	if address.IsLinkLocalUnicast() {
 		return 1

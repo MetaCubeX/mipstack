@@ -25,6 +25,12 @@ func TestMTUAndRouteFamilyValidation(t *testing.T) {
 	if _, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.255/24")}}); err == nil {
 		t.Fatal("IPv4 subnet broadcast address was accepted as local")
 	}
+	if _, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.MustParsePrefix("192.0.2.255/32"),
+		netip.MustParsePrefix("192.0.2.1/24"),
+	}}); err == nil {
+		t.Fatal("address that is another configured prefix's broadcast was accepted as local")
+	}
 	if _, err := New(Config{
 		LocalAddresses: []netip.Prefix{ipv4},
 		Routes:         []Route{{Destination: netip.MustParsePrefix("2001:db8::/32")}},
@@ -47,9 +53,52 @@ func TestMTUAndRouteFamilyValidation(t *testing.T) {
 		if _, routeErr := broadcastStack.RouteFor(destination); !errors.Is(routeErr, syscall.EACCES) {
 			t.Fatalf("broadcast route %s = %v, want EACCES", destination, routeErr)
 		}
-		if _, sourceErr := broadcastStack.sourceForRequested(destination, netip.Addr{}); !errors.Is(sourceErr, syscall.EACCES) {
-			t.Fatalf("broadcast source %s = %v, want EACCES", destination, sourceErr)
+		if source, sourceErr := broadcastStack.sourceForRequested(destination, netip.Addr{}); sourceErr != nil || source != netip.MustParseAddr("192.0.2.15") {
+			t.Fatalf("broadcast source %s = %s, %v, want 192.0.2.15", destination, source, sourceErr)
 		}
+	}
+}
+
+func TestIPv4BroadcastPrefixBoundaries(t *testing.T) {
+	tests := []struct {
+		prefix    string
+		address   string
+		broadcast bool
+	}{
+		{prefix: "192.0.2.1/24", address: "192.0.2.255", broadcast: true},
+		{prefix: "192.0.2.1/30", address: "192.0.2.3", broadcast: true},
+		{prefix: "192.0.2.0/31", address: "192.0.2.1"},
+		{prefix: "192.0.2.255/32", address: "192.0.2.255"},
+	}
+	for _, test := range tests {
+		state, err := buildNetworkState(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix(test.prefix)}})
+		if err != nil {
+			t.Fatalf("buildNetworkState(%s): %v", test.prefix, err)
+		}
+		address := netip.MustParseAddr(test.address)
+		if got := state.broadcastDestination(address); got != test.broadcast {
+			t.Fatalf("broadcastDestination(%s, %s) = %v, want %v", test.prefix, address, got, test.broadcast)
+		}
+	}
+}
+
+func TestDirectedBroadcastSelectsAddressOnMatchingSubnet(t *testing.T) {
+	primary := netip.MustParseAddr("198.51.100.1")
+	matching := netip.MustParseAddr("192.0.2.1")
+	state, err := buildNetworkState(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(primary, 24),
+		netip.PrefixFrom(matching, 24),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := netip.MustParseAddr("192.0.2.255")
+	source, err := state.sourceForNonUnicast(destination, netip.Addr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source != matching {
+		t.Fatalf("directed-broadcast source = %s, want %s", source, matching)
 	}
 }
 
@@ -451,6 +500,32 @@ func TestRFC6724AddressLabels(t *testing.T) {
 		if label := addressLabel(netip.MustParseAddr(test.address)); label != test.label {
 			t.Errorf("addressLabel(%s) = %d, want %d", test.address, label, test.label)
 		}
+	}
+}
+
+func TestIPv4MulticastUsesPrimaryInterfaceAddress(t *testing.T) {
+	loopback := netip.MustParseAddr("127.0.0.1")
+	primary := netip.MustParseAddr("10.0.0.1")
+	secondary := netip.MustParseAddr("192.0.2.1")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(loopback, 8), netip.PrefixFrom(primary, 24), netip.PrefixFrom(secondary, 24),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := stack.sourceForRequested(netip.MustParseAddr("239.192.0.1"), netip.Addr{})
+	if err != nil || source != primary {
+		t.Fatalf("IPv4 multicast source = %s, %v, want primary %s", source, err, primary)
+	}
+	source, err = stack.sourceForRequested(netip.MustParseAddr("255.255.255.255"), netip.Addr{})
+	if err != nil || source != primary {
+		t.Fatalf("limited-broadcast source = %s, %v, want primary %s", source, err, primary)
+	}
+	if _, err = stack.sourceForRequested(netip.MustParseAddr("127.255.255.255"), netip.Addr{}); !errors.Is(err, syscall.ENETUNREACH) {
+		t.Fatalf("loopback directed-broadcast route = %v, want ENETUNREACH", err)
+	}
+	if source, ok := (&multicastState{stack: stack}).reportSource(false); !ok || source != primary {
+		t.Fatalf("IGMP report source = %s, %v, want primary %s", source, ok, primary)
 	}
 }
 

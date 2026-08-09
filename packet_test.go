@@ -81,6 +81,43 @@ func TestTransportChecksumPartsMatchesContiguousPayload(t *testing.T) {
 	}
 }
 
+func TestIPv6RouterAlertValidation(t *testing.T) {
+	valid := []byte{protocolICMPv6, 0, 5, 2, 0, 0, 1, 0}
+	if !ipv6RouterAlert(valid) {
+		t.Fatal("valid IPv6 Router Alert was rejected")
+	}
+	malformed := []byte{protocolICMPv6, 0, 5, 1, 0, 1, 1, 0}
+	if ipv6RouterAlert(malformed) {
+		t.Fatal("malformed IPv6 Router Alert was accepted")
+	}
+	duplicate := []byte{protocolICMPv6, 1, 5, 2, 0, 0, 5, 2, 0, 0, 1, 4, 0, 0, 0, 0}
+	if ipv6RouterAlert(duplicate) {
+		t.Fatal("duplicate IPv6 Router Alert was accepted")
+	}
+}
+
+func TestIPv4RouterAlertValidation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		options []byte
+		valid   bool
+	}{
+		{name: "exact", options: []byte{148, 4, 0, 0}, valid: true},
+		{name: "with-eol-padding", options: []byte{148, 4, 0, 0, 0, 0, 0, 0}, valid: true},
+		{name: "after-nops", options: []byte{1, 1, 1, 1, 148, 4, 0, 0}, valid: true},
+		{name: "missing", options: []byte{1, 1, 1, 0}},
+		{name: "nonzero-value", options: []byte{148, 4, 0, 1}},
+		{name: "duplicate", options: []byte{148, 4, 0, 0, 148, 4, 0, 0}},
+		{name: "nonzero-eol-padding", options: []byte{148, 4, 0, 0, 0, 1, 0, 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ipv4RouterAlert(test.options); got != test.valid {
+				t.Fatalf("ipv4RouterAlert() = %t, want %t", got, test.valid)
+			}
+		})
+	}
+}
+
 func BenchmarkChecksum(b *testing.B) {
 	data := make([]byte, 1500)
 	for index := range data {
@@ -368,6 +405,27 @@ func TestIPv4MappedIPv6WireSourceIsDropped(t *testing.T) {
 	if entry, ok := stack.outbound.tryDequeue(); ok {
 		response := consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("mapped IPv6 source produced response: %x", response)
+	}
+}
+
+func TestIPv4MappedIPv6WireDestinationIsDropped(t *testing.T) {
+	local4 := netip.MustParseAddr("192.0.2.62")
+	remote6 := netip.MustParseAddr("2001:db8::63")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local4, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	packet := buildIPPacket(remote6, netip.MustParseAddr("::ffff:192.0.2.62"), 99, []byte{1}, 0, true)
+	before := stack.Stats().InboundDroppedPackets
+	if err = writeTestPacket(stack, packet); err != nil {
+		t.Fatal(err)
+	}
+	if after := stack.Stats().InboundDroppedPackets; after != before+1 {
+		t.Fatalf("mapped IPv6 destination drop count = %d, want %d", after, before+1)
 	}
 }
 

@@ -27,12 +27,14 @@ const (
 	fragmentIPv6Lifetime = 60 * time.Second
 )
 
-// fragmentKey identifies one IPv4 or IPv6 fragmented datagram.
+// fragmentKey identifies one IPv4 or IPv6 fragmented datagram and keeps
+// internal loopback separate from packets received on the embedding link.
 type fragmentKey struct {
 	source, target netip.Addr
 	identification uint32
 	protocol       byte
 	v6             bool
+	loopback       bool
 }
 
 // fragmentPiece is a non-overlapping byte range in a fragment set.
@@ -119,11 +121,14 @@ func (s *Stack) runFragmentCleaner() {
 
 // reassemblePacketStatus distinguishes a valid fragment waiting for more data
 // from malformed input. pending is true only when the fragment was retained.
-func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time) (_ []byte, pending bool) {
+func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time, loopback bool) (_ []byte, pending bool) {
 	fragment, ok := parseFragment(packet)
-	if !ok || fragment.truncated || fragment.parameter || !s.network.Load().acceptsInboundDestination(fragment.key.target) || fragment.key.source.IsUnspecified() || fragment.key.source.IsMulticast() || fragment.key.source.Is4In6() {
+	network := s.network.Load()
+	if !ok || fragment.truncated || fragment.parameter || !s.acceptsInboundDestination(network, fragment.key.target, loopback) ||
+		!validInboundFragmentSource(network, fragment.key.source, fragment.key.target, fragment.protocol) {
 		return nil, false
 	}
+	fragment.key.loopback = loopback
 	s.fragmentMu.Lock()
 	expired := s.cleanFragmentsLocked(now)
 	defer func() {
@@ -685,13 +690,13 @@ func (s *Stack) discardFragment(key fragmentKey) {
 	s.fragmentMu.Unlock()
 }
 
-// pruneFragments discards incomplete datagrams for addresses removed by a
-// configuration update. They must not later emit timeout errors from an
-// address the stack no longer owns.
+// pruneFragments discards incomplete datagrams whose destination was removed
+// by a configuration or multicast-membership update. They must not later emit
+// timeout errors or become deliverable after their admission state changed.
 func (s *Stack) pruneFragments(network *networkState) {
 	s.fragmentMu.Lock()
 	for key, set := range s.fragments {
-		if !network.acceptsInboundDestination(key.target) {
+		if !s.acceptsInboundDestination(network, key.target, key.loopback) {
 			s.removeFragmentLocked(key, set)
 		}
 	}

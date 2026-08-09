@@ -142,6 +142,17 @@ type DatagramSocketDefaults struct {
 	ReceiveBuffer int
 	// HopLimit is the default IPv4 TTL or IPv6 Hop Limit. Zero selects 64.
 	HopLimit int
+	// MulticastHopLimit is the default IPv4 multicast TTL or IPv6 multicast
+	// Hop Limit. Zero selects the socket-compatible default of one hop.
+	MulticastHopLimit int
+	// DisableMulticastLoopback disables delivery of transmitted multicast
+	// packets to matching local memberships. Loopback is enabled by default,
+	// matching IP_MULTICAST_LOOP and IPV6_MULTICAST_LOOP.
+	DisableMulticastLoopback bool
+	// DisableBroadcast clears the SO_BROADCAST-equivalent permission inherited
+	// by new sockets. Broadcast is enabled by default, matching Go's net UDP
+	// sockets on supported operating systems.
+	DisableBroadcast bool
 	// TrafficClass is the default IPv4 TOS or IPv6 Traffic Class byte.
 	TrafficClass uint8
 	// FlowLabel is the default IPv6 Flow Label. Zero selects a stable automatic
@@ -198,6 +209,8 @@ type Stack struct {
 	udpForwarded  map[udpFlowKey]*UDPConn
 	udpForwarder  udpForwarderEndpoints
 	ip            ipEndpoints
+	multicast     multicastEndpoints
+	multicastSeed *multicastQuerierSeed
 	icmpForwarder icmpForwarderEndpoints
 	nextPort      [2]automaticPortCursor
 
@@ -221,6 +234,27 @@ type Stack struct {
 	controlLimiters [controlResponseClassCount]tokenBucket
 	stats           stackCounters
 }
+
+// inboundDestinationClass keeps local ownership, non-unicast reception, and
+// transparent admission distinct throughout transport dispatch.
+type inboundDestinationClass uint8
+
+const (
+	// inboundDestinationRejected identifies traffic outside every admissible
+	// local, non-unicast, and transparent destination class.
+	inboundDestinationRejected inboundDestinationClass = iota
+	// inboundDestinationLocalUnicast identifies an address owned by the Stack.
+	inboundDestinationLocalUnicast
+	// inboundDestinationBroadcast identifies limited or configured-subnet IPv4
+	// broadcast traffic.
+	inboundDestinationBroadcast
+	// inboundDestinationMulticast identifies traffic admitted by an implicit
+	// all-hosts group or an explicit multicast membership.
+	inboundDestinationMulticast
+	// inboundDestinationPromiscuousUnicast identifies nonlocal unicast admitted
+	// only for transparent forwarders.
+	inboundDestinationPromiscuousUnicast
+)
 
 // StackStats is a point-in-time snapshot of stack activity. Counters are
 // monotonic except ActiveTCPConnections, ActiveTCPListeners,
@@ -1287,6 +1321,7 @@ func (s *Stack) UpdateConfig(config Config) error {
 		return ErrClosed
 	}
 	previous := s.network.Load()
+	multicastConfigurationChanged := !previous.sameMulticastConfiguration(state)
 	if !previous.samePathConfiguration(state) {
 		s.pathMTUMu.Lock()
 		s.network.Store(state)
@@ -1302,6 +1337,7 @@ func (s *Stack) UpdateConfig(config Config) error {
 	}
 	tcpPassive := s.tcpPassive
 	tcpForwarder, udpForwarder, icmpForwarder := s.tcpForwarder, s.udpForwarder, s.icmpForwarder
+	multicast := s.multicast
 	udpConnections := s.udpConnectionsLocked()
 	ip := s.ip
 	s.mu.Unlock()
@@ -1338,13 +1374,16 @@ func (s *Stack) UpdateConfig(config Config) error {
 			continue
 		}
 		if connection.remote.IsValid() {
-			if _, routed := state.routeFor(connection.remote.Addr()); !routed {
+			if !state.hasOutputPath(connection.remote.Addr()) {
 				s.closeUDP(connection)
 			}
 		}
 	}
 	if ip != nil {
 		ip.updateConfig(s, state)
+	}
+	if multicast != nil && multicastConfigurationChanged {
+		multicast.updateConfig(state)
 	}
 	s.pruneFragments(state)
 	return nil
@@ -1757,7 +1796,7 @@ func (s *Stack) runLoopback() {
 	for {
 		select {
 		case entry := <-s.loopback.packets:
-			_ = s.handleInboundPacket(entry.packet, time.Now())
+			_ = s.handleInboundPacket(entry.packet, time.Now(), true)
 			s.loopback.release(entry)
 		case <-s.closeCh:
 			return
@@ -1778,9 +1817,120 @@ func (s *Stack) ready() error {
 	return nil
 }
 
-// sourceForRequested validates an explicit source or selects one automatically.
+// sourceForOutput validates an explicit source or selects one automatically
+// and returns whether output must use multicast or broadcast semantics.
+func (s *Stack) sourceForOutput(destination, requested netip.Addr) (netip.Addr, bool, error) {
+	state := s.network.Load()
+	destination = destination.Unmap()
+	if destination.IsMulticast() || state.broadcastDestination(destination) {
+		source, err := state.sourceForNonUnicast(destination, requested)
+		return source, true, err
+	}
+	source, err := state.sourceForUnicast(destination, requested)
+	return source, false, err
+}
+
+// sourceForRequested is the source-selection form used when the caller does
+// not need the already-computed output class.
 func (s *Stack) sourceForRequested(destination, requested netip.Addr) (netip.Addr, error) {
-	return s.network.Load().sourceFor(destination, requested)
+	source, _, err := s.sourceForOutput(destination, requested)
+	return source, err
+}
+
+// classifyInboundDestination applies local ownership and network policy, then
+// consults the optional multicast membership state only for multicast input.
+func (s *Stack) classifyInboundDestination(state *networkState, destination netip.Addr, loopback bool) inboundDestinationClass {
+	if destination.Is4In6() {
+		return inboundDestinationRejected
+	}
+	destination = destination.Unmap()
+	if networkStateHasLocal(state, destination) {
+		return inboundDestinationLocalUnicast
+	}
+	if state.broadcastDestination(destination) {
+		if !networkStateHasFamily(state, false) {
+			return inboundDestinationRejected
+		}
+		return inboundDestinationBroadcast
+	}
+	if destination.IsMulticast() {
+		if !validMulticastGroup(destination) || isInterfaceLocalMulticast(destination) && !loopback {
+			return inboundDestinationRejected
+		}
+		if isAllHostsGroup(destination) && networkStateHasFamily(state, destination.Is6()) {
+			return inboundDestinationMulticast
+		}
+		s.mu.RLock()
+		multicast := s.multicast
+		s.mu.RUnlock()
+		if multicast != nil && multicast.acceptsDestination(destination) {
+			return inboundDestinationMulticast
+		}
+		return inboundDestinationRejected
+	}
+	if state.acceptsNonlocalDestination(destination) {
+		return inboundDestinationPromiscuousUnicast
+	}
+	return inboundDestinationRejected
+}
+
+// acceptsInboundDestination is the admission predicate used before fragment
+// retention. Final dispatch classifies the reassembled packet again so a
+// membership removal cannot deliver stale queued fragments.
+func (s *Stack) acceptsInboundDestination(state *networkState, destination netip.Addr, loopback bool) bool {
+	return s.classifyInboundDestination(state, destination, loopback) != inboundDestinationRejected
+}
+
+// validInboundSource applies protocol-independent martian-source checks.
+// RFC 1122 permits 0.0.0.0 only during address initialization; accepting it
+// solely for limited broadcast preserves DHCP and BOOTP. Protocol-specific
+// exceptions are applied only after this predicate rejects the source.
+func validInboundSource(state *networkState, source, destination netip.Addr) bool {
+	if source.Is4In6() {
+		return false
+	}
+	source, destination = source.Unmap(), destination.Unmap()
+	if source.Is4() {
+		value := source.As4()
+		if value[0] == 0 {
+			return source.IsUnspecified() && destination == netip.AddrFrom4([4]byte{255, 255, 255, 255})
+		}
+	}
+	if !source.IsValid() || source.IsUnspecified() || source.IsMulticast() ||
+		source == netip.AddrFrom4([4]byte{255, 255, 255, 255}) || state.invalidInboundSource(source) {
+		return false
+	}
+	return !source.IsLoopback() || networkStateHasLocal(state, source)
+}
+
+// validInboundFragmentSource admits the only protocol-specific source that
+// cannot be verified before reassembly. RFC 9776 allows an IGMP Membership
+// Report from 0.0.0.0; the complete payload is checked again after assembly.
+func validInboundFragmentSource(state *networkState, source, destination netip.Addr, protocol byte) bool {
+	if validInboundSource(state, source, destination) {
+		return true
+	}
+	source = source.Unmap()
+	return protocol == 2 && source.Is4() && source.IsUnspecified()
+}
+
+// validInboundPacketSource applies the RFC 9776 section 4.2.14 exception for
+// Membership Reports from a host that has not acquired an IPv4 address. The
+// exception does not admit zero-source Queries or unrelated IGMP messages.
+func validInboundPacketSource(state *networkState, packet ipPacket) bool {
+	if validInboundSource(state, packet.source, packet.target) {
+		return true
+	}
+	source := packet.source.Unmap()
+	if packet.protocol != 2 || !source.Is4() || !source.IsUnspecified() || len(packet.payload) == 0 {
+		return false
+	}
+	switch packet.payload[0] {
+	case igmpV1MembershipReport, igmpV2MembershipReport, igmpV3MembershipReport:
+		return true
+	default:
+		return false
+	}
 }
 
 // automaticFlowLabel derives one nonzero RFC 6437-style label from a stable
@@ -2060,7 +2210,7 @@ func (s *Stack) DialUDP(ctx context.Context, network string, source, remote neti
 	if err := validateTransportNetwork(network, "udp", remote.Addr()); err != nil {
 		return wrap(nil, err)
 	}
-	if !remote.IsValid() || remote.Addr().IsUnspecified() || remote.Addr().IsMulticast() || remote.Addr().Zone() != "" {
+	if !remote.IsValid() || remote.Addr().IsUnspecified() || remote.Addr().Zone() != "" {
 		return wrap(nil, errors.New("mipstack: invalid UDP destination"))
 	}
 	if err := ctx.Err(); err != nil {
@@ -2214,7 +2364,7 @@ func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 		if offset < 0 || offset > len(buffer) {
 			return count, errors.New("mipstack: invalid Write offset")
 		}
-		if err := s.handleInboundPacket(buffer[offset:], receivedAt); err != nil {
+		if err := s.handleInboundPacket(buffer[offset:], receivedAt, false); err != nil {
 			return count, err
 		}
 		count++
@@ -2583,42 +2733,42 @@ func (s *Stack) recordOutput(loopback bool) {
 // dispatching it to ICMP, TCP, UDP, or a raw IP endpoint. receivedAt is shared
 // by packets from one device batch so transport timing does not depend on
 // parsing order.
-func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time) error {
+func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopback bool) error {
 	s.stats.inboundPackets.Add(1)
 	parsed, ok := parseIPPacket(packet)
 	if !ok {
-		if fragment, valid := parseFragment(packet); valid && s.network.Load().acceptsInboundDestination(fragment.key.target) &&
-			!fragment.key.source.IsUnspecified() && !fragment.key.source.IsMulticast() && !fragment.key.source.Is4In6() {
+		network := s.network.Load()
+		if fragment, valid := parseFragment(packet); valid && s.acceptsInboundDestination(network, fragment.key.target, loopback) &&
+			validInboundFragmentSource(network, fragment.key.source, fragment.key.target, fragment.protocol) {
 			if fragment.truncated || fragment.parameter {
+				fragment.key.loopback = loopback
 				s.discardFragment(fragment.key)
 				s.stats.inboundDroppedPackets.Add(1)
-				if !s.isLocal(fragment.key.target) {
-					return nil
-				}
+				destination := s.classifyInboundDestination(s.network.Load(), fragment.key.target, loopback)
 				code, at := byte(3), uint32(0)
 				if fragment.parameter && !fragment.truncated {
 					code, at = fragment.parameterCode, fragment.parameterAt
 				}
-				_ = s.sendParameterProblem(ipPacket{
+				_ = s.sendInboundParameterProblem(ipPacket{
 					source: fragment.key.source, target: fragment.key.target, original: fragment.original,
 					parameterError: true, parameterCode: code, parameterAt: at,
-				})
+				}, destination)
 				return nil
 			}
 		}
-		if reassembled, pending := s.reassemblePacketStatus(packet, receivedAt); reassembled != nil {
+		if reassembled, pending := s.reassemblePacketStatus(packet, receivedAt, loopback); reassembled != nil {
 			parsed, ok = parseIPPacket(reassembled)
 		} else if pending {
 			return nil
 		}
 	}
 	network := s.network.Load()
-	limitedBroadcast := parsed.source.Is4() && parsed.source == netip.AddrFrom4([4]byte{255, 255, 255, 255})
-	foreignLoopback := parsed.source.IsLoopback() && !networkStateHasLocal(network, parsed.source)
-	localDestination := ok && networkStateHasLocal(network, parsed.target)
-	acceptedDestination := localDestination || ok && network.acceptsNonlocalDestination(parsed.target)
-	invalidSource := ok && (parsed.source.IsUnspecified() || parsed.source.IsMulticast() || parsed.source.Is4In6() || limitedBroadcast ||
-		network.invalidInboundSource(parsed.source) || foreignLoopback)
+	destination := inboundDestinationRejected
+	if ok {
+		destination = s.classifyInboundDestination(network, parsed.target, loopback)
+	}
+	acceptedDestination := destination != inboundDestinationRejected
+	invalidSource := ok && !validInboundPacketSource(network, parsed)
 	if !ok || !acceptedDestination || invalidSource {
 		s.stats.inboundDroppedPackets.Add(1)
 		if !ok {
@@ -2633,47 +2783,103 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time) error {
 		}
 		return nil
 	}
-	if !localDestination {
+	if destination == inboundDestinationPromiscuousUnicast {
 		s.stats.promiscuousInboundPackets.Add(1)
 	}
 	s.mu.RLock()
 	closed := s.closed
+	ip := s.ip
+	multicast := s.multicast
 	s.mu.RUnlock()
 	if closed {
 		return ErrClosed
 	}
+	multicastControl := isMulticastControlPacket(parsed)
+	if multicastControl {
+		multicast = s.multicastStateForQuery(parsed, multicast, receivedAt)
+	}
 	if parsed.parameterError {
 		s.stats.inboundDroppedPackets.Add(1)
-		if !localDestination {
+		if destination == inboundDestinationMulticast && !isAllHostsGroup(parsed.target) &&
+			(multicast == nil || !multicast.acceptsSource(parsed.target, parsed.source)) {
 			return nil
 		}
-		_ = s.sendParameterProblem(parsed)
+		_ = s.sendInboundParameterProblem(parsed, destination)
 		return nil
 	}
-	s.mu.RLock()
-	ip := s.ip
-	s.mu.RUnlock()
-	rawDelivered := localDestination && ip != nil && ip.deliver(s, parsed)
+	// UDP and raw sockets apply equivalent per-socket filters during fanout.
+	// Built-in ICMP processing needs the aggregate interface filter here.
+	if destination == inboundDestinationMulticast && (parsed.protocol == protocolICMPv4 || parsed.protocol == protocolICMPv6) &&
+		!isAllHostsGroup(parsed.target) && !isMulticastControlPacket(parsed) &&
+		(multicast == nil || !multicast.acceptsSource(parsed.target, parsed.source)) {
+		s.stats.inboundDroppedPackets.Add(1)
+		return nil
+	}
+	rawDelivered := false
+	switch destination {
+	case inboundDestinationLocalUnicast, inboundDestinationBroadcast:
+		rawDelivered = ip != nil && ip.deliver(s, parsed)
+	case inboundDestinationMulticast:
+		if isAllHostsGroup(parsed.target) {
+			if multicast != nil {
+				rawDelivered = multicast.deliverImplicitIP(parsed, ip)
+			} else {
+				rawDelivered = ip != nil && ip.deliver(s, parsed)
+			}
+		} else {
+			rawDelivered = multicast != nil && multicast.deliverIP(parsed)
+		}
+	}
+	if multicastControl {
+		if multicast != nil {
+			multicast.handleControl(parsed, receivedAt)
+		}
+		return nil
+	}
 	switch parsed.protocol {
 	case protocolTCP:
-		return s.handleTCPForDestination(parsed, receivedAt, localDestination)
+		if destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast {
+			return s.handleTCPForDestination(parsed, receivedAt, destination == inboundDestinationLocalUnicast)
+		}
+		return nil
 	case protocolUDP:
-		return s.handleUDP(parsed, localDestination)
+		return s.handleUDP(parsed, destination)
 	case protocolICMPv4:
-		if parsed.source.Is4() {
-			return s.handleICMP(parsed, localDestination)
+		if parsed.source.Is4() && (destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast) {
+			return s.handleICMP(parsed, destination == inboundDestinationLocalUnicast)
 		}
 	case protocolICMPv6:
-		if parsed.source.Is6() {
-			return s.handleICMP(parsed, localDestination)
+		if parsed.source.Is6() && destination == inboundDestinationMulticast {
+			return s.handleMulticastICMPv6(parsed)
+		}
+		if parsed.source.Is6() && (destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast) {
+			return s.handleICMP(parsed, destination == inboundDestinationLocalUnicast)
 		}
 	default:
 	}
-	if !localDestination || parsed.protocol == 59 || rawDelivered {
+	if destination != inboundDestinationLocalUnicast || parsed.protocol == 59 || rawDelivered {
 		return nil
 	}
 	_ = s.sendProtocolUnreachable(parsed)
 	return nil
+}
+
+// sendInboundParameterProblem applies the RFC 4443 multicast exception for
+// an unrecognized IPv6 option. A multicast destination is never a valid reply
+// source, so the response uses the unicast source selected for the sender.
+func (s *Stack) sendInboundParameterProblem(packet ipPacket, destination inboundDestinationClass) error {
+	if destination == inboundDestinationLocalUnicast {
+		return s.sendParameterProblem(packet)
+	}
+	if destination != inboundDestinationMulticast || !packet.source.Is6() || packet.parameterCode != 2 {
+		return nil
+	}
+	source, err := s.sourceForRequested(packet.source, netip.Addr{})
+	if err != nil {
+		return err
+	}
+	packet.target = source
+	return s.sendParameterProblem(packet)
 }
 
 // Close closes every socket and releases all stack resources.
@@ -2693,6 +2899,7 @@ func (s *Stack) Close() error {
 	udpConnections := s.udpConnectionsLocked()
 	ip := s.ip
 	tcpForwarder, udpForwarder, icmpForwarder := s.tcpForwarder, s.udpForwarder, s.icmpForwarder
+	multicast := s.multicast
 	s.tcp = make(map[tcpKey]*TCPConn)
 	s.tcpPassive = nil
 	s.tcpForwarder = nil
@@ -2702,6 +2909,8 @@ func (s *Stack) Close() error {
 	s.udpForwarder = nil
 	s.ip = nil
 	s.icmpForwarder = nil
+	s.multicast = nil
+	s.multicastSeed = nil
 	s.stats.activeTCPConnections.Store(0)
 	s.stats.activeTCPListeners.Store(0)
 	s.stats.activeUDPSockets.Store(0)
@@ -2722,6 +2931,9 @@ func (s *Stack) Close() error {
 	}
 	if icmpForwarder != nil {
 		icmpForwarder.closeFromStack()
+	}
+	if multicast != nil {
+		multicast.close()
 	}
 	for _, connection := range tcpConnections {
 		connection.abortWithoutReset(ErrClosed)
@@ -2775,9 +2987,15 @@ func (s *Stack) closeUDP(connection *UDPConn) bool {
 		}
 	}
 	if removed {
+		if s.multicast != nil {
+			s.multicast.removeEndpoint(connection)
+		}
 		s.stats.activeUDPSockets.Add(^uint64(0))
 	}
 	s.mu.Unlock()
+	if removed {
+		s.pruneFragments(s.network.Load())
+	}
 	connection.closeFromStack()
 	return removed
 }
@@ -2804,6 +3022,9 @@ func (s *Stack) closeIP(connection *IPConn) bool {
 	removed := false
 	state, ok := s.ip.(*ipEndpointState)
 	if ok && state.remove(connection) {
+		if s.multicast != nil {
+			s.multicast.removeEndpoint(connection)
+		}
 		s.stats.activeIPSockets.Add(^uint64(0))
 		removed = true
 		if state.empty() {
@@ -2811,6 +3032,9 @@ func (s *Stack) closeIP(connection *IPConn) bool {
 		}
 	}
 	s.mu.Unlock()
+	if removed {
+		s.pruneFragments(s.network.Load())
+	}
 	connection.closeFromStack()
 	return removed
 }
