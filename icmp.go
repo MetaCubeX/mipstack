@@ -13,19 +13,23 @@ type ICMPError struct {
 	Reporter netip.Addr
 	// Type and Code retain the wire ICMP classification.
 	Type byte
+	// Code retains the wire subtype within Type.
 	Code byte
 	// MTU is present for fragmentation-needed and packet-too-big errors.
 	MTU uint32
 	// QuotedSource and QuotedTarget identify the failed original packet.
 	QuotedSource netip.Addr
+	// QuotedTarget is the destination of the failed original packet.
 	QuotedTarget netip.Addr
 	// QuotedProtocol and QuotedPayload locate the available original transport
 	// header bytes.
 	QuotedProtocol byte
-	QuotedPayload  []byte
+	// QuotedPayload contains the available original transport header bytes.
+	QuotedPayload []byte
 	// QuotedSourcePort and QuotedTargetPort identify TCP or UDP endpoints when
 	// the quoted transport header contains them.
 	QuotedSourcePort uint16
+	// QuotedTargetPort is the original TCP or UDP destination port when present.
 	QuotedTargetPort uint16
 }
 

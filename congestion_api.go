@@ -35,6 +35,7 @@ const (
 // own acknowledgement validation, loss detection, retransmission selection,
 // SACK/RACK/TLP, PRR accounting, and delivery-rate measurement.
 type CongestionController interface {
+	// HandleCongestionEvent applies one serialized transport event.
 	HandleCongestionEvent(event *CongestionEvent)
 }
 
@@ -65,6 +66,7 @@ const (
 	CongestionControlFeatureLossEvents
 )
 
+// congestionControlKnownFeatures is the complete transport-supported feature mask.
 const congestionControlKnownFeatures = CongestionControlFeatureDeliveryRate |
 	CongestionControlFeatureCustomPacing |
 	CongestionControlFeatureTransmissionEvents |
@@ -85,6 +87,7 @@ type CongestionControlDefinition struct {
 	SendBufferMultiplier uint32
 }
 
+// congestionControlRegistry holds built-in and application-registered algorithms.
 var congestionControlRegistry = struct {
 	sync.RWMutex
 	definitions map[CongestionControl]CongestionControlDefinition

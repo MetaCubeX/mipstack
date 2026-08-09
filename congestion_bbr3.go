@@ -7,26 +7,43 @@ import (
 )
 
 const (
-	// These fixed-point values are the defaults in Google's public Linux BBRv3
-	// implementation. Byte accounting replaces the kernel's packet accounting,
-	// but ratios and packet-timed state transitions are unchanged.
-	bbr3Scale                 = 256
-	bbr3StartupPacingGain     = 710.0 / bbr3Scale
-	bbr3DrainPacingGain       = 88.0 / bbr3Scale
-	bbr3ProbeDownPacingGain   = 232.0 / bbr3Scale
-	bbr3ProbeUpPacingGain     = 1.25
-	bbr3CongestionWindowGain  = 2.0
-	bbr3ProbeUpWindowGain     = 2.25
-	bbr3ProbeRTTWindowGain    = 0.5
-	bbr3LossThreshold         = 5
-	bbr3LossRetained          = 180
-	bbr3InflightHeadroom      = 38
-	bbr3FullLossEvents        = 6
-	bbr3ProbeMaximumRounds    = 63
-	bbr3ProbeBase             = 2 * time.Second
-	bbr3ProbeRandom           = time.Second
-	bbr3ProbeRTTWindow        = 5 * time.Second
-	bbr3PacketInflightMask    = uint32(1)<<31 - 1
+	// bbr3Scale is the fixed-point denominator used by Linux BBRv3 defaults.
+	// Mipstack uses byte rather than kernel packet accounting, while retaining
+	// the same ratios and packet-timed state transitions.
+	bbr3Scale = 256
+	// bbr3StartupPacingGain is the Linux Startup pacing gain.
+	bbr3StartupPacingGain = 710.0 / bbr3Scale
+	// bbr3DrainPacingGain drains Startup's excess queue.
+	bbr3DrainPacingGain = 88.0 / bbr3Scale
+	// bbr3ProbeDownPacingGain drains excess inflight after Probe Up.
+	bbr3ProbeDownPacingGain = 232.0 / bbr3Scale
+	// bbr3ProbeUpPacingGain raises inflight during a bandwidth probe.
+	bbr3ProbeUpPacingGain = 1.25
+	// bbr3CongestionWindowGain is the ordinary model-window gain.
+	bbr3CongestionWindowGain = 2.0
+	// bbr3ProbeUpWindowGain is the model-window gain during Probe Up.
+	bbr3ProbeUpWindowGain = 2.25
+	// bbr3ProbeRTTWindowGain reduces inflight while measuring minimum RTT.
+	bbr3ProbeRTTWindowGain = 0.5
+	// bbr3LossThreshold is the loss percentage that marks inflight as excessive.
+	bbr3LossThreshold = 5
+	// bbr3LossRetained is the fixed-point inflight retention after excessive loss.
+	bbr3LossRetained = 180
+	// bbr3InflightHeadroom is the fixed-point headroom below inflight_hi.
+	bbr3InflightHeadroom = 38
+	// bbr3FullLossEvents is the Startup loss-round exit threshold.
+	bbr3FullLossEvents = 6
+	// bbr3ProbeMaximumRounds bounds the upward probe slope.
+	bbr3ProbeMaximumRounds = 63
+	// bbr3ProbeBase is the minimum wall-clock interval between bandwidth probes.
+	bbr3ProbeBase = 2 * time.Second
+	// bbr3ProbeRandom is the randomized addition to the probe interval.
+	bbr3ProbeRandom = time.Second
+	// bbr3ProbeRTTWindow is the shortened minimum-RTT window used after ProbeRTT.
+	bbr3ProbeRTTWindow = 5 * time.Second
+	// bbr3PacketInflightMask extracts inflight bytes from a packet-state cookie.
+	bbr3PacketInflightMask = uint32(1)<<31 - 1
+	// bbr3PacketApplicationFlag marks an application-limited packet-state cookie.
 	bbr3PacketApplicationFlag = uint32(1) << 31
 )
 
@@ -34,9 +51,13 @@ const (
 type bbr3ProbePhase uint8
 
 const (
+	// bbr3ProbeUp grows inflight to search for additional bandwidth.
 	bbr3ProbeUp bbr3ProbePhase = iota
+	// bbr3ProbeDown drains the queue created by Probe Up.
 	bbr3ProbeDown
+	// bbr3ProbeCruise holds inflight below the learned upper bound.
 	bbr3ProbeCruise
+	// bbr3ProbeRefill restores inflight before the next Probe Up.
 	bbr3ProbeRefill
 )
 
@@ -60,10 +81,15 @@ func (p bbr3ProbePhase) String() string {
 type bbr3ACKPhase uint8
 
 const (
+	// bbr3ACKsInitial is the neutral probe-feedback state.
 	bbr3ACKsInitial bbr3ACKPhase = iota
+	// bbr3ACKsRefilling observes packets sent while refilling inflight.
 	bbr3ACKsRefilling
+	// bbr3ACKsProbeStarting waits for the first Probe Up transmission feedback.
 	bbr3ACKsProbeStarting
+	// bbr3ACKsProbeFeedback observes delivery from Probe Up transmissions.
 	bbr3ACKsProbeFeedback
+	// bbr3ACKsProbeStopping waits for pre-stop probe feedback to drain.
 	bbr3ACKsProbeStopping
 )
 
@@ -92,6 +118,7 @@ func bbr3EncodePacketState(state *CongestionState, bytes int) uint64 {
 	return uint64(uint32(state.LostBytes))<<32 | uint64(flags)
 }
 
+// bbr3DecodePacketState restores per-transmission inflight and loss evidence.
 func bbr3DecodePacketState(value uint64) bbr3PacketSnapshot {
 	flags := uint32(value)
 	return bbr3PacketSnapshot{
@@ -180,6 +207,7 @@ type bbr3CongestionControl struct {
 	undoInflightHigh   uint32
 }
 
+// newBBR3CongestionControl constructs one independent BBRv3 controller.
 func newBBR3CongestionControl() *bbr3CongestionControl {
 	return &bbr3CongestionControl{
 		probePhase:         bbr3ProbeDown,
@@ -188,6 +216,7 @@ func newBBR3CongestionControl() *bbr3CongestionControl {
 	}
 }
 
+// bbr3InitialWindowMSS expresses the initial window as a rounded MSS count.
 func bbr3InitialWindowMSS(window uint32, mss int) uint32 {
 	if mss < 1 {
 		return bbrInitialCongestionMSS
@@ -278,6 +307,7 @@ func (b *bbr3CongestionControl) HandleCongestionEvent(event *CongestionEvent) {
 	}
 }
 
+// syncDeliveryState publishes controller delivery-model state for diagnostics.
 func (b *bbr3CongestionControl) syncDeliveryState(state *CongestionState) {
 	b.delivered = state.DeliveredBytes
 	b.lost = state.LostBytes
@@ -286,6 +316,7 @@ func (b *bbr3CongestionControl) syncDeliveryState(state *CongestionState) {
 	b.schedulerLimitedEvents = state.SchedulerLimitedEvents
 }
 
+// handleRecoveryEvent checkpoints, restores, or exits controller recovery state.
 func (b *bbr3CongestionControl) handleRecoveryEvent(event *CongestionEvent) {
 	switch event.Recovery.Stage {
 	case CongestionRecoverySelectFlight:
@@ -303,6 +334,7 @@ func (b *bbr3CongestionControl) handleRecoveryEvent(event *CongestionEvent) {
 	}
 }
 
+// handlePacingEvent answers transport pacing queries and transmission notices.
 func (b *bbr3CongestionControl) handlePacingEvent(event *CongestionEvent) {
 	switch event.Pacing.Operation {
 	case CongestionPacingQuery:
@@ -317,6 +349,7 @@ func (b *bbr3CongestionControl) handlePacingEvent(event *CongestionEvent) {
 	}
 }
 
+// onRateSample advances the path model and returns updated cwnd and ssthresh.
 func (b *bbr3CongestionControl) onRateSample(window uint32, mss int, sample *tcpDeliveryRateSample) (uint32, uint32) {
 	packet := bbr3DecodePacketState(sample.packetState)
 	if packet.inflight == 0 {
@@ -340,6 +373,7 @@ func (b *bbr3CongestionControl) onRateSample(window uint32, mss int, sample *tcp
 	return window, threshold
 }
 
+// updateBandwidth incorporates one valid delivery sample into round maxima.
 func (b *bbr3CongestionControl) updateBandwidth(sample *tcpDeliveryRateSample) float64 {
 	b.roundStart = false
 	if !sample.valid || sample.interval <= 0 {
@@ -363,6 +397,7 @@ func (b *bbr3CongestionControl) updateBandwidth(sample *tcpDeliveryRateSample) f
 	return rate
 }
 
+// maximumBandwidth returns the current two-round delivery-rate maximum.
 func (b *bbr3CongestionControl) maximumBandwidth() float64 {
 	if b.bandwidthHigh[0] > b.bandwidthHigh[1] {
 		return b.bandwidthHigh[0]
@@ -370,6 +405,7 @@ func (b *bbr3CongestionControl) maximumBandwidth() float64 {
 	return b.bandwidthHigh[1]
 }
 
+// updateLatestDeliverySignals accumulates delivery and loss within one packet round.
 func (b *bbr3CongestionControl) updateLatestDeliverySignals(sample *tcpDeliveryRateSample, rate float64) {
 	b.lossRoundStart = false
 	if !sample.valid || sample.acked == 0 {
@@ -387,6 +423,7 @@ func (b *bbr3CongestionControl) updateLatestDeliverySignals(sample *tcpDeliveryR
 	}
 }
 
+// advanceLatestDeliverySignals starts a new packet round with current evidence.
 func (b *bbr3CongestionControl) advanceLatestDeliverySignals(sample *tcpDeliveryRateSample, rate float64) {
 	if !b.lossRoundStart {
 		return
@@ -397,6 +434,7 @@ func (b *bbr3CongestionControl) advanceLatestDeliverySignals(sample *tcpDelivery
 	}
 }
 
+// updateCongestionSignals advances lower bandwidth and inflight bounds on round starts.
 func (b *bbr3CongestionControl) updateCongestionSignals(sample *tcpDeliveryRateSample, rate float64, window uint32) {
 	if sample.losses != 0 {
 		b.noteLossRound()
@@ -428,6 +466,7 @@ func (b *bbr3CongestionControl) updateCongestionSignals(sample *tcpDeliveryRateS
 	b.lossInRound = false
 }
 
+// noteLossRound counts one Startup round with excessive loss.
 func (b *bbr3CongestionControl) noteLossRound() {
 	if !b.lossInRound {
 		b.lossRoundDelivered = uint32(b.delivered) & tcpDeliveryDeliveredMask
@@ -435,6 +474,7 @@ func (b *bbr3CongestionControl) noteLossRound() {
 	b.lossInRound = true
 }
 
+// checkStartupLoss exits Startup after persistent excessive-loss rounds.
 func (b *bbr3CongestionControl) checkStartupLoss(sample *tcpDeliveryRateSample, packet bbr3PacketSnapshot, mss int) {
 	if b.fullBandwidthReached {
 		return
@@ -455,6 +495,7 @@ func (b *bbr3CongestionControl) checkStartupLoss(sample *tcpDeliveryRateSample, 
 	}
 }
 
+// checkFullBandwidth detects the end of Startup's exponential bandwidth growth.
 func (b *bbr3CongestionControl) checkFullBandwidth(sample *tcpDeliveryRateSample, rate float64) {
 	if b.fullBandwidthNow || sample.applicationLimited || !sample.valid {
 		return
@@ -485,12 +526,14 @@ func (b *bbr3CongestionControl) checkFullBandwidth(sample *tcpDeliveryRateSample
 	}
 }
 
+// resetFullBandwidth restarts Startup growth detection after an idle restart.
 func (b *bbr3CongestionControl) resetFullBandwidth() {
 	b.fullBandwidth = 0
 	b.fullRounds = 0
 	b.fullBandwidthNow = false
 }
 
+// checkDrain leaves Drain when inflight reaches the modeled path pipe.
 func (b *bbr3CongestionControl) checkDrain(sample *tcpDeliveryRateSample, mss int) uint32 {
 	inflight := b.packetsInNetwork(sample.inFlight, sample.ackTime, mss, b.pacingGain())
 	var threshold uint32
@@ -507,6 +550,7 @@ func (b *bbr3CongestionControl) checkDrain(sample *tcpDeliveryRateSample, mss in
 	return threshold
 }
 
+// updateProbeBandwidth advances ProbeBW phases and their learned upper bounds.
 func (b *bbr3CongestionControl) updateProbeBandwidth(sample *tcpDeliveryRateSample, packet bbr3PacketSnapshot, rate float64, window uint32, mss int) {
 	if b.adaptUpperBounds(sample, packet, window, mss) {
 		return
@@ -556,6 +600,7 @@ func (b *bbr3CongestionControl) updateProbeBandwidth(sample *tcpDeliveryRateSamp
 	}
 }
 
+// adaptUpperBounds updates bandwidth_hi and inflight_hi from probe feedback.
 func (b *bbr3CongestionControl) adaptUpperBounds(sample *tcpDeliveryRateSample, packet bbr3PacketSnapshot, window uint32, mss int) bool {
 	if !b.fullBandwidthReached {
 		return false
@@ -590,6 +635,7 @@ func (b *bbr3CongestionControl) adaptUpperBounds(sample *tcpDeliveryRateSample, 
 	return false
 }
 
+// probeDue reports whether elapsed time or round count requires another probe.
 func (b *bbr3CongestionControl) probeDue(now time.Time, window uint32, mss int) bool {
 	if mss < 1 {
 		return false
@@ -608,6 +654,7 @@ func (b *bbr3CongestionControl) probeDue(now time.Time, window uint32, mss int) 
 	return !b.probeStarted.IsZero() && now.Sub(b.probeStarted) > b.probeWait || b.roundsSinceProbe >= rounds
 }
 
+// enterProbePhase resets phase-local state and selects the next ACK phase.
 func (b *bbr3CongestionControl) enterProbePhase(phase bbr3ProbePhase, now time.Time) {
 	b.probePhase = phase
 	switch phase {
@@ -635,12 +682,14 @@ func (b *bbr3CongestionControl) enterProbePhase(phase bbr3ProbePhase, now time.T
 	}
 }
 
+// pickProbeWait selects the randomized time and round interval to Probe Up.
 func (b *bbr3CongestionControl) pickProbeWait(now time.Time) {
 	b.roundsSinceProbe = uint32(b.randomBelow(2, now))
 	b.probeStarted = now
 	b.probeWait = bbr3ProbeBase + time.Duration(b.randomBelow(uint64(bbr3ProbeRandom), now.Add(time.Nanosecond)))
 }
 
+// randomBelow returns a bounded value from the controller's private PRNG.
 func (b *bbr3CongestionControl) randomBelow(limit uint64, now time.Time) uint64 {
 	if limit <= 1 {
 		return 0
@@ -655,6 +704,7 @@ func (b *bbr3CongestionControl) randomBelow(limit uint64, now time.Time) uint64 
 	}
 }
 
+// nextRandom advances the per-connection non-cryptographic PRNG.
 func (b *bbr3CongestionControl) nextRandom(now time.Time) uint64 {
 	if b.probeRandom == 0 {
 		b.probeRandom = uint64(now.UnixNano()) ^ bbrCycleRandomSequence.Add(bbrCycleRandomIncrement)
@@ -666,6 +716,7 @@ func (b *bbr3CongestionControl) nextRandom(now time.Time) uint64 {
 	return value ^ value>>31
 }
 
+// raiseProbeSlope increases the per-ACK inflight_hi growth slope by probe round.
 func (b *bbr3CongestionControl) raiseProbeSlope(window uint32, mss int) {
 	if mss < 1 {
 		return
@@ -681,6 +732,7 @@ func (b *bbr3CongestionControl) raiseProbeSlope(window uint32, mss int) {
 	b.probeUpCount = clampCongestionUint32(count)
 }
 
+// probeInflightHighUpward spends ACK credit to grow inflight_hi during Probe Up.
 func (b *bbr3CongestionControl) probeInflightHighUpward(acked, flight, window uint32, mss int) {
 	if b.inflightHigh == 0 || !congestionWindowLimited(window, flight, mss) || window < b.inflightHigh {
 		return
@@ -699,6 +751,7 @@ func (b *bbr3CongestionControl) probeInflightHighUpward(acked, flight, window ui
 	}
 }
 
+// inflightTooHigh applies the configured loss-rate threshold to one transmission.
 func (b *bbr3CongestionControl) inflightTooHigh(lost uint64, inflight uint32) bool {
 	return lost != 0 && inflight != 0 && lost > uint64(inflight)*bbr3LossThreshold/bbr3Scale
 }
@@ -709,6 +762,7 @@ func (b *bbr3CongestionControl) lossesSince(packet bbr3PacketSnapshot) uint64 {
 	return uint64(uint32(b.lost) - packet.lost)
 }
 
+// onPacketLost incorporates one transmission generation proven lost.
 func (b *bbr3CongestionControl) onPacketLost(event *CongestionEvent) {
 	b.syncDeliveryState(event.State)
 	b.noteLossRound()
@@ -741,6 +795,7 @@ func (b *bbr3CongestionControl) onPacketLost(event *CongestionEvent) {
 	b.handleInflightTooHigh(clampCongestionUint32(uint64(inflightBefore)+lostPrefix), packet.applicationLimited, event.State.CongestionWindow, event.State.MaximumSegmentSize, event.Time)
 }
 
+// onTailLossProbeRecovered applies prompt loss evidence from successful TLP recovery.
 func (b *bbr3CongestionControl) onTailLossProbeRecovered(event *CongestionEvent) {
 	b.syncDeliveryState(event.State)
 	b.noteLossRound()
@@ -754,6 +809,7 @@ func (b *bbr3CongestionControl) onTailLossProbeRecovered(event *CongestionEvent)
 	}
 }
 
+// handleInflightTooHigh lowers model bounds after non-application-limited loss.
 func (b *bbr3CongestionControl) handleInflightTooHigh(inflight uint32, applicationLimited bool, window uint32, mss int, now time.Time) {
 	b.previousProbeTooHigh = true
 	b.stoppedRiskyProbe = false
@@ -775,16 +831,19 @@ func (b *bbr3CongestionControl) handleInflightTooHigh(inflight uint32, applicati
 	}
 }
 
+// isProbingBandwidth reports whether current ACKs can raise model upper bounds.
 func (b *bbr3CongestionControl) isProbingBandwidth() bool {
 	return b.mode == bbrStartup || b.mode == bbrProbeBandwidth && (b.probePhase == bbr3ProbeRefill || b.probePhase == bbr3ProbeUp)
 }
 
+// resetCongestionSignals starts a fresh lower-bound adaptation interval.
 func (b *bbr3CongestionControl) resetCongestionSignals() {
 	b.lossInRound = false
 	b.latestBandwidth = 0
 	b.latestInflight = 0
 }
 
+// updateMinimumRTT maintains the minimum-RTT filter and ProbeRTT lifecycle.
 func (b *bbr3CongestionControl) updateMinimumRTT(window uint32, sample *tcpDeliveryRateSample, mss int) uint32 {
 	probeExpired := b.probeRTTMinimum != 0 && sample.ackTime.Sub(b.probeRTTStamp) > bbr3ProbeRTTWindow
 	minimumExpired := b.minimumRTT != 0 && sample.ackTime.Sub(b.minimumRTTStamp) > bbrMinRTTWindow
@@ -833,6 +892,7 @@ func (b *bbr3CongestionControl) updateMinimumRTT(window uint32, sample *tcpDeliv
 	return window
 }
 
+// exitProbeRTT restores Startup or ProbeBW after the measurement interval.
 func (b *bbr3CongestionControl) exitProbeRTT(now time.Time) {
 	if b.fullBandwidthReached {
 		b.mode = bbrProbeBandwidth
@@ -843,6 +903,7 @@ func (b *bbr3CongestionControl) exitProbeRTT(now time.Time) {
 	b.mode = bbrStartup
 }
 
+// setCongestionWindow applies ACK growth, recovery conservation, and model bounds.
 func (b *bbr3CongestionControl) setCongestionWindow(window uint32, sample *tcpDeliveryRateSample, mss int) uint32 {
 	minimum := uint32(bbrMinimumCongestionMSS * mss)
 	probeTarget := clampCongestionUint32(b.modelWindowForBandwidth(b.effectiveBandwidth(), bbr3ProbeRTTWindowGain, mss))
@@ -907,6 +968,7 @@ func (b *bbr3CongestionControl) setCongestionWindow(window uint32, sample *tcpDe
 	return window
 }
 
+// boundWindow applies mode-specific inflight_hi, inflight_lo, and ProbeRTT limits.
 func (b *bbr3CongestionControl) boundWindow(window uint64, mss int) uint64 {
 	cap := uint64(tcpMaximumScaledWindow)
 	if b.mode == bbrProbeBandwidth && b.probePhase != bbr3ProbeCruise {
@@ -929,6 +991,7 @@ func (b *bbr3CongestionControl) boundWindow(window uint64, mss int) uint64 {
 	return window
 }
 
+// inflightWithHeadroom reserves model headroom below a finite inflight_hi.
 func (b *bbr3CongestionControl) inflightWithHeadroom(mss int) uint64 {
 	if b.inflightHigh == 0 {
 		return uint64(tcpMaximumScaledWindow)
@@ -950,6 +1013,7 @@ func (b *bbr3CongestionControl) inflightWithHeadroom(mss int) uint64 {
 	return upper
 }
 
+// ackAggregationWindow returns bounded extra cwnd for compressed ACK bursts.
 func (b *bbr3CongestionControl) ackAggregationWindow() uint64 {
 	extra := uint64(b.extraACKed[0])
 	if uint64(b.extraACKed[1]) > extra {
@@ -962,6 +1026,7 @@ func (b *bbr3CongestionControl) ackAggregationWindow() uint64 {
 	return extra
 }
 
+// clampCongestionUint32 saturates a byte count at the controller API width.
 func clampCongestionUint32(value uint64) uint32 {
 	if value > uint64(tcpMaximumScaledWindow) {
 		return tcpMaximumScaledWindow
@@ -969,6 +1034,7 @@ func clampCongestionUint32(value uint64) uint32 {
 	return uint32(value)
 }
 
+// updateACKAggregation tracks excess delivery beyond the modeled bandwidth.
 func (b *bbr3CongestionControl) updateACKAggregation(sample *tcpDeliveryRateSample, window uint32, mss int) {
 	if !sample.valid || sample.acked == 0 || mss < 1 {
 		return
@@ -1020,10 +1086,12 @@ func (b *bbr3CongestionControl) updateACKAggregation(sample *tcpDeliveryRateSamp
 	}
 }
 
+// modelWindow returns a gain-scaled BDP at the effective model bandwidth.
 func (b *bbr3CongestionControl) modelWindow(gain float64, mss int) uint64 {
 	return b.modelWindowForBandwidth(b.effectiveBandwidth(), gain, mss)
 }
 
+// modelWindowForBandwidth returns a quantized gain-scaled BDP for bandwidth.
 func (b *bbr3CongestionControl) modelWindowForBandwidth(bandwidth, gain float64, mss int) uint64 {
 	if mss < 1 {
 		return 0
@@ -1041,6 +1109,7 @@ func (b *bbr3CongestionControl) modelWindowForBandwidth(bandwidth, gain float64,
 	return uint64(value)
 }
 
+// initialWindow reconstructs the controller's MSS-scaled initial window.
 func (b *bbr3CongestionControl) initialWindow(mss int) uint64 {
 	if mss < 1 {
 		return 0
@@ -1052,10 +1121,12 @@ func (b *bbr3CongestionControl) initialWindow(mss int) uint64 {
 	return uint64(segments) * uint64(mss)
 }
 
+// quantizeWindow adds Linux-style offload and delayed-ACK allowances.
 func (b *bbr3CongestionControl) quantizeWindow(target uint64, mss int) uint64 {
 	return b.quantizeWindowAt(target, mss, b.mode == bbrProbeBandwidth && b.probePhase == bbr3ProbeUp)
 }
 
+// quantizeWindowAt applies phase-specific packet quanta and the minimum window.
 func (b *bbr3CongestionControl) quantizeWindowAt(target uint64, mss int, probeUp bool) uint64 {
 	if mss < 1 {
 		return 0
@@ -1080,6 +1151,7 @@ func (b *bbr3CongestionControl) quantizeWindowAt(target uint64, mss int, probeUp
 	return target
 }
 
+// packetsInNetwork estimates bytes still in the network at a pacing instant.
 func (b *bbr3CongestionControl) packetsInNetwork(inflight uint32, now time.Time, mss int, gain float64) uint32 {
 	value := uint64(inflight)
 	if gain > 1 {
@@ -1095,6 +1167,7 @@ func (b *bbr3CongestionControl) packetsInNetwork(inflight uint32, now time.Time,
 	return clampCongestionUint32(value)
 }
 
+// effectiveBandwidth applies a finite lower bandwidth bound when present.
 func (b *bbr3CongestionControl) effectiveBandwidth() float64 {
 	bandwidth := b.maximumBandwidth()
 	if b.bandwidthLow != 0 && b.bandwidthLow < bandwidth {
@@ -1103,6 +1176,7 @@ func (b *bbr3CongestionControl) effectiveBandwidth() float64 {
 	return bandwidth
 }
 
+// pacingGain returns the current mode and phase pacing multiplier.
 func (b *bbr3CongestionControl) pacingGain() float64 {
 	switch b.mode {
 	case bbrStartup:
@@ -1120,6 +1194,7 @@ func (b *bbr3CongestionControl) pacingGain() float64 {
 	return 1
 }
 
+// congestionWindowGain returns the current mode and phase cwnd multiplier.
 func (b *bbr3CongestionControl) congestionWindowGain() float64 {
 	if b.mode == bbrProbeRTT {
 		return bbr3ProbeRTTWindowGain
@@ -1130,6 +1205,7 @@ func (b *bbr3CongestionControl) congestionWindowGain() float64 {
 	return bbr3CongestionWindowGain
 }
 
+// initializePacingRate seeds pacing from the initial window and RTT estimate.
 func (b *bbr3CongestionControl) initializePacingRate(window uint32, smoothedRTT time.Duration) {
 	roundTrip := smoothedRTT
 	if roundTrip <= 0 {
@@ -1140,6 +1216,7 @@ func (b *bbr3CongestionControl) initializePacingRate(window uint32, smoothedRTT 
 	b.pacingRate = float64(window) / roundTrip.Seconds() * bbr3StartupPacingGain * bbrPacingMargin
 }
 
+// setPacingRate raises or updates pacing from the current bandwidth model.
 func (b *bbr3CongestionControl) setPacingRate(window uint32, smoothedRTT time.Duration) {
 	if !b.hasSeenRTT && smoothedRTT > 0 {
 		b.initializePacingRate(window, smoothedRTT)
@@ -1154,6 +1231,7 @@ func (b *bbr3CongestionControl) setPacingRate(window uint32, smoothedRTT time.Du
 	}
 }
 
+// effectivePacingRate applies the socket pacing ceiling to the model rate.
 func (b *bbr3CongestionControl) effectivePacingRate() float64 {
 	rate := b.pacingRate
 	if b.maximumPacingRate != 0 && rate > float64(b.maximumPacingRate) {
@@ -1162,6 +1240,7 @@ func (b *bbr3CongestionControl) effectivePacingRate() float64 {
 	return rate
 }
 
+// pacingDelay returns the wait before bytes may be sent and whether pacing applies.
 func (b *bbr3CongestionControl) pacingDelay(now time.Time, bytes, mss int, flight uint32) (time.Duration, bool) {
 	rate := b.effectivePacingRate()
 	if bytes <= 0 || rate <= 0 {
@@ -1187,6 +1266,7 @@ func (b *bbr3CongestionControl) pacingDelay(now time.Time, bytes, mss int, fligh
 	return 0, schedulerLimited
 }
 
+// consumePacingWake validates and consumes one armed pacing wakeup.
 func (b *bbr3CongestionControl) consumePacingWake(now time.Time, flight uint32) bool {
 	if b.pacingWakeDeadline.IsZero() {
 		return false
@@ -1196,6 +1276,7 @@ func (b *bbr3CongestionControl) consumePacingWake(now time.Time, flight uint32) 
 	return flight != 0 && now.Sub(deadline) > tcpUserspaceSchedulingTolerance
 }
 
+// consumePacingBurst spends initial unpaced burst credit.
 func (b *bbr3CongestionControl) consumePacingBurst(bytes int) {
 	if bytes <= 0 || b.pacingBurstRemaining <= 0 {
 		return
@@ -1206,16 +1287,19 @@ func (b *bbr3CongestionControl) consumePacingBurst(bytes int) {
 	}
 }
 
+// advancePacing advances the ordinary transmission pacing clock.
 func (b *bbr3CongestionControl) advancePacing(bytes, mss int, now time.Time) {
 	b.advancePacingAt(bytes, mss, now, true)
 }
 
+// advanceRetransmissionPacing advances pacing without consuming new-data burst credit.
 func (b *bbr3CongestionControl) advanceRetransmissionPacing(bytes, mss int, now time.Time) {
 	b.pacingWakeDeadline = time.Time{}
 	b.consumePacingBurst(bytes)
 	b.advancePacingAt(bytes, mss, now, false)
 }
 
+// advancePacingAt updates the pacing deadline with optional scheduler catch-up.
 func (b *bbr3CongestionControl) advancePacingAt(bytes, mss int, now time.Time, catchUp bool) {
 	rate := b.effectivePacingRate()
 	if bytes <= 0 || rate <= 0 {
@@ -1226,12 +1310,14 @@ func (b *bbr3CongestionControl) advancePacingAt(bytes, mss int, now time.Time, c
 	b.nextSend = pacingScheduleBase(b.nextSend, now, maximumDebt, catchUp).Add(delay)
 }
 
+// resetPacer clears pacing deadline, residual credit, and initial burst state.
 func (b *bbr3CongestionControl) resetPacer() {
 	b.nextSend = time.Time{}
 	b.pacingWakeDeadline = time.Time{}
 	b.pacingBurstRemaining = 0
 }
 
+// onDeliverySend records an idle restart and returns the packet-state inflight snapshot.
 func (b *bbr3CongestionControl) onDeliverySend(now time.Time, packetsOut, window uint32) uint32 {
 	if packetsOut == 0 {
 		b.resetPacer()
@@ -1254,6 +1340,7 @@ func (b *bbr3CongestionControl) onDeliverySend(now time.Time, packetsOut, window
 	return window
 }
 
+// saveWindow checkpoints model and window state before recovery or ProbeRTT.
 func (b *bbr3CongestionControl) saveWindow(window uint32) {
 	if !b.recovery && !b.lossRecovery {
 		b.undoBounds = true
@@ -1268,6 +1355,7 @@ func (b *bbr3CongestionControl) saveWindow(window uint32) {
 	}
 }
 
+// undoRecovery restores model state after Eifel or DSACK proves recovery spurious.
 func (b *bbr3CongestionControl) undoRecovery() {
 	b.resetFullBandwidth()
 	b.recovery = false
@@ -1283,6 +1371,7 @@ func (b *bbr3CongestionControl) undoRecovery() {
 	}
 }
 
+// bbr3WiderBound combines optional integer bounds by choosing the less restrictive.
 func bbr3WiderBound(left, right uint32) uint32 {
 	if left == 0 || right == 0 {
 		return 0
@@ -1293,6 +1382,7 @@ func bbr3WiderBound(left, right uint32) uint32 {
 	return left
 }
 
+// bbr3WiderFloatBound combines optional floating bounds by choosing the larger.
 func bbr3WiderFloatBound(left, right float64) float64 {
 	if left == 0 || right == 0 {
 		return 0

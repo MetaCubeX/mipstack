@@ -7,21 +7,33 @@ import (
 )
 
 const (
-	// Msg methods use this fixed Linux 64-bit little-endian ancillary ABI on
-	// every host so control data remains portable between MIPS instances.
-	linuxControlHeaderSize       = 16
-	linuxControlAlignment        = 8
+	// linuxControlHeaderSize is the fixed Linux 64-bit ancillary header size
+	// used on every host so control data remains portable between MIPS instances.
+	linuxControlHeaderSize = 16
+	// linuxControlAlignment is the fixed Linux 64-bit ancillary alignment.
+	linuxControlAlignment = 8
+	// linuxMessageControlTruncated is Linux MSG_CTRUNC.
 	linuxMessageControlTruncated = 0x08
-	linuxMessageTruncated        = 0x20
-	linuxLevelIP                 = 0
-	linuxIPTypeOfService         = 1
-	linuxIPTimeToLive            = 2
-	linuxIPPacketInfo            = 8
-	linuxLevelIPv6               = 41
-	linuxIPv6FlowInfo            = 11
-	linuxIPv6PacketInfo          = 50
-	linuxIPv6HopLimit            = 52
-	linuxIPv6TrafficClass        = 67
+	// linuxMessageTruncated is Linux MSG_TRUNC.
+	linuxMessageTruncated = 0x20
+	// linuxLevelIP is Linux IPPROTO_IP.
+	linuxLevelIP = 0
+	// linuxIPTypeOfService is Linux IP_TOS.
+	linuxIPTypeOfService = 1
+	// linuxIPTimeToLive is Linux IP_TTL.
+	linuxIPTimeToLive = 2
+	// linuxIPPacketInfo is Linux IP_PKTINFO.
+	linuxIPPacketInfo = 8
+	// linuxLevelIPv6 is Linux IPPROTO_IPV6.
+	linuxLevelIPv6 = 41
+	// linuxIPv6FlowInfo is Linux IPV6_FLOWINFO.
+	linuxIPv6FlowInfo = 11
+	// linuxIPv6PacketInfo is Linux IPV6_PKTINFO.
+	linuxIPv6PacketInfo = 50
+	// linuxIPv6HopLimit is Linux IPV6_HOPLIMIT.
+	linuxIPv6HopLimit = 52
+	// linuxIPv6TrafficClass is Linux IPV6_TCLASS.
+	linuxIPv6TrafficClass = 67
 )
 
 // IPv4ControlMessage represents per-packet IPv4 metadata carried by

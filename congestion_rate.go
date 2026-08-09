@@ -32,8 +32,10 @@ func tcpDeliveryTimestampDuration(later, earlier tcpDeliveryTimestamp) time.Dura
 }
 
 const (
+	// tcpDeliveryApplicationLimited packs the application-limited flag into deliveredFlags.
 	tcpDeliveryApplicationLimited = uint32(1) << 31
-	tcpDeliveryDeliveredMask      = tcpDeliveryApplicationLimited - 1
+	// tcpDeliveryDeliveredMask extracts the wrapping delivered-byte counter.
+	tcpDeliveryDeliveredMask = tcpDeliveryApplicationLimited - 1
 )
 
 // tcpDeliverySnapshot is Linux tcp_rate_skb_sent's per-transmission delivery

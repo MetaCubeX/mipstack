@@ -11,9 +11,12 @@ import (
 // preferred local source address; Metric breaks ties between equal prefixes.
 // The embedding link remains responsible for next-hop selection.
 type Route struct {
+	// Destination is the admitted unicast prefix.
 	Destination netip.Prefix
-	Source      netip.Addr
-	Metric      uint32
+	// Source pins the preferred local source address when valid.
+	Source netip.Addr
+	// Metric breaks ties between routes with equal prefix length.
+	Metric uint32
 }
 
 // networkState is an immutable address, route, and MTU snapshot.

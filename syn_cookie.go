@@ -15,10 +15,11 @@ const (
 	// retransmission delays. The current and immediately previous period are
 	// accepted.
 	synCookiePeriod = 64 * time.Second
-	// Eight low sequence-number bits carry conservative, reconstructible peer
+	// synCookieDataBits reserves low sequence-number bits for reconstructible peer
 	// options. The remaining 24 bits authenticate the tuple, client ISN, time
 	// period, and all negotiated option flags.
 	synCookieDataBits = 8
+	// synCookieDataMask extracts the reconstructible option bits.
 	synCookieDataMask = uint32(1<<synCookieDataBits - 1)
 )
 

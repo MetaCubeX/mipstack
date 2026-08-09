@@ -6,13 +6,18 @@ import (
 )
 
 const (
-	// RFC 9406 HyStart++ delay-increase and Conservative Slow Start values.
+	// hyStartMinimumRTTThreshold is the RFC 9406 lower delay threshold.
 	hyStartMinimumRTTThreshold = 4 * time.Millisecond
+	// hyStartMaximumRTTThreshold is the RFC 9406 upper delay threshold.
 	hyStartMaximumRTTThreshold = 16 * time.Millisecond
-	hyStartRTTDivisor          = 8
-	hyStartMinimumRTTSamples   = 8
-	hyStartCSSGrowthDivisor    = 4
-	hyStartCSSRounds           = 5
+	// hyStartRTTDivisor scales the measured minimum RTT into a delay threshold.
+	hyStartRTTDivisor = 8
+	// hyStartMinimumRTTSamples is the sample floor for a round decision.
+	hyStartMinimumRTTSamples = 8
+	// hyStartCSSGrowthDivisor reduces growth during Conservative Slow Start.
+	hyStartCSSGrowthDivisor = 4
+	// hyStartCSSRounds bounds consecutive Conservative Slow Start rounds.
+	hyStartCSSRounds = 5
 	// tcpPacingInitialBurst matches Linux fq's unpaced first ten segments.
 	tcpPacingInitialBurst = 10
 	// tcpUserspaceSchedulingTolerance avoids classifying ordinary timer and

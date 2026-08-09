@@ -91,19 +91,28 @@ type UDPInfo struct {
 // The concrete registry is linked only when its public listen entry point is
 // referenced.
 type udpReuseEndpoints interface {
+	// empty reports whether the registry contains no sockets.
 	empty() bool
+	// connections returns a snapshot of all registered sockets.
 	connections() []*UDPConn
+	// contains reports whether the registry owns a socket.
 	contains(connection *UDPConn) bool
+	// overlaps reports whether a binding conflicts with any registry entry.
 	overlaps(address netip.Addr, port uint16, dual bool) bool
+	// connection selects a socket for one local and remote endpoint pair.
 	connection(binding, local, remote netip.AddrPort) *UDPConn
+	// add registers a socket in its reuse-port group.
 	add(connection *UDPConn)
+	// remove unregisters a socket and reports whether it was present.
 	remove(connection *UDPConn) bool
 }
 
 // udpSocketBinding supplies the registration policy shared by ListenUDP and
 // ListenUDPReusePort.
 type udpSocketBinding interface {
+	// available reports whether the requested socket binding can be registered.
 	available(stack *Stack, address netip.Addr, port uint16, dual bool) bool
+	// register publishes one validated socket binding.
 	register(stack *Stack, connection *UDPConn) error
 }
 

@@ -291,6 +291,7 @@ type ICMPMessage struct {
 	// Type and Code retain the wire classification. Unknown or unassigned
 	// values can reach an ICMP forwarder when no built-in handler consumes them.
 	Type uint8
+	// Code retains the wire subtype within Type.
 	Code uint8
 	// Payload contains the complete ICMP header and body.
 	Payload []byte
@@ -357,22 +358,31 @@ type ICMPForwarderResponder struct {
 
 // tcpForwarderEndpoints is the small dispatch surface retained by Stack.
 type tcpForwarderEndpoints interface {
+	// handleSegment offers one otherwise unhandled SYN to the forwarder.
 	handleSegment(segment tcpSegment, key tcpKey) bool
+	// updateConfig invalidates requests no longer admitted by network policy.
 	updateConfig(network *networkState)
+	// closeFromStack cancels pending requests during stack closure.
 	closeFromStack()
 }
 
 // udpForwarderEndpoints is the small dispatch surface retained by Stack.
 type udpForwarderEndpoints interface {
+	// handlePacket offers one otherwise unhandled datagram to the forwarder.
 	handlePacket(packet ipPacket, flow TransportFlow, options ipPacketOptions) bool
+	// updateConfig invalidates requests no longer admitted by network policy.
 	updateConfig(network *networkState)
+	// closeFromStack cancels pending requests during stack closure.
 	closeFromStack()
 }
 
 // icmpForwarderEndpoints is the small dispatch surface retained by Stack.
 type icmpForwarderEndpoints interface {
+	// handlePacket offers one otherwise unhandled ICMP message to the forwarder.
 	handlePacket(packet ipPacket) bool
+	// updateConfig invalidates requests no longer admitted by network policy.
 	updateConfig(network *networkState)
+	// closeFromStack cancels pending requests during stack closure.
 	closeFromStack()
 }
 

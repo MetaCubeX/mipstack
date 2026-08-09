@@ -78,6 +78,7 @@ func (c *cubicCongestionControl) HandleCongestionEvent(event *CongestionEvent) {
 	}
 }
 
+// increaseOnACK applies slow start or CUBIC congestion avoidance to one ACK.
 func (c *cubicCongestionControl) increaseOnACK(window, acknowledged uint32, mss int, now time.Time, smoothedRTT time.Duration, flight, slowStartThreshold uint32) uint32 {
 	if !congestionWindowLimited(window, flight, mss) {
 		c.onApplicationLimited(now)

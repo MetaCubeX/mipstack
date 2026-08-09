@@ -1,5 +1,6 @@
 package mipstack
 
+// deviceBatchSize is the maximum packet count exchanged by one device call.
 const deviceBatchSize = 64
 
 // MTU returns the current link MTU.

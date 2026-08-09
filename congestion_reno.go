@@ -48,6 +48,7 @@ func (r *renoCongestionControl) HandleCongestionEvent(event *CongestionEvent) {
 	}
 }
 
+// reduceOnLoss returns the RFC 5681 fast-loss slow-start threshold.
 func (r *renoCongestionControl) reduceOnLoss(flight uint32, mss int) uint32 {
 	r.credit = 0
 	// RFC 5681 defines the threshold from FlightSize, not cwnd. They differ
@@ -55,16 +56,19 @@ func (r *renoCongestionControl) reduceOnLoss(flight uint32, mss int) uint32 {
 	return congestionThreshold(flight, mss, 1, 2)
 }
 
+// reduceOnECN returns the ECN response threshold with its one-MSS floor.
 func (r *renoCongestionControl) reduceOnECN(flight uint32, mss int) uint32 {
 	r.credit = 0
 	return congestionThresholdWithFloor(flight, mss, 1, 2, 1)
 }
 
+// reduceOnTimeout returns the RFC 5681 timeout slow-start threshold.
 func (r *renoCongestionControl) reduceOnTimeout(flight uint32, mss int) uint32 {
 	r.credit = 0
 	return congestionThreshold(flight, mss, 1, 2)
 }
 
+// increaseOnACK applies slow start or Reno additive increase to one ACK.
 func (r *renoCongestionControl) increaseOnACK(window, acknowledged uint32, mss int, flight, slowStartThreshold uint32) uint32 {
 	if !congestionWindowLimited(window, flight, mss) {
 		return window

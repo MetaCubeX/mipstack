@@ -475,8 +475,10 @@ type datagramQueue[T any] struct {
 	head   int
 }
 
+// len returns the number of queued values.
 func (q *datagramQueue[T]) len() int { return len(q.values) - q.head }
 
+// push appends one value while compacting a full partially consumed backing.
 func (q *datagramQueue[T]) push(value T) {
 	if q.head != 0 && len(q.values) == cap(q.values) {
 		copy(q.values, q.values[q.head:])
@@ -491,6 +493,7 @@ func (q *datagramQueue[T]) push(value T) {
 	q.values = append(q.values, value)
 }
 
+// pop removes the oldest value and releases oversized drained backing storage.
 func (q *datagramQueue[T]) pop() (T, bool) {
 	var zero T
 	if q.head == len(q.values) {
@@ -510,6 +513,7 @@ func (q *datagramQueue[T]) pop() (T, bool) {
 	return value, true
 }
 
+// clear releases all values and backing storage.
 func (q *datagramQueue[T]) clear() {
 	var zero T
 	for index := range q.values {
@@ -549,9 +553,13 @@ type automaticPortCursor struct {
 }
 
 const (
+	// outputFlowDetached marks retained scheduler state with no ready packets.
 	outputFlowDetached = iota
+	// outputFlowNew marks a ready flow eligible for initial priority.
 	outputFlowNew
+	// outputFlowOld marks a ready flow that consumed its initial priority.
 	outputFlowOld
+	// outputFlowUnused marks an available fixed scheduler entry.
 	outputFlowUnused
 )
 
@@ -587,11 +595,13 @@ type outputFlowKey struct {
 	hash uint64
 }
 
+// outputFlowList is an intrusive FIFO of scheduler flows in one state.
 type outputFlowList struct {
 	first *outputFlow
 	last  *outputFlow
 }
 
+// append adds flow to the tail of the list.
 func (l *outputFlowList) append(flow *outputFlow) {
 	flow.previous = l.last
 	flow.next = nil
@@ -603,6 +613,7 @@ func (l *outputFlowList) append(flow *outputFlow) {
 	l.last = flow
 }
 
+// remove detaches flow from the list that currently owns it.
 func (l *outputFlowList) remove(flow *outputFlow) {
 	if flow.previous == nil {
 		l.first = flow.next
@@ -640,6 +651,7 @@ type fairPacketScheduler struct {
 	lastFlow *outputFlow
 }
 
+// newFairPacketScheduler allocates one fixed-capacity flow scheduler.
 func newFairPacketScheduler(capacity, mtu int, secret [16]byte) *fairPacketScheduler {
 	if mtu < 1 {
 		mtu = defaultMTU
@@ -661,6 +673,7 @@ func newFairPacketScheduler(capacity, mtu int, secret [16]byte) *fairPacketSched
 	return scheduler
 }
 
+// setMTU updates byte credit from a validated or defaulted link MTU.
 func (s *fairPacketScheduler) setMTU(mtu int) {
 	if mtu < 1 {
 		mtu = defaultMTU
@@ -670,11 +683,13 @@ func (s *fairPacketScheduler) setMTU(mtu int) {
 	s.mu.Unlock()
 }
 
+// setMTULocked updates byte credit while s.mu is held.
 func (s *fairPacketScheduler) setMTULocked(mtu int) {
 	s.quantum = 2 * mtu
 	s.initial = 10 * mtu
 }
 
+// signal publishes level-triggered dequeue readiness without blocking.
 func (s *fairPacketScheduler) signal() {
 	select {
 	case s.ready <- struct{}{}:
@@ -682,6 +697,7 @@ func (s *fairPacketScheduler) signal() {
 	}
 }
 
+// acquireFlow obtains and initializes fixed flow state for key.
 func (s *fairPacketScheduler) acquireFlow(key outputFlowKey) *outputFlow {
 	if s.free == nil {
 		// An empty new flow takes one pass through old_flows before detaching,
@@ -719,6 +735,7 @@ func (s *fairPacketScheduler) acquireFlow(key outputFlowKey) *outputFlow {
 	return flow
 }
 
+// reactivateFlow moves retained idle state back to the new-flow list.
 func (s *fairPacketScheduler) reactivateFlow(flow *outputFlow) {
 	s.detached.remove(flow)
 	if time.Since(flow.detachedAt) >= outputFlowRefillDelay && flow.credit < s.quantum {
@@ -729,6 +746,7 @@ func (s *fairPacketScheduler) reactivateFlow(flow *outputFlow) {
 	s.newFlows.append(flow)
 }
 
+// enqueue publishes entry to its scheduler flow.
 func (s *fairPacketScheduler) enqueue(entry packetQueueEntry, flowID uint64) {
 	key := outputFlowKey{tcp: flowID}
 	if flowID == 0 {
@@ -760,12 +778,14 @@ func (s *fairPacketScheduler) enqueue(entry packetQueueEntry, flowID uint64) {
 	s.mu.Unlock()
 }
 
+// detachFlow retains empty flow credit for bounded idle reuse.
 func (s *fairPacketScheduler) detachFlow(flow *outputFlow) {
 	flow.state = outputFlowDetached
 	flow.detachedAt = time.Now()
 	s.detached.append(flow)
 }
 
+// selectList returns the highest-priority nonempty ready list.
 func (s *fairPacketScheduler) selectList() (*outputFlowList, uint8) {
 	if s.newFlows.first != nil {
 		return &s.newFlows, outputFlowNew
@@ -776,6 +796,7 @@ func (s *fairPacketScheduler) selectList() (*outputFlowList, uint8) {
 	return nil, outputFlowDetached
 }
 
+// tryDequeue removes one immediately schedulable packet.
 func (s *fairPacketScheduler) tryDequeue() (packetQueueEntry, bool) {
 	return s.tryDequeueAndSignal(false)
 }
@@ -844,6 +865,7 @@ func (s *fairPacketScheduler) tryDequeueAndSignal(signalRemaining bool) (packetQ
 	return packetQueueEntry{}, false
 }
 
+// dequeue waits for one schedulable packet or closure.
 func (s *fairPacketScheduler) dequeue(closeCh <-chan struct{}) (packetQueueEntry, bool) {
 	for {
 		if entry, ok := s.tryDequeueAndSignal(true); ok {
@@ -857,6 +879,7 @@ func (s *fairPacketScheduler) dequeue(closeCh <-chan struct{}) (packetQueueEntry
 	}
 }
 
+// len returns the current scheduled packet count.
 func (s *fairPacketScheduler) len() int {
 	s.mu.Lock()
 	queued := s.queued
@@ -1202,6 +1225,7 @@ func (q *packetQueue) tryDequeue() (packetQueueEntry, bool) {
 	}
 }
 
+// len returns the number of published packets waiting for a consumer.
 func (q *packetQueue) len() int {
 	if q.scheduler != nil {
 		return q.scheduler.len()
@@ -1209,6 +1233,7 @@ func (q *packetQueue) len() int {
 	return len(q.packets)
 }
 
+// setMTU updates scheduler byte credit when this queue is flow-scheduled.
 func (q *packetQueue) setMTU(mtu int) {
 	if q.scheduler != nil {
 		q.scheduler.setMTU(mtu)
@@ -2664,6 +2689,7 @@ type ownedTimer struct {
 	active bool
 }
 
+// newOwnedTimer allocates one stopped timer with reusable ownership state.
 func newOwnedTimer() *ownedTimer {
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {
@@ -2697,6 +2723,7 @@ func (t *ownedTimer) stop() {
 	}
 }
 
+// close stops the timer and drains any value still owned by the caller.
 func (t *ownedTimer) close() {
 	t.stop()
 	t.timer.Stop()

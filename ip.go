@@ -101,9 +101,13 @@ type ipKey struct {
 // socket parsing, queues, and typed methods to be removed from TCP/UDP-only
 // binaries.
 type ipEndpoints interface {
+	// deliver dispatches one protocol payload to matching raw sockets.
 	deliver(stack *Stack, packet ipPacket) bool
+	// deliverError dispatches one correlated ICMP error to matching sockets.
 	deliverError(stack *Stack, networkError ICMPError) bool
+	// updateConfig closes raw sockets invalidated by new network policy.
 	updateConfig(stack *Stack, network *networkState)
+	// closeAll closes every raw socket retained by the dispatcher.
 	closeAll()
 }
 

@@ -33,23 +33,27 @@ const (
 	// tcpFlagCWR acknowledges an ECN congestion response or negotiates ECN on
 	// an initial SYN.
 	tcpFlagCWR = byte(0x80)
-	// TCP actor wake bits coalesce state-only notifications without allocating
-	// one channel for each notification class on every connection.
-	tcpActorWakeSend    = uint32(1 << 0)
-	tcpActorWakeWindow  = uint32(1 << 1)
+	// tcpActorWakeSend reports application send-buffer progress. Wake bits
+	// coalesce state-only notifications without per-class connection channels.
+	tcpActorWakeSend = uint32(1 << 0)
+	// tcpActorWakeWindow reports newly available receive-window space.
+	tcpActorWakeWindow = uint32(1 << 1)
+	// tcpActorWakeOptions reports a mutable socket-policy change.
 	tcpActorWakeOptions = uint32(1 << 2)
+	// tcpActorWakePathMTU reports a changed path packet-size ceiling.
 	tcpActorWakePathMTU = uint32(1 << 3)
 	// tcpReceiveCapacity bounds unread and out-of-order bytes per connection.
 	tcpReceiveCapacity = 1024 * 1024
 	// tcpSendCapacity bounds unacknowledged and not-yet-transmitted application
 	// bytes retained by one connection.
 	tcpSendCapacity = 256 * 1024
-	// tcpMaximumReceiveCapacity and tcpMaximumSendCapacity bound automatic
-	// buffer growth. Capacity is allocated only as application data arrives;
+	// tcpMaximumReceiveCapacity bounds automatic receive-buffer growth.
+	// Capacity is allocated only as application data arrives;
 	// the limits therefore permit high-bandwidth-delay paths without charging
 	// every mostly idle proxy connection up front.
 	tcpMaximumReceiveCapacity = 16 * 1024 * 1024
-	tcpMaximumSendCapacity    = 16 * 1024 * 1024
+	// tcpMaximumSendCapacity bounds automatic send-buffer growth under the same policy.
+	tcpMaximumSendCapacity = 16 * 1024 * 1024
 	// tcpReadChunkRetain keeps metadata for a modest receive burst after it
 	// drains without retaining the payload backing or a multi-megabyte array of
 	// slice headers on an idle connection.
@@ -58,13 +62,15 @@ const (
 	// connection. Larger packets are released after Read so an occasional jumbo
 	// segment cannot permanently raise the idle memory cost.
 	tcpReusableReceivePayloadLimit = 2048
-	// TCP send chunks avoid moving bytes referenced by retransmission metadata.
-	// The lower bound packs small writes, while the upper bound limits unused
+	// tcpSendChunkMinimum packs small writes without moving bytes referenced by
+	// retransmission metadata, while the upper bound limits unused
 	// tail capacity and keeps cross-chunk gathers uncommon on bulk streams.
 	tcpSendChunkMinimum = 16 * 1024
+	// tcpSendChunkMaximum bounds unused tail capacity in one send chunk.
 	tcpSendChunkMaximum = tcpSendCapacity
-	// Only a modest fully acknowledged send chunk is retained. Larger chunks
-	// are released so a completed bulk transfer does not pin its former window.
+	// tcpReusableSendChunkLimit retains only a modest acknowledged send chunk.
+	// Larger chunks are released so a completed bulk transfer does not pin its
+	// former window.
 	tcpReusableSendChunkLimit = 32 * 1024
 	// tcpMetadataQueueRetain keeps common short actor bursts from reallocating
 	// metadata while releasing larger arrays after they drain.
@@ -181,9 +187,12 @@ const (
 // KeepAliveConfig configures TCP keepalive probing. Every field must be
 // positive when supplied to SetKeepAliveConfig.
 type KeepAliveConfig struct {
-	Idle     time.Duration
+	// Idle is the inactivity interval before the first probe.
+	Idle time.Duration
+	// Interval is the delay between unanswered probes.
 	Interval time.Duration
-	Count    int
+	// Count is the number of unanswered probes allowed before failure.
+	Count int
 }
 
 // TCPState identifies the current RFC 9293 connection state exposed by
@@ -244,65 +253,124 @@ func (s TCPState) String() string {
 // bytes; PathMTU and MaximumSegmentSize include and exclude IP/TCP headers,
 // respectively.
 type TCPInfo struct {
-	LocalAddress           netip.AddrPort
-	RemoteAddress          netip.AddrPort
-	State                  TCPState
-	CongestionControl      CongestionControl
-	RTT                    time.Duration
-	MinimumRTT             time.Duration
-	RTTVariation           time.Duration
-	RetransmissionTimeout  time.Duration
-	CongestionWindow       uint32
-	SlowStartThreshold     uint32
-	BytesInFlight          uint32
-	DeliveryRate           uint64
-	PacingRate             uint64
-	MaximumPacingRate      uint64
-	CongestionState        string
-	PeerWindow             uint32
-	ReceiveWindow          uint32
-	MaximumSegmentSize     int
-	PathMTU                int
-	SendBufferSize         int
-	SendBufferCapacity     int
-	MaximumSendBuffer      int
-	ReceiveBufferSize      int
-	ReceiveBufferCapacity  int
-	MaximumReceiveBuffer   int
-	BytesSent              uint64
-	BytesAcknowledged      uint64
-	BytesReceived          uint64
-	Retransmissions        uint64
-	InboundQueueDrops      uint64
-	InboundQueueBytes      int64
-	InboundQueuePeak       int64
-	InboundQueueCapacity   int
-	FastRecovery           bool
+	// LocalAddress is the local TCP endpoint.
+	LocalAddress netip.AddrPort
+	// RemoteAddress is the peer TCP endpoint.
+	RemoteAddress netip.AddrPort
+	// State is the current RFC 9293 connection state.
+	State TCPState
+	// CongestionControl identifies the selected congestion controller.
+	CongestionControl CongestionControl
+	// RTT is the smoothed round-trip time.
+	RTT time.Duration
+	// MinimumRTT is the minimum recent round-trip time.
+	MinimumRTT time.Duration
+	// RTTVariation is the smoothed round-trip-time variation.
+	RTTVariation time.Duration
+	// RetransmissionTimeout is the current RFC 6298 RTO.
+	RetransmissionTimeout time.Duration
+	// CongestionWindow is the current congestion window in bytes.
+	CongestionWindow uint32
+	// SlowStartThreshold is the current slow-start threshold in bytes.
+	SlowStartThreshold uint32
+	// BytesInFlight is the amount of transmitted but unacknowledged data.
+	BytesInFlight uint32
+	// DeliveryRate is the most recent delivery-rate estimate in bytes per second.
+	DeliveryRate uint64
+	// PacingRate is the controller's current pacing rate in bytes per second.
+	PacingRate uint64
+	// MaximumPacingRate is the configured pacing-rate ceiling, or zero if unlimited.
+	MaximumPacingRate uint64
+	// CongestionState is the controller-specific diagnostic state name.
+	CongestionState string
+	// PeerWindow is the latest advertised peer receive window in bytes.
+	PeerWindow uint32
+	// ReceiveWindow is the currently advertised local receive window in bytes.
+	ReceiveWindow uint32
+	// MaximumSegmentSize is the effective outbound TCP payload ceiling.
+	MaximumSegmentSize int
+	// PathMTU is the effective complete-IP-packet path MTU.
+	PathMTU int
+	// SendBufferSize is the number of application bytes currently buffered for send.
+	SendBufferSize int
+	// SendBufferCapacity is the current send-buffer limit.
+	SendBufferCapacity int
+	// MaximumSendBuffer is the automatic send-buffer tuning ceiling.
+	MaximumSendBuffer int
+	// ReceiveBufferSize is the number of application bytes waiting to be read.
+	ReceiveBufferSize int
+	// ReceiveBufferCapacity is the current receive-buffer limit.
+	ReceiveBufferCapacity int
+	// MaximumReceiveBuffer is the automatic receive-buffer tuning ceiling.
+	MaximumReceiveBuffer int
+	// BytesSent counts original application bytes transmitted.
+	BytesSent uint64
+	// BytesAcknowledged counts application bytes cumulatively acknowledged.
+	BytesAcknowledged uint64
+	// BytesReceived counts in-order application bytes received.
+	BytesReceived uint64
+	// Retransmissions counts retransmitted TCP segments.
+	Retransmissions uint64
+	// InboundQueueDrops counts segments rejected by the bounded actor queue.
+	InboundQueueDrops uint64
+	// InboundQueueBytes is the packet memory retained by the actor queue.
+	InboundQueueBytes int64
+	// InboundQueuePeak is the lifetime peak retained actor-queue memory.
+	InboundQueuePeak int64
+	// InboundQueueCapacity is the actor queue's memory bound.
+	InboundQueueCapacity int
+	// FastRecovery reports whether loss or ECN fast recovery is active.
+	FastRecovery bool
+	// RetransmissionRecovery reports whether recovery was entered by an RTO.
 	RetransmissionRecovery bool
-	HyStartCSS             bool
-	PathMTUDiscovery       bool
-	PathMTUProbe           int
-	WindowScaling          bool
-	PeerWindowScale        uint8
-	ReceiveWindowScale     uint8
-	SACK                   bool
-	Timestamps             bool
-	ECN                    bool
-	KeepAlive              bool
-	KeepAliveConfig        KeepAliveConfig
-	IdleTimeout            time.Duration
-	UserTimeout            time.Duration
-	NoDelay                bool
-	TrafficClass           uint8
-	FlowLabel              uint32
-	SpuriousRecoveryUndos  uint64
-	PathMTUProbes          uint64
-	PathMTUProbeSuccesses  uint64
-	PathMTUProbeFailures   uint64
-	ApplicationLimited     bool
-	SchedulerLimited       bool
+	// HyStartCSS reports whether HyStart++ Conservative Slow Start is active.
+	HyStartCSS bool
+	// PathMTUDiscovery reports whether packetization-layer discovery is enabled.
+	PathMTUDiscovery bool
+	// PathMTUProbe is the complete packet size of an outstanding probe, or zero.
+	PathMTUProbe int
+	// WindowScaling reports whether RFC 7323 window scaling was negotiated.
+	WindowScaling bool
+	// PeerWindowScale is the peer's advertised receive-window shift.
+	PeerWindowScale uint8
+	// ReceiveWindowScale is the local advertised receive-window shift.
+	ReceiveWindowScale uint8
+	// SACK reports whether selective acknowledgements were negotiated.
+	SACK bool
+	// Timestamps reports whether RFC 7323 timestamps were negotiated.
+	Timestamps bool
+	// ECN reports whether explicit congestion notification was negotiated.
+	ECN bool
+	// KeepAlive reports whether keepalive probing is enabled.
+	KeepAlive bool
+	// KeepAliveConfig is the effective keepalive probe policy.
+	KeepAliveConfig KeepAliveConfig
+	// IdleTimeout is the configured bidirectional inactivity timeout.
+	IdleTimeout time.Duration
+	// UserTimeout is the configured TCP user timeout.
+	UserTimeout time.Duration
+	// NoDelay reports whether Nagle coalescing is disabled.
+	NoDelay bool
+	// TrafficClass is the IPv4 TOS or IPv6 Traffic Class byte.
+	TrafficClass uint8
+	// FlowLabel is the IPv6 Flow Label, or zero for IPv4.
+	FlowLabel uint32
+	// SpuriousRecoveryUndos counts Eifel or DSACK recovery reversals.
+	SpuriousRecoveryUndos uint64
+	// PathMTUProbes counts packetization-layer probes sent.
+	PathMTUProbes uint64
+	// PathMTUProbeSuccesses counts acknowledged path-MTU probes.
+	PathMTUProbeSuccesses uint64
+	// PathMTUProbeFailures counts probes inferred lost.
+	PathMTUProbeFailures uint64
+	// ApplicationLimited reports whether delivery sampling is application-limited.
+	ApplicationLimited bool
+	// SchedulerLimited reports whether local scheduling currently limits delivery.
+	SchedulerLimited bool
+	// SchedulerLimitedEvents counts transitions into scheduler-limited delivery.
 	SchedulerLimitedEvents uint64
-	LastError              error
+	// LastError is the most recently recorded socket or asynchronous network error.
+	LastError error
 }
 
 // tcpSocketOptions is one lock-protected option snapshot.
@@ -1349,6 +1417,7 @@ type tcpSendChunk struct {
 	streamStart uint64
 }
 
+// tcpPayloadViewMaximumChunks bounds scatter metadata for one TCP segment.
 const tcpPayloadViewMaximumChunks = 5
 
 // tcpPayloadView is a stack-owned scatter view of immutable send-buffer bytes.
@@ -1611,9 +1680,13 @@ type tcpListenKey struct {
 // Its implementation is created only when an application uses TCP listeners,
 // allowing listener-only protocol code to be removed from dial-only binaries.
 type tcpPassiveEndpoints interface {
+	// portListened reports whether passive dispatch owns the local port.
 	portListened(local netip.Addr, port uint16) bool
+	// handleSegment dispatches one segment to a listener or SYN-cookie path.
 	handleSegment(stack *Stack, packet ipPacket, segment tcpSegment, key tcpKey) (bool, error)
+	// updateConfig closes listeners invalidated by new network policy.
 	updateConfig(stack *Stack, network *networkState)
+	// closeAll closes every listener retained by the dispatcher.
 	closeAll()
 }
 
@@ -1621,11 +1694,17 @@ type tcpPassiveEndpoints interface {
 // deliberately reached through an interface so ordinary listeners do not
 // retain group selection and hashing code.
 type tcpReuseEndpoints interface {
+	// empty reports whether the registry contains no listeners.
 	empty() bool
+	// listeners returns a snapshot of all registered listeners.
 	listeners() []*TCPListener
+	// overlaps reports whether a binding conflicts with any registry entry.
 	overlaps(address netip.Addr, port uint16, dual bool) bool
+	// listener selects a listener for one local and remote endpoint pair.
 	listener(binding, local, remote netip.AddrPort) *TCPListener
+	// add registers a listener in its reuse-port group.
 	add(listener *TCPListener)
+	// remove unregisters a listener and reports whether it was present.
 	remove(listener *TCPListener) bool
 }
 
@@ -1653,7 +1732,9 @@ type tcpPassiveState struct {
 // between ordinary and REUSEPORT listeners; validation and construction stay
 // in one shared Listen implementation.
 type tcpListenerBinding interface {
+	// available reports whether the requested listener binding can be registered.
 	available(state *tcpPassiveState, address netip.Addr, port uint16, dual bool) bool
+	// register publishes one validated listener binding.
 	register(state *tcpPassiveState, listener *TCPListener) error
 }
 
@@ -1663,24 +1744,42 @@ type exclusiveTCPListenerBinding struct{}
 // TCPListenerInfo is a point-in-time diagnostic snapshot of one passive TCP
 // endpoint. Queue peaks and counters cover the listener's complete lifetime.
 type TCPListenerInfo struct {
-	LocalAddress           netip.AddrPort
-	Closed                 bool
+	// LocalAddress is the bound listener endpoint.
+	LocalAddress netip.AddrPort
+	// Closed reports whether the listener was closed when sampled.
+	Closed bool
+	// AcceptQueueConnections is the number of completed connections awaiting Accept.
 	AcceptQueueConnections int
-	AcceptQueueCapacity    int
-	AcceptQueuePeak        int
-	SYNBacklogConnections  int
-	SYNBacklogCapacity     int
-	SYNBacklogPeak         int
-	SYNsReceived           uint64
-	StatefulHandshakes     uint64
-	HandshakeCompletions   uint64
-	HandshakeFailures      uint64
-	HandshakeTimeouts      uint64
-	SYNCookiesSent         uint64
-	SYNCookiesAccepted     uint64
-	SYNCookiesRejected     uint64
-	AcceptQueueDrops       uint64
-	AcceptedConnections    uint64
+	// AcceptQueueCapacity is the completed-connection queue limit.
+	AcceptQueueCapacity int
+	// AcceptQueuePeak is the lifetime peak completed-connection queue depth.
+	AcceptQueuePeak int
+	// SYNBacklogConnections is the number of stateful handshakes in progress.
+	SYNBacklogConnections int
+	// SYNBacklogCapacity is the stateful handshake limit.
+	SYNBacklogCapacity int
+	// SYNBacklogPeak is the lifetime peak number of stateful handshakes.
+	SYNBacklogPeak int
+	// SYNsReceived counts valid initial SYN segments dispatched to the listener.
+	SYNsReceived uint64
+	// StatefulHandshakes counts connection states allocated for initial SYNs.
+	StatefulHandshakes uint64
+	// HandshakeCompletions counts passive handshakes that reached the accept queue.
+	HandshakeCompletions uint64
+	// HandshakeFailures counts stateful passive handshakes that did not complete.
+	HandshakeFailures uint64
+	// HandshakeTimeouts counts stateful passive handshakes that timed out.
+	HandshakeTimeouts uint64
+	// SYNCookiesSent counts stateless SYN-cookie responses.
+	SYNCookiesSent uint64
+	// SYNCookiesAccepted counts valid cookie acknowledgements.
+	SYNCookiesAccepted uint64
+	// SYNCookiesRejected counts invalid or stale cookie acknowledgements.
+	SYNCookiesRejected uint64
+	// AcceptQueueDrops counts completed handshakes rejected by a full accept queue.
+	AcceptQueueDrops uint64
+	// AcceptedConnections counts connections returned successfully by Accept.
+	AcceptedConnections uint64
 }
 
 // TCPListener is a passive userspace TCP endpoint.
@@ -4154,10 +4253,9 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 	}
 }
 
-// The fields below are initialized by handshake before established runs and
-// thereafter belong exclusively to the connection actor.
 // established runs the serialized data, congestion, receive, and close state
-// machine.
+// machine. Its handshake-derived arguments belong exclusively to the
+// connection actor after entry.
 func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialReceive tcpInitialReceive) error {
 	localMaximum := tcpMSSForMTU(c.mtu, c.key.local.Addr())
 	if c.peerTimestamp {
