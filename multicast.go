@@ -810,7 +810,8 @@ func isSourceSpecificMulticast(group netip.Addr) bool {
 	if group.Is4() {
 		return group.As4()[0] == 232
 	}
-	return group.As16()[1]>>4 == 3
+	raw := group.As16()
+	return raw[1]>>4 == 3 && raw[2] == 0 && raw[3] == 0
 }
 
 // multicastSourceFilter snapshots one socket's current group state.

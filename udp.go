@@ -663,22 +663,33 @@ func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, tar
 
 // WriteTo sends one datagram, fragmenting its IP payload when required.
 func (c *UDPConn) WriteTo(payload []byte, address net.Addr) (int, error) {
+	netAddress := address
+	if udp, ok := address.(*net.UDPAddr); ok {
+		netAddress = udpNetAddr(udp)
+		if c.remote.IsValid() {
+			return 0, c.operationError("write", netAddress, net.ErrWriteToConnected)
+		}
+	}
 	target, err := udpAddrPort(address)
 	if err != nil {
-		return 0, c.operationError("write", address, err)
+		return 0, c.operationError("write", netAddress, err)
 	}
 	if c.remote.IsValid() {
-		return 0, c.operationError("write", address, net.ErrWriteToConnected)
+		return 0, c.operationError("write", netAddress, net.ErrWriteToConnected)
 	}
 	n, err := c.writeTo(payload, target)
 	if err != nil {
-		return n, c.operationError("write", address, err)
+		return n, c.operationError("write", netAddress, err)
 	}
 	return n, nil
 }
 
 // WriteToUDP acts like WriteTo but accepts a UDPAddr directly.
 func (c *UDPConn) WriteToUDP(payload []byte, address *net.UDPAddr) (int, error) {
+	netAddress := udpNetAddr(address)
+	if c.remote.IsValid() {
+		return 0, c.operationError("write", netAddress, net.ErrWriteToConnected)
+	}
 	if address == nil {
 		return 0, c.operationError("write", nil, errors.New("mipstack: UDP destination is required"))
 	}
@@ -687,13 +698,14 @@ func (c *UDPConn) WriteToUDP(payload []byte, address *net.UDPAddr) (int, error) 
 
 // WriteToUDPAddrPort acts like WriteTo but accepts a netip.AddrPort directly.
 func (c *UDPConn) WriteToUDPAddrPort(payload []byte, address netip.AddrPort) (int, error) {
+	netAddress := addrPortUDPAddr{address}
 	if c.remote.IsValid() {
-		return 0, c.operationError("write", net.UDPAddrFromAddrPort(address), net.ErrWriteToConnected)
+		return 0, c.operationError("write", netAddress, net.ErrWriteToConnected)
 	}
 	target := netip.AddrPortFrom(address.Addr().Unmap(), address.Port())
 	n, err := c.writeTo(payload, target)
 	if err != nil {
-		return n, c.operationError("write", net.UDPAddrFromAddrPort(address), err)
+		return n, c.operationError("write", netAddress, err)
 	}
 	return n, nil
 }
@@ -782,10 +794,11 @@ func (c *UDPConn) ConfirmPathMTUFor(target netip.Addr, mtu int) error {
 // WriteMsgUDP writes a payload using Linux-compatible packet-info ancillary
 // data. A connected socket requires a nil address.
 func (c *UDPConn) WriteMsgUDP(payload, oob []byte, address *net.UDPAddr) (n, oobn int, err error) {
+	netAddress := udpNetAddr(address)
 	var target netip.AddrPort
 	if c.remote.IsValid() {
 		if address != nil {
-			return 0, 0, c.operationError("write", address, net.ErrWriteToConnected)
+			return 0, 0, c.operationError("write", netAddress, net.ErrWriteToConnected)
 		}
 		target = c.remote
 	} else {
@@ -796,10 +809,6 @@ func (c *UDPConn) WriteMsgUDP(payload, oob []byte, address *net.UDPAddr) (n, oob
 	}
 	n, oobn, err = c.writeMsgUDPAddrPort(payload, oob, target)
 	if err != nil {
-		var netAddress net.Addr = address
-		if netAddress == nil {
-			netAddress = c.remoteAddr()
-		}
 		return n, oobn, c.operationError("write", netAddress, err)
 	}
 	return n, oobn, nil
@@ -808,19 +817,20 @@ func (c *UDPConn) WriteMsgUDP(payload, oob []byte, address *net.UDPAddr) (n, oob
 // WriteMsgUDPAddrPort is the netip.AddrPort form of WriteMsgUDP. A connected
 // socket requires an invalid address.
 func (c *UDPConn) WriteMsgUDPAddrPort(payload, oob []byte, address netip.AddrPort) (n, oobn int, err error) {
+	netAddress := addrPortUDPAddr{address}
 	if c.remote.IsValid() {
 		if address.IsValid() {
-			return 0, 0, c.operationError("write", net.UDPAddrFromAddrPort(address), net.ErrWriteToConnected)
+			return 0, 0, c.operationError("write", netAddress, net.ErrWriteToConnected)
 		}
 		address = c.remote
 	} else {
 		if !address.IsValid() {
-			return 0, 0, c.operationError("write", nil, errors.New("mipstack: UDP destination is required"))
+			return 0, 0, c.operationError("write", netAddress, errors.New("mipstack: UDP destination is required"))
 		}
 	}
 	n, oobn, err = c.writeMsgUDPAddrPort(payload, oob, address)
 	if err != nil {
-		return n, oobn, c.operationError("write", net.UDPAddrFromAddrPort(address), err)
+		return n, oobn, c.operationError("write", netAddress, err)
 	}
 	return n, oobn, nil
 }
@@ -829,7 +839,16 @@ func (c *UDPConn) WriteMsgUDPAddrPort(payload, oob []byte, address netip.AddrPor
 // datagram without wrapping errors. oobn is reported only when the complete
 // message was accepted.
 func (c *UDPConn) writeMsgUDPAddrPort(payload, oob []byte, target netip.AddrPort) (n, oobn int, err error) {
-	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
+	target, err = c.validateWriteTarget(target)
+	if err != nil {
+		return 0, 0, err
+	}
+	// net converts the destination before entering poll.SendMsg, then poll
+	// reports an expired deadline or closed descriptor before the kernel parses
+	// ancillary data. Preserve that observable error precedence.
+	if err = (socketWriteState{deadline: &c.writeDeadline, closed: c.closed}).err(); err != nil {
+		return 0, 0, err
+	}
 	source, options, err := parseControlMessageForWrite(oob, target.Addr().Is6())
 	if err != nil {
 		return 0, 0, err
@@ -855,9 +874,10 @@ func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, packetInfoS
 // and ICMP correlation shared while leaving optional output policies
 // independently reachable by the linker.
 func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, uint16, uint16, []byte, ipPacketOptions, bool) error) (int, error) {
-	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
-	if !target.IsValid() || target.Addr().Is6() != c.v6 && !c.dual || target.Addr().IsUnspecified() {
-		return 0, errors.New("mipstack: invalid UDP destination")
+	var err error
+	target, err = c.validateWriteTarget(target)
+	if err != nil {
+		return 0, err
 	}
 	state, options := c.writeStateAndOptions(options)
 	if err := state.err(); err != nil {
@@ -1076,6 +1096,9 @@ func udpAddrPort(address net.Addr) (netip.AddrPort, error) {
 		return netip.AddrPort{}, errors.New("mipstack: UDP destination is required")
 	}
 	if udp, ok := address.(*net.UDPAddr); ok {
+		if udp == nil {
+			return netip.AddrPort{}, errors.New("mipstack: UDP destination is required")
+		}
 		return udp.AddrPort(), nil
 	}
 	result, err := netip.ParseAddrPort(address.String())
@@ -1083,6 +1106,39 @@ func udpAddrPort(address net.Addr) (netip.AddrPort, error) {
 		return netip.AddrPort{}, errors.New("mipstack: invalid UDP destination")
 	}
 	return result, nil
+}
+
+// validateWriteTarget normalizes one UDP destination and applies the address
+// conversion errors that net reports before deadline and ancillary-data work.
+func (c *UDPConn) validateWriteTarget(target netip.AddrPort) (netip.AddrPort, error) {
+	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
+	address := target.Addr()
+	if !target.IsValid() || address.IsUnspecified() || address.Zone() != "" {
+		return netip.AddrPort{}, errors.New("mipstack: invalid UDP destination")
+	}
+	if !c.dual && address.Is6() != c.v6 {
+		family := "IPv4"
+		if c.v6 {
+			family = "IPv6"
+		}
+		return netip.AddrPort{}, &net.AddrError{Err: "non-" + family + " address", Addr: address.String()}
+	}
+	return target, nil
+}
+
+// addrPortUDPAddr preserves the netip argument in operation errors just as
+// the standard library's AddrPort-based UDP methods do.
+type addrPortUDPAddr struct{ netip.AddrPort }
+
+// Network returns the UDP network name required by net.Addr.
+func (addrPortUDPAddr) Network() string { return "udp" }
+
+// udpNetAddr avoids storing a typed nil pointer in net.OpError.Addr.
+func udpNetAddr(address *net.UDPAddr) net.Addr {
+	if address == nil {
+		return nil
+	}
+	return address
 }
 
 // Close unregisters the socket and wakes blocked reads.

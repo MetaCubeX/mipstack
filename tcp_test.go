@@ -58,7 +58,8 @@ func TestTCPListenerAcceptAndClose(t *testing.T) {
 	if err = listener.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if closedInfo := listener.Info(); !closedInfo.Closed || closedInfo.AcceptedConnections != 1 {
+	if closedInfo := listener.Info(); !closedInfo.Closed || closedInfo.AcceptedConnections != 1 ||
+		closedInfo.AcceptQueueCapacity != listenerInfo.AcceptQueueCapacity || closedInfo.SYNBacklogCapacity != listenerInfo.SYNBacklogCapacity {
 		t.Fatalf("closed listener diagnostics = %+v", closedInfo)
 	}
 	if _, err = serverConnection.Write([]byte("response")); err != nil {

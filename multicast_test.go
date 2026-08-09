@@ -505,21 +505,23 @@ func TestIPv6InterfaceLocalMulticastStaysInsideHost(t *testing.T) {
 
 func TestIPv6ReservedMulticastScopeIsRejected(t *testing.T) {
 	stack := newMulticastTestStack(t, []netip.Prefix{netip.MustParsePrefix("2001:db8::32/64")}, 1400)
-	reserved := netip.MustParseAddr("ff00::1234")
-	if _, err := stack.ListenMulticastUDP(context.Background(), "udp6", netip.AddrPortFrom(reserved, 43004)); !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("ListenMulticastUDP scope zero = %v, want EINVAL", err)
-	}
 	packet, err := stack.ListenUDP(context.Background(), "udp6", netip.AddrPortFrom(netip.IPv6Unspecified(), 0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	connection := multicastTestUDP(t, packet)
 	defer connection.Close()
-	if err = connection.JoinGroup(reserved); !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("JoinGroup scope zero = %v, want EINVAL", err)
-	}
-	if _, err = connection.WriteToUDPAddrPort([]byte("reserved"), netip.AddrPortFrom(reserved, 43004)); !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("multicast output to scope zero = %v, want EINVAL", err)
+	for _, address := range []string{"ff00::1234", "ff0f::1234"} {
+		reserved := netip.MustParseAddr(address)
+		if _, err = stack.ListenMulticastUDP(context.Background(), "udp6", netip.AddrPortFrom(reserved, 43004)); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("ListenMulticastUDP reserved scope %s = %v, want EINVAL", address, err)
+		}
+		if err = connection.JoinGroup(reserved); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("JoinGroup reserved scope %s = %v, want EINVAL", address, err)
+		}
+		if _, err = connection.WriteToUDPAddrPort([]byte("reserved"), netip.AddrPortFrom(reserved, 43004)); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("multicast output to reserved scope %s = %v, want EINVAL", address, err)
+		}
 	}
 }
 
@@ -529,7 +531,6 @@ func TestIPv6MulticastAddressFormatValidation(t *testing.T) {
 		"ff32::1",
 		"ff72:0140:2001:db8::1",
 		"ff32:0100::1",
-		"ff0f::1",
 	} {
 		if !validMulticastGroup(netip.MustParseAddr(address)) {
 			t.Fatalf("valid IPv6 multicast address %s was rejected", address)
@@ -537,6 +538,7 @@ func TestIPv6MulticastAddressFormatValidation(t *testing.T) {
 	}
 	for _, address := range []string{
 		"ff00::1", // Reserved scope zero.
+		"ff0f::1", // Reserved scope fifteen.
 		"ff22::1", // P requires T.
 		"ff52::1", // R requires P and T.
 		"ff82::1", // Highest flag bit is reserved.
@@ -1125,6 +1127,33 @@ func TestSourceSpecificMulticastRejectsAnySourceOperations(t *testing.T) {
 			t.Fatalf("%s source-specific leave: %v", test.group, err)
 		}
 		_ = connection.Close()
+	}
+}
+
+func TestIPv6PrefixBasedMulticastIsNotSourceSpecific(t *testing.T) {
+	stack := newMulticastTestStack(t, []netip.Prefix{
+		netip.MustParsePrefix("fe80::110/64"),
+	}, 1400)
+	group := netip.MustParseAddr("ff32:0100::1")
+	source := netip.MustParseAddr("fe80::111")
+	packet, err := stack.ListenUDP(context.Background(), "udp6", netip.MustParseAddrPort("[::]:43129"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := multicastTestUDP(t, packet)
+	defer connection.Close()
+	if err = connection.JoinGroup(group); err != nil {
+		t.Fatalf("prefix-based ASM join: %v", err)
+	}
+	if err = connection.ExcludeSourceSpecificGroup(group, source); err != nil {
+		t.Fatalf("prefix-based ASM EXCLUDE delta: %v", err)
+	}
+	filter, err := connection.MulticastSourceFilter(group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filter.Mode != MulticastSourceFilterExclude || len(filter.Sources) != 1 || filter.Sources[0] != source {
+		t.Fatalf("prefix-based ASM filter = %+v", filter)
 	}
 }
 

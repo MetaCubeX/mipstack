@@ -550,10 +550,10 @@ func sourceScopeUsable(source, destination netip.Addr) bool {
 }
 
 // validMulticastGroup rejects malformed group addresses that netip still
-// classifies by prefix. It applies RFC 4291's reserved flag/scope rules and
-// the RFC 3306/RFC 3956 dependencies between R, P, and T. Embedded fields are
-// deliberately not validated here because RFC 3956 requires receivers to
-// ignore some sender-reserved values.
+// classifies by prefix. It applies RFC 4291/RFC 7346 reserved flag and scope
+// rules plus the RFC 3306/RFC 3956 dependencies between R, P, and T. Embedded
+// fields are deliberately not validated here because RFC 3956 requires
+// receivers to ignore some sender-reserved values.
 func validMulticastGroup(address netip.Addr) bool {
 	address = address.Unmap()
 	if !address.IsValid() || !address.IsMulticast() || address.Zone() != "" {
@@ -564,7 +564,7 @@ func validMulticastGroup(address netip.Addr) bool {
 	}
 	raw := address.As16()
 	flags, scope := raw[1]>>4, raw[1]&0x0f
-	if scope == 0 || flags&8 != 0 {
+	if scope == 0 || scope == 0x0f || flags&8 != 0 {
 		return false
 	}
 	transient, prefixBased, embeddedRP := flags&1 != 0, flags&2 != 0, flags&4 != 0

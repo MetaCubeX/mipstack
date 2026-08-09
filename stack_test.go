@@ -1,6 +1,7 @@
 package mipstack
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -19,6 +20,54 @@ var _ func(*Stack, context.Context, string, netip.AddrPort) (*TCPListener, error
 var _ func(*Stack, context.Context, string, netip.AddrPort) (net.PacketConn, error) = (*Stack).ListenUDP
 var _ func(*Stack, context.Context, string, netip.AddrPort) (*TCPListener, error) = (*Stack).ListenTCPReusePort
 var _ func(*Stack, context.Context, string, netip.AddrPort) (net.PacketConn, error) = (*Stack).ListenUDPReusePort
+
+func TestStackReadCompletedPacketWinsCloseRace(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.249")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	packet := buildIPPacket(local, netip.MustParseAddr("192.0.2.248"), 99, []byte("completed"), 0, true)
+	slot, ok := stack.outbound.tryReserve()
+	if !ok || !stack.outbound.enqueueReservedPacket(slot, packet, false) {
+		t.Fatal("failed to enqueue test packet")
+	}
+	// Fill the semaphore with a duplicate token so release blocks after it has
+	// copied the packet and cleared slot ownership. This exposes the otherwise
+	// very narrow interval in which Close races a completed device read.
+	stack.outbound.free <- slot
+	buffer := make([]byte, len(packet))
+	sizes := make([]int, 1)
+	type readResult struct {
+		count int
+		err   error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		count, readErr := stack.Read([][]byte{buffer}, sizes, 0)
+		done <- readResult{count: count, err: readErr}
+	}()
+	waitFor(t, time.Second, func() bool { return stack.outbound.slots[slot].Load()&1 == 0 })
+	if err = stack.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-stack.outbound.free
+	select {
+	case result := <-done:
+		if result.count != 1 || result.err != nil {
+			t.Fatalf("completed Read = %d, %v, want 1, nil", result.count, result.err)
+		}
+		if sizes[0] != len(packet) || !bytes.Equal(buffer, packet) {
+			t.Fatalf("completed Read payload = %d bytes, equal %t", sizes[0], bytes.Equal(buffer, packet))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("completed Read remained blocked")
+	}
+}
 
 // TestStackClosePreventsCacheRepopulation verifies that operations already
 // entering protocol code cannot recreate mutable caches after their cleaners

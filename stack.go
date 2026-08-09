@@ -1145,10 +1145,6 @@ func (t packetQueueTicket) pending(stack *Stack) bool {
 func (q *packetQueue) tryReserve() (uint16, bool) {
 	select {
 	case slot := <-q.free:
-		if q.closed.Load() {
-			q.releaseReserved(slot)
-			return 0, false
-		}
 		return slot, true
 	default:
 		return 0, false
@@ -1276,7 +1272,7 @@ func (q *packetQueue) acquireBuffer(size int) ([]byte, bool) {
 
 // releaseBuffer returns reusable storage without publishing a queue slot.
 func (q *packetQueue) releaseBuffer(packet []byte, reusable bool) {
-	if !reusable || q.closed.Load() {
+	if !reusable {
 		return
 	}
 	select {
@@ -1304,9 +1300,9 @@ func (q *packetQueue) release(entry packetQueueEntry) {
 	q.free <- entry.slot
 }
 
-// close rejects future reservations and discards all currently published
-// packets and reusable buffers. Publishers already past the first closed check
-// call discard themselves after publication, so close never waits for them.
+// close rejects future publications and discards all currently published
+// packets and reusable buffers. Publishers racing closure discard themselves
+// after publication, so close never waits for them.
 func (q *packetQueue) close() {
 	q.closed.Store(true)
 	q.discard()
@@ -2406,11 +2402,6 @@ func (s *Stack) Read(buffers [][]byte, sizes []int, offset int) (int, error) {
 			return 0, errors.New("mipstack: invalid Read offset")
 		}
 	}
-	select {
-	case <-s.closeCh:
-		return 0, os.ErrClosed
-	default:
-	}
 	readPacket := func(index int, entry packetQueueEntry) error {
 		if len(entry.packet) > len(buffers[index])-offset {
 			s.outbound.release(entry)
@@ -2418,22 +2409,11 @@ func (s *Stack) Read(buffers [][]byte, sizes []int, offset int) (int, error) {
 		}
 		sizes[index] = copy(buffers[index][offset:], entry.packet)
 		s.outbound.release(entry)
-		select {
-		case <-s.closeCh:
-			return os.ErrClosed
-		default:
-			return nil
-		}
+		return nil
 	}
 	first, ok := s.outbound.dequeue(s.closeCh)
 	if !ok {
 		return 0, os.ErrClosed
-	}
-	select {
-	case <-s.closeCh:
-		s.outbound.release(first)
-		return 0, os.ErrClosed
-	default:
 	}
 	if err := readPacket(0, first); err != nil {
 		return 0, err
@@ -2474,11 +2454,6 @@ func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 			return count, err
 		}
 		count++
-		select {
-		case <-s.closeCh:
-			return count, os.ErrClosed
-		default:
-		}
 	}
 	return count, nil
 }

@@ -1790,10 +1790,11 @@ type TCPListener struct {
 	dual  bool
 	net   string
 
-	accept  chan *TCPConn
-	closed  chan struct{}
-	once    sync.Once
-	backlog int
+	accept         chan *TCPConn
+	closed         chan struct{}
+	once           sync.Once
+	backlog        int
+	acceptCapacity int
 
 	mu          sync.Mutex
 	deadline    socketDeadline
@@ -1878,7 +1879,8 @@ func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrP
 	key := tcpListenKey{address: address, port: port}
 	listener := &TCPListener{
 		stack: s, key: key, local: local, dual: dual, net: network, accept: make(chan *TCPConn, state.tcpDefaults.AcceptQueue), backlog: state.tcpDefaults.SYNBacklog,
-		closed: make(chan struct{}), pending: make(map[*TCPConn]struct{}), handshaking: make(map[*TCPConn]struct{}),
+		acceptCapacity: state.tcpDefaults.AcceptQueue,
+		closed:         make(chan struct{}), pending: make(map[*TCPConn]struct{}), handshaking: make(map[*TCPConn]struct{}),
 	}
 	if err = binding.register(passive, listener); err != nil {
 		return wrap(err)
@@ -2115,7 +2117,7 @@ func (l *TCPListener) Info() TCPListenerInfo {
 	l.mu.Lock()
 	info := TCPListenerInfo{
 		LocalAddress:           l.local,
-		AcceptQueueConnections: len(l.accept), AcceptQueueCapacity: cap(l.accept), AcceptQueuePeak: l.acceptPeak,
+		AcceptQueueConnections: len(l.accept), AcceptQueueCapacity: l.acceptCapacity, AcceptQueuePeak: l.acceptPeak,
 		SYNBacklogConnections: len(l.handshaking), SYNBacklogCapacity: l.backlog, SYNBacklogPeak: l.backlogPeak,
 	}
 	select {

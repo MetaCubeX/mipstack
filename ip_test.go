@@ -281,6 +281,17 @@ func TestIPConnTypedWritesAndDeadlines(t *testing.T) {
 	if connection.RemoteAddr() != nil {
 		t.Fatalf("unconnected remote address = %v", connection.RemoteAddr())
 	}
+	if _, writeErr := connection.WriteToIP([]byte("missing"), nil); writeErr == nil {
+		t.Fatal("WriteToIP accepted a nil address")
+	} else if operationError := checkNetOpError(t, writeErr, "write", "ip4:99"); operationError.Addr != nil {
+		t.Fatalf("nil WriteToIP error address = %#v, want nil", operationError.Addr)
+	}
+	var nilIP *net.IPAddr
+	if _, writeErr := connection.WriteTo([]byte("missing"), nilIP); writeErr == nil {
+		t.Fatal("WriteTo accepted a nil *net.IPAddr")
+	} else if operationError := checkNetOpError(t, writeErr, "write", "ip4:99"); operationError.Addr != nil {
+		t.Fatalf("nil *net.IPAddr error address = %#v, want nil", operationError.Addr)
+	}
 	if err = connection.SetDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -301,6 +312,18 @@ func TestIPConnTypedWritesAndDeadlines(t *testing.T) {
 	}
 	if _, err = connection.WriteToIP([]byte("late"), ipNetAddr(remote)); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("expired WriteToIP = %v, want deadline", err)
+	}
+	if _, _, err = connection.WriteMsgIP([]byte("late"), []byte{1}, ipNetAddr(remote)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expired WriteMsgIP with invalid control = %v, want deadline", err)
+	}
+	wrongFamily := &net.IPAddr{IP: net.ParseIP("2001:db8::123")}
+	if _, _, err = connection.WriteMsgIP([]byte("wrong-family"), []byte{1}, wrongFamily); err == nil {
+		t.Fatal("WriteMsgIP accepted an IPv6 destination on an IPv4 socket")
+	} else {
+		var addressError *net.AddrError
+		if !errors.As(err, &addressError) || errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("WriteMsgIP family/control precedence = %T %v, want net.AddrError", err, err)
+		}
 	}
 }
 
@@ -328,6 +351,16 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
 	if !ok || transportChecksum(local, remote, protocolICMPv6, packet.payload) != 0 {
 		t.Fatalf("ICMPv6 raw checksum is invalid: %x", packet.payload)
+	}
+	if _, _, err = connection.(*IPConn).WriteMsgIP(payload, nil, nil); !errors.Is(err, net.ErrWriteToConnected) {
+		t.Fatalf("connected IP WriteMsgIP = %v, want net.ErrWriteToConnected", err)
+	} else if operationError := checkNetOpError(t, err, "write", "ip6:ipv6-icmp"); operationError.Addr != nil {
+		t.Fatalf("connected IP WriteMsgIP error address = %v, want nil", operationError.Addr)
+	}
+	if _, err = connection.(*IPConn).WriteToIP(payload, nil); !errors.Is(err, net.ErrWriteToConnected) {
+		t.Fatalf("connected IP WriteToIP(nil) = %v, want net.ErrWriteToConnected", err)
+	} else if operationError := checkNetOpError(t, err, "write", "ip6:ipv6-icmp"); operationError.Addr != nil {
+		t.Fatalf("connected IP WriteToIP(nil) error address = %v, want nil", operationError.Addr)
 	}
 	wrong := buildIPPacket(other, local, protocolICMPv6, []byte{129, 0, 0, 0, 0, 1, 0, 1}, 0, true)
 	binaryPayload := wrong[40:]
@@ -511,11 +544,10 @@ func TestIPConnFragmentReassembly(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer listener.Close()
-			netConnection, err := client.DialIP(context.Background(), network, netip.Addr{}, test.remote)
+			connection, err := client.ListenIP(context.Background(), network, netip.Addr{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			connection := netConnection.(*IPConn)
 			defer connection.Close()
 			payload := bytes.Repeat([]byte{0x5a}, 3000)
 			var oob []byte
@@ -527,7 +559,7 @@ func TestIPConnFragmentReassembly(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if n, _, writeErr := connection.WriteMsgIP(payload, oob, nil); writeErr != nil || n != len(payload) {
+			if n, _, writeErr := connection.WriteMsgIP(payload, oob, ipNetAddr(test.remote)); writeErr != nil || n != len(payload) {
 				t.Fatalf("fragmented WriteMsgIP = %d, %v", n, writeErr)
 			}
 			buffer := make([]byte, len(payload))

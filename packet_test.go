@@ -139,6 +139,12 @@ func FuzzInboundPacket(f *testing.F) {
 	f.Add([]byte(nil))
 	f.Add([]byte{0x45, 0, 0, 20})
 	f.Add(buildIPPacket(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.1"), protocolUDP, make([]byte, 8), 1, false))
+	f.Add(buildMulticastTestIGMPQuery(
+		netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("224.0.0.1"), netip.IPv4Unspecified(), 3, nil, true,
+	))
+	f.Add(buildMulticastTestMLDQuery(
+		netip.MustParseAddr("fe80::2"), netip.MustParseAddr("ff02::1"), netip.IPv6Unspecified(), 2, nil,
+	))
 	f.Fuzz(func(t *testing.T, packet []byte) {
 		_, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
 		defer stack.Close()

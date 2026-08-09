@@ -645,7 +645,7 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 // WriteTo sends one payload to an unconnected destination.
 func (c *IPConn) WriteTo(payload []byte, address net.Addr) (int, error) {
 	ipAddress, ok := address.(*net.IPAddr)
-	if !ok || ipAddress == nil {
+	if !ok {
 		return 0, c.operationErrorTo("write", address, syscall.EINVAL)
 	}
 	return c.WriteToIP(payload, ipAddress)
@@ -653,16 +653,17 @@ func (c *IPConn) WriteTo(payload []byte, address net.Addr) (int, error) {
 
 // WriteToIP acts like WriteTo but accepts an IPAddr directly.
 func (c *IPConn) WriteToIP(payload []byte, address *net.IPAddr) (int, error) {
+	netAddress := ipAddrNet(address)
+	if c.remote.IsValid() {
+		return 0, c.operationErrorTo("write", netAddress, net.ErrWriteToConnected)
+	}
 	target, err := ipAddr(address)
 	if err != nil {
-		return 0, c.operationErrorTo("write", address, err)
-	}
-	if c.remote.IsValid() {
-		return 0, c.operationErrorTo("write", address, net.ErrWriteToConnected)
+		return 0, c.operationErrorTo("write", netAddress, err)
 	}
 	n, err := c.writeTo(payload, target, netip.Addr{}, ipPacketOptions{})
 	if err != nil {
-		return n, c.operationErrorTo("write", address, err)
+		return n, c.operationErrorTo("write", netAddress, err)
 	}
 	return n, nil
 }
@@ -735,21 +736,25 @@ func (c *IPConn) ConfirmPathMTUFor(target netip.Addr, mtu int) error {
 }
 
 // WriteMsgIP writes one payload with Linux-compatible source, hop-limit, and
-// traffic-class ancillary data. A connected socket requires a nil address.
+// traffic-class ancillary data. Like net.IPConn, it requires an unconnected
+// socket and a non-nil destination.
 func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn int, err error) {
-	var target netip.Addr
-	var netAddress net.Addr
+	netAddress := ipAddrNet(address)
 	if c.remote.IsValid() {
-		if address != nil {
-			return 0, 0, c.operationErrorTo("write", address, net.ErrWriteToConnected)
-		}
-		target, netAddress = c.remote, c.remoteAddr()
-	} else {
-		target, err = ipAddr(address)
-		if err != nil {
-			return 0, 0, c.operationErrorTo("write", address, err)
-		}
-		netAddress = address
+		return 0, 0, c.operationErrorTo("write", netAddress, net.ErrWriteToConnected)
+	}
+	target, err := ipAddr(address)
+	if err != nil {
+		return 0, 0, c.operationErrorTo("write", netAddress, err)
+	}
+	target, err = c.validateWriteTarget(target)
+	if err != nil {
+		return 0, 0, c.operationErrorTo("write", netAddress, err)
+	}
+	// Match net.IPConn: destination conversion precedes poll state, while an
+	// expired deadline or closed descriptor precedes ancillary-data parsing.
+	if err = (socketWriteState{deadline: &c.writeDeadline, closed: c.closed}).err(); err != nil {
+		return 0, 0, c.operationErrorTo("write", netAddress, err)
 	}
 	source, options, err := parseControlMessageForWrite(oob, target.Is6())
 	if err != nil {
@@ -771,9 +776,10 @@ func (c *IPConn) writeTo(payload []byte, target netip.Addr, packetInfoSource net
 // writeToWith keeps routing, checksums, deadlines, accounting, and ICMP
 // correlation shared between ordinary writes and PLPMTUD probes.
 func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, []byte, ipPacketOptions, bool) error) (int, error) {
-	target = target.Unmap()
-	if !target.IsValid() || target.IsUnspecified() || !c.dual && target.Is6() != c.v6 || target.Zone() != "" {
-		return 0, syscall.EINVAL
+	var err error
+	target, err = c.validateWriteTarget(target)
+	if err != nil {
+		return 0, err
 	}
 	state, options := c.writeStateAndOptions(options)
 	if err := state.err(); err != nil {
@@ -1126,6 +1132,14 @@ func ipNetAddr(address netip.Addr) *net.IPAddr {
 	return &net.IPAddr{IP: net.IP(address.AsSlice()), Zone: address.Zone()}
 }
 
+// ipAddrNet avoids storing a typed nil pointer in net.OpError.Addr.
+func ipAddrNet(address *net.IPAddr) net.Addr {
+	if address == nil {
+		return nil
+	}
+	return address
+}
+
 // ipAddr converts an IPAddr without name resolution.
 func ipAddr(address *net.IPAddr) (netip.Addr, error) {
 	if address == nil || address.Zone != "" {
@@ -1140,6 +1154,23 @@ func ipAddr(address *net.IPAddr) (netip.Addr, error) {
 		return netip.Addr{}, syscall.EINVAL
 	}
 	return result, nil
+}
+
+// validateWriteTarget normalizes one raw-IP destination and mirrors net's
+// address-family conversion before deadline and ancillary-data processing.
+func (c *IPConn) validateWriteTarget(target netip.Addr) (netip.Addr, error) {
+	target = target.Unmap()
+	if !target.IsValid() || target.IsUnspecified() || target.Zone() != "" {
+		return netip.Addr{}, syscall.EINVAL
+	}
+	if !c.dual && target.Is6() != c.v6 {
+		family := "IPv4"
+		if c.v6 {
+			family = "IPv6"
+		}
+		return netip.Addr{}, &net.AddrError{Err: "non-" + family + " address", Addr: target.String()}
+	}
+	return target, nil
 }
 
 // Verify the standard connection interfaces implemented without an OS fd.

@@ -1038,6 +1038,15 @@ func TestUDPConnectedMessageMethods(t *testing.T) {
 	if _, _, err = connection.WriteMsgUDP([]byte("bad"), nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 50017))); err == nil {
 		t.Fatal("connected WriteMsgUDP accepted an explicit destination")
 	}
+	var nilUDP *net.UDPAddr
+	if _, err = connection.WriteToUDP([]byte("bad"), nilUDP); !errors.Is(err, net.ErrWriteToConnected) {
+		t.Fatalf("connected WriteToUDP(nil) = %v, want net.ErrWriteToConnected", err)
+	} else if operationError := checkNetOpError(t, err, "write", "udp"); operationError.Addr != nil {
+		t.Fatalf("connected WriteToUDP(nil) error address = %#v, want nil", operationError.Addr)
+	}
+	if _, err = connection.WriteTo([]byte("bad"), nilUDP); !errors.Is(err, net.ErrWriteToConnected) {
+		t.Fatalf("connected WriteTo(nil *net.UDPAddr) = %v, want net.ErrWriteToConnected", err)
+	}
 	if n, oobn, writeErr := connection.WriteMsgUDPAddrPort([]byte("netip"), nil, netip.AddrPort{}); writeErr != nil || n != 5 || oobn != 0 {
 		t.Fatalf("connected WriteMsgUDPAddrPort = %d/%d, %v", n, oobn, writeErr)
 	}
@@ -1047,6 +1056,28 @@ func TestUDPConnectedMessageMethods(t *testing.T) {
 	}
 	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("bad"), nil, netip.AddrPortFrom(remote, 50017)); !errors.Is(err, net.ErrWriteToConnected) {
 		t.Fatalf("connected WriteMsgUDPAddrPort with destination = %v, want net.ErrWriteToConnected", err)
+	}
+	if err = connection.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = connection.WriteMsgUDP([]byte("late"), nil, nil); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("connected WriteMsgUDP deadline = %v, want deadline", err)
+	} else if operationError := checkNetOpError(t, err, "write", "udp"); operationError.Addr != nil {
+		t.Fatalf("connected WriteMsgUDP error address = %v, want nil", operationError.Addr)
+	}
+	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("late"), nil, netip.AddrPort{}); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("connected WriteMsgUDPAddrPort deadline = %v, want deadline", err)
+	} else if operationError := checkNetOpError(t, err, "write", "udp"); operationError.Addr == nil || operationError.Addr.String() != "invalid AddrPort" {
+		t.Fatalf("connected WriteMsgUDPAddrPort error address = %#v, want invalid AddrPort", operationError.Addr)
+	}
+	if _, _, err = connection.WriteMsgUDP([]byte("late"), []byte{1}, nil); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("connected WriteMsgUDP invalid control deadline = %v, want deadline", err)
+	}
+	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("late"), []byte{1}, netip.AddrPort{}); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("connected WriteMsgUDPAddrPort invalid control deadline = %v, want deadline", err)
+	}
+	if err = connection.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
 	}
 	localPort := connection.LocalAddr().(*net.UDPAddr).AddrPort().Port()
 	if err = writeTestPacket(stack, buildTestUDP(remote, local, 50017, localPort, []byte("reply"))); err != nil {
@@ -1079,7 +1110,16 @@ func TestUDPUnconnectedMessageRequiresDestination(t *testing.T) {
 	if _, _, err = connection.(*UDPConn).WriteMsgUDPAddrPort([]byte("missing"), nil, netip.AddrPort{}); err == nil {
 		t.Fatal("unconnected WriteMsgUDPAddrPort accepted an invalid destination")
 	} else {
-		checkNetOpError(t, err, "write", "udp4")
+		operationError := checkNetOpError(t, err, "write", "udp4")
+		if operationError.Addr == nil || operationError.Addr.String() != "invalid AddrPort" {
+			t.Fatalf("unconnected WriteMsgUDPAddrPort error address = %#v, want invalid AddrPort", operationError.Addr)
+		}
+	}
+	var nilUDP *net.UDPAddr
+	if _, err = connection.WriteTo([]byte("missing"), nilUDP); err == nil {
+		t.Fatal("unconnected WriteTo accepted a nil *net.UDPAddr")
+	} else if operationError := checkNetOpError(t, err, "write", "udp4"); operationError.Addr != nil {
+		t.Fatalf("nil *net.UDPAddr error address = %#v, want nil", operationError.Addr)
 	}
 	if _, err = connection.WriteTo([]byte("invalid"), testUDPStringAddress("not-an-address")); err == nil {
 		t.Fatal("unconnected WriteTo accepted an invalid generic destination")
@@ -1093,6 +1133,23 @@ func TestUDPUnconnectedMessageRequiresDestination(t *testing.T) {
 	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
 	if !ok || packet.source != local || packet.target != remote || string(packet.payload[udpHeaderSize:]) != "generic" {
 		t.Fatalf("generic UDP packet = %v -> %v payload %q, parsed = %v", packet.source, packet.target, packet.payload, ok)
+	}
+	udpConnection := connection.(*UDPConn)
+	if err = udpConnection.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	target := net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 50018))
+	if _, _, err = udpConnection.WriteMsgUDP([]byte("late"), []byte{1}, target); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("unconnected WriteMsgUDP invalid control deadline = %v, want deadline", err)
+	}
+	wrongFamily := &net.UDPAddr{IP: net.ParseIP("2001:db8::101"), Port: 50018}
+	if _, _, err = udpConnection.WriteMsgUDP([]byte("wrong-family"), []byte{1}, wrongFamily); err == nil {
+		t.Fatal("WriteMsgUDP accepted an IPv6 destination on an IPv4 socket")
+	} else {
+		var addressError *net.AddrError
+		if !errors.As(err, &addressError) || errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("WriteMsgUDP family/control precedence = %T %v, want net.AddrError", err, err)
+		}
 	}
 }
 
