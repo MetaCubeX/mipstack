@@ -2485,8 +2485,12 @@ func (s *Stack) rejectTCPSegment(key tcpKey, segment tcpSegment) error {
 	if segment.flags&tcpFlagRST != 0 {
 		return nil
 	}
-	if !s.network.Load().acceptsInboundDestination(key.local.Addr()) {
-		return nil
+	state := s.network.Load()
+	if !state.acceptsInboundDestination(key.local.Addr()) {
+		return syscall.EADDRNOTAVAIL
+	}
+	if _, routed := state.routeFor(key.remote.Addr()); !routed {
+		return syscall.ENETUNREACH
 	}
 	if !s.allowControlResponse(controlResponseTCPReset) {
 		return nil

@@ -166,7 +166,7 @@ func (s *Stack) deliverICMPError(remoteError ICMPError) bool {
 			}
 			s.mu.RUnlock()
 			if connection != nil && connection.acceptsLocal(remoteError.QuotedSource) && connection.acceptsError(target) {
-				if remoteError.MTU != 0 {
+				if remoteError.MTU != 0 && connection.acceptsPathMTU() {
 					if s.observePathMTU(remoteError.QuotedTarget, remoteError.MTU) {
 						s.notifyTCPPathMTU(remoteError.QuotedTarget, nil)
 					}
@@ -246,7 +246,17 @@ func (s *Stack) writeOwnedICMPReply(packet ipPacket, reply []byte) error {
 // sendAdministrativeUnreachable rejects a handler-supplied ICMP request when
 // RFC 792 or RFC 4443 permits an error response.
 func (s *Stack) sendAdministrativeUnreachable(packet ipPacket) error {
-	if !s.network.Load().acceptsInboundDestination(packet.target) || packetInvokesICMPError(packet.original) || !s.allowControlResponse(controlResponsePortUnreachable) {
+	state := s.network.Load()
+	if !state.acceptsInboundDestination(packet.target) {
+		return syscall.EADDRNOTAVAIL
+	}
+	if packetInvokesICMPError(packet.original) {
+		return nil
+	}
+	if _, routed := state.routeFor(packet.source); !routed {
+		return syscall.ENETUNREACH
+	}
+	if !s.allowControlResponse(controlResponsePortUnreachable) {
 		return nil
 	}
 	quoteLength := len(packet.original)
@@ -473,7 +483,14 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 
 // sendPortUnreachable rejects a valid UDP datagram with no local socket.
 func (s *Stack) sendPortUnreachable(packet ipPacket) error {
-	if !s.network.Load().acceptsInboundDestination(packet.target) || !s.allowControlResponse(controlResponsePortUnreachable) {
+	state := s.network.Load()
+	if !state.acceptsInboundDestination(packet.target) {
+		return syscall.EADDRNOTAVAIL
+	}
+	if _, routed := state.routeFor(packet.source); !routed {
+		return syscall.ENETUNREACH
+	}
+	if !s.allowControlResponse(controlResponsePortUnreachable) {
 		return nil
 	}
 	quoteLength := len(packet.original)
@@ -504,6 +521,13 @@ func (s *Stack) sendPortUnreachable(packet ipPacket) error {
 // sendProtocolUnreachable rejects a valid packet whose upper-layer protocol
 // has no endpoint handler. IPv6 identifies the unrecognized Next Header field.
 func (s *Stack) sendProtocolUnreachable(packet ipPacket) error {
+	state := s.network.Load()
+	if !state.acceptsInboundDestination(packet.target) {
+		return syscall.EADDRNOTAVAIL
+	}
+	if _, routed := state.routeFor(packet.source); !routed {
+		return syscall.ENETUNREACH
+	}
 	if !s.allowControlResponse(controlResponseParameterProblem) {
 		return nil
 	}

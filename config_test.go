@@ -353,6 +353,7 @@ func TestDatagramSocketDefaultConfiguration(t *testing.T) {
 		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{ReceiveBuffer: -1}},
 		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{HopLimit: 256}},
 		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{FlowLabel: ipv6MaximumFlowLabel + 1}},
+		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{PathMTUDiscovery: PathMTUDiscovery(99)}},
 		{LocalAddresses: []netip.Prefix{local}, IP: DatagramSocketDefaults{HopLimit: -1}},
 		{LocalAddresses: []netip.Prefix{local}, IP: DatagramSocketDefaults{FlowLabel: ipv6MaximumFlowLabel + 1}},
 	} {
@@ -362,19 +363,19 @@ func TestDatagramSocketDefaultConfiguration(t *testing.T) {
 	}
 	stack, err := New(Config{
 		LocalAddresses: []netip.Prefix{local},
-		UDP:            DatagramSocketDefaults{ReceiveBuffer: 2048, HopLimit: 31, TrafficClass: 0xb8},
-		IP:             DatagramSocketDefaults{ReceiveBuffer: 4096, HopLimit: 29, TrafficClass: 0x2e},
+		UDP:            DatagramSocketDefaults{ReceiveBuffer: 2048, HopLimit: 31, TrafficClass: 0xb8, PathMTUDiscovery: PathMTUDiscoveryProbe},
+		IP:             DatagramSocketDefaults{ReceiveBuffer: 4096, HopLimit: 29, TrafficClass: 0x2e, PathMTUDiscovery: PathMTUDiscoveryOmit},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	udp := newUDPConn(stack, "udp4", 1000, false, local.Addr(), netip.AddrPort{})
-	if udp.receiveCapacity != 2048 || udp.defaultOptions != (ipPacketOptions{hopLimit: 31, trafficClass: 0xb8}) {
-		t.Fatalf("UDP defaults = %d, %+v", udp.receiveCapacity, udp.defaultOptions)
+	if udp.receiveCapacity != 2048 || udp.defaultOptions != (ipPacketOptions{hopLimit: 31, trafficClass: 0xb8}) || udp.pathMTUDiscovery != PathMTUDiscoveryProbe {
+		t.Fatalf("UDP defaults = %d, %+v, PMTU mode %d", udp.receiveCapacity, udp.defaultOptions, udp.pathMTUDiscovery)
 	}
 	ip := newIPConn(stack, "ip4:99", 99, local.Addr(), netip.Addr{})
-	if ip.receiveCapacity != 4096 || ip.defaultOptions != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e}) {
-		t.Fatalf("IP defaults = %d, %+v", ip.receiveCapacity, ip.defaultOptions)
+	if ip.receiveCapacity != 4096 || ip.defaultOptions != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e}) || ip.pathMTUDiscovery != PathMTUDiscoveryOmit {
+		t.Fatalf("IP defaults = %d, %+v, PMTU mode %d", ip.receiveCapacity, ip.defaultOptions, ip.pathMTUDiscovery)
 	}
 }
 
@@ -482,6 +483,146 @@ func TestRoutesAndRFC6724SourceSelection(t *testing.T) {
 	}
 }
 
+func TestRFC6724AddressProperties(t *testing.T) {
+	stable := netip.MustParseAddr("2001:db8:10::10")
+	temporary := netip.MustParseAddr("2001:db8:10::20")
+	deprecated := netip.MustParseAddr("2001:db8:10::30")
+	destination := netip.MustParseAddr("2001:db8:10::31")
+	base := Config{
+		LocalAddresses: []netip.Prefix{
+			netip.PrefixFrom(deprecated, 128),
+			netip.PrefixFrom(temporary, 128),
+			netip.PrefixFrom(stable, 128),
+		},
+		AddressProperties: map[netip.Addr]AddressProperties{
+			deprecated: {Deprecated: true},
+			temporary:  {Temporary: true},
+		},
+	}
+	stack, err := New(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source, sourceErr := stack.sourceForRequested(destination, netip.Addr{}); sourceErr != nil || source != stable {
+		t.Fatalf("stable source preference = %v, %v, want %v", source, sourceErr, stable)
+	}
+	preferTemporary := base
+	preferTemporary.PreferTemporaryAddresses = true
+	temporaryStack, err := New(preferTemporary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source, sourceErr := temporaryStack.sourceForRequested(destination, netip.Addr{}); sourceErr != nil || source != temporary {
+		t.Fatalf("temporary source preference = %v, %v, want %v", source, sourceErr, temporary)
+	}
+	if source, sourceErr := stack.sourceForRequested(deprecated, netip.Addr{}); sourceErr != nil || source != deprecated {
+		t.Fatalf("same deprecated source rule = %v, %v, want %v", source, sourceErr, deprecated)
+	}
+
+	base.AddressProperties[stable] = AddressProperties{Deprecated: true}
+	if source, sourceErr := stack.sourceForRequested(destination, netip.Addr{}); sourceErr != nil || source != stable {
+		t.Fatalf("configuration map mutation changed snapshot source = %v, %v", source, sourceErr)
+	}
+}
+
+func TestRFC6724SourceScopePreference(t *testing.T) {
+	linkLocal := netip.MustParseAddr("fe80::10")
+	global := netip.MustParseAddr("2001:db8::10")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(global, 128),
+		netip.PrefixFrom(linkLocal, 128),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, destination := range []netip.Addr{
+		netip.MustParseAddr("ff01::123"),
+		netip.MustParseAddr("ff02::123"),
+	} {
+		source, sourceErr := stack.sourceForRequested(destination, netip.Addr{})
+		if sourceErr != nil || source != linkLocal {
+			t.Fatalf("source for %s = %v, %v, want %v", destination, source, sourceErr, linkLocal)
+		}
+	}
+
+	destination := netip.MustParseAddr("ff0e::123")
+	if source, sourceErr := stack.sourceForRequested(destination, netip.Addr{}); sourceErr != nil || source != global {
+		t.Fatalf("source for %s = %v, %v, want %v", destination, source, sourceErr, global)
+	}
+
+	limited, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(linkLocal, 128)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, destination = range []netip.Addr{
+		netip.MustParseAddr("2001:db8:1::123"),
+		netip.MustParseAddr("ff0e::123"),
+	} {
+		source, sourceErr := limited.sourceForRequested(destination, netip.Addr{})
+		if sourceErr != nil || source != linkLocal {
+			t.Fatalf("insufficient-scope source for %s = %v, %v, want %v", destination, source, sourceErr, linkLocal)
+		}
+	}
+
+	siteLocal := netip.MustParseAddr("fec0::10")
+	scoped, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(global, 128),
+		netip.PrefixFrom(siteLocal, 128),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		destination, source netip.Addr
+	}{
+		{destination: netip.MustParseAddr("ff05::123"), source: siteLocal},
+		{destination: netip.MustParseAddr("ff08::123"), source: global},
+	} {
+		source, sourceErr := scoped.sourceForRequested(test.destination, netip.Addr{})
+		if sourceErr != nil || source != test.source {
+			t.Fatalf("source for %s = %v, %v, want %v", test.destination, source, sourceErr, test.source)
+		}
+	}
+}
+
+func TestAddressPropertiesValidation(t *testing.T) {
+	local4 := netip.MustParseAddr("192.0.2.32")
+	local6 := netip.MustParseAddr("2001:db8::32")
+	base := []netip.Prefix{netip.PrefixFrom(local4, 32), netip.PrefixFrom(local6, 128)}
+	for _, properties := range []map[netip.Addr]AddressProperties{
+		{netip.MustParseAddr("198.51.100.32"): {Deprecated: true}},
+		{local4: {Temporary: true}},
+		{netip.IPv6Unspecified(): {Deprecated: true}},
+	} {
+		if _, err := New(Config{LocalAddresses: base, AddressProperties: properties}); err == nil {
+			t.Fatalf("invalid address properties were accepted: %+v", properties)
+		}
+	}
+}
+
+func TestAddressPropertyUpdateInvalidatesPathMTU(t *testing.T) {
+	stable := netip.MustParseAddr("2001:db8:20::1")
+	temporary := netip.MustParseAddr("2001:db8:20::2")
+	remote := netip.MustParseAddr("2001:db8:30::1")
+	config := Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(stable, 128), netip.PrefixFrom(temporary, 128)}, MTU: 1500,
+		AddressProperties: map[netip.Addr]AddressProperties{temporary: {Temporary: true}}}
+	stack, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stack.observePathMTU(remote, 1280) {
+		t.Fatal("failed to install test PMTU")
+	}
+	config.PreferTemporaryAddresses = true
+	if err = stack.UpdateConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	if mtu := stack.mtuFor(remote); mtu != 1500 {
+		t.Fatalf("source-preference update retained PMTU %d, want 1500", mtu)
+	}
+}
+
 func TestRFC6724AddressLabels(t *testing.T) {
 	for _, test := range []struct {
 		address string
@@ -499,6 +640,34 @@ func TestRFC6724AddressLabels(t *testing.T) {
 	} {
 		if label := addressLabel(netip.MustParseAddr(test.address)); label != test.label {
 			t.Errorf("addressLabel(%s) = %d, want %d", test.address, label, test.label)
+		}
+	}
+}
+
+func TestRFC6724AddressScopes(t *testing.T) {
+	for _, test := range []struct {
+		address string
+		scope   uint8
+	}{
+		{address: "127.0.0.1", scope: 2},
+		{address: "169.254.1.1", scope: 2},
+		{address: "10.0.0.1", scope: 14},
+		{address: "224.0.0.1", scope: 2},
+		{address: "239.1.1.1", scope: 14},
+		{address: "239.255.1.1", scope: 3},
+		{address: "239.192.1.1", scope: 8},
+		{address: "::1", scope: 2},
+		{address: "fe80::1", scope: 2},
+		{address: "fec0::1", scope: 5},
+		{address: "fd00::1", scope: 14},
+		{address: "ff01::1", scope: 1},
+		{address: "ff04::1", scope: 4},
+		{address: "ff05::1", scope: 5},
+		{address: "ff08::1", scope: 8},
+		{address: "ff0e::1", scope: 14},
+	} {
+		if scope := addressScope(netip.MustParseAddr(test.address)); scope != test.scope {
+			t.Errorf("addressScope(%s) = %d, want %d", test.address, scope, test.scope)
 		}
 	}
 }
@@ -530,8 +699,25 @@ func TestIPv4MulticastUsesPrimaryInterfaceAddress(t *testing.T) {
 }
 
 func TestCommonPrefixBitsRejectsInvalidAddresses(t *testing.T) {
-	if bits := commonPrefixBits(netip.Addr{}, netip.Addr{}); bits != 0 {
+	if bits := commonPrefixBits(netip.Addr{}, netip.Addr{}, 128); bits != 0 {
 		t.Fatalf("invalid common-prefix length = %d", bits)
+	}
+}
+
+func TestRFC6724CommonPrefixUsesSourcePrefixLength(t *testing.T) {
+	shortPrefix := netip.MustParseAddr("2001:db8:1234:5678:aaaa::1")
+	longPrefix := netip.MustParseAddr("2001:db8:1234:5000::1")
+	destination := netip.MustParseAddr("2001:db8:1234:5678:bbbb::1")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(shortPrefix, 48),
+		netip.PrefixFrom(longPrefix, 64),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := stack.sourceForRequested(destination, netip.Addr{})
+	if err != nil || source != longPrefix {
+		t.Fatalf("RFC 6724 prefix-limited source = %v, %v, want %v", source, err, longPrefix)
 	}
 }
 

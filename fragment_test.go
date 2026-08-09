@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -49,6 +50,107 @@ func TestIPv6FragmentReservedBitsAreIgnored(t *testing.T) {
 				t.Fatalf("reserved-bit IPv6 reassembly = %+v, parsed = %v", parsed, ok)
 			}
 		}
+	}
+}
+
+// TestPathMTUDiscoveryOutputPolicy verifies both MTU selection and the wire
+// effects of every Linux IP_MTU_DISCOVER mode. The three packet sizes cover
+// output below the confirmed PMTU, between that PMTU and the interface MTU,
+// and above the interface MTU.
+func TestPathMTUDiscoveryOutputPolicy(t *testing.T) {
+	type expectation struct {
+		error        bool
+		fragmented   bool
+		dontFragment bool
+		identifiable bool
+		ceiling      int
+	}
+	for _, family := range []struct {
+		name           string
+		source, target netip.Addr
+		headerSize     int
+		pathMTU        int
+	}{
+		{name: "IPv4", source: netip.MustParseAddr("192.0.2.201"), target: netip.MustParseAddr("198.51.100.201"), headerSize: 20, pathMTU: 1000},
+		{name: "IPv6", source: netip.MustParseAddr("2001:db8::201"), target: netip.MustParseAddr("2001:db8:1::201"), headerSize: 40, pathMTU: 1280},
+	} {
+		t.Run(family.name, func(t *testing.T) {
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(family.source, family.source.BitLen())}, MTU: 1500})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			if !stack.observePathMTU(family.target, uint32(family.pathMTU)) {
+				t.Fatal("failed to install confirmed PMTU")
+			}
+
+			tests := []struct {
+				name       string
+				mode       PathMTUDiscovery
+				packetSize int
+				want       expectation
+			}{
+				{name: "dont-small", mode: PathMTUDiscoveryDont, packetSize: 900, want: expectation{identifiable: true, ceiling: family.pathMTU}},
+				{name: "want-small", mode: PathMTUDiscoveryWant, packetSize: 900, want: expectation{dontFragment: true, identifiable: true, ceiling: family.pathMTU}},
+				{name: "do-small", mode: PathMTUDiscoveryDo, packetSize: 900, want: expectation{dontFragment: true, ceiling: family.pathMTU}},
+				{name: "probe-small", mode: PathMTUDiscoveryProbe, packetSize: 900, want: expectation{dontFragment: true, ceiling: 1500}},
+				{name: "interface-small", mode: PathMTUDiscoveryInterface, packetSize: 900, want: expectation{identifiable: true, ceiling: 1500}},
+				{name: "omit-small", mode: PathMTUDiscoveryOmit, packetSize: 900, want: expectation{identifiable: true, ceiling: 1500}},
+				{name: "dont-path-exceeded", mode: PathMTUDiscoveryDont, packetSize: family.pathMTU + 200, want: expectation{fragmented: true, ceiling: family.pathMTU}},
+				{name: "want-path-exceeded", mode: PathMTUDiscoveryWant, packetSize: family.pathMTU + 200, want: expectation{fragmented: true, ceiling: family.pathMTU}},
+				{name: "do-path-exceeded", mode: PathMTUDiscoveryDo, packetSize: family.pathMTU + 200, want: expectation{error: true, ceiling: family.pathMTU}},
+				{name: "probe-ignores-path", mode: PathMTUDiscoveryProbe, packetSize: family.pathMTU + 200, want: expectation{dontFragment: true, ceiling: 1500}},
+				{name: "interface-ignores-path", mode: PathMTUDiscoveryInterface, packetSize: family.pathMTU + 200, want: expectation{identifiable: true, ceiling: 1500}},
+				{name: "omit-ignores-path", mode: PathMTUDiscoveryOmit, packetSize: family.pathMTU + 200, want: expectation{identifiable: true, ceiling: 1500}},
+				{name: "dont-interface-exceeded", mode: PathMTUDiscoveryDont, packetSize: 1600, want: expectation{fragmented: true, ceiling: family.pathMTU}},
+				{name: "want-interface-exceeded", mode: PathMTUDiscoveryWant, packetSize: 1600, want: expectation{fragmented: true, ceiling: family.pathMTU}},
+				{name: "do-interface-exceeded", mode: PathMTUDiscoveryDo, packetSize: 1600, want: expectation{error: true, ceiling: family.pathMTU}},
+				{name: "probe-interface-exceeded", mode: PathMTUDiscoveryProbe, packetSize: 1600, want: expectation{error: true, ceiling: 1500}},
+				{name: "interface-interface-exceeded", mode: PathMTUDiscoveryInterface, packetSize: 1600, want: expectation{error: true, ceiling: 1500}},
+				{name: "omit-interface-exceeded", mode: PathMTUDiscoveryOmit, packetSize: 1600, want: expectation{fragmented: true, ceiling: 1500}},
+			}
+			for _, test := range tests {
+				t.Run(test.name, func(t *testing.T) {
+					stack.ipv4ID.Store(100)
+					mtu, fragmentation := stack.pathMTUOutputPolicy(family.target, test.mode)
+					if mtu != test.want.ceiling {
+						t.Fatalf("selected MTU = %d, want %d", mtu, test.want.ceiling)
+					}
+					payload := make([]byte, test.packetSize-family.headerSize)
+					packets, outputErr := stack.ipPayloadPacketsForMTU(family.source, family.target, 99, payload, fragmentation, ipPacketOptions{}, mtu)
+					if test.want.error {
+						if !errors.Is(outputErr, syscall.EMSGSIZE) || len(packets) != 0 {
+							t.Fatalf("output = %d packets, %v; want EMSGSIZE", len(packets), outputErr)
+						}
+						return
+					}
+					if outputErr != nil {
+						t.Fatal(outputErr)
+					}
+					if fragmented := len(packets) > 1; fragmented != test.want.fragmented {
+						t.Fatalf("fragmented = %v (%d packets), want %v", fragmented, len(packets), test.want.fragmented)
+					}
+					for _, packet := range packets {
+						if len(packet) > test.want.ceiling {
+							t.Fatalf("packet length = %d, ceiling %d", len(packet), test.want.ceiling)
+						}
+						if family.source.Is4() {
+							df := binary.BigEndian.Uint16(packet[6:8])&0x4000 != 0
+							if df != test.want.dontFragment {
+								t.Fatalf("IPv4 DF = %v, want %v", df, test.want.dontFragment)
+							}
+							identification := binary.BigEndian.Uint16(packet[4:6])
+							wantIdentification := test.want.identifiable || test.want.fragmented
+							if (identification != 0) != wantIdentification {
+								t.Fatalf("IPv4 identification = %d, identifiable want %v", identification, wantIdentification)
+							}
+						} else if test.want.fragmented && packet[6] != 44 {
+							t.Fatalf("IPv6 next header = %d, want Fragment", packet[6])
+						}
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -493,7 +595,7 @@ func TestDirectFragmentOutputPreservesPartialDeadlineEmission(t *testing.T) {
 	var deadline socketDeadline
 	deadline.set(time.Now().Add(20 * time.Millisecond))
 	state := socketWriteState{deadline: &deadline, closed: make(chan struct{})}
-	err = stack.writeIPPayloadUntilOptionsForMTU(local, remote, protocolUDP, make([]byte, 96), true, ipPacketOptions{}, 68, state)
+	err = stack.writeIPPayloadUntilOptionsForMTU(local, remote, protocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, 68, state)
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("fragmented write error = %v, want deadline exceeded", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -61,7 +62,7 @@ func TestIPConnFanoutAndLinuxControl(t *testing.T) {
 			short := make([]byte, 3)
 			oob := make([]byte, 128)
 			n, oobn, flags, source, err := all.ReadMsgIP(short, oob)
-			if err != nil || n != len(short) || string(short) != "raw" || flags != linuxMessageTruncated || oobn != test.controlSize {
+			if err != nil || n != len(short) || string(short) != "raw" || flags != MessageTruncated || oobn != test.controlSize {
 				t.Fatalf("ReadMsgIP = %q/%d flags %#x from %v, %v", short[:n], oobn, flags, source, err)
 			}
 			if test.local.Is4() {
@@ -629,6 +630,304 @@ func TestIPConnConfigurationLifecycle(t *testing.T) {
 	}
 }
 
+func TestIPExplicitErrorQueue(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.185")
+	first := netip.MustParseAddr("198.51.100.185")
+	second := netip.MustParseAddr("198.51.100.186")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{})
+	defer connection.closeFromStack()
+	if err = connection.SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, getErr := connection.ReceiveErrors(); getErr != nil || !enabled {
+		t.Fatalf("ReceiveErrors = %v, %v", enabled, getErr)
+	}
+	connection.deliverError(first, ICMPError{Code: 1})
+	connection.deliverError(second, ICMPError{Code: 2})
+	if info := connection.Info(); info.ErrorQueueEntries != 2 || info.ErrorQueueBytes != 2*socketErrorMetadataSize || !info.ReceiveErrors || info.ErrorsDropped != 0 {
+		t.Fatalf("explicit IP error queue diagnostics = %+v", info)
+	}
+	if err = connection.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, readErr := connection.Read(make([]byte, 1)); !errors.Is(readErr, os.ErrDeadlineExceeded) {
+		t.Fatalf("ordinary read with explicit errors = %v, want deadline", readErr)
+	}
+	if err = connection.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	for index, target := range []netip.Addr{first, second} {
+		queued, readErr := connection.ReadError()
+		if readErr != nil || queued == nil {
+			t.Fatalf("ReadError %d = %#v, %v", index, queued, readErr)
+		}
+		address, ok := queued.Addr.(*net.IPAddr)
+		if !ok || address.String() != target.String() {
+			t.Fatalf("ReadError %d address = %#v, want %v", index, queued.Addr, target)
+		}
+		var networkError ICMPError
+		if !errors.As(queued, &networkError) || networkError.Code != byte(index+1) {
+			t.Fatalf("ReadError %d payload = %#v", index, queued)
+		}
+	}
+	if queued, readErr := connection.ReadError(); queued != nil || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("empty ReadError = %#v, %v", queued, readErr)
+	}
+
+	if err = connection.SetReadBuffer(socketErrorMetadataSize); err != nil {
+		t.Fatal(err)
+	}
+	connection.deliverError(first, ICMPError{Code: 3})
+	connection.deliverError(second, ICMPError{Code: 4})
+	if info := connection.Info(); info.ErrorQueueEntries != 1 || info.ErrorsDropped != 1 || info.ICMPErrors != 4 {
+		t.Fatalf("bounded IP error queue diagnostics = %+v", info)
+	}
+	if _, err = connection.ReadError(); err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetReceiveErrors(false); err != nil {
+		t.Fatal(err)
+	}
+	connection.deliverError(first, ICMPError{Code: 5})
+	if _, readErr := connection.Read(make([]byte, 1)); readErr == nil {
+		t.Fatal("ordinary IP read did not consume an asynchronous error")
+	}
+	connection.closeFromStack()
+	if _, err = connection.ReceiveErrors(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("ReceiveErrors after Close = %v", err)
+	}
+	if queued, readErr := connection.ReadError(); queued != nil || !errors.Is(readErr, net.ErrClosed) {
+		t.Fatalf("ReadError after Close = %#v, %v", queued, readErr)
+	}
+}
+
+func TestIPErrorQueueFanoutOwnsQuotedPayload(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.186")
+	remote := netip.MustParseAddr("198.51.100.186")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := newIPConn(stack, "ip4:99", 99, local, remote)
+	second := newIPConn(stack, "ip4:99", 99, local, remote)
+	defer first.closeFromStack()
+	defer second.closeFromStack()
+	for _, connection := range []*IPConn{first, second} {
+		if err = connection.SetReceiveErrors(true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state := &ipEndpointState{bindings: map[ipKey]map[*IPConn]struct{}{
+		{address: local, protocol: 99}: {first: {}, second: {}},
+	}}
+	stack.ip = state
+	networkError := ICMPError{
+		QuotedSource: local, QuotedTarget: remote, QuotedProtocol: 99,
+		QuotedPayload: []byte{1, 2, 3, 4},
+	}
+	if !state.deliverError(stack, networkError) {
+		t.Fatal("raw error fanout was not accepted")
+	}
+	firstError, err := first.ReadError()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstICMP ICMPError
+	if !errors.As(firstError, &firstICMP) {
+		t.Fatalf("first error = %#v", firstError)
+	}
+	firstICMP.QuotedPayload[0] = 0xff
+	secondError, err := second.ReadError()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondICMP ICMPError
+	if !errors.As(secondError, &secondICMP) || !bytes.Equal(secondICMP.QuotedPayload, []byte{1, 2, 3, 4}) {
+		t.Fatalf("second quoted payload shares ownership: %x", secondICMP.QuotedPayload)
+	}
+}
+
+func TestIPBatchReadAndWrite(t *testing.T) {
+	firstLocal := netip.MustParseAddr("192.0.2.187")
+	secondLocal := netip.MustParseAddr("192.0.2.188")
+	remote := netip.MustParseAddr("198.51.100.187")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(firstLocal, 32), netip.PrefixFrom(secondLocal, 32),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection, err := stack.ListenIP(context.Background(), "ip4:99", netip.IPv4Unspecified())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	for index, payload := range [][]byte{[]byte("abcdef"), []byte("second")} {
+		packet := buildIPPacket(remote, secondLocal, 99, payload, uint16(index+1), true)
+		if err = writeTestPacket(stack, packet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstA, firstB := make([]byte, 1), make([]byte, 5)
+	second := make([]byte, 2)
+	messages := []Message{
+		{Buffers: [][]byte{firstA, firstB}, OOB: make([]byte, 128)},
+		{Buffers: [][]byte{second}, OOB: make([]byte, 8)},
+		{Buffers: [][]byte{make([]byte, 1)}, N: 91, NN: 92, Flags: 93, Addr: ipNetAddr(remote)},
+	}
+	n, err := connection.ReadBatch(messages, 0)
+	if err != nil || n != 2 {
+		t.Fatalf("ReadBatch = %d, %v", n, err)
+	}
+	if string(append(firstA, firstB...)) != "abcdef" || messages[0].N != 6 || messages[0].NN == 0 || messages[0].Flags != 0 {
+		t.Fatalf("first IP batch message = %+v payload %q", messages[0], append(firstA, firstB...))
+	}
+	if address, ok := messages[0].Addr.(*net.IPAddr); !ok || address.String() != remote.String() {
+		t.Fatalf("first IP batch source = %#v", messages[0].Addr)
+	}
+	var control IPv4ControlMessage
+	if err = control.Parse(messages[0].OOB[:messages[0].NN]); err != nil || control.Dst != secondLocal {
+		t.Fatalf("first IP batch control = %+v, %v", control, err)
+	}
+	if string(second) != "se" || messages[1].Flags != MessageTruncated|MessageControlTruncated {
+		t.Fatalf("second IP batch message = %+v payload %q", messages[1], second)
+	}
+	if messages[2].N != 91 || messages[2].NN != 92 || messages[2].Flags != 93 || messages[2].Addr == nil {
+		t.Fatalf("unprocessed IP batch message changed = %+v", messages[2])
+	}
+	if n, err = connection.ReadBatch(messages[:1], MessageDontWait); n != 0 || !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("nonblocking empty IP ReadBatch = %d, %v", n, err)
+	}
+
+	controlBytes := appendLinuxPacketInfoControl(nil, secondLocal)
+	writes := []Message{
+		{Buffers: [][]byte{[]byte("ab"), []byte("cd")}, Addr: ipNetAddr(remote)},
+		{Buffers: [][]byte{[]byte("ef"), []byte("gh")}, OOB: controlBytes, Addr: ipNetAddr(remote)},
+	}
+	if n, err = connection.WriteBatch(writes, 0); n != 2 || err != nil {
+		t.Fatalf("WriteBatch = %d, %v", n, err)
+	}
+	for index, source := range []netip.Addr{firstLocal, secondLocal} {
+		packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+		if !ok || packet.source != source || string(packet.payload) != []string{"abcd", "efgh"}[index] {
+			t.Fatalf("IP batch packet %d = %+v payload %q", index, packet, packet.payload)
+		}
+		if writes[index].N != 4 || writes[index].NN != len(writes[index].OOB) {
+			t.Fatalf("IP batch result %d = %+v", index, writes[index])
+		}
+	}
+	prefix := []Message{writes[0], {Buffers: nil, Addr: ipNetAddr(remote), N: 91, NN: 92, Flags: 93}}
+	if n, err = connection.WriteBatch(prefix, 0); n != 1 || err != nil {
+		t.Fatalf("partial IP WriteBatch = %d, %v", n, err)
+	}
+	if prefix[1].N != 91 || prefix[1].NN != 92 || prefix[1].Flags != 93 {
+		t.Fatalf("unprocessed IP WriteBatch message changed = %+v", prefix[1])
+	}
+	_ = readOutboundPacket(t, stack)
+	if n, err = connection.WriteBatch(prefix[1:], 0); n != 0 || !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("retried invalid IP WriteBatch suffix = %d, %v", n, err)
+	}
+
+	connectedNet, err := stack.DialIP(context.Background(), "ip4:99", netip.Addr{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connected := connectedNet.(*IPConn)
+	defer connected.Close()
+	connectedMessage := []Message{{Buffers: [][]byte{[]byte("connected")}}}
+	if n, err = connected.WriteBatch(connectedMessage, 0); n != 1 || err != nil {
+		t.Fatalf("connected IP WriteBatch = %d, %v", n, err)
+	}
+	_ = readOutboundPacket(t, stack)
+	connectedMessage[0].Addr = ipNetAddr(remote)
+	if n, err = connected.WriteBatch(connectedMessage, 0); n != 0 || !errors.Is(err, net.ErrWriteToConnected) {
+		t.Fatalf("addressed connected IP WriteBatch = %d, %v", n, err)
+	}
+}
+
+func TestIPBatchWriteIPv6ChecksumAndFlowLabel(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::189")
+	remote := netip.MustParseAddr("2001:db8:1::189")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	netConnection, err := stack.DialIP(context.Background(), "ip6:ipv6-icmp", netip.Addr{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := netConnection.(*IPConn)
+	defer connection.Close()
+	payload := []byte{128, 0, 0xaa, 0xbb, 0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4}
+	original := append([]byte(nil), payload...)
+	messages := []Message{{Buffers: [][]byte{payload[:3], payload[3:7], payload[7:]}}}
+	if count, writeErr := connection.WriteBatch(messages, 0); writeErr != nil || count != 1 {
+		t.Fatalf("IPv6 ICMP WriteBatch = %d, %v", count, writeErr)
+	}
+	if !bytes.Equal(payload, original) {
+		t.Fatalf("WriteBatch mutated caller payload: %x", payload)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.source != local || packet.target != remote || packet.protocol != protocolICMPv6 ||
+		transportChecksum(local, remote, protocolICMPv6, packet.payload) != 0 {
+		t.Fatalf("IPv6 ICMP batch packet = %+v, parsed = %v", packet, ok)
+	}
+	wantLabel := stack.automaticFlowLabel(local, remote, protocolICMPv6, original)
+	if packet.flowLabel != wantLabel {
+		t.Fatalf("IPv6 ICMP batch flow label = %#x, want %#x", packet.flowLabel, wantLabel)
+	}
+}
+
+func TestIPBatchWriteFragmentedBuffers(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.190")
+	remote := netip.MustParseAddr("198.51.100.190")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	netConnection, err := stack.DialIP(context.Background(), "ip4:99", netip.Addr{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := netConnection.(*IPConn)
+	defer connection.Close()
+	payload := bytes.Repeat([]byte{0x6b}, 2000)
+	messages := []Message{{Buffers: [][]byte{payload[:511], payload[511:1700], payload[1700:]}}}
+	if count, writeErr := connection.WriteBatch(messages, 0); writeErr != nil || count != 1 || messages[0].N != len(payload) {
+		t.Fatalf("fragmented IP WriteBatch = %d, %v, message %+v", count, writeErr, messages[0])
+	}
+	receiver, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(remote, 32)}, MTU: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	var reassembled []byte
+	for fragmentCount := 0; reassembled == nil && fragmentCount < 16; fragmentCount++ {
+		reassembled = receiver.reassemblePacket(readOutboundPacket(t, stack), time.Now())
+	}
+	packet, ok := parseIPPacket(reassembled)
+	if !ok || packet.protocol != 99 || !bytes.Equal(packet.payload, payload) {
+		t.Fatalf("reassembled IP batch packet = %+v, parsed = %v", packet, ok)
+	}
+}
+
 func TestIPConnReceiveCapacity(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.120")
 	remote := netip.MustParseAddr("198.51.100.120")
@@ -763,6 +1062,15 @@ func TestIPDefaultsAndDiagnostics(t *testing.T) {
 		t.Fatal(err)
 	}
 	ip := connection.(*IPConn)
+	if err = ip.SetPathMTUDiscovery(PathMTUDiscovery(99)); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("invalid IP PMTU mode = %v", err)
+	}
+	if err = ip.SetPathMTUDiscovery(PathMTUDiscoveryOmit); err != nil {
+		t.Fatal(err)
+	}
+	if mode, modeErr := ip.PathMTUDiscovery(); modeErr != nil || mode != PathMTUDiscoveryOmit {
+		t.Fatalf("IP PMTU mode = %v, %v", mode, modeErr)
+	}
 	if err = ip.SetHopLimit(41); err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +1102,8 @@ func TestIPDefaultsAndDiagnostics(t *testing.T) {
 	info := ip.Info()
 	if info.Protocol != 99 || info.PacketsSent != 1 || info.BytesSent != 5 || info.PacketsReceived != 2 || info.BytesReceived != 6 ||
 		info.PacketsDropped != 1 || info.ReceiveQueuePackets != 1 || info.ReceiveQueueBytes != ipDatagramMetadataSize ||
-		info.ReceiveQueueCapacity != ipDatagramMetadataSize || info.PathMTU != 1400 || info.HopLimit != 41 || info.TrafficClass != 0x2e {
+		info.ReceiveQueueCapacity != ipDatagramMetadataSize || info.PathMTU != 1400 || info.PathMTUDiscovery != PathMTUDiscoveryOmit ||
+		info.HopLimit != 41 || info.TrafficClass != 0x2e {
 		t.Fatalf("IP Info = %+v", info)
 	}
 }
@@ -928,7 +1237,8 @@ func TestIPConnCloseReleasesRetainedState(t *testing.T) {
 	connection.enqueue(make([]byte, 1200), remote, local, ipPacketOptions{})
 	connection.mu.Lock()
 	released := connection.receive.values == nil && connection.receiveSpare == nil && connection.queuedBytes == 0 &&
-		connection.recentTargets == nil && connection.lastError == nil && len(connection.errors) == 0 &&
+		connection.errorQueue.values == nil && connection.errorQueuedBytes == 0 &&
+		connection.recentTargets == nil && connection.lastError == nil &&
 		connection.readDeadline.timer == nil && connection.writeDeadline.timer == nil
 	connection.mu.Unlock()
 	if !released || connection.icmpErrors.Load() != 1 {
@@ -967,5 +1277,56 @@ func BenchmarkIPPacketWrite(b *testing.B) {
 		if count, readErr := stack.Read(buffers, sizes, 0); readErr != nil || count != 1 {
 			b.Fatalf("Stack.Read = %d, %v", count, readErr)
 		}
+	}
+}
+
+func BenchmarkIPBatchWrite(b *testing.B) {
+	const batchSize = 16
+	const payloadSize = 1200
+	for _, buffersPerMessage := range []int{1, 2} {
+		b.Run(fmt.Sprintf("buffers-%d", buffersPerMessage), func(b *testing.B) {
+			local := netip.MustParseAddr("192.0.2.245")
+			remote := netip.MustParseAddr("198.51.100.245")
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				b.Fatal(err)
+			}
+			netConnection, err := stack.DialIP(context.Background(), "ip4:99", netip.Addr{}, remote)
+			if err != nil {
+				b.Fatal(err)
+			}
+			connection := netConnection.(*IPConn)
+			b.Cleanup(func() {
+				_ = connection.Close()
+				_ = stack.Close()
+			})
+			payload := make([]byte, payloadSize)
+			messages := make([]Message, batchSize)
+			for index := range messages {
+				messages[index].Buffers = [][]byte{payload}
+				if buffersPerMessage == 2 {
+					messages[index].Buffers = [][]byte{payload[:400], payload[400:]}
+				}
+			}
+			packets := make([][]byte, batchSize)
+			for index := range packets {
+				packets[index] = make([]byte, 1500)
+			}
+			sizes := make([]int, batchSize)
+			b.SetBytes(batchSize * payloadSize)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if count, writeErr := connection.WriteBatch(messages, 0); writeErr != nil || count != batchSize {
+					b.Fatalf("WriteBatch = %d, %v", count, writeErr)
+				}
+				if count, readErr := stack.Read(packets, sizes, 0); readErr != nil || count != batchSize {
+					b.Fatalf("Stack.Read = %d, %v", count, readErr)
+				}
+			}
+		})
 	}
 }

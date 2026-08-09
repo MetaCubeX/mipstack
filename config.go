@@ -7,6 +7,17 @@ import (
 	"syscall"
 )
 
+// AddressProperties supplies RFC 6724 source-selection state that cannot be
+// represented by a netip.Prefix alone.
+type AddressProperties struct {
+	// Deprecated marks an address past its preferred lifetime. Automatic source
+	// selection avoids it when an otherwise usable preferred address exists.
+	Deprecated bool
+	// Temporary marks an IPv6 privacy address. PreferTemporaryAddresses selects
+	// whether automatic source selection favors it over a stable address.
+	Temporary bool
+}
+
 // Route admits one unicast destination prefix. Source optionally pins the
 // preferred local source address; Metric breaks ties between equal prefixes.
 // The embedding link remains responsible for next-hop selection.
@@ -30,8 +41,11 @@ type networkState struct {
 	local             map[netip.Addr]struct{}
 	broadcast         map[netip.Addr]struct{}
 	sources           []netip.Addr
+	sourcePrefixBits  []int
 	localPrefixes     []netip.Prefix
 	routes            []Route
+	addressProperties map[netip.Addr]AddressProperties
+	preferTemporary   bool
 }
 
 // samePathConfiguration reports whether cached destination PMTU information
@@ -40,7 +54,8 @@ type networkState struct {
 // equal-priority route selection.
 func (state *networkState) samePathConfiguration(other *networkState) bool {
 	if state == nil || other == nil || state.mtu != other.mtu ||
-		len(state.sources) != len(other.sources) || len(state.localPrefixes) != len(other.localPrefixes) || len(state.routes) != len(other.routes) {
+		len(state.sources) != len(other.sources) || len(state.localPrefixes) != len(other.localPrefixes) || len(state.routes) != len(other.routes) ||
+		!state.sameSourceProperties(other) {
 		return false
 	}
 	for index := range state.sources {
@@ -64,7 +79,8 @@ func (state *networkState) samePathConfiguration(other *networkState) bool {
 // sameMulticastConfiguration reports whether family availability, report
 // source selection, and IPv4 directed-broadcast classification are unchanged.
 func (state *networkState) sameMulticastConfiguration(other *networkState) bool {
-	if state == nil || other == nil || len(state.sources) != len(other.sources) || len(state.localPrefixes) != len(other.localPrefixes) {
+	if state == nil || other == nil || len(state.sources) != len(other.sources) || len(state.localPrefixes) != len(other.localPrefixes) ||
+		!state.sameSourceProperties(other) {
 		return false
 	}
 	for index := range state.sources {
@@ -74,6 +90,21 @@ func (state *networkState) sameMulticastConfiguration(other *networkState) bool 
 	}
 	for index := range state.localPrefixes {
 		if state.localPrefixes[index] != other.localPrefixes[index] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameSourceProperties reports whether RFC 6724 address preference state is
+// unchanged between immutable network snapshots.
+func (state *networkState) sameSourceProperties(other *networkState) bool {
+	if state.preferTemporary != other.preferTemporary || len(state.addressProperties) != len(other.addressProperties) {
+		return false
+	}
+	for address, properties := range state.addressProperties {
+		otherProperties, exists := other.addressProperties[address]
+		if !exists || otherProperties != properties {
 			return false
 		}
 	}
@@ -107,8 +138,8 @@ func buildNetworkState(config Config) (*networkState, error) {
 	state := &networkState{
 		mtu: mtu, maxTCPConnections: config.MaxTCPConnections, promiscuous: config.Promiscuous,
 		tcpDefaults: tcpDefaults, udpDefaults: udpDefaults, ipDefaults: ipDefaults,
-		local:   make(map[netip.Addr]struct{}, len(config.LocalAddresses)),
-		sources: make([]netip.Addr, 0, len(config.LocalAddresses)),
+		local: make(map[netip.Addr]struct{}, len(config.LocalAddresses)), sources: make([]netip.Addr, 0, len(config.LocalAddresses)),
+		preferTemporary: config.PreferTemporaryAddresses,
 	}
 	for _, prefix := range config.LocalAddresses {
 		address := prefix.Addr().Unmap()
@@ -128,6 +159,7 @@ func buildNetworkState(config Config) (*networkState, error) {
 		if _, exists := state.local[address]; !exists {
 			state.local[address] = struct{}{}
 			state.sources = append(state.sources, address)
+			state.sourcePrefixBits = append(state.sourcePrefixBits, bits)
 		}
 		masked := netip.PrefixFrom(address, bits).Masked()
 		state.localPrefixes = append(state.localPrefixes, masked)
@@ -141,6 +173,25 @@ func buildNetworkState(config Config) (*networkState, error) {
 	for address := range state.local {
 		if _, broadcast := state.broadcast[address]; broadcast {
 			return nil, errors.New("mipstack: IPv4 broadcast address cannot be local")
+		}
+	}
+	if len(config.AddressProperties) != 0 {
+		state.addressProperties = make(map[netip.Addr]AddressProperties, len(config.AddressProperties))
+		for address, properties := range config.AddressProperties {
+			normalized := address.Unmap()
+			if !address.IsValid() || address.Zone() != "" || !normalized.IsValid() || normalized.IsUnspecified() || normalized.IsMulticast() {
+				return nil, errors.New("mipstack: invalid address-properties key")
+			}
+			if _, local := state.local[normalized]; !local {
+				return nil, errors.New("mipstack: address properties refer to a nonlocal address")
+			}
+			if properties.Temporary && normalized.Is4() {
+				return nil, errors.New("mipstack: temporary source property requires IPv6")
+			}
+			if existing, duplicate := state.addressProperties[normalized]; duplicate && existing != properties {
+				return nil, errors.New("mipstack: conflicting address properties")
+			}
+			state.addressProperties[normalized] = properties
 		}
 	}
 	if len(state.local) == 0 {
@@ -285,6 +336,9 @@ func normalizeDatagramSocketDefaults(value DatagramSocketDefaults, defaultReceiv
 	if value.ReceiveBuffer < 0 || value.HopLimit < 0 || value.HopLimit > 255 || value.MulticastHopLimit < 0 || value.MulticastHopLimit > 255 {
 		return DatagramSocketDefaults{}, errors.New("receive buffer and hop limit must be valid")
 	}
+	if !value.PathMTUDiscovery.valid() {
+		return DatagramSocketDefaults{}, errors.New("unsupported path MTU discovery mode")
+	}
 	if value.FlowLabel > ipv6MaximumFlowLabel {
 		return DatagramSocketDefaults{}, errors.New("flow label exceeds 20 bits")
 	}
@@ -395,8 +449,8 @@ func (state *networkState) routeFor(destination netip.Addr) (Route, bool) {
 }
 
 // sourceForUnicast selects a route-admitted local address using the applicable
-// RFC 6724 rules for a single interface with preferred, non-temporary
-// addresses. The caller has already excluded multicast and broadcast.
+// RFC 6724 rules for a single interface. The caller has already excluded
+// multicast and broadcast.
 func (state *networkState) sourceForUnicast(destination, requested netip.Addr) (netip.Addr, error) {
 	destination = destination.Unmap()
 	if !destination.IsValid() || destination.IsUnspecified() || destination.IsMulticast() || destination.Zone() != "" {
@@ -425,12 +479,15 @@ func (state *networkState) sourceForUnicast(destination, requested netip.Addr) (
 		return route.Source, nil
 	}
 	var selected netip.Addr
-	for _, candidate := range state.sources {
-		if candidate.Is6() != destination.Is6() || !sourceScopeUsable(candidate, destination) {
+	selectedPrefixBits := 0
+	for index, candidate := range state.sources {
+		if candidate.Is6() != destination.Is6() {
 			continue
 		}
-		if !selected.IsValid() || preferSource(candidate, selected, destination) {
+		candidatePrefixBits := state.sourcePrefixBits[index]
+		if !selected.IsValid() || state.preferSource(candidate, candidatePrefixBits, selected, selectedPrefixBits, destination) {
 			selected = candidate
+			selectedPrefixBits = candidatePrefixBits
 		}
 	}
 	if !selected.IsValid() {
@@ -495,19 +552,22 @@ func (state *networkState) sourceForNonUnicast(destination, requested netip.Addr
 		// primary IPv4 address. Configuration order defines that primary
 		// address for mipstack's single interface.
 		for _, candidate := range state.sources {
-			if candidate.Is4() && !candidate.IsLoopback() && sourceScopeUsable(candidate, destination) {
+			if candidate.Is4() && !candidate.IsLoopback() {
 				return candidate, nil
 			}
 		}
 		return netip.Addr{}, syscall.EADDRNOTAVAIL
 	}
 	var selected netip.Addr
-	for _, candidate := range state.sources {
-		if candidate.Is6() != destination.Is6() || !sourceScopeUsable(candidate, destination) {
+	selectedPrefixBits := 0
+	for index, candidate := range state.sources {
+		if candidate.Is6() != destination.Is6() {
 			continue
 		}
-		if !selected.IsValid() || preferSource(candidate, selected, destination) {
+		candidatePrefixBits := state.sourcePrefixBits[index]
+		if !selected.IsValid() || state.preferSource(candidate, candidatePrefixBits, selected, selectedPrefixBits, destination) {
 			selected = candidate
+			selectedPrefixBits = candidatePrefixBits
 		}
 	}
 	if !selected.IsValid() {
@@ -528,23 +588,43 @@ func (state *networkState) hasOutputPath(destination netip.Addr) bool {
 	return routed
 }
 
-// preferSource applies same-address, matching-scope, matching-label, and
-// longest-prefix rules. Stable configuration order resolves complete ties.
-func preferSource(candidate, current, destination netip.Addr) bool {
+// preferSource applies the relevant RFC 6724 rules in order. Home-address and
+// outgoing-interface rules are ties because one Stack represents one
+// interface and exposes no mobile home-address state. Stable configuration
+// order resolves complete ties.
+func (state *networkState) preferSource(candidate netip.Addr, candidatePrefixBits int, current netip.Addr, currentPrefixBits int, destination netip.Addr) bool {
 	if candidate == destination || current == destination {
 		return candidate == destination
 	}
 	candidateScope, currentScope, destinationScope := addressScope(candidate), addressScope(current), addressScope(destination)
-	if (candidateScope == destinationScope) != (currentScope == destinationScope) {
-		return candidateScope == destinationScope
+	if candidateScope != currentScope {
+		candidateAppropriate := candidateScope >= destinationScope
+		currentAppropriate := currentScope >= destinationScope
+		if candidateAppropriate != currentAppropriate {
+			return candidateAppropriate
+		}
+		if candidateAppropriate {
+			return candidateScope < currentScope
+		}
+		return candidateScope > currentScope
+	}
+	candidateProperties, currentProperties := state.addressProperties[candidate], state.addressProperties[current]
+	if candidateProperties.Deprecated != currentProperties.Deprecated {
+		return !candidateProperties.Deprecated
 	}
 	if (addressLabel(candidate) == addressLabel(destination)) != (addressLabel(current) == addressLabel(destination)) {
 		return addressLabel(candidate) == addressLabel(destination)
 	}
-	return commonPrefixBits(candidate, destination) > commonPrefixBits(current, destination)
+	if candidateProperties.Temporary != currentProperties.Temporary {
+		return candidateProperties.Temporary == state.preferTemporary
+	}
+	return commonPrefixBits(candidate, destination, candidatePrefixBits) > commonPrefixBits(current, destination, currentPrefixBits)
 }
 
-// sourceScopeUsable rejects a source whose scope cannot reach destination.
+// sourceScopeUsable reports whether an explicitly selected source has enough
+// scope for a non-unicast destination. Automatic RFC 6724 selection does not
+// discard insufficient candidates because one must still win when every
+// configured address has insufficient scope.
 func sourceScopeUsable(source, destination netip.Addr) bool {
 	return addressScope(source) >= addressScope(destination) || destination.IsLoopback()
 }
@@ -582,33 +662,39 @@ func isInterfaceLocalMulticast(address netip.Addr) bool {
 	return address.Is6() && address.IsMulticast() && address.As16()[1]&0x0f == 1
 }
 
-// addressScope returns an ordered subset of the RFC 6724 scope classes.
+// addressScope returns the RFC 6724 scope used to compare unicast and
+// multicast candidates. The values match IPv6 multicast's scope field.
 func addressScope(address netip.Addr) uint8 {
 	address = address.Unmap()
 	if address.IsLoopback() {
-		return 0
+		return 2
 	}
 	if address.IsMulticast() {
 		if address.Is4() {
 			value := address.As4()
 			if value[0] == 224 && value[1] == 0 && value[2] == 0 {
-				return 1
+				return 2
 			}
-			return 2
+			if value[0] == 239 && value[1] == 255 {
+				return 3
+			}
+			if value[0] == 239 && value[1]&0xfc == 192 {
+				return 8
+			}
+			return 14
 		}
-		scope := address.As16()[1] & 0x0f
-		if scope <= 1 {
-			return 0
-		}
-		if scope == 2 {
-			return 1
-		}
-		return 2
+		return address.As16()[1] & 0x0f
 	}
 	if address.IsLinkLocalUnicast() {
-		return 1
+		return 2
 	}
-	return 2
+	if address.Is6() {
+		value := address.As16()
+		if value[0] == 0xfe && value[1]&0xc0 == 0xc0 {
+			return 5
+		}
+	}
+	return 14
 }
 
 // addressLabel returns the relevant RFC 6724 default-policy label.
@@ -642,10 +728,11 @@ func addressLabel(address netip.Addr) uint8 {
 	return 1
 }
 
-// commonPrefixBits counts equal high-order address bits.
-func commonPrefixBits(left, right netip.Addr) int {
+// commonPrefixBits counts equal high-order address bits up to the source
+// address's configured prefix length, as required by RFC 6724 rule 8.
+func commonPrefixBits(left, right netip.Addr, limit int) int {
 	left, right = left.Unmap(), right.Unmap()
-	if !left.IsValid() || !right.IsValid() || left.Is4() != right.Is4() {
+	if !left.IsValid() || !right.IsValid() || left.Is4() != right.Is4() || limit <= 0 {
 		return 0
 	}
 	leftValue, rightValue := left.As16(), right.As16()
@@ -665,6 +752,9 @@ func commonPrefixBits(left, right netip.Addr) int {
 			result++
 		}
 		break
+	}
+	if result > limit {
+		return limit
 	}
 	return result
 }

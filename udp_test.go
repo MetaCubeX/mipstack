@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -111,6 +112,279 @@ func TestUDPDestinationPortZeroUsesProtocolPath(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestUDPExplicitErrorQueue(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.232")
+	first := netip.MustParseAddrPort("198.51.100.232:53")
+	second := netip.MustParseAddrPort("198.51.100.233:54")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newUDPConn(stack, "udp4", 5300, false, local, netip.AddrPort{})
+	defer connection.closeFromStack()
+	if err = connection.SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, getErr := connection.ReceiveErrors(); getErr != nil || !enabled {
+		t.Fatalf("ReceiveErrors = %v, %v", enabled, getErr)
+	}
+	connection.deliverError(first, ICMPError{Code: 1})
+	connection.deliverError(second, ICMPError{Code: 2})
+	if info := connection.Info(); info.ErrorQueueEntries != 2 || info.ErrorQueueBytes != 2*socketErrorMetadataSize || !info.ReceiveErrors || info.ErrorsDropped != 0 {
+		t.Fatalf("explicit UDP error queue diagnostics = %+v", info)
+	}
+	if err = connection.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, readErr := connection.Read(make([]byte, 1)); !errors.Is(readErr, os.ErrDeadlineExceeded) {
+		t.Fatalf("ordinary read with explicit errors = %v, want deadline", readErr)
+	}
+	if err = connection.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	for index, target := range []netip.AddrPort{first, second} {
+		queued, readErr := connection.ReadError()
+		if readErr != nil || queued == nil {
+			t.Fatalf("ReadError %d = %#v, %v", index, queued, readErr)
+		}
+		address, ok := queued.Addr.(*net.UDPAddr)
+		if !ok || address.AddrPort() != target {
+			t.Fatalf("ReadError %d address = %#v, want %v", index, queued.Addr, target)
+		}
+		var networkError ICMPError
+		if !errors.As(queued, &networkError) || networkError.Code != byte(index+1) {
+			t.Fatalf("ReadError %d payload = %#v", index, queued)
+		}
+	}
+	if queued, readErr := connection.ReadError(); queued != nil || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("empty ReadError = %#v, %v", queued, readErr)
+	}
+
+	if err = connection.SetReadBuffer(socketErrorMetadataSize); err != nil {
+		t.Fatal(err)
+	}
+	connection.deliverError(first, ICMPError{Code: 3})
+	connection.deliverError(second, ICMPError{Code: 4})
+	if info := connection.Info(); info.ErrorQueueEntries != 1 || info.ErrorsDropped != 1 || info.ICMPErrors != 4 {
+		t.Fatalf("bounded UDP error queue diagnostics = %+v", info)
+	}
+	if _, err = connection.ReadError(); err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetReceiveErrors(false); err != nil {
+		t.Fatal(err)
+	}
+	connection.deliverError(first, ICMPError{Code: 5})
+	if _, readErr := connection.Read(make([]byte, 1)); readErr == nil {
+		t.Fatal("ordinary UDP read did not consume an asynchronous error")
+	}
+	connection.closeFromStack()
+	if _, err = connection.ReceiveErrors(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("ReceiveErrors after Close = %v", err)
+	}
+	if queued, readErr := connection.ReadError(); queued != nil || !errors.Is(readErr, net.ErrClosed) {
+		t.Fatalf("ReadError after Close = %#v, %v", queued, readErr)
+	}
+}
+
+func TestUDPBatchRead(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.234")
+	remote := netip.MustParseAddr("198.51.100.234")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	packetConnection, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(local, 5310))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := packetConnection.(*UDPConn)
+	defer connection.Close()
+	for index, payload := range [][]byte{[]byte("abcdef"), []byte("second")} {
+		if err = writeTestPacket(stack, buildTestUDP(remote, local, uint16(5320+index), 5310, payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstA, firstB := make([]byte, 2), make([]byte, 4)
+	second := make([]byte, 3)
+	messages := []Message{
+		{Buffers: [][]byte{firstA, firstB}, OOB: make([]byte, 128)},
+		{Buffers: [][]byte{second}, OOB: make([]byte, 8)},
+		{Buffers: [][]byte{make([]byte, 1)}, N: 91, NN: 92, Flags: 93, Addr: net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5399))},
+	}
+	n, err := connection.ReadBatch(messages, 0)
+	if err != nil || n != 2 {
+		t.Fatalf("ReadBatch = %d, %v, want 2, nil", n, err)
+	}
+	if string(append(firstA, firstB...)) != "abcdef" || messages[0].N != 6 || messages[0].NN == 0 || messages[0].Flags != 0 {
+		t.Fatalf("first batch message = %+v payload %q", messages[0], append(firstA, firstB...))
+	}
+	if address, ok := messages[0].Addr.(*net.UDPAddr); !ok || address.AddrPort() != netip.AddrPortFrom(remote, 5320) {
+		t.Fatalf("first batch source = %#v", messages[0].Addr)
+	}
+	var control IPv4ControlMessage
+	if err = control.Parse(messages[0].OOB[:messages[0].NN]); err != nil || control.Dst != local {
+		t.Fatalf("first batch control = %+v, %v", control, err)
+	}
+	if string(second) != "sec" || messages[1].N != 3 || messages[1].NN != len(messages[1].OOB) ||
+		messages[1].Flags != MessageTruncated|MessageControlTruncated {
+		t.Fatalf("second batch message = %+v payload %q", messages[1], second)
+	}
+	if messages[2].N != 91 || messages[2].NN != 92 || messages[2].Flags != 93 || messages[2].Addr == nil {
+		t.Fatalf("unprocessed batch message changed = %+v", messages[2])
+	}
+
+	n, err = connection.ReadBatch([]Message{{Buffers: [][]byte{make([]byte, 1)}}}, MessageDontWait)
+	if n != 0 || !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("nonblocking empty ReadBatch = %d, %v", n, err)
+	}
+	if n, err = connection.ReadBatch(messages[:1], 1); n != 0 || !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("unsupported ReadBatch flags = %d, %v", n, err)
+	}
+	if err = writeTestPacket(stack, buildTestUDP(remote, local, 5330, 5310, []byte("kept"))); err != nil {
+		t.Fatal(err)
+	}
+	if n, err = connection.ReadBatch([]Message{{Buffers: nil}}, MessageDontWait); n != 0 || !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("empty-buffer ReadBatch = %d, %v", n, err)
+	}
+	kept := make([]byte, 4)
+	if n, err = connection.ReadBatch([]Message{{Buffers: [][]byte{kept}}}, MessageDontWait); n != 1 || err != nil || string(kept) != "kept" {
+		t.Fatalf("message after invalid buffer = %d, %v, %q", n, err, kept)
+	}
+
+	if err = writeTestPacket(stack, buildTestUDP(remote, local, 5331, 5310, []byte("data"))); err != nil {
+		t.Fatal(err)
+	}
+	connection.deliverError(netip.AddrPortFrom(remote, 5331), ICMPError{Code: 7})
+	batch := []Message{{Buffers: [][]byte{make([]byte, 4)}}, {Buffers: [][]byte{make([]byte, 1)}}}
+	if n, err = connection.ReadBatch(batch, 0); n != 1 || err != nil {
+		t.Fatalf("data before queued error = %d, %v", n, err)
+	}
+	if info := connection.Info(); info.ErrorQueueEntries != 1 {
+		t.Fatalf("batch consumed trailing error: %+v", info)
+	}
+	if n, err = connection.ReadBatch(batch[1:], MessageDontWait); n != 0 || err == nil {
+		t.Fatalf("leading queued error = %d, %v", n, err)
+	}
+}
+
+func TestUDPBatchWrite(t *testing.T) {
+	firstLocal := netip.MustParseAddr("192.0.2.235")
+	secondLocal := netip.MustParseAddr("192.0.2.236")
+	remote := netip.MustParseAddr("198.51.100.235")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(firstLocal, 32), netip.PrefixFrom(secondLocal, 32),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	packetConnection, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(netip.IPv4Unspecified(), 5340))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := packetConnection.(*UDPConn)
+	defer connection.Close()
+	control := appendLinuxPacketInfoControl(nil, secondLocal)
+	messages := []Message{
+		{Buffers: [][]byte{[]byte("ab"), []byte("cd")}, Addr: net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5350))},
+		{Buffers: [][]byte{[]byte("ef"), []byte("gh")}, OOB: control, Addr: net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5351))},
+	}
+	n, err := connection.WriteBatch(messages, 0)
+	if err != nil || n != 2 {
+		t.Fatalf("WriteBatch = %d, %v", n, err)
+	}
+	for index, want := range []struct {
+		payload string
+		source  netip.Addr
+		port    uint16
+	}{{"abcd", firstLocal, 5350}, {"efgh", secondLocal, 5351}} {
+		packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+		if !ok || packet.source != want.source || string(packet.payload[udpHeaderSize:]) != want.payload || binary.BigEndian.Uint16(packet.payload[2:4]) != want.port {
+			t.Fatalf("batch packet %d = %+v payload %q", index, packet, packet.payload)
+		}
+		if messages[index].N != 4 || messages[index].NN != len(messages[index].OOB) {
+			t.Fatalf("batch result %d = %+v", index, messages[index])
+		}
+	}
+	if n, err = connection.WriteBatch(messages[:1], MessageDontWait); n != 0 || !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("unsupported WriteBatch flags = %d, %v", n, err)
+	}
+	prefix := []Message{messages[0], {Buffers: nil, Addr: messages[1].Addr, N: 91, NN: 92, Flags: 93}}
+	if n, err = connection.WriteBatch(prefix, 0); n != 1 || err != nil {
+		t.Fatalf("partial WriteBatch = %d, %v", n, err)
+	}
+	if prefix[1].N != 91 || prefix[1].NN != 92 || prefix[1].Flags != 93 {
+		t.Fatalf("unprocessed WriteBatch message changed = %+v", prefix[1])
+	}
+	_ = readOutboundPacket(t, stack)
+	if n, err = connection.WriteBatch(prefix[1:], 0); n != 0 || !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("retried invalid WriteBatch suffix = %d, %v", n, err)
+	}
+
+	connectedNet, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 5352))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connected := connectedNet.(*UDPConn)
+	defer connected.Close()
+	connectedMessage := []Message{{Buffers: [][]byte{[]byte("connected")}}}
+	if n, err = connected.WriteBatch(connectedMessage, 0); n != 1 || err != nil {
+		t.Fatalf("connected WriteBatch = %d, %v", n, err)
+	}
+	_ = readOutboundPacket(t, stack)
+	connectedMessage[0].Addr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5352))
+	if n, err = connected.WriteBatch(connectedMessage, 0); n != 0 || !errors.Is(err, net.ErrWriteToConnected) {
+		t.Fatalf("addressed connected WriteBatch = %d, %v", n, err)
+	}
+}
+
+func TestUDPBatchWriteFragmentedBuffers(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.237")
+	remote := netip.MustParseAddr("198.51.100.237")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	netConnection, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 5353))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := netConnection.(*UDPConn)
+	defer connection.Close()
+	payload := bytes.Repeat([]byte{0x5a}, 2000)
+	messages := []Message{{Buffers: [][]byte{payload[:333], payload[333:1500], payload[1500:]}}}
+	if count, writeErr := connection.WriteBatch(messages, 0); writeErr != nil || count != 1 || messages[0].N != len(payload) {
+		t.Fatalf("fragmented UDP WriteBatch = %d, %v, message %+v", count, writeErr, messages[0])
+	}
+	receiver, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(remote, 32)}, MTU: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	var reassembled []byte
+	for fragmentCount := 0; reassembled == nil && fragmentCount < 16; fragmentCount++ {
+		reassembled = receiver.reassemblePacket(readOutboundPacket(t, stack), time.Now())
+	}
+	packet, ok := parseIPPacket(reassembled)
+	if !ok || packet.protocol != protocolUDP || len(packet.payload) != udpHeaderSize+len(payload) ||
+		!bytes.Equal(packet.payload[udpHeaderSize:], payload) || transportChecksum(local, remote, protocolUDP, packet.payload) != 0 {
+		t.Fatalf("reassembled UDP batch packet = %+v, parsed = %v", packet, ok)
 	}
 }
 
@@ -316,7 +590,7 @@ func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
 					stack.outbound.release(entry)
 				}
 			}
-			if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, true, 1280); err != nil {
+			if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, sourceFragmentation{allow: true}, 1280); err != nil {
 				b.Fatal(err)
 			}
 			drain()
@@ -324,7 +598,7 @@ func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
-				if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, true, 1280); err != nil {
+				if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, sourceFragmentation{allow: true}, 1280); err != nil {
 					b.Fatal(err)
 				}
 				drain()
@@ -806,8 +1080,8 @@ func TestUDPMessagePacketInfoRoundTrip(t *testing.T) {
 			if err != nil || n != 3 || string(buffer) != "req" || source != netip.AddrPortFrom(test.remote, 50014) {
 				t.Fatalf("ReadMsgUDPAddrPort = %q, %d oob, flags %#x, source %v, %v", buffer[:n], oobn, flags, source, err)
 			}
-			if oobn != test.controlSize || flags != linuxMessageTruncated {
-				t.Fatalf("packet info size/flags = %d/%#x, want %d/%#x", oobn, flags, test.controlSize, linuxMessageTruncated)
+			if oobn != test.controlSize || flags != MessageTruncated {
+				t.Fatalf("packet info size/flags = %d/%#x, want %d/%#x", oobn, flags, test.controlSize, MessageTruncated)
 			}
 			if test.first.Is4() {
 				var message IPv4ControlMessage
@@ -868,7 +1142,7 @@ func TestUDPMessageControlValidationAndWriteBuffer(t *testing.T) {
 	buffer := make([]byte, 16)
 	oob := make([]byte, 8)
 	_, oobn, flags, _, err := connection.ReadMsgUDPAddrPort(buffer, oob)
-	if err != nil || oobn != len(oob) || flags != linuxMessageControlTruncated {
+	if err != nil || oobn != len(oob) || flags != MessageControlTruncated {
 		t.Fatalf("control truncation = oob %d flags %#x, %v", oobn, flags, err)
 	}
 	if err = connection.Close(); err != nil {
@@ -1263,6 +1537,15 @@ func TestUDPDefaultsAndDiagnostics(t *testing.T) {
 		t.Fatal(err)
 	}
 	udp := connection.(*UDPConn)
+	if err = udp.SetPathMTUDiscovery(PathMTUDiscovery(99)); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("invalid UDP PMTU mode = %v", err)
+	}
+	if err = udp.SetPathMTUDiscovery(PathMTUDiscoveryProbe); err != nil {
+		t.Fatal(err)
+	}
+	if mode, modeErr := udp.PathMTUDiscovery(); modeErr != nil || mode != PathMTUDiscoveryProbe {
+		t.Fatalf("UDP PMTU mode = %v, %v", mode, modeErr)
+	}
 	if err = udp.SetHopLimit(37); err != nil {
 		t.Fatal(err)
 	}
@@ -1302,7 +1585,8 @@ func TestUDPDefaultsAndDiagnostics(t *testing.T) {
 	info := udp.Info()
 	if info.PacketsSent != 2 || info.BytesSent != 9 || info.PacketsReceived != 2 || info.BytesReceived != 6 ||
 		info.PacketsDropped != 1 || info.ReceiveQueuePackets != 1 || info.ReceiveQueueBytes != udpDatagramMetadataSize ||
-		info.ReceiveQueueCapacity != udpDatagramMetadataSize || info.PathMTU != 1400 || info.HopLimit != 37 || info.TrafficClass != 0x2e {
+		info.ReceiveQueueCapacity != udpDatagramMetadataSize || info.PathMTU != 1400 || info.PathMTUDiscovery != PathMTUDiscoveryProbe ||
+		info.HopLimit != 37 || info.TrafficClass != 0x2e {
 		t.Fatalf("UDP Info = %+v", info)
 	}
 }
@@ -1326,6 +1610,57 @@ func BenchmarkUDPReceiveQueue(b *testing.B) {
 		if n, _, _, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) {
 			b.Fatalf("readDatagram = %d, %v", n, readErr)
 		}
+	}
+}
+
+func BenchmarkUDPBatchWrite(b *testing.B) {
+	const batchSize = 16
+	const payloadSize = 1200
+	for _, buffersPerMessage := range []int{1, 2} {
+		b.Run(fmt.Sprintf("buffers-%d", buffersPerMessage), func(b *testing.B) {
+			local := netip.MustParseAddr("192.0.2.242")
+			remote := netip.MustParseAddrPort("198.51.100.242:5353")
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				b.Fatal(err)
+			}
+			netConnection, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, remote)
+			if err != nil {
+				b.Fatal(err)
+			}
+			connection := netConnection.(*UDPConn)
+			b.Cleanup(func() {
+				_ = connection.Close()
+				_ = stack.Close()
+			})
+			payload := make([]byte, payloadSize)
+			messages := make([]Message, batchSize)
+			for index := range messages {
+				messages[index].Buffers = [][]byte{payload}
+				if buffersPerMessage == 2 {
+					messages[index].Buffers = [][]byte{payload[:400], payload[400:]}
+				}
+			}
+			packets := make([][]byte, batchSize)
+			for index := range packets {
+				packets[index] = make([]byte, 1500)
+			}
+			sizes := make([]int, batchSize)
+			b.SetBytes(batchSize * payloadSize)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if count, writeErr := connection.WriteBatch(messages, 0); writeErr != nil || count != batchSize {
+					b.Fatalf("WriteBatch = %d, %v", count, writeErr)
+				}
+				if count, readErr := stack.Read(packets, sizes, 0); readErr != nil || count != batchSize {
+					b.Fatalf("Stack.Read = %d, %v", count, readErr)
+				}
+			}
+		})
 	}
 }
 
@@ -1394,7 +1729,8 @@ func TestUDPConnCloseReleasesRetainedState(t *testing.T) {
 	connection.enqueue(make([]byte, 1200), remote, local, ipPacketOptions{})
 	connection.mu.Lock()
 	released := connection.receive.values == nil && connection.receiveSpare == nil && connection.queuedBytes == 0 &&
-		connection.recentTargets == nil && connection.lastError == nil && len(connection.errors) == 0 &&
+		connection.errorQueue.values == nil && connection.errorQueuedBytes == 0 &&
+		connection.recentTargets == nil && connection.lastError == nil &&
 		connection.readDeadline.timer == nil && connection.writeDeadline.timer == nil
 	connection.mu.Unlock()
 	if !released || connection.icmpErrors.Load() != 1 {

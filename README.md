@@ -102,8 +102,9 @@ MIPS provides:
 - `DialIP` and `ListenIP` for connected and unconnected IPv4 or IPv6 protocol
   payload sockets, using standard network names such as `ip4:icmp`,
   `ip6:ipv6-icmp`, and `ip:99`;
-- `TCPForwarder`, `UDPForwarder`, and `ICMPForwarder` for otherwise unhandled
-  inbound traffic, including transparent nonlocal destinations;
+- `TCPForwarder`, `UDPForwarder`, `IPForwarder`, and `ICMPForwarder` for
+  otherwise unhandled inbound traffic, including transparent nonlocal
+  destinations;
 - exported `TCPConn`, `TCPListener`, `UDPConn`, and `IPConn` implementations of the
   corresponding standard `net` interfaces.
 
@@ -188,21 +189,23 @@ otherwise unhandled traffic addressed to `LocalAddresses`, without requiring
 `Promiscuous`. `Promiscuous` is required only when the original destination is
 not locally owned. Enabling it without a matching forwarder does not make
 ordinary wildcard sockets transparent and does not generate automatic replies;
-the admitted nonlocal TCP, UDP, and ICMP packet is silently dropped.
+admitted nonlocal traffic without a matching protocol forwarder is silently
+dropped.
 
-`NewTCPForwarder`, `NewUDPForwarder`, and `NewICMPForwarder` install one
-protocol-specific fallback handler each. All three constructors take their own
-options type so later protocol policy can evolve independently. Established
-tuples and ordinary local listeners take precedence. A TCP request represents
-a valid initial SYN. Its handler runs in a new goroutine and may block, but an
-undecided handler occupies `TCPForwarderOptions.MaxInFlight` capacity. `Accept`
-blocks until the handshake, context cancellation, or stack closure and returns
-a `TCPConn` whose `LocalAddr` preserves the original destination. The handler
-must wait for `Accept` itself to return, but may return immediately afterward:
-the returned connection has its own lifetime and may instead be handed to
-another goroutine. `Drop` consumes the SYN silently, while `Reject` sends the
-RFC 9293 reset on a best-effort basis. Retransmitted SYNs do not create
-duplicate handler calls.
+`NewTCPForwarder`, `NewUDPForwarder`, `NewIPForwarder`, and
+`NewICMPForwarder` install one protocol-specific fallback handler each. All
+four constructors take their own options type so later protocol policy can
+evolve independently. Established tuples and ordinary local listeners take
+precedence. A TCP request represents a valid initial SYN. Its handler runs in
+a new goroutine and may block, but an undecided handler occupies
+`TCPForwarderOptions.MaxInFlight` capacity. `Accept` blocks until the handshake,
+context cancellation, or stack closure and returns a `TCPConn` whose
+`LocalAddr` preserves the original destination. The handler must wait for
+`Accept` itself to return, but may return immediately afterward: the returned
+connection has its own lifetime and may instead be handed to another
+goroutine. `Drop` consumes the SYN silently, while `Reject` sends the RFC 9293
+reset on a best-effort basis. Retransmitted SYNs do not create duplicate
+handler calls.
 
 `TCPForwarderRequest.Done` closes when its handler returns, a pending request
 is invalidated by configuration, or its forwarder or stack closes. Forwarder
@@ -224,7 +227,8 @@ drop does not undo endpoint registration. The handler must wait for `Accept` or
 `Listen` to return, but the returned connection remains valid after the
 callback. `Reply` writes one reverse datagram without retaining a flow. Its
 first call selects synchronous reply mode, and it may then be repeated or
-retried until the callback returns.
+retried until the callback returns. Stateless replies inherit the current
+`Config.UDP` output defaults.
 
 ICMP requests similarly expose a checksum-validated complete message and
 provide a repeatable, checksum-repairing reverse `Reply`. `IsEchoRequest`
@@ -234,12 +238,22 @@ snapshot permits `Payload` modification, but its `Type` and `Code` retain the
 original classification; changing the corresponding `Payload` bytes makes
 `IsEchoRequest` false and causes `ReplyEcho` to report `syscall.EINVAL`.
 
-UDP and ICMP handlers run synchronously inside `Stack.Write` or loopback packet
-delivery. They may be invoked concurrently by concurrent writers and must
-return promptly; waiting for traffic that depends on the same delivery call
-would deadlock it. Request values and payloads returned by request methods are
-borrowed and valid only during the callback. Detached responders instead own
-their payload or message snapshot. Every handler must select one terminal
+IP requests cover valid, reassembled upper-layer protocols that matched no
+`IPConn` and are not TCP, UDP, ICMP, or IPv6 No Next Header. A matching raw
+protocol socket always takes priority. `Message` exposes the source,
+destination, protocol number, received hop limit, traffic class, IPv6 flow
+label, and protocol payload. `Reply` sends the same protocol number in the
+reverse direction using the current `Config.IP` output defaults, while
+`Reject` emits IPv4 Protocol Unreachable or IPv6 Parameter Problem. IPv4
+protocol number 59 remains an ordinary protocol; No Next Header is special
+only in IPv6.
+
+UDP, IP, and ICMP handlers run synchronously inside `Stack.Write` or loopback
+packet delivery. They may be invoked concurrently by concurrent writers and
+must return promptly; waiting for traffic that depends on the same delivery
+call would deadlock it. Request values and payloads returned by request methods
+are borrowed and valid only during the callback. Detached responders instead
+own their payload or message snapshot. Every handler must select one terminal
 action or make at least one `Reply` call before returning; otherwise MIPS
 applies `Drop`. After Reply mode begins, further Reply calls are allowed but
 other request actions report `ErrForwarderReplyActive`. Every call must finish
@@ -251,7 +265,7 @@ retained or handed to another goroutine, while concurrent access to its mutable
 snapshot remains the application's responsibility. Repeated or invalidated
 terminal request actions report `ErrForwarderRequestCompleted`.
 
-A detached UDP or ICMP responder starts pending. Its first `Reply` selects
+A detached UDP, IP, or ICMP responder starts pending. Its first `Reply` selects
 reply mode, after which `Reply` may be called repeatedly or concurrently until
 `Close`; concurrent calls have no ordering guarantee. Reply mode is selected
 before output validation, so an output error does not change the legal next
@@ -264,7 +278,8 @@ reply mode reports `ErrForwarderReplyActive`; actions after closure report
 `net.ErrClosed`. The forwarder does not retain the responder, create a timer,
 or impose a detached-request capacity. The application owns its memory,
 concurrency bound, cancellation, timeout, and eventual logical closure. Every
-output call revalidates forwarder closure and the current destination policy.
+output call revalidates forwarder closure, the current destination policy, and
+the return route.
 `Done` lets asynchronous work observe permanent forwarder or stack closure;
 configuration changes remain dynamic and are reported by individual calls.
 
@@ -310,6 +325,13 @@ is controlled only by available memory and explicit application creation.
 family. A non-nil empty route slice deliberately admits only destinations that
 are themselves local. IPv4-only stacks accept MTUs down to 68; configurations
 containing IPv6 require the IPv6 minimum MTU of 1280.
+`Config.AddressProperties` supplies the deprecated and temporary state that a
+`netip.Prefix` cannot express. Automatic source selection applies the RFC 6724
+same-address, scope, deprecation, label, temporary-address, and longest-prefix
+rules in order. `PreferTemporaryAddresses` selects temporary IPv6 privacy
+addresses after label matching; the zero value favors stable addresses. Every
+property key must identify a configured local address, and `Temporary` is valid
+only for IPv6.
 `Config.TCP` defines policies inherited by newly created connections and
 listeners: initial and maximum automatic receive/send buffers, completed and
 half-open listener queues, congestion control, maximum pacing rate, keepalive,
@@ -339,14 +361,26 @@ path model. BBR pacing groups whole Linux-style send quanta to amortize
 userspace actor scheduling; a group never exceeds four send quanta, and only
 one bounded group may be credited ahead of the pacing clock.
 
-`Config.UDP` and `Config.IP` define the receive-buffer capacity, default
-TTL/Hop Limit, default TOS/Traffic Class, and IPv6 Flow Label policy inherited
-by new datagram sockets. `SetReadBuffer`, `SetHopLimit`, `SetTrafficClass`, and
-`SetFlowLabel` provide per-socket overrides. A zero configured Flow Label uses
-a stable keyed label for each flow; explicitly setting a socket label to zero
-disables automatic labeling. Nonzero message control fields override the
-socket defaults; an explicit zero TOS/Traffic Class or Flow Label encoded in
-raw OOB data remains distinguishable from an omitted field.
+`Config.UDP` and `Config.IP` define the receive-buffer capacity, path-MTU
+policy, default TTL/Hop Limit, default TOS/Traffic Class, and IPv6 Flow Label
+policy inherited by new datagram sockets. `SetReadBuffer`,
+`SetPathMTUDiscovery`, `SetHopLimit`, `SetTrafficClass`, and `SetFlowLabel`
+provide per-socket overrides. A zero configured Flow Label uses a stable keyed
+label for each flow; explicitly setting a socket label to zero disables
+automatic labeling. Nonzero message control fields override the socket
+defaults; an explicit zero TOS/Traffic Class or Flow Label encoded in raw OOB
+data remains distinguishable from an omitted field.
+
+`PathMTUDiscovery` uses Linux's numeric `IP_PMTUDISC_*` values. `Dont` uses
+confirmed destination PMTU, permits source fragmentation, and leaves IPv4 DF
+clear. `Want` also uses destination PMTU, requests DF on a fitting IPv4 packet,
+and may still fragment locally when needed. `Do` uses destination PMTU and
+returns `EMSGSIZE` instead of fragmenting. `Probe` ignores destination PMTU,
+uses the link MTU, requests DF, and returns `EMSGSIZE` above it. `Interface`
+uses the link MTU, leaves DF clear, and rejects an oversized local packet;
+`Omit` instead permits source fragmentation. `Interface` and `Omit` ignore
+ICMP PMTU updates for that socket, matching Linux. The zero value is `Dont` and
+preserves MIPS's fragmentable datagram default.
 
 Socket operation failures use `*net.OpError`. `errors.Is` continues to identify
 `os.ErrDeadlineExceeded`, `net.ErrClosed`, and syscall errors. Orderly TCP EOF
@@ -356,9 +390,14 @@ details are available through `errors.As` to `mipstack.ICMPError`.
 
 `TCPConn.SetLinger` provides background graceful close, abortive close, and a
 bounded wait for acknowledgement. `UDPConn.SetReadBuffer` changes the receive
-queue's approximate retained-memory capacity; payload and per-datagram
-metadata both count toward the bound. UDP writes are synchronous with packet
-delivery to the embedding device, so `SetWriteBuffer` is a validated no-op.
+queue's approximate retained-memory capacity; payload, per-datagram metadata,
+and asynchronous errors share the bound. `IPConn` applies the same policy.
+`SetReceiveErrors(true)` reserves asynchronous ICMP errors for nonblocking
+`ReadError`; an empty error queue returns `EAGAIN`. With the default false
+setting, ordinary reads return queued errors after already queued payloads,
+preserving the original socket behavior. `ReceiveErrors` reports the current
+mode. UDP and IP writes are synchronous with packet delivery to the embedding
+device, so `SetWriteBuffer` is a validated no-op.
 
 `TCPConn.Info` returns a consistent live diagnostic snapshot from the
 connection actor and retains the final snapshot after close. It includes RFC
@@ -380,10 +419,12 @@ the accept and SYN backlogs, along with handshake, SYN-cookie, accept, timeout,
 and queue-drop counters. `UDPConn.Info` and `IPConn.Info` expose endpoint
 identity, queue occupancy, socket defaults, path MTU for connected sockets,
 and cumulative accepted, dropped, and transmitted datagram counters. Both
-retain the latest correlated ICMP error while open; closing the socket releases
-that diagnostic state while preserving cumulative counters. An automatic
-`IPConn` Flow Label is reported as zero because raw payload fields may select a
-different flow on each write; fixed socket labels are reported directly.
+also report the PMTU-discovery mode, explicit-error mode, queued error count and
+bytes, and errors dropped by the shared receive-buffer bound. They retain the
+latest correlated ICMP error while open; closing the socket releases that
+diagnostic state while preserving cumulative counters. An automatic `IPConn`
+Flow Label is reported as zero because raw payload fields may select a different
+flow on each write; fixed socket labels are reported directly.
 
 UDP message methods use the Linux 64-bit little-endian control-message layout
 on every host. `ReadMsgUDP` emits `IP_PKTINFO` or `IPV6_PKTINFO` for the local
@@ -398,6 +439,19 @@ message read; their `Marshal` methods encode `Src`, TTL/Hop Limit, and
 TOS/Traffic Class for a message write. `IPv6ControlMessage` also exposes the
 20-bit Flow Label. `Dst` is populated while parsing. `IfIndex` is always zero
 because MIPS has one embedding link.
+
+`UDPConn.ReadBatch`/`WriteBatch` and `IPConn.ReadBatch`/`WriteBatch` use the
+same `Message` layout as `x/net/ipv4` and `x/net/ipv6`: `Buffers` contains the
+scatter/gather payload, `OOB` contains ancillary data, `Addr` carries the peer,
+and `N`, `NN`, and `Flags` receive operation results. A read blocks for its
+first message and then drains only the currently ready prefix;
+`MessageDontWait` makes the first read nonblocking. `MessageTruncated` and
+`MessageControlTruncated` name the fixed Linux result bits returned on every
+host. Batch operations follow Linux `recvmmsg`/`sendmmsg` successful-prefix
+semantics: an error after one or more completed messages is deferred until the
+caller retries the unprocessed suffix, whose result fields remain unchanged.
+Batch writes currently require zero flags; nonzero write flags return
+`EOPNOTSUPP`.
 
 ## Protocol behavior
 
@@ -614,6 +668,13 @@ metrics, and optional preferred sources, while the lower link remains
 responsible for gateways, next hops, and L2 neighbor handling. Applications
 requiring those facilities should use a mature general-purpose userspace
 stack.
+
+TCP Fast Open is also intentionally absent. A complete server implementation
+must deliver SYN data before the handshake completes and integrate cookie,
+SYN-cookie, retransmission, and accept ownership; merely parsing the option or
+delaying the data until `Accept` would not implement RFC 7413. The current
+`DialTCP` API has no early-data argument, so a partial client implementation
+would not benefit existing consumers.
 
 ## License
 

@@ -1447,7 +1447,7 @@ func nonUnicastOutputPolicy(target netip.Addr, multicastHopLimit byte, multicast
 // writeNonUnicastDatagram emits broadcast or multicast output against the
 // interface MTU. It deliberately bypasses destination PMTU state and ICMP
 // correlation, neither of which identifies one non-unicast receiver.
-func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions) error {
+func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery) error {
 	udpSize := udpHeaderSize + len(payload)
 	if udpSize > 65535 || target.Is4() && udpSize > 65515 {
 		return syscall.EMSGSIZE
@@ -1458,11 +1458,12 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 	if err != nil {
 		return err
 	}
+	fragmentation := sourceFragmentationForMode(pathMTUDiscovery)
 	if !loopback {
 		if !external {
 			return nil
 		}
-		return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, true, c.stack.network.Load().mtu)
+		return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, fragmentation, c.stack.network.Load().mtu)
 	}
 	if source.Is6() && !options.flowLabelSet {
 		options.flowLabel = c.stack.automaticTransportFlowLabel(source, target, protocolUDP, sourcePort, targetPort)
@@ -1476,20 +1477,23 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
 	if ipSize+udpSize <= mtu {
 		identification := uint16(0)
-		if source.Is4() {
+		if source.Is4() && fragmentation.requiresIPv4ID() {
 			identification = uint16(c.stack.ipv4ID.Add(1))
 		}
 		return c.stack.writeNonUnicastPacketUntil(ipSize+udpSize, external, loopback, state, func(packet []byte) bool {
-			if !marshalIPHeader(packet, source, target, protocolUDP, identification, false, options) {
+			if !marshalIPHeader(packet, source, target, protocolUDP, identification, fragmentation.dontFragment, options) {
 				return false
 			}
 			marshalUDPDatagram(packet[ipSize:], source, target, sourcePort, targetPort, payload)
 			return true
 		})
 	}
+	if !fragmentation.allow {
+		return syscall.EMSGSIZE
+	}
 	datagram := make([]byte, udpSize)
 	marshalUDPDatagram(datagram, source, target, sourcePort, targetPort, payload)
-	packets, err := c.stack.ipPayloadPacketsForMTU(source, target, protocolUDP, datagram, true, options, mtu)
+	packets, err := c.stack.ipPayloadPacketsForMTU(source, target, protocolUDP, datagram, fragmentation, options, mtu)
 	if err != nil {
 		return err
 	}
@@ -1498,7 +1502,7 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 
 // writeNonUnicastPayload is the raw-protocol counterpart of UDP multicast and
 // broadcast output.
-func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byte, options ipPacketOptions) error {
+func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery) error {
 	ipSize := ipHeaderSize(source, target, len(payload))
 	if ipSize == 0 {
 		return syscall.EMSGSIZE
@@ -1509,12 +1513,13 @@ func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byt
 	if err != nil {
 		return err
 	}
+	fragmentation := sourceFragmentationForMode(pathMTUDiscovery)
 	if !loopback {
 		if !external {
 			return nil
 		}
 		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
-		return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, true, options, c.stack.network.Load().mtu, state)
+		return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, fragmentation, options, c.stack.network.Load().mtu, state)
 	}
 	if source.Is6() && !options.flowLabelSet {
 		options.flowLabel = c.stack.automaticFlowLabel(source, target, c.protocol, payload)
@@ -1524,18 +1529,21 @@ func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byt
 	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
 	if ipSize+len(payload) <= mtu {
 		identification := uint16(0)
-		if source.Is4() {
+		if source.Is4() && fragmentation.requiresIPv4ID() {
 			identification = uint16(c.stack.ipv4ID.Add(1))
 		}
 		return c.stack.writeNonUnicastPacketUntil(ipSize+len(payload), external, loopback, state, func(packet []byte) bool {
-			if !marshalIPHeader(packet, source, target, c.protocol, identification, false, options) {
+			if !marshalIPHeader(packet, source, target, c.protocol, identification, fragmentation.dontFragment, options) {
 				return false
 			}
 			copy(packet[ipSize:], payload)
 			return true
 		})
 	}
-	packets, err := c.stack.ipPayloadPacketsForMTU(source, target, c.protocol, payload, true, options, mtu)
+	if !fragmentation.allow {
+		return syscall.EMSGSIZE
+	}
+	packets, err := c.stack.ipPayloadPacketsForMTU(source, target, c.protocol, payload, fragmentation, options, mtu)
 	if err != nil {
 		return err
 	}

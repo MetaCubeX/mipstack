@@ -12,10 +12,6 @@ const (
 	linuxControlHeaderSize = 16
 	// linuxControlAlignment is the fixed Linux 64-bit ancillary alignment.
 	linuxControlAlignment = 8
-	// linuxMessageControlTruncated is Linux MSG_CTRUNC.
-	linuxMessageControlTruncated = 0x08
-	// linuxMessageTruncated is Linux MSG_TRUNC.
-	linuxMessageTruncated = 0x20
 	// linuxLevelIP is Linux IPPROTO_IP.
 	linuxLevelIP = 0
 	// linuxIPTypeOfService is Linux IP_TOS.

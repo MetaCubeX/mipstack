@@ -57,6 +57,9 @@ func TestForwarderRegistrationAndCloseLifecycle(t *testing.T) {
 		{name: "UDP", new: func(stack *Stack) (control, error) {
 			return NewUDPForwarder(stack, UDPForwarderOptions{}, func(*UDPForwarderRequest) {})
 		}},
+		{name: "IP", new: func(stack *Stack) (control, error) {
+			return NewIPForwarder(stack, IPForwarderOptions{}, func(*IPForwarderRequest) {})
+		}},
 		{name: "ICMP", new: func(stack *Stack) (control, error) {
 			return NewICMPForwarder(stack, ICMPForwarderOptions{}, func(*ICMPForwarderRequest) {})
 		}},
@@ -2114,6 +2117,436 @@ func TestAutomaticControlResponsesDoNotBlockOnFullQueue(t *testing.T) {
 				t.Fatalf("automatic %s response blocked Stack.Write", protocol)
 			}
 		})
+	}
+}
+
+func TestIPForwarderReplyAndMetadata(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		owned, remote netip.Addr
+		target        netip.Addr
+	}{
+		{name: "IPv4", owned: netip.MustParseAddr("192.0.2.114"), remote: netip.MustParseAddr("198.51.100.114"), target: netip.MustParseAddr("203.0.113.114")},
+		{name: "IPv6", owned: netip.MustParseAddr("2001:db8::114"), remote: netip.MustParseAddr("2001:db8:1::114"), target: netip.MustParseAddr("2001:db8:2::114")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack, err := New(Config{
+				LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.owned, test.owned.BitLen())},
+				Promiscuous:    true,
+				IP: DatagramSocketDefaults{
+					HopLimit: 41, TrafficClass: 0x2e, FlowLabel: 0x34567,
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stack.Close() })
+			var observed IPMessage
+			forwarder, err := NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+				observed = request.Message()
+				if replyErr := request.Reply([]byte("first")); replyErr != nil {
+					t.Errorf("first IP Reply: %v", replyErr)
+				}
+				if replyErr := request.Reply([]byte("second")); replyErr != nil {
+					t.Errorf("second IP Reply: %v", replyErr)
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			options := ipPacketOptions{hopLimit: 37, trafficClass: 0xb8, flowLabel: 0x12345, flowLabelSet: true}
+			packet := buildIPPacketWithOptions(test.remote, test.target, 99, []byte("request"), 7, true, options)
+			if err = writeTestPacket(stack, packet); err != nil {
+				t.Fatal(err)
+			}
+			wantFlowLabel := uint32(0)
+			if test.remote.Is6() {
+				wantFlowLabel = 0x12345
+			}
+			if observed.Source != test.remote || observed.Destination != test.target || observed.Protocol != 99 ||
+				observed.HopLimit != 37 || observed.TrafficClass != 0xb8 || observed.FlowLabel != wantFlowLabel || string(observed.Payload) != "request" {
+				t.Fatalf("forwarded IP message = %+v", observed)
+			}
+			for _, payload := range []string{"first", "second"} {
+				response := readForwarderTestPacket(t, stack)
+				parsed, ok := parseIPPacket(response)
+				if !ok || parsed.source != test.target || parsed.target != test.remote || parsed.protocol != 99 || string(parsed.payload) != payload {
+					t.Fatalf("forwarded IP reply = %+v payload %q", parsed, parsed.payload)
+				}
+				wantReplyFlowLabel := uint32(0)
+				if test.remote.Is6() {
+					wantReplyFlowLabel = 0x34567
+				}
+				if parsed.hopLimit != 41 || parsed.trafficClass != 0x2e || parsed.flowLabel != wantReplyFlowLabel {
+					t.Fatalf("configured IP reply fields = hop %d, class %#x, label %#x", parsed.hopLimit, parsed.trafficClass, parsed.flowLabel)
+				}
+			}
+			if info := forwarder.Info(); info.Requests != 1 || info.Replies != 2 || info.Dropped != 0 || info.Pending != 0 {
+				t.Fatalf("IP forwarder diagnostics = %+v", info)
+			}
+		})
+	}
+}
+
+func TestForwarderRepliesUseDatagramPathMTUDefaults(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.119")
+	remote := netip.MustParseAddr("198.51.100.119")
+	target := netip.MustParseAddr("203.0.113.119")
+	for _, test := range []struct {
+		name     string
+		register func(*Stack, chan<- error) (interface{ Close() error }, error)
+		packet   func() []byte
+	}{
+		{
+			name: "UDP",
+			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
+				return NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+					_, err := request.Reply(make([]byte, 1100))
+					result <- err
+				})
+			},
+			packet: func() []byte { return buildTestUDP(remote, target, 53000, 53, []byte("query")) },
+		},
+		{
+			name: "IP",
+			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
+				return NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+					result <- request.Reply(make([]byte, 1100))
+				})
+			},
+			packet: func() []byte { return buildIPPacket(remote, target, 99, []byte("request"), 1, true) },
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack, err := New(Config{
+				LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, Promiscuous: true, MTU: 1400,
+				UDP: DatagramSocketDefaults{PathMTUDiscovery: PathMTUDiscoveryDo},
+				IP:  DatagramSocketDefaults{PathMTUDiscovery: PathMTUDiscoveryDo},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stack.Close() })
+			if !stack.observePathMTU(remote, 1000) {
+				t.Fatal("failed to install forwarder PMTU")
+			}
+			result := make(chan error, 1)
+			forwarder, err := test.register(stack, result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			if err = writeTestPacket(stack, test.packet()); err != nil {
+				t.Fatal(err)
+			}
+			if replyErr := <-result; !errors.Is(replyErr, syscall.EMSGSIZE) {
+				t.Fatalf("oversized forwarder Reply = %v, want EMSGSIZE", replyErr)
+			}
+			if entry, queued := stack.outbound.tryDequeue(); queued {
+				stack.outbound.release(entry)
+				t.Fatal("failed PMTU-limited forwarder Reply queued output")
+			}
+		})
+	}
+}
+
+func TestForwarderRejectRequiresReturnRoute(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.120")
+	remote := netip.MustParseAddr("198.51.100.120")
+	for _, test := range []struct {
+		name          string
+		responseClass controlResponseClass
+		register      func(*Stack, chan<- error) (interface{ Close() error }, error)
+		packet        func() []byte
+	}{
+		{
+			name: "TCP", responseClass: controlResponseTCPReset,
+			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
+				return NewTCPForwarder(stack, TCPForwarderOptions{}, func(request *TCPForwarderRequest) {
+					result <- request.Reject()
+				})
+			},
+			packet: func() []byte {
+				return buildTestTCP(remote, local, 53001, 443, 1, 0, tcpFlagSYN, 65535, nil, nil)
+			},
+		},
+		{
+			name: "UDP", responseClass: controlResponsePortUnreachable,
+			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
+				return NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+					result <- request.Reject()
+				})
+			},
+			packet: func() []byte { return buildTestUDP(remote, local, 53002, 53, []byte("query")) },
+		},
+		{
+			name: "IP", responseClass: controlResponseParameterProblem,
+			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
+				return NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+					result <- request.Reject()
+				})
+			},
+			packet: func() []byte { return buildIPPacket(remote, local, 99, []byte("request"), 1, true) },
+		},
+		{
+			name: "ICMP", responseClass: controlResponsePortUnreachable,
+			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
+				return NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+					result <- request.Reject()
+				})
+			},
+			packet: func() []byte {
+				message := make([]byte, 8)
+				message[0] = 42
+				binary.BigEndian.PutUint16(message[2:4], checksum(message))
+				return buildIPPacket(remote, local, protocolICMPv4, message, 1, true)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack, err := New(Config{
+				LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, Routes: []Route{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stack.Close() })
+			// Route validation must not be hidden by a concurrently exhausted
+			// control-response limiter.
+			stack.controlLimiters[test.responseClass] = tokenBucket{updated: time.Now().Add(time.Hour)}
+			result := make(chan error, 1)
+			forwarder, err := test.register(stack, result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			if err = writeTestPacket(stack, test.packet()); err != nil {
+				t.Fatal(err)
+			}
+			if rejectErr := <-result; !errors.Is(rejectErr, syscall.ENETUNREACH) {
+				t.Fatalf("Reject without a return route = %v, want ENETUNREACH", rejectErr)
+			}
+			if entry, queued := stack.outbound.tryDequeue(); queued {
+				stack.outbound.release(entry)
+				t.Fatal("Reject without a return route queued output")
+			}
+		})
+	}
+}
+
+func TestIPForwarderRawSocketPriorityAndProtocolScope(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.115")
+	remote := netip.MustParseAddr("198.51.100.115")
+	stack := newForwarderTestStack(t, local, false)
+	var calls atomic.Int32
+	forwarder, err := NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+		calls.Add(1)
+		_ = request.Drop()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	raw, err := stack.ListenIP(context.Background(), "ip4:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if err = writeTestPacket(stack, buildIPPacket(remote, local, 99, []byte("raw"), 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	if err = raw.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 3)
+	if n, _, readErr := raw.ReadFrom(buffer); readErr != nil || n != 3 || string(buffer) != "raw" {
+		t.Fatalf("raw priority read = %d, %v, %q", n, readErr, buffer)
+	}
+	for _, packet := range [][]byte{
+		buildTestUDP(remote, local, 50000, 50001, []byte("udp")),
+	} {
+		if err = writeTestPacket(stack, packet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("IP forwarder received %d raw or built-in packets", got)
+	}
+	if err = writeTestPacket(stack, buildIPPacket(remote, local, 59, nil, 2, true)); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("IP forwarder received %d IPv4 protocol 59 packets, want 1", got)
+	}
+
+	local6 := netip.MustParseAddr("2001:db8::115")
+	remote6 := netip.MustParseAddr("2001:db8:1::115")
+	stack6 := newForwarderTestStack(t, local6, false)
+	var calls6 atomic.Int32
+	forwarder6, err := NewIPForwarder(stack6, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+		calls6.Add(1)
+		_ = request.Drop()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder6.Close()
+	if err = writeTestPacket(stack6, buildIPPacket(remote6, local6, 59, nil, 0, true)); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls6.Load(); got != 0 {
+		t.Fatalf("IP forwarder received %d IPv6 No Next Header packets", got)
+	}
+}
+
+func TestIPForwarderDetachAndReject(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.116")
+	remote := netip.MustParseAddr("198.51.100.116")
+	stack := newForwarderTestStack(t, local, false)
+	responders := make(chan *IPForwarderResponder, 1)
+	forwarder, err := NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+		responder, detachErr := request.Detach()
+		if detachErr != nil {
+			t.Errorf("Detach: %v", detachErr)
+		}
+		responders <- responder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	packet := buildIPPacket(remote, local, 100, []byte("owned"), 3, true)
+	if err = writeTestPacket(stack, packet); err != nil {
+		t.Fatal(err)
+	}
+	responder := <-responders
+	for index := range packet {
+		packet[index] = 0
+	}
+	if message := responder.Message(); string(message.Payload) != "owned" || message.Protocol != 100 {
+		t.Fatalf("detached IP snapshot = %+v", message)
+	}
+	if err = responder.Reply([]byte("async")); err != nil {
+		t.Fatal(err)
+	}
+	response := readForwarderTestPacket(t, stack)
+	parsed, ok := parseIPPacket(response)
+	if !ok || parsed.source != local || parsed.target != remote || parsed.protocol != 100 || string(parsed.payload) != "async" {
+		t.Fatalf("detached IP reply = %+v", parsed)
+	}
+	if err = responder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = responder.Reply(nil); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Reply after Close = %v", err)
+	}
+
+	if err = forwarder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rejectForwarder, err := NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+		if rejectErr := request.Reject(); rejectErr != nil {
+			t.Errorf("Reject: %v", rejectErr)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rejectForwarder.Close()
+	if err = writeTestPacket(stack, buildIPPacket(remote, local, 101, []byte("reject"), 4, true)); err != nil {
+		t.Fatal(err)
+	}
+	response = readForwarderTestPacket(t, stack)
+	parsed, ok = parseIPPacket(response)
+	if !ok || parsed.protocol != protocolICMPv4 || len(parsed.payload) < 2 || parsed.payload[0] != 3 || parsed.payload[1] != 2 {
+		t.Fatalf("IP forwarder rejection = %+v", parsed)
+	}
+}
+
+func TestIPForwarderConfigInvalidatesRunningRequest(t *testing.T) {
+	owned := netip.MustParseAddr("192.0.2.117")
+	remote := netip.MustParseAddr("198.51.100.117")
+	target := netip.MustParseAddr("203.0.113.117")
+	stack := newForwarderTestStack(t, owned, true)
+	entered, release := make(chan struct{}), make(chan struct{})
+	actionResult := make(chan error, 1)
+	forwarder, err := NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+		close(entered)
+		<-release
+		actionResult <- request.Drop()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	writeResult := make(chan error, 1)
+	go func() {
+		writeResult <- writeTestPacket(stack, buildIPPacket(remote, target, 102, []byte("pending"), 5, true))
+	}()
+	<-entered
+	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(owned, 32)}, MTU: 1400}); err != nil {
+		t.Fatal(err)
+	}
+	if info := forwarder.Info(); info.Pending != 0 || info.Dropped != 1 {
+		t.Fatalf("configuration-invalidated IP forwarder info = %+v", info)
+	}
+	close(release)
+	if err = <-actionResult; !errors.Is(err, ErrForwarderRequestCompleted) {
+		t.Fatalf("action after IP configuration invalidation = %v", err)
+	}
+	if err = <-writeResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDetachedIPForwarderResponderRevalidatesConfiguration(t *testing.T) {
+	owned := netip.MustParseAddr("192.0.2.118")
+	remote := netip.MustParseAddr("198.51.100.118")
+	target := netip.MustParseAddr("203.0.113.118")
+	stack := newForwarderTestStack(t, owned, true)
+	detached := make(chan *IPForwarderResponder, 2)
+	forwarder, err := NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+		responder, detachErr := request.Detach()
+		if detachErr != nil {
+			t.Errorf("Detach IP: %v", detachErr)
+			return
+		}
+		detached <- responder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	for protocol := byte(103); protocol <= 104; protocol++ {
+		if err = writeTestPacket(stack, buildIPPacket(remote, target, protocol, []byte("detached"), uint16(protocol), true)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, second := <-detached, <-detached
+	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(owned, 32)}, MTU: 1400}); err != nil {
+		t.Fatal(err)
+	}
+	if err = first.Reply([]byte("late")); !errors.Is(err, syscall.EADDRNOTAVAIL) {
+		t.Fatalf("configuration-invalidated IP Reply = %v", err)
+	}
+	if err = second.Reject(); !errors.Is(err, syscall.EADDRNOTAVAIL) {
+		t.Fatalf("configuration-invalidated IP Reject = %v", err)
+	}
+	if err = first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if info := forwarder.Info(); info.Pending != 0 || info.Requests != 2 || info.ReplyErrors != 1 || info.Rejected != 1 {
+		t.Fatalf("configuration-invalidated IP responder info = %+v", info)
 	}
 }
 

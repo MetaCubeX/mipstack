@@ -3,7 +3,7 @@
 // with an L3 link. It implements active and passive TCP, connected and
 // unconnected UDP and IP protocol sockets, and the ICMP behavior required by
 // those transports. Optional forwarders provide transparent handling of
-// otherwise unbound TCP, UDP, and ICMP traffic.
+// otherwise unbound TCP, UDP, ICMP, and other IP protocol traffic.
 package mipstack
 
 import (
@@ -135,11 +135,83 @@ type TCPSocketDefaults struct {
 	FlowLabel uint32
 }
 
+// PathMTUDiscovery is the Linux-compatible IP_MTU_DISCOVER policy used by UDP
+// and IP protocol sockets. Its numeric values match IP_PMTUDISC_* so callers
+// translating a Linux socket policy do not need another mapping table.
+type PathMTUDiscovery int
+
+const (
+	// PathMTUDiscoveryDont permits source fragmentation and leaves IPv4 DF
+	// clear. Validated destination PMTU information still selects the local
+	// fragment size, matching Linux IP_PMTUDISC_DONT route-cache behavior.
+	PathMTUDiscoveryDont PathMTUDiscovery = iota
+	// PathMTUDiscoveryWant uses the destination PMTU, sets IPv4 DF when a
+	// datagram fits, and source-fragments it when needed.
+	PathMTUDiscoveryWant
+	// PathMTUDiscoveryDo uses the destination PMTU, always sets IPv4 DF, and
+	// reports EMSGSIZE instead of source-fragmenting an oversized datagram.
+	PathMTUDiscoveryDo
+	// PathMTUDiscoveryProbe ignores the destination PMTU, uses the embedding
+	// interface MTU, sets IPv4 DF, and reports EMSGSIZE above that MTU.
+	PathMTUDiscoveryProbe
+	// PathMTUDiscoveryInterface ignores destination PMTU updates, uses the
+	// embedding interface MTU, leaves IPv4 DF clear, and reports EMSGSIZE above
+	// that MTU.
+	PathMTUDiscoveryInterface
+	// PathMTUDiscoveryOmit ignores destination PMTU updates, uses the embedding
+	// interface MTU, leaves IPv4 DF clear, and permits source fragmentation.
+	PathMTUDiscoveryOmit
+)
+
+// valid reports whether mode is one of Linux's IP_PMTUDISC_* values.
+func (mode PathMTUDiscovery) valid() bool {
+	return mode >= PathMTUDiscoveryDont && mode <= PathMTUDiscoveryOmit
+}
+
+// Message represents one scatter/gather datagram or IP protocol message. Its
+// layout and field meanings match golang.org/x/net/ipv4.Message and
+// golang.org/x/net/ipv6.Message without requiring either package.
+type Message struct {
+	// Buffers contains the contiguous payload regions read or written in order.
+	// A batch operation requires their combined length to be nonzero.
+	Buffers [][]byte
+	// OOB contains Linux-compatible packet-info, hop-limit, traffic-class, and
+	// IPv6 flow-label ancillary data.
+	OOB []byte
+	// Addr specifies the destination for an unconnected write and receives the
+	// source address after a successful read. It must be nil for a connected
+	// write.
+	Addr net.Addr
+	// N is the number of payload bytes read or written through Buffers.
+	N int
+	// NN is the number of ancillary bytes read or written through OOB.
+	NN int
+	// Flags contains Linux-compatible MSG_TRUNC and MSG_CTRUNC results after a
+	// successful read.
+	Flags int
+}
+
+const (
+	// MessageControlTruncated is Linux MSG_CTRUNC. ReadMsg and ReadBatch include
+	// it in the result flags when the supplied OOB buffer was too small.
+	MessageControlTruncated = 0x08
+	// MessageTruncated is Linux MSG_TRUNC. ReadMsg and ReadBatch include it in
+	// the result flags when the supplied payload buffers were too small.
+	MessageTruncated = 0x20
+	// MessageDontWait is Linux MSG_DONTWAIT for ReadBatch. It makes the first
+	// message nonblocking; draining after a successful first message is always
+	// nonblocking.
+	MessageDontWait = 0x40
+)
+
 // DatagramSocketDefaults configures policies inherited by newly created UDP
 // or IP protocol sockets. Zero fields retain the package defaults.
 type DatagramSocketDefaults struct {
 	// ReceiveBuffer is the approximate retained-memory receive capacity.
 	ReceiveBuffer int
+	// PathMTUDiscovery selects the Linux-compatible source-fragmentation and
+	// destination-PMTU policy. The zero value is PathMTUDiscoveryDont.
+	PathMTUDiscovery PathMTUDiscovery
 	// HopLimit is the default IPv4 TTL or IPv6 Hop Limit. Zero selects 64.
 	HopLimit int
 	// MulticastHopLimit is the default IPv4 multicast TTL or IPv6 multicast
@@ -165,11 +237,19 @@ type Config struct {
 	// LocalAddresses lists addresses owned by ordinary sockets and available
 	// for source selection and loopback delivery.
 	LocalAddresses []netip.Prefix
+	// AddressProperties optionally marks configured local addresses as
+	// deprecated or temporary for RFC 6724 source selection. Every key must
+	// identify an address in LocalAddresses.
+	AddressProperties map[netip.Addr]AddressProperties
+	// PreferTemporaryAddresses applies RFC 6724 rule 7 in favor of temporary
+	// IPv6 privacy addresses. The zero value favors stable public addresses,
+	// matching Linux unless per-interface privacy preference is enabled.
+	PreferTemporaryAddresses bool
 	// Promiscuous admits unicast packets addressed to otherwise nonlocal
 	// destinations so protocol forwarders can intercept them. Forwarders do not
 	// require Promiscuous for unhandled packets addressed to LocalAddresses.
 	// Enabling Promiscuous without a matching forwarder only admits and silently
-	// drops nonlocal TCP, UDP, and ICMP traffic. Ordinary sockets retain
+	// drops nonlocal protocol traffic. Ordinary sockets retain
 	// LocalAddresses semantics, and only forwarder-created endpoints or
 	// request-scoped actions may reply from intercepted addresses.
 	Promiscuous bool
@@ -209,6 +289,7 @@ type Stack struct {
 	udpForwarded  map[udpFlowKey]*UDPConn
 	udpForwarder  udpForwarderEndpoints
 	ip            ipEndpoints
+	ipForwarder   ipForwarderEndpoints
 	multicast     multicastEndpoints
 	multicastSeed *multicastQuerierSeed
 	icmpForwarder icmpForwarderEndpoints
@@ -473,6 +554,92 @@ func (c recentDestinationCache[T]) contains(destination T, now time.Time) bool {
 type datagramQueue[T any] struct {
 	values []T
 	head   int
+}
+
+const socketErrorMetadataSize = 192
+
+// queuedSocketError retains one asynchronous network error and its
+// conservative receive-buffer charge.
+type queuedSocketError struct {
+	err  *net.OpError
+	size int
+}
+
+// socketErrorSize returns the receive-buffer charge for an asynchronous
+// network error, including any retained quoted packet bytes.
+func socketErrorSize(err error) int {
+	size := socketErrorMetadataSize
+	var networkError ICMPError
+	if errors.As(err, &networkError) {
+		size += len(networkError.QuotedPayload)
+	}
+	return size
+}
+
+// messageBufferLength validates the nonempty scatter/gather payload required
+// by the batch API and detects integer overflow before allocation.
+func messageBufferLength(buffers [][]byte) (int, error) {
+	total := 0
+	maximum := int(^uint(0) >> 1)
+	for _, buffer := range buffers {
+		if len(buffer) > maximum-total {
+			return 0, syscall.EMSGSIZE
+		}
+		total += len(buffer)
+	}
+	if total == 0 {
+		return 0, syscall.EINVAL
+	}
+	return total, nil
+}
+
+// copyMessagePayload scatters one complete payload across buffers in order.
+func copyMessagePayload(buffers [][]byte, payload []byte) int {
+	written := 0
+	for _, buffer := range buffers {
+		if len(payload) == 0 {
+			break
+		}
+		n := copy(buffer, payload)
+		written += n
+		payload = payload[n:]
+	}
+	return written
+}
+
+// copyMessageBuffers joins scatter/gather source regions into destination
+// without allocating an intermediate payload.
+func copyMessageBuffers(destination []byte, buffers [][]byte) int {
+	written := 0
+	for _, buffer := range buffers {
+		written += copy(destination[written:], buffer)
+		if written == len(destination) {
+			break
+		}
+	}
+	return written
+}
+
+// gatherMessagePayload returns the single supplied region directly and joins
+// a true scatter/gather message only when the existing transmit path requires
+// contiguous protocol payload bytes.
+func gatherMessagePayload(buffers [][]byte, maximum int) ([]byte, error) {
+	size, err := messageBufferLength(buffers)
+	if err != nil {
+		return nil, err
+	}
+	if size > maximum {
+		return nil, syscall.EMSGSIZE
+	}
+	if len(buffers) == 1 {
+		return buffers[0], nil
+	}
+	payload := make([]byte, size)
+	offset := 0
+	for _, buffer := range buffers {
+		offset += copy(payload[offset:], buffer)
+	}
+	return payload, nil
 }
 
 // len returns the number of queued values.
@@ -1371,10 +1538,11 @@ func New(config Config) (*Stack, error) {
 	return stack, nil
 }
 
-// UpdateConfig atomically replaces addresses, routes, promiscuous admission,
-// the link MTU, congestion control, and the optional TCP connection limit.
-// Sockets bound to removed addresses or destinations without a remaining
-// route are closed. Other TCP connections immediately reclamp their MSS.
+// UpdateConfig validates and atomically replaces the stack configuration. New
+// sockets inherit the replacement defaults. Sockets bound to removed addresses
+// or destinations without a remaining route are closed. Other TCP connections
+// immediately apply a changed default congestion controller and reclamp their
+// MSS; existing sockets retain the remaining inherited policies.
 func (s *Stack) UpdateConfig(config Config) error {
 	state, err := buildNetworkState(config)
 	if err != nil {
@@ -1401,7 +1569,7 @@ func (s *Stack) UpdateConfig(config Config) error {
 		tcpConnections = append(tcpConnections, connection)
 	}
 	tcpPassive := s.tcpPassive
-	tcpForwarder, udpForwarder, icmpForwarder := s.tcpForwarder, s.udpForwarder, s.icmpForwarder
+	tcpForwarder, udpForwarder, ipForwarder, icmpForwarder := s.tcpForwarder, s.udpForwarder, s.ipForwarder, s.icmpForwarder
 	multicast := s.multicast
 	udpConnections := s.udpConnectionsLocked()
 	ip := s.ip
@@ -1414,6 +1582,9 @@ func (s *Stack) UpdateConfig(config Config) error {
 	}
 	if udpForwarder != nil {
 		udpForwarder.updateConfig(state)
+	}
+	if ipForwarder != nil {
+		ipForwarder.updateConfig(state)
 	}
 	if icmpForwarder != nil {
 		icmpForwarder.updateConfig(state)
@@ -2896,6 +3067,7 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 	s.mu.RLock()
 	closed := s.closed
 	ip := s.ip
+	ipForwarder := s.ipForwarder
 	multicast := s.multicast
 	s.mu.RUnlock()
 	if closed {
@@ -2964,7 +3136,12 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 		}
 	default:
 	}
-	if destination != inboundDestinationLocalUnicast || parsed.protocol == 59 || rawDelivered {
+	noNextHeader := parsed.source.Is6() && parsed.protocol == 59
+	if (destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast) &&
+		!noNextHeader && !rawDelivered && ipForwarder != nil && ipForwarder.handlePacket(parsed) {
+		return nil
+	}
+	if destination != inboundDestinationLocalUnicast || noNextHeader || rawDelivered {
 		return nil
 	}
 	_ = s.sendProtocolUnreachable(parsed)
@@ -3007,7 +3184,7 @@ func (s *Stack) Close() error {
 	tcpPassive := s.tcpPassive
 	udpConnections := s.udpConnectionsLocked()
 	ip := s.ip
-	tcpForwarder, udpForwarder, icmpForwarder := s.tcpForwarder, s.udpForwarder, s.icmpForwarder
+	tcpForwarder, udpForwarder, ipForwarder, icmpForwarder := s.tcpForwarder, s.udpForwarder, s.ipForwarder, s.icmpForwarder
 	multicast := s.multicast
 	s.tcp = nil
 	s.tcpPassive = nil
@@ -3017,6 +3194,7 @@ func (s *Stack) Close() error {
 	s.udpForwarded = nil
 	s.udpForwarder = nil
 	s.ip = nil
+	s.ipForwarder = nil
 	s.icmpForwarder = nil
 	s.multicast = nil
 	s.multicastSeed = nil
@@ -3042,6 +3220,9 @@ func (s *Stack) Close() error {
 	}
 	if udpForwarder != nil {
 		udpForwarder.closeFromStack()
+	}
+	if ipForwarder != nil {
+		ipForwarder.closeFromStack()
 	}
 	if icmpForwarder != nil {
 		icmpForwarder.closeFromStack()

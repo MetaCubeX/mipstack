@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -379,6 +380,114 @@ func TestIPConnPathMTUAndICMPCorrelation(t *testing.T) {
 				t.Fatalf("IP socket diagnostics = %+v", info)
 			}
 		})
+	}
+}
+
+func TestDatagramPathMTUDiscoverySocketPolicy(t *testing.T) {
+	type pathMTUSocket interface {
+		net.Conn
+		SetPathMTUDiscovery(PathMTUDiscovery) error
+		PathMTUDiscovery() (PathMTUDiscovery, error)
+	}
+	protocols := []struct {
+		name string
+		open func(*Stack, netip.Addr) (pathMTUSocket, error)
+	}{
+		{name: "UDP", open: func(stack *Stack, remote netip.Addr) (pathMTUSocket, error) {
+			connection, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 5353))
+			if err != nil {
+				return nil, err
+			}
+			return connection.(*UDPConn), nil
+		}},
+		{name: "IP", open: func(stack *Stack, remote netip.Addr) (pathMTUSocket, error) {
+			connection, err := stack.DialIP(context.Background(), "ip4:99", netip.Addr{}, remote)
+			if err != nil {
+				return nil, err
+			}
+			return connection.(*IPConn), nil
+		}},
+	}
+	modes := []struct {
+		name    string
+		mode    PathMTUDiscovery
+		updates bool
+	}{
+		{name: "dont", mode: PathMTUDiscoveryDont, updates: true},
+		{name: "want", mode: PathMTUDiscoveryWant, updates: true},
+		{name: "do", mode: PathMTUDiscoveryDo, updates: true},
+		{name: "probe", mode: PathMTUDiscoveryProbe, updates: true},
+		{name: "interface", mode: PathMTUDiscoveryInterface},
+		{name: "omit", mode: PathMTUDiscoveryOmit},
+	}
+	for _, protocol := range protocols {
+		for _, mode := range modes {
+			t.Run(protocol.name+"/"+mode.name, func(t *testing.T) {
+				local := netip.MustParseAddr("192.0.2.190")
+				remote := netip.MustParseAddr("198.51.100.190")
+				stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer stack.Close()
+				if err = stack.Start(); err != nil {
+					t.Fatal(err)
+				}
+				connection, err := protocol.open(stack, remote)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if initial, getErr := connection.PathMTUDiscovery(); getErr != nil || initial != PathMTUDiscoveryDont {
+					t.Fatalf("initial PathMTUDiscovery = %v, %v", initial, getErr)
+				}
+				if err = connection.SetPathMTUDiscovery(mode.mode); err != nil {
+					t.Fatal(err)
+				}
+				if selected, getErr := connection.PathMTUDiscovery(); getErr != nil || selected != mode.mode {
+					t.Fatalf("PathMTUDiscovery = %v, %v, want %v", selected, getErr, mode.mode)
+				}
+				if err = connection.SetPathMTUDiscovery(PathMTUDiscovery(99)); !errors.Is(err, syscall.EINVAL) {
+					t.Fatalf("invalid SetPathMTUDiscovery = %v", err)
+				}
+				if selected, getErr := connection.PathMTUDiscovery(); getErr != nil || selected != mode.mode {
+					t.Fatalf("invalid option changed mode to %v, %v", selected, getErr)
+				}
+				if _, err = connection.Write([]byte("probe")); err != nil {
+					t.Fatal(err)
+				}
+				quoted := readOutboundPacket(t, stack)
+				if err = writeTestPacket(stack, buildTestPacketTooBig(remote, local, quoted, 1200)); err != nil {
+					t.Fatal(err)
+				}
+				wantMTU := 1400
+				if mode.updates {
+					wantMTU = 1200
+				}
+				if mtu := stack.mtuFor(remote); mtu != wantMTU {
+					t.Fatalf("PMTU after Packet Too Big = %d, want %d", mtu, wantMTU)
+				}
+				if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = connection.Read(make([]byte, 1)); err == nil {
+					t.Fatal("Packet Too Big was not delivered to socket")
+				} else {
+					var networkError ICMPError
+					if !errors.As(err, &networkError) || networkError.MTU != 1200 {
+						t.Fatalf("socket error = %#v, want Packet Too Big", err)
+					}
+				}
+				if err = connection.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = connection.PathMTUDiscovery(); !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("PathMTUDiscovery after Close = %v", err)
+				}
+				if err = connection.SetPathMTUDiscovery(mode.mode); !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("SetPathMTUDiscovery after Close = %v", err)
+				}
+			})
+		}
 	}
 }
 

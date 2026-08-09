@@ -27,6 +27,53 @@ const (
 	fragmentIPv6Lifetime = 60 * time.Second
 )
 
+// sourceFragmentation separates local source fragmentation from the IPv4 DF
+// value used when one datagram fits without fragmentation. Linux WANT mode
+// permits the former while requesting the latter.
+type sourceFragmentation struct {
+	allow        bool
+	dontFragment bool
+}
+
+// requiresIPv4ID reports whether Linux gives the datagram a fragmentation
+// identity. Locally fragmentable WANT traffic retains an ID even when DF is
+// set, while INTERFACE traffic needs one because DF remains clear and a router
+// may fragment it despite local source fragmentation being disabled.
+func (policy sourceFragmentation) requiresIPv4ID() bool {
+	return policy.allow || !policy.dontFragment
+}
+
+// sourceFragmentationForMode returns the Linux IP_PMTUDISC_* output policy.
+func sourceFragmentationForMode(mode PathMTUDiscovery) sourceFragmentation {
+	switch mode {
+	case PathMTUDiscoveryWant:
+		return sourceFragmentation{allow: true, dontFragment: true}
+	case PathMTUDiscoveryDo, PathMTUDiscoveryProbe:
+		return sourceFragmentation{dontFragment: true}
+	case PathMTUDiscoveryInterface:
+		return sourceFragmentation{}
+	case PathMTUDiscoveryOmit, PathMTUDiscoveryDont:
+		return sourceFragmentation{allow: true}
+	default:
+		return sourceFragmentation{allow: true}
+	}
+}
+
+// pathMTUOutputPolicy selects the destination or interface MTU together with
+// the socket's local fragmentation and IPv4 DF behavior.
+func (s *Stack) pathMTUOutputPolicy(destination netip.Addr, mode PathMTUDiscovery) (int, sourceFragmentation) {
+	mtu := s.network.Load().mtu
+	if mode < PathMTUDiscoveryProbe {
+		mtu = s.mtuFor(destination)
+	}
+	return mtu, sourceFragmentationForMode(mode)
+}
+
+// acceptsPathMTU reports whether Linux accepts ICMP PMTU updates in mode.
+func (mode PathMTUDiscovery) acceptsPathMTU() bool {
+	return mode != PathMTUDiscoveryInterface && mode != PathMTUDiscoveryOmit
+}
+
 // fragmentKey identifies one IPv4 or IPv6 fragmented datagram and keeps
 // internal loopback separate from packets received on the embedding link.
 type fragmentKey struct {
@@ -717,19 +764,20 @@ func (s *Stack) ipPayloadPackets(source, target netip.Addr, protocol byte, paylo
 
 // ipPayloadPacketsWithOptions is the raw-output form of ipPayloadPackets.
 func (s *Stack) ipPayloadPacketsWithOptions(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions) ([][]byte, error) {
-	return s.ipPayloadPacketsForMTU(source, target, protocol, payload, allowFragment, options, s.mtuFor(target))
+	fragmentation := sourceFragmentation{allow: allowFragment, dontFragment: !allowFragment}
+	return s.ipPayloadPacketsForMTU(source, target, protocol, payload, fragmentation, options, s.mtuFor(target))
 }
 
 // ipPayloadPacketsForMTU builds output against an explicit ceiling. Ordinary
 // traffic passes the confirmed PMTU; packetization-layer probes pass the
 // first-hop MTU and disable fragmentation.
-func (s *Stack) ipPayloadPacketsForMTU(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, mtu int) ([][]byte, error) {
+func (s *Stack) ipPayloadPacketsForMTU(source, target netip.Addr, protocol byte, payload []byte, fragmentation sourceFragmentation, options ipPacketOptions, mtu int) ([][]byte, error) {
 	if source.Is6() && !options.flowLabelSet {
 		options.flowLabel = s.automaticFlowLabel(source, target, protocol, payload)
 		options.flowLabelSet = true
 	}
 	var identification uint16
-	if source.Is4() && allowFragment {
+	if source.Is4() && fragmentation.requiresIPv4ID() {
 		// A router may fragment any IPv4 datagram without DF, so reserve its
 		// ID even when it currently fits the managed link MTU.
 		identification = uint16(s.ipv4ID.Add(1))
@@ -739,10 +787,10 @@ func (s *Stack) ipPayloadPacketsForMTU(source, target netip.Addr, protocol byte,
 		return nil, syscall.EMSGSIZE
 	}
 	if headerSize+len(payload) <= mtu {
-		packet := buildIPPacketWithOptions(source, target, protocol, payload, identification, !allowFragment, options)
+		packet := buildIPPacketWithOptions(source, target, protocol, payload, identification, fragmentation.dontFragment, options)
 		return [][]byte{packet}, nil
 	}
-	if !allowFragment {
+	if !fragmentation.allow {
 		return nil, syscall.EMSGSIZE
 	}
 	var fragments [][]byte
@@ -759,7 +807,7 @@ func (s *Stack) ipPayloadPacketsForMTU(source, target netip.Addr, protocol byte,
 
 // writeIPPayloadUntilOptionsForMTU emits output against an explicit packet
 // ceiling while preserving socket deadline and closure behavior.
-func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, mtu int, state socketWriteState) error {
+func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, protocol byte, payload []byte, fragmentation sourceFragmentation, options ipPacketOptions, mtu int, state socketWriteState) error {
 	if source.Is6() && !options.flowLabelSet {
 		options.flowLabel = s.automaticFlowLabel(source, target, protocol, payload)
 		options.flowLabelSet = true
@@ -770,7 +818,7 @@ func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, prot
 	}
 	if headerSize+len(payload) <= mtu {
 		var identification uint16
-		if source.Is4() && allowFragment {
+		if source.Is4() && fragmentation.requiresIPv4ID() {
 			identification = uint16(s.ipv4ID.Add(1))
 		}
 		queue, loopback := s.outputQueueFor(target)
@@ -779,7 +827,7 @@ func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, prot
 			return err
 		}
 		packet, reusable := queue.acquireBuffer(headerSize + len(payload))
-		if !marshalIPHeader(packet, source, target, protocol, identification, !allowFragment, options) {
+		if !marshalIPHeader(packet, source, target, protocol, identification, fragmentation.dontFragment, options) {
 			queue.releaseBuffer(packet, reusable)
 			queue.releaseReserved(slot)
 			return syscall.EMSGSIZE
@@ -791,7 +839,7 @@ func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, prot
 		s.recordOutput(loopback)
 		return nil
 	}
-	if !allowFragment {
+	if !fragmentation.allow {
 		return syscall.EMSGSIZE
 	}
 	return s.writeIPFragmentsUntilOptionsForMTU(source, target, protocol, payload, nil, options, mtu, state)
@@ -800,6 +848,9 @@ func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, prot
 // writeIPPayload atomically queues one best-effort protocol response or its
 // complete source-fragmented sequence without waiting for device capacity.
 func (s *Stack) writeIPPayload(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool) error {
+	if _, routed := s.network.Load().routeFor(target); !routed {
+		return syscall.ENETUNREACH
+	}
 	packets, err := s.ipPayloadPackets(source, target, protocol, payload, allowFragment)
 	if err != nil {
 		return err
@@ -809,7 +860,8 @@ func (s *Stack) writeIPPayload(source, target netip.Addr, protocol byte, payload
 
 // writeIPPayloadUntilOptions emits raw IP output with mutable deadline state.
 func (s *Stack) writeIPPayloadUntilOptions(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, state socketWriteState) error {
-	return s.writeIPPayloadUntilOptionsForMTU(source, target, protocol, payload, allowFragment, options, s.mtuFor(target), state)
+	fragmentation := sourceFragmentation{allow: allowFragment, dontFragment: !allowFragment}
+	return s.writeIPPayloadUntilOptionsForMTU(source, target, protocol, payload, fragmentation, options, s.mtuFor(target), state)
 }
 
 // writeIPFragmentsUntilOptionsForMTU writes fragments directly into reserved
