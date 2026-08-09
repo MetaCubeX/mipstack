@@ -1562,7 +1562,9 @@ func (s *Stack) writeNonUnicastPacketUntil(size int, external, loopback bool, st
 			s.loopback.releaseReserved(slot)
 			return syscall.EMSGSIZE
 		}
-		s.loopback.enqueueReservedPacket(slot, packet, reusable)
+		if !s.loopback.enqueueReservedPacket(slot, packet, reusable) {
+			return ErrClosed
+		}
 		s.recordOutput(true)
 		return nil
 	}
@@ -1586,11 +1588,17 @@ func (s *Stack) writeNonUnicastPacketUntil(size int, external, loopback bool, st
 			copy(localPacket, packet)
 		}
 	}
-	s.outbound.enqueueReservedPacket(slot, packet, reusable)
+	if !s.outbound.enqueueReservedPacket(slot, packet, reusable) {
+		if localReserved {
+			s.loopback.releaseReserved(localSlot)
+		}
+		return ErrClosed
+	}
 	s.recordOutput(false)
 	if localReserved {
-		s.loopback.enqueueReservedPacket(localSlot, localPacket, localReusable)
-		s.recordOutput(true)
+		if s.loopback.enqueueReservedPacket(localSlot, localPacket, localReusable) {
+			s.recordOutput(true)
+		}
 	}
 	return nil
 }
@@ -1616,14 +1624,24 @@ func (s *Stack) writeNonUnicastPacketsUntil(packets [][]byte, external, loopback
 			}
 		}
 		if external {
-			s.outbound.enqueueReservedPacket(slot, packet, false)
+			if !s.outbound.enqueueReservedPacket(slot, packet, false) {
+				return ErrClosed
+			}
 			s.recordOutput(false)
 		}
 		// Fragment builders return immutable, independently owned packets.
 		// Both queues may therefore retain the same slice without the extra
 		// full-fragment copy required by reusable queue-owned buffers.
-		if loopback && s.loopback.tryEnqueue(packet) {
-			s.recordOutput(true)
+		if loopback {
+			if s.loopback.tryEnqueue(packet) {
+				s.recordOutput(true)
+			} else if !external {
+				select {
+				case <-s.closeCh:
+					return ErrClosed
+				default:
+				}
+			}
 		}
 	}
 	return nil

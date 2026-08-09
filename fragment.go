@@ -130,6 +130,12 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time, loopback bo
 	}
 	fragment.key.loopback = loopback
 	s.fragmentMu.Lock()
+	select {
+	case <-s.closeCh:
+		s.fragmentMu.Unlock()
+		return nil, false
+	default:
+	}
 	expired := s.cleanFragmentsLocked(now)
 	defer func() {
 		s.fragmentMu.Unlock()
@@ -779,7 +785,9 @@ func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, prot
 			return syscall.EMSGSIZE
 		}
 		copy(packet[headerSize:], payload)
-		queue.enqueueReservedPacket(slot, packet, reusable)
+		if !queue.enqueueReservedPacket(slot, packet, reusable) {
+			return ErrClosed
+		}
 		s.recordOutput(loopback)
 		return nil
 	}
@@ -866,7 +874,9 @@ func (s *Stack) writeIPFragmentsUntilOptionsForMTU(source, target netip.Addr, pr
 			binary.BigEndian.PutUint32(fragment[4:8], identification6)
 		}
 		copyIPPayloadParts(packet[headerSize:], offset, first, second)
-		queue.enqueueReservedPacket(slot, packet, reusable)
+		if !queue.enqueueReservedPacket(slot, packet, reusable) {
+			return ErrClosed
+		}
 		s.recordOutput(loopback)
 		offset += size
 	}

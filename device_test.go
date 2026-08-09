@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -101,6 +102,124 @@ func TestPacketDeviceReadUnblocksOnClose(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Read did not unblock after Close")
+	}
+	if count, writeErr := stack.Write([][]byte{{0x45}}, 0); count != 0 || !errors.Is(writeErr, os.ErrClosed) {
+		t.Fatalf("Write after Close = %d, %v", count, writeErr)
+	}
+}
+
+// TestPacketDeviceCloseDiscardsOutput verifies that Close releases queued
+// output and that operations already holding queue ownership cannot recreate
+// retained packets or reusable buffers afterward.
+func TestPacketDeviceCloseDiscardsOutput(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.20")
+	remote := netip.MustParseAddr("192.0.2.21")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	packet := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	inFlightSlot, reserved := stack.outbound.tryReserve()
+	if !reserved {
+		t.Fatal("no output slot available for in-flight Read")
+	}
+	inFlightBuffer, inFlightReusable := stack.outbound.acquireBuffer(len(packet))
+	copy(inFlightBuffer, packet)
+	if !stack.outbound.enqueueReservedPacket(inFlightSlot, inFlightBuffer, inFlightReusable) {
+		t.Fatal("failed to publish in-flight output")
+	}
+	inFlight, available := stack.outbound.tryDequeue()
+	if !available || !inFlight.reusable {
+		t.Fatal("failed to retain reusable packet across Close")
+	}
+	if err = stack.writePacket(packet); err != nil {
+		t.Fatal(err)
+	}
+	lateSlot, reserved := stack.outbound.tryReserve()
+	if !reserved {
+		t.Fatal("no output slot available for late publisher")
+	}
+	lateBuffer, lateReusable := stack.outbound.acquireBuffer(len(packet))
+	copy(lateBuffer, packet)
+	if err = stack.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if stack.outbound.enqueueReservedPacket(lateSlot, lateBuffer, lateReusable) {
+		t.Fatal("packet publication succeeded after Close")
+	}
+	stack.outbound.release(inFlight)
+	if queued := stack.outbound.len(); queued != 0 {
+		t.Fatalf("Close retained %d outbound packets", queued)
+	}
+	if slots := len(stack.outbound.free); slots != cap(stack.outbound.free) {
+		t.Fatalf("output slots after Close = %d, want %d", slots, cap(stack.outbound.free))
+	}
+	if buffers := len(stack.outbound.buffers); buffers != 0 {
+		t.Fatalf("Close retained %d reusable packet buffers", buffers)
+	}
+}
+
+// TestPacketDeviceConcurrentCloseAndPublish verifies that publishers which
+// crossed the initial close check still clean up without making Close wait.
+func TestPacketDeviceConcurrentCloseAndPublish(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.24")
+	remote := netip.MustParseAddr("192.0.2.25")
+	for round := 0; round < 100; round++ {
+		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = stack.Start(); err != nil {
+			t.Fatal(err)
+		}
+		packet := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), uint16(round), false)
+		start := make(chan struct{})
+		publish := make(chan struct{})
+		var ready, writers sync.WaitGroup
+		ready.Add(8)
+		writers.Add(8)
+		for writer := 0; writer < 8; writer++ {
+			go func() {
+				defer writers.Done()
+				<-start
+				if writeErr := stack.tryWritePacket(packet); writeErr != nil {
+					ready.Done()
+					t.Errorf("round %d initial publisher: %v", round, writeErr)
+					return
+				}
+				ready.Done()
+				<-publish
+				for {
+					err := stack.tryWritePacket(packet)
+					if errors.Is(err, ErrClosed) {
+						return
+					}
+					if err != nil && !errors.Is(err, ErrResourceLimit) {
+						t.Errorf("round %d publisher: %v", round, err)
+						return
+					}
+				}
+			}()
+		}
+		close(start)
+		ready.Wait()
+		close(publish)
+		if err = stack.Close(); err != nil {
+			t.Fatal(err)
+		}
+		writers.Wait()
+		if queued := stack.outbound.len(); queued != 0 {
+			t.Fatalf("round %d retained %d outbound packets", round, queued)
+		}
+		if slots := len(stack.outbound.free); slots != cap(stack.outbound.free) {
+			t.Fatalf("round %d output slots = %d, want %d", round, slots, cap(stack.outbound.free))
+		}
+		if buffers := len(stack.outbound.buffers); buffers != 0 {
+			t.Fatalf("round %d retained %d reusable buffers", round, buffers)
+		}
 	}
 }
 

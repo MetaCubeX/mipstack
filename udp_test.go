@@ -1310,6 +1310,41 @@ func TestUDPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
 	}
 }
 
+// TestUDPConnCloseReleasesRetainedState verifies that socket closure clears
+// payload, destination-correlation, and asynchronous-error ownership and that
+// late delivery cannot recreate any of it.
+func TestUDPConnCloseReleasesRetainedState(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.253")
+	remote := netip.MustParseAddrPort("198.51.100.253:5353")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newUDPConn(stack, "udp4", 5300, false, local, netip.AddrPort{})
+	if err = connection.SetDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	connection.enqueue(make([]byte, 1200), remote, local, ipPacketOptions{})
+	connection.rememberTarget(remote)
+	connection.deliverError(remote, ICMPError{QuotedPayload: make([]byte, 1200)})
+	connection.mu.Lock()
+	connection.receiveSpare = make([]byte, 0, 1200)
+	connection.mu.Unlock()
+	connection.closeFromStack()
+	connection.rememberTarget(remote)
+	connection.deliverError(remote, ICMPError{QuotedPayload: make([]byte, 1200)})
+	connection.enqueue(make([]byte, 1200), remote, local, ipPacketOptions{})
+	connection.mu.Lock()
+	released := connection.receive.values == nil && connection.receiveSpare == nil && connection.queuedBytes == 0 &&
+		connection.recentTargets == nil && connection.lastError == nil && len(connection.errors) == 0 &&
+		connection.readDeadline.timer == nil && connection.writeDeadline.timer == nil
+	connection.mu.Unlock()
+	if !released || connection.icmpErrors.Load() != 1 {
+		t.Fatal("closed UDP socket retained or recreated payload-bearing state")
+	}
+}
+
 // TestUDPImpairedLinkLatencyAndLoss verifies propagation delay, jitter-driven
 // reordering, and deterministic independent loss at the packet-device boundary.
 func TestUDPImpairedLinkLatencyAndLoss(t *testing.T) {

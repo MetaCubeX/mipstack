@@ -61,7 +61,11 @@ The packet methods intentionally match the common batched userspace-TUN shape.
 `Read` blocks for one packet and then drains up to 64 currently queued packets
 into the supplied buffers; `BatchSize` reports that upper bound. `Write`
 accepts every packet supplied in an inbound batch. `Start` is idempotent, while
-`Close` is terminal and unblocks pending packet and socket operations.
+`Close` is terminal and unblocks pending packet and socket operations. It
+returns after publishing closure and starting orderly shutdown; it does not
+wait for TCP actors or user forwarder handlers to return. Stack-owned queues
+and caches are discarded before it returns, while actor-owned buffers are
+released as those actors observe cancellation.
 `Read` requires `sizes` to be at least as long as the buffer slice and honors
 the same leading `offset` in every buffer. Both methods report the successfully
 completed packet prefix before any later-buffer error, as expected by wireguard-go's
@@ -376,9 +380,10 @@ the accept and SYN backlogs, along with handshake, SYN-cookie, accept, timeout,
 and queue-drop counters. `UDPConn.Info` and `IPConn.Info` expose endpoint
 identity, queue occupancy, socket defaults, path MTU for connected sockets,
 and cumulative accepted, dropped, and transmitted datagram counters. Both
-retain the latest correlated ICMP error. An automatic `IPConn` Flow Label is
-reported as zero because raw payload fields may select a different flow on
-each write; fixed socket labels are reported directly.
+retain the latest correlated ICMP error while open; closing the socket releases
+that diagnostic state while preserving cumulative counters. An automatic
+`IPConn` Flow Label is reported as zero because raw payload fields may select a
+different flow on each write; fixed socket labels are reported directly.
 
 UDP message methods use the Linux 64-bit little-endian control-message layout
 on every host. `ReadMsgUDP` emits `IP_PKTINFO` or `IPV6_PKTINFO` for the local

@@ -981,7 +981,9 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 		}
 		udp := packet[ipSize:]
 		marshalUDPDatagram(udp, source, target, sourcePort, targetPort, payload)
-		queue.enqueueReservedPacket(slot, packet, reusable)
+		if !queue.enqueueReservedPacket(slot, packet, reusable) {
+			return ErrClosed
+		}
 		c.stack.recordOutput(loopback)
 		return nil
 	}
@@ -1023,6 +1025,12 @@ func (c *UDPConn) rememberTarget(target netip.AddrPort) {
 		return
 	}
 	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return
+	default:
+	}
 	c.recentTargets.remember(target, time.Now())
 	c.mu.Unlock()
 }
@@ -1047,13 +1055,19 @@ func (c *UDPConn) deliverError(target netip.AddrPort, err error) {
 		Addr: net.UDPAddrFromAddrPort(target), Err: err,
 	}
 	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return
+	default:
+	}
 	c.lastError = operationError
-	c.mu.Unlock()
-	c.icmpErrors.Add(1)
 	select {
 	case c.errors <- operationError:
 	default:
 	}
+	c.mu.Unlock()
+	c.icmpErrors.Add(1)
 }
 
 // udpAddrPort converts a net.Addr without performing name resolution.
@@ -1079,7 +1093,8 @@ func (c *UDPConn) Close() error {
 	return c.operationError("close", c.remoteAddr(), net.ErrClosed)
 }
 
-// closeFromStack publishes closure exactly once and releases queued payloads.
+// closeFromStack publishes closure exactly once and releases payload-bearing
+// and error-correlation state.
 func (c *UDPConn) closeFromStack() {
 	c.once.Do(func() {
 		c.mu.Lock()
@@ -1088,6 +1103,16 @@ func (c *UDPConn) closeFromStack() {
 		c.receive.clear()
 		c.receiveSpare = nil
 		c.queuedBytes = 0
+		c.recentTargets = nil
+		c.lastError = nil
+	drainErrors:
+		for {
+			select {
+			case <-c.errors:
+			default:
+				break drainErrors
+			}
+		}
 		close(c.closed)
 		c.mu.Unlock()
 	})

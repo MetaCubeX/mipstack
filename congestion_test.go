@@ -802,7 +802,7 @@ func newTestDeviceBottleneck(t testing.TB, algorithm CongestionControl, bytesPer
 			t.Fatal(err)
 		}
 		if !fair {
-			stack.outbound = newPacketQueueAt(outboundPacketQueue, stack.timestampEpoch)
+			stack.outbound.initFIFO(outboundPacketQueue, stack.timestampEpoch)
 		}
 		if err = stack.Start(); err != nil {
 			t.Fatal(err)

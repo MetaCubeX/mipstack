@@ -109,6 +109,81 @@ func TestTCPDestinationPortZeroUsesProtocolPath(t *testing.T) {
 	}
 }
 
+// TestTCPListenerCloseReleasesPendingOwnership verifies that a closed
+// listener does not retain its accept channel or unaccepted connection maps.
+func TestTCPListenerCloseReleasesPendingOwnership(t *testing.T) {
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.251/32")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := newTCPConn(stack, "tcp4", tcpKey{
+		local:  netip.MustParseAddrPort("192.0.2.251:443"),
+		remote: netip.MustParseAddrPort("198.51.100.251:50000"),
+	}, 1400)
+	listener := &TCPListener{
+		stack: stack, net: "tcp4", local: netip.MustParseAddrPort("192.0.2.251:443"), accept: make(chan *TCPConn, 1024), closed: make(chan struct{}),
+		pending: map[*TCPConn]struct{}{connection: {}}, handshaking: map[*TCPConn]struct{}{connection: {}},
+	}
+	if err = listener.SetDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	listener.accept <- connection
+	listener.closeFromStack()
+	listener.mu.Lock()
+	released := listener.accept == nil && listener.pending == nil && listener.handshaking == nil && listener.deadline.timer == nil
+	listener.mu.Unlock()
+	if !released {
+		t.Fatal("closed listener retained accept or pending connection storage")
+	}
+	select {
+	case <-connection.abortCh:
+	default:
+		t.Fatal("closed listener did not abort its pending connection")
+	}
+}
+
+// TestStackCloseEventuallyReleasesTCPBuffers verifies that Stack.Close only
+// signals the actor synchronously but that actor termination releases all
+// payload-bearing connection-owned queues within a bounded interval.
+func TestStackCloseEventuallyReleasesTCPBuffers(t *testing.T) {
+	local := netip.MustParseAddrPort("192.0.2.252:40000")
+	remote := netip.MustParseAddrPort("198.51.100.252:443")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local.Addr(), 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := newTCPConn(stack, "tcp4", tcpKey{local: local, remote: remote}, 1400)
+	connection.connected = make(chan error, 1)
+	payload := make([]byte, 1<<20)
+	connection.mu.Lock()
+	connection.readBuffer.append(payload)
+	connection.sendBuffer.append(payload)
+	connection.mu.Unlock()
+	if err = connection.SetDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	connection.deliverError(errors.New("retained network error"))
+	stack.tcp[connection.key] = connection
+	stack.stats.activeTCPConnections.Add(1)
+	go connection.run(1)
+	if err = stack.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-connection.done:
+	case <-time.After(time.Second):
+		t.Fatal("TCP actor did not terminate after Stack.Close")
+	}
+	connection.mu.Lock()
+	released := connection.readBuffer.size == 0 && connection.readBuffer.chunks == nil &&
+		connection.sendBuffer.size == 0 && connection.sendBuffer.chunks == nil && connection.sendBuffer.spare == nil &&
+		connection.networkError == nil && connection.readDeadline.timer == nil && connection.writeDeadline.timer == nil
+	connection.mu.Unlock()
+	if !released || connection.inbound.retainedBytes() != 0 {
+		t.Fatal("terminated TCP connection retained payload-bearing buffers")
+	}
+}
+
 func TestTCPListenerCompletedConnectionsLeaveSYNBacklog(t *testing.T) {
 	listener := &TCPListener{
 		accept: make(chan *TCPConn, 2), closed: make(chan struct{}), backlog: 1,

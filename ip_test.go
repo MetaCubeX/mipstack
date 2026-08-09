@@ -869,6 +869,41 @@ func TestIPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
 	}
 }
 
+// TestIPConnCloseReleasesRetainedState verifies that socket closure clears
+// payload, destination-correlation, and asynchronous-error ownership and that
+// late delivery cannot recreate any of it.
+func TestIPConnCloseReleasesRetainedState(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.254")
+	remote := netip.MustParseAddr("198.51.100.254")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{})
+	if err = connection.SetDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	connection.enqueue(make([]byte, 1200), remote, local, ipPacketOptions{})
+	connection.rememberTarget(remote)
+	connection.deliverError(remote, ICMPError{QuotedPayload: make([]byte, 1200)})
+	connection.mu.Lock()
+	connection.receiveSpare = make([]byte, 0, 1200)
+	connection.mu.Unlock()
+	connection.closeFromStack()
+	connection.rememberTarget(remote)
+	connection.deliverError(remote, ICMPError{QuotedPayload: make([]byte, 1200)})
+	connection.enqueue(make([]byte, 1200), remote, local, ipPacketOptions{})
+	connection.mu.Lock()
+	released := connection.receive.values == nil && connection.receiveSpare == nil && connection.queuedBytes == 0 &&
+		connection.recentTargets == nil && connection.lastError == nil && len(connection.errors) == 0 &&
+		connection.readDeadline.timer == nil && connection.writeDeadline.timer == nil
+	connection.mu.Unlock()
+	if !released || connection.icmpErrors.Load() != 1 {
+		t.Fatal("closed IP socket retained or recreated payload-bearing state")
+	}
+}
+
 func BenchmarkIPPacketWrite(b *testing.B) {
 	local := netip.MustParseAddr("192.0.2.246")
 	remote := netip.MustParseAddr("198.51.100.246")

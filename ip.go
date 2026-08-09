@@ -835,7 +835,8 @@ func (c *IPConn) Close() error {
 	return c.operationError("close", net.ErrClosed)
 }
 
-// closeFromStack publishes closure and releases queued payloads.
+// closeFromStack publishes closure and releases payload-bearing and
+// error-correlation state.
 func (c *IPConn) closeFromStack() {
 	c.once.Do(func() {
 		c.mu.Lock()
@@ -844,6 +845,16 @@ func (c *IPConn) closeFromStack() {
 		c.receive.clear()
 		c.receiveSpare = nil
 		c.queuedBytes = 0
+		c.recentTargets = nil
+		c.lastError = nil
+	drainErrors:
+		for {
+			select {
+			case <-c.errors:
+			default:
+				break drainErrors
+			}
+		}
 		close(c.closed)
 		c.mu.Unlock()
 	})
@@ -1040,6 +1051,12 @@ func (c *IPConn) rememberTarget(target netip.Addr) {
 		return
 	}
 	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return
+	default:
+	}
 	c.recentTargets.remember(target, time.Now())
 	c.mu.Unlock()
 }
@@ -1062,13 +1079,19 @@ func (c *IPConn) deliverError(target netip.Addr, err error) {
 		Op: "read", Net: c.net, Source: c.LocalAddr(), Addr: ipNetAddr(target), Err: err,
 	}
 	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return
+	default:
+	}
 	c.lastError = operationError
-	c.mu.Unlock()
-	c.icmpErrors.Add(1)
 	select {
 	case c.errors <- operationError:
 	default:
 	}
+	c.mu.Unlock()
+	c.icmpErrors.Add(1)
 }
 
 // writeStateAndOptions reads the output defaults and returns the independent

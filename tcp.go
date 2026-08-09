@@ -2231,8 +2231,8 @@ func (l *TCPListener) noteHandshakeFailure(err error) {
 	}
 }
 
-// closeFromStack publishes listener closure and aborts connections not yet
-// returned by Accept.
+// closeFromStack publishes listener closure, releases accept storage, and
+// aborts connections not yet returned by Accept.
 func (l *TCPListener) closeFromStack() {
 	l.once.Do(func() {
 		l.mu.Lock()
@@ -2242,8 +2242,9 @@ func (l *TCPListener) closeFromStack() {
 		for connection := range l.pending {
 			pending = append(pending, connection)
 		}
-		l.pending = make(map[*TCPConn]struct{})
-		l.handshaking = make(map[*TCPConn]struct{})
+		l.accept = nil
+		l.pending = nil
+		l.handshaking = nil
 		l.mu.Unlock()
 		for _, connection := range pending {
 			connection.abort(net.ErrClosed)
@@ -2787,10 +2788,16 @@ func (c *TCPConn) deliverError(err error) {
 	if errors.As(err, &networkError) && networkError.MTU != 0 {
 		return
 	}
+	c.mu.Lock()
+	if c.terminalErr != nil {
+		c.mu.Unlock()
+		return
+	}
 	select {
 	case c.networkError <- err:
 	default:
 	}
+	c.mu.Unlock()
 }
 
 // enqueueInbound hands one validated segment to the byte-bounded actor queue.
@@ -3767,18 +3774,48 @@ func (c *TCPConn) setReadEOF() {
 	c.mu.Unlock()
 }
 
-// finish publishes the actor terminal state and wakes application calls.
+// finish publishes the actor terminal state, releases actor-owned buffers,
+// and wakes application calls.
 func (c *TCPConn) finish(err error) {
 	if err == nil {
 		err = net.ErrClosed
+	}
+	discardReceive := false
+	select {
+	case <-c.stack.closeCh:
+		discardReceive = true
+	default:
+	}
+	if !discardReceive {
+		select {
+		case <-c.abortCh:
+			discardReceive = true
+		default:
+		}
 	}
 	c.mu.Lock()
 	c.terminalErr = err
 	c.readDeadline.stop()
 	c.writeDeadline.stop()
-	if c.readErr == nil {
+	if discardReceive {
+		c.readBuffer = tcpReadBuffer{}
+		c.outOfOrderUnread.Store(0)
+		c.readErr = err
+	} else if c.readErr == nil {
 		c.readErr = err
 	}
+	c.sendBuffer.clear()
+
+releaseNetworkErrors:
+	for {
+		select {
+		case <-c.networkError:
+			continue
+		default:
+			break releaseNetworkErrors
+		}
+	}
+	c.networkError = nil
 	c.notifyReadLocked()
 	c.notifySendChangedLocked()
 	c.mu.Unlock()
@@ -6603,7 +6640,10 @@ func (c *TCPConn) writeTCP(sequence, acknowledgement uint32, flags byte, window 
 		queue.releaseReserved(slot)
 		return packetQueueTicket{}, err
 	}
-	hostQueue := queue.enqueueReservedTCP(slot, built, reusable, c.outputFlowID, loopback)
+	hostQueue, published := queue.enqueueReservedTCP(slot, built, reusable, c.outputFlowID, loopback)
+	if !published {
+		return packetQueueTicket{}, ErrClosed
+	}
 	c.stack.recordOutput(loopback)
 	return hostQueue, nil
 }

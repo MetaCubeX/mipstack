@@ -20,6 +20,56 @@ var _ func(*Stack, context.Context, string, netip.AddrPort) (net.PacketConn, err
 var _ func(*Stack, context.Context, string, netip.AddrPort) (*TCPListener, error) = (*Stack).ListenTCPReusePort
 var _ func(*Stack, context.Context, string, netip.AddrPort) (net.PacketConn, error) = (*Stack).ListenUDPReusePort
 
+// TestStackClosePreventsCacheRepopulation verifies that operations already
+// entering protocol code cannot recreate mutable caches after their cleaners
+// and owners have stopped.
+func TestStackClosePreventsCacheRepopulation(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.250")
+	remote := netip.MustParseAddr("198.51.100.250")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stack.pathMTU[remote] = pathMTUEntry{mtu: 1200, updated: time.Now()}
+	fragments := buildIPv4Fragments(remote, local, protocolUDP, make([]byte, 1600), 600, 1)
+	if len(fragments) < 2 {
+		t.Fatal("test datagram was not fragmented")
+	}
+	if packet, pending := stack.reassemblePacketStatus(fragments[0], time.Now(), false); packet != nil || !pending {
+		t.Fatalf("first fragment = %x, pending %v", packet, pending)
+	}
+	if err = stack.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stack.pathMTUMu.RLock()
+	pathMTUReleased := stack.pathMTU == nil
+	stack.pathMTUMu.RUnlock()
+	stack.fragmentMu.Lock()
+	fragmentsReleased := stack.fragments == nil && stack.fragmentBytes == 0
+	stack.fragmentMu.Unlock()
+	if !pathMTUReleased || !fragmentsReleased {
+		t.Fatalf("Close retained caches: path MTU released=%v, fragments released=%v", pathMTUReleased, fragmentsReleased)
+	}
+	if err = stack.ConfirmPathMTU(remote, 1200); !errors.Is(err, ErrClosed) {
+		t.Fatalf("ConfirmPathMTU after Close = %v", err)
+	}
+	if stack.observePathMTU(remote, 1000) || stack.confirmPathMTU(remote, 1200, nil) {
+		t.Fatal("internal PMTU update succeeded after Close")
+	}
+	if packet, pending := stack.reassemblePacketStatus(fragments[1], time.Now(), false); packet != nil || pending {
+		t.Fatalf("fragment after Close = %x, pending %v", packet, pending)
+	}
+	stack.pathMTUMu.RLock()
+	pathMTUReleased = stack.pathMTU == nil
+	stack.pathMTUMu.RUnlock()
+	stack.fragmentMu.Lock()
+	fragmentsReleased = stack.fragments == nil && stack.fragmentBytes == 0
+	stack.fragmentMu.Unlock()
+	if !pathMTUReleased || !fragmentsReleased {
+		t.Fatalf("post-Close operation rebuilt caches: path MTU released=%v, fragments released=%v", pathMTUReleased, fragmentsReleased)
+	}
+}
+
 func TestPacketQueueWaitDoesNotSerializeWriteDeadlines(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.1")
 	remote := netip.MustParseAddr("192.0.2.2")
@@ -334,7 +384,8 @@ func TestPacketQueueTicketTracksDeviceDequeue(t *testing.T) {
 }
 
 func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
-	queue := newPacketQueue(1)
+	var queue packetQueue
+	queue.initFIFO(1, time.Now())
 	firstSlot, reserved := queue.tryReserve()
 	if !reserved {
 		t.Fatal("first queue slot was not available")
@@ -370,14 +421,16 @@ func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
 // outbound-versus-loopback identity without storing a queue pointer.
 func TestPacketQueueTicketSelectsItsQueue(t *testing.T) {
 	epoch := time.Now()
-	stack := &Stack{outbound: newPacketQueueAt(1, epoch), loopback: newPacketQueueAt(1, epoch)}
+	stack := &Stack{}
+	stack.outbound.initFIFO(1, epoch)
+	stack.loopback.initFIFO(1, epoch)
 	outboundSlot, outboundReserved := stack.outbound.tryReserve()
 	loopbackSlot, loopbackReserved := stack.loopback.tryReserve()
 	if !outboundReserved || !loopbackReserved {
 		t.Fatal("packet queue slots were not available")
 	}
-	outbound := stack.outbound.enqueueReservedTCP(outboundSlot, []byte{1}, false, 1, false)
-	loopback := stack.loopback.enqueueReservedTCP(loopbackSlot, []byte{2}, false, 1, true)
+	outbound, _ := stack.outbound.enqueueReservedTCP(outboundSlot, []byte{1}, false, 1, false)
+	loopback, _ := stack.loopback.enqueueReservedTCP(loopbackSlot, []byte{2}, false, 1, true)
 	if outbound.loopback() || !loopback.loopback() || !outbound.pending(stack) || !loopback.pending(stack) {
 		t.Fatal("packet queue tickets did not retain their queue identity")
 	}
@@ -1153,7 +1206,7 @@ func enqueueTestOutputPacket(t *testing.T, queue *packetQueue, packet []byte) {
 	if !ok {
 		t.Fatal("output queue has no free slot")
 	}
-	queue.enqueueReservedPacket(slot, packet, false)
+	_ = queue.enqueueReservedPacket(slot, packet, false)
 }
 
 func TestFairPacketQueueRotatesAfterInitialByteCredit(t *testing.T) {
@@ -1161,7 +1214,8 @@ func TestFairPacketQueueRotatesAfterInitialByteCredit(t *testing.T) {
 	target := netip.MustParseAddr("198.51.100.1")
 	first := testOutputUDPPacket(source, target, 10000, 53, 80)
 	second := testOutputUDPPacket(source, target, 10001, 53, 80)
-	queue := newFairPacketQueueAt(16, time.Now(), len(first), [16]byte{1})
+	var queue packetQueue
+	queue.initFair(16, time.Now(), len(first), [16]byte{1})
 	for index := 0; index < 12; index++ {
 		enqueueTestOutputPacket(t, &queue, first)
 	}
@@ -1191,7 +1245,8 @@ func TestFairPacketQueueUsesByteCredit(t *testing.T) {
 	target := netip.MustParseAddr("198.51.100.2")
 	large := testOutputUDPPacket(source, target, 11000, 53, 1400)
 	small := testOutputUDPPacket(source, target, 11001, 53, 200)
-	queue := newFairPacketQueueAt(128, time.Now(), 1500, [16]byte{2})
+	var queue packetQueue
+	queue.initFair(128, time.Now(), 1500, [16]byte{2})
 	for index := 0; index < 64; index++ {
 		enqueueTestOutputPacket(t, &queue, large)
 		enqueueTestOutputPacket(t, &queue, small)
@@ -1295,7 +1350,8 @@ func TestOutputPacketFlowHashKeepsICMPEchoSequenceTogether(t *testing.T) {
 func TestFairPacketQueueReusesBoundedFlowStorage(t *testing.T) {
 	source := netip.MustParseAddr("192.0.2.4")
 	target := netip.MustParseAddr("198.51.100.4")
-	queue := newFairPacketQueueAt(4, time.Now(), 1500, [16]byte{4})
+	var queue packetQueue
+	queue.initFair(4, time.Now(), 1500, [16]byte{4})
 	for round := 0; round < 128; round++ {
 		packet := testOutputUDPPacket(source, target, uint16(13000+round), 53, 64)
 		enqueueTestOutputPacket(t, &queue, packet)
@@ -1316,7 +1372,8 @@ func TestFairPacketQueueReusesBoundedFlowStorage(t *testing.T) {
 func TestFairPacketQueueWakesConcurrentSinglePacketReaders(t *testing.T) {
 	source := netip.MustParseAddr("192.0.2.6")
 	target := netip.MustParseAddr("198.51.100.6")
-	queue := newFairPacketQueueAt(4, time.Now(), 1500, [16]byte{6})
+	var queue packetQueue
+	queue.initFair(4, time.Now(), 1500, [16]byte{6})
 	packet := testOutputUDPPacket(source, target, 15000, 53, 64)
 	closed := make(chan struct{})
 	started := make(chan struct{}, 2)
@@ -1365,9 +1422,11 @@ func BenchmarkPacketQueueScheduling(b *testing.B) {
 		{name: "drr-64", fair: true, flows: 64},
 	} {
 		b.Run(benchmark.name, func(b *testing.B) {
-			queue := newPacketQueue(capacity)
+			var queue packetQueue
 			if benchmark.fair {
-				queue = newFairPacketQueueAt(capacity, time.Now(), 1500, [16]byte{5})
+				queue.initFair(capacity, time.Now(), 1500, [16]byte{5})
+			} else {
+				queue.initFIFO(capacity, time.Now())
 			}
 			flowIDs := make([]uint64, benchmark.flows)
 			for index := range flowIDs {
@@ -1382,7 +1441,7 @@ func BenchmarkPacketQueueScheduling(b *testing.B) {
 					if !ok {
 						b.Fatal("output queue unexpectedly full")
 					}
-					queue.enqueueReservedTCP(slot, packet, false, flowIDs[index%len(flowIDs)], false)
+					_, _ = queue.enqueueReservedTCP(slot, packet, false, flowIDs[index%len(flowIDs)], false)
 				}
 				for index := 0; index < capacity; index++ {
 					entry, ok := queue.tryDequeue()
