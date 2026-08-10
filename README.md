@@ -656,6 +656,22 @@ message-control helpers, forwarder implementations, or other unreferenced
 public methods. No package-level registration table or reflection root keeps
 these APIs alive.
 
+## gVisor interoperability
+
+[`interop/gvisor`](interop/gvisor) is an independent Go 1.20 module that links
+the current checkout directly to the metacubex gVisor fork. Its tests exchange
+complete L3 packets over an IPv4 MTU matrix from 68 through 9,000 bytes and an
+IPv6 matrix from 1,280 through 9,000 bytes. Coverage includes bidirectional
+TCP, UDP, ICMP echo, fragmentation and impairment recovery, every built-in TCP
+congestion controller, socket errors and ancillary data, transparent
+Forwarders, broadcast, multicast, PMTU handling, and raw IP payload sockets.
+Keeping the tests behind a nested module preserves the root module's
+standard-library-only dependency graph.
+
+The root `go test ./...` command does not enter nested modules. Run this suite
+explicitly with `cd interop/gvisor && go test ./...` when changing packet or
+transport behavior.
+
 ## Scope
 
 MIPS is an endpoint stack, not a general host network stack. `IPConn`
