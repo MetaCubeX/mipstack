@@ -94,8 +94,15 @@ var (
 type TCPSocketDefaults struct {
 	// CongestionControl selects the algorithm used by new connections. The
 	// zero value selects CUBIC. UpdateConfig also applies a changed value to
-	// established connections without an explicit per-connection override.
+	// established connections without an explicit per-connection override. It
+	// must be empty when CongestionControlFactory is set.
 	CongestionControl CongestionControl
+	// CongestionControlFactory selects an immutable local factory without
+	// process-wide registration. It must be created by
+	// NewCongestionControlFactory and is mutually exclusive with
+	// CongestionControl. The factory creates an independent controller for every
+	// connection and may be shared safely by multiple stacks and listeners.
+	CongestionControlFactory *CongestionControlFactory
 	// ReceiveBuffer is the initial application receive capacity.
 	ReceiveBuffer int
 	// MaximumReceiveBuffer bounds automatic receive tuning.
@@ -1591,7 +1598,7 @@ func (s *Stack) UpdateConfig(config Config) error {
 		icmpForwarder.updateConfig(state)
 	}
 	for _, connection := range tcpConnections {
-		connection.updateDefaultCongestionControl(state.tcpDefaults.CongestionControl)
+		connection.updateDefaultCongestionControl(state.tcpDefaults.CongestionControlFactory)
 		_, routed := state.routeFor(connection.key.remote.Addr())
 		if !networkStateHasLocal(state, connection.key.local.Addr()) && !(connection.forwarded && state.acceptsInboundDestination(connection.key.local.Addr())) {
 			connection.abortWithoutReset(syscall.EADDRNOTAVAIL)

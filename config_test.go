@@ -227,15 +227,16 @@ func TestCongestionControlConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := stack.network.Load().tcpDefaults.CongestionControl; got != CongestionControlCUBIC {
-		t.Fatalf("default congestion control = %q, want %q", got, CongestionControlCUBIC)
+	if defaults := stack.network.Load().tcpDefaults; defaults.CongestionControl != "" || defaults.CongestionControlFactory.Name() != CongestionControlCUBIC {
+		t.Fatalf("default congestion control = name %q factory %q, want factory %q", defaults.CongestionControl, defaults.CongestionControlFactory.Name(), CongestionControlCUBIC)
 	}
 	for _, algorithm := range []CongestionControl{CongestionControlCUBIC, CongestionControlReno, CongestionControlBBR, CongestionControlBBR3} {
 		if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{local}, TCP: TCPSocketDefaults{CongestionControl: algorithm}}); err != nil {
 			t.Fatalf("UpdateConfig(%q): %v", algorithm, err)
 		}
-		if got := stack.network.Load().tcpDefaults.CongestionControl; got != algorithm {
-			t.Fatalf("configured congestion control = %q, want %q", got, algorithm)
+		defaults := stack.network.Load().tcpDefaults
+		if defaults.CongestionControl != "" || defaults.CongestionControlFactory.Name() != algorithm {
+			t.Fatalf("configured congestion control = name %q factory %q, want factory %q", defaults.CongestionControl, defaults.CongestionControlFactory.Name(), algorithm)
 		}
 	}
 	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{local}, TCP: TCPSocketDefaults{CongestionControl: "invalid"}}); err == nil {
@@ -263,7 +264,7 @@ func TestCongestionControlConfigurationUpdatesExistingConnections(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := tcpConnection.socketOptions().congestion; got != CongestionControlReno {
+	if got := tcpConnection.socketOptions().congestionFactory.Name(); got != CongestionControlReno {
 		t.Fatalf("updated connection congestion control = %q, want %q", got, CongestionControlReno)
 	}
 	if err = tcpConnection.SetCongestionControl(CongestionControlBBR); err != nil {
@@ -275,7 +276,7 @@ func TestCongestionControlConfigurationUpdatesExistingConnections(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := tcpConnection.socketOptions().congestion; got != CongestionControlBBR {
+	if got := tcpConnection.socketOptions().congestionFactory.Name(); got != CongestionControlBBR {
 		t.Fatalf("per-connection congestion control changed to %q, want %q", got, CongestionControlBBR)
 	}
 }

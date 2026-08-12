@@ -380,7 +380,7 @@ type tcpSocketOptions struct {
 	idleTimeout       time.Duration
 	userTimeout       time.Duration
 	noDelay           bool
-	congestion        CongestionControl
+	congestionFactory *CongestionControlFactory
 	maximumPacingRate uint64
 }
 
@@ -1643,7 +1643,7 @@ type TCPConn struct {
 	idleTimeout        time.Duration
 	userTimeout        time.Duration
 	noDelay            bool
-	congestion         CongestionControl
+	congestionFactory  *CongestionControlFactory
 	congestionUser     bool
 	maximumPacingRate  uint64
 	outputFlowID       uint64
@@ -2356,7 +2356,8 @@ func newTCPConn(stack *Stack, network string, key tcpKey, mtu int) *TCPConn {
 		receiveAutoTune: defaults.MaximumReceiveBuffer > defaults.ReceiveBuffer,
 		sendAutoTune:    defaults.MaximumSendBuffer > defaults.SendBuffer,
 		keepAlive:       defaults.KeepAlive, keepAliveConfig: defaults.KeepAliveConfig,
-		idleTimeout: defaults.IdleTimeout, userTimeout: defaults.UserTimeout, congestion: defaults.CongestionControl,
+		idleTimeout: defaults.IdleTimeout, userTimeout: defaults.UserTimeout,
+		congestionFactory:  defaults.CongestionControlFactory,
 		maximumPacingRate:  defaults.MaximumPacingRate,
 		receiveWindowScale: tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer),
 	}
@@ -3228,7 +3229,7 @@ func (c *TCPConn) tcpInfoBase(state TCPState) TCPInfo {
 func (c *TCPConn) tcpInfoBaseLocked(state TCPState) TCPInfo {
 	info := TCPInfo{
 		LocalAddress: c.key.local, RemoteAddress: c.key.remote, State: state,
-		CongestionControl: c.congestion,
+		CongestionControl: c.congestionFactory.Name(),
 		SendBufferSize:    c.sendBuffer.size, SendBufferCapacity: c.sendCapacity, MaximumSendBuffer: c.sendMaximum,
 		ReceiveBufferSize: c.readBuffer.size + int(c.outOfOrderUnread.Load()), ReceiveBufferCapacity: c.receiveCapacity, MaximumReceiveBuffer: c.receiveMaximum,
 		Retransmissions: c.retransmissions.Load(), InboundQueueDrops: c.inboundQueueDrops.Load(),
@@ -3379,11 +3380,26 @@ func (c *TCPConn) SetNoDelay(noDelay bool) error {
 // SetCongestionControl changes the algorithm for this connection and prevents
 // later stack-default updates from overriding the explicit choice.
 func (c *TCPConn) SetCongestionControl(algorithm CongestionControl) error {
-	if !algorithm.valid() {
+	factory, exists := registeredCongestionControlFactory(algorithm)
+	if !exists {
 		return c.setOperationError(syscall.EINVAL)
 	}
 	return c.updateSocketOptions(func() {
-		c.congestion = algorithm
+		c.congestionFactory = factory
+		c.congestionUser = true
+	})
+}
+
+// SetCongestionControlFactory changes this connection to an immutable local
+// factory and prevents later stack-default updates from overriding the explicit
+// choice. The factory creates a new connection-private controller on the actor
+// goroutine; it may be shared with other connections safely.
+func (c *TCPConn) SetCongestionControlFactory(factory *CongestionControlFactory) error {
+	if !factory.valid() {
+		return c.setOperationError(syscall.EINVAL)
+	}
+	return c.updateSocketOptions(func() {
+		c.congestionFactory = factory
 		c.congestionUser = true
 	})
 }
@@ -3551,19 +3567,20 @@ func (c *TCPConn) socketOptions() tcpSocketOptions {
 	return tcpSocketOptions{
 		keepAlive: c.keepAlive, keepAliveConfig: c.keepAliveConfig,
 		idleTimeout: c.idleTimeout, userTimeout: c.userTimeout, noDelay: c.noDelay,
-		congestion: c.congestion, maximumPacingRate: c.maximumPacingRate,
+		congestionFactory: c.congestionFactory,
+		maximumPacingRate: c.maximumPacingRate,
 	}
 }
 
 // updateDefaultCongestionControl preserves Config.UpdateConfig's established-
 // connection behavior unless the application selected a per-socket override.
-func (c *TCPConn) updateDefaultCongestionControl(algorithm CongestionControl) {
+func (c *TCPConn) updateDefaultCongestionControl(factory *CongestionControlFactory) {
 	c.mu.Lock()
-	if c.congestionUser || c.userClosed || c.terminalErr != nil || c.congestion == algorithm {
+	if c.congestionUser || c.userClosed || c.terminalErr != nil || c.congestionFactory == factory {
 		c.mu.Unlock()
 		return
 	}
-	c.congestion = algorithm
+	c.congestionFactory = factory
 	c.mu.Unlock()
 	c.wakeActor(tcpActorWakeOptions)
 }
@@ -4361,7 +4378,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		lastTimestampUpdate = time.Now()
 		ecnRecoveryPoint    uint32
 		ecnRecoveryActive   bool
-		controller          = newTCPCongestionController(initialSocketOptions.congestion)
+		controller          = newTCPCongestionControllerFromFactory(initialSocketOptions.congestionFactory, CongestionControlContext{
+			LocalAddress: c.key.local, RemoteAddress: c.key.remote,
+			Passive: c.passive, Forwarded: c.forwarded,
+		})
 		rackLatestDelivered tcpRACKSample
 		rackForwardACK      uint32
 		rackForwardACKSet   bool
@@ -4480,6 +4500,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		}
 		return ordinaryFlight()
 	}
+	defer func() {
+		controller.release(time.Now(), congestionWindow, slowStartThreshold, congestionFlight(), peerMSS, rtt.srtt, rtt.minimum)
+	}()
 	recountSACK := func() {
 		sackedRanges, sackedBytes = tcpSACKedState(outstanding)
 	}
@@ -5364,22 +5387,26 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			}
 		}
 	}
-	changeCongestionController := func(configured CongestionControl, maximumPacingRate uint64) {
-		if configured == controller.algorithmName() {
+	changeCongestionController := func(factory *CongestionControlFactory, maximumPacingRate uint64) {
+		if factory == controller.factory {
 			if controller.setMaximumPacingRate(maximumPacingRate) {
 				pacing = false
 				pacingDeadline = time.Time{}
 			}
 			return
 		}
-		controller = newTCPCongestionController(configured)
+		now := time.Now()
+		controller.release(now, congestionWindow, slowStartThreshold, congestionFlight(), peerMSS, rtt.srtt, rtt.minimum)
+		controller = newTCPCongestionControllerFromFactory(factory, CongestionControlContext{
+			LocalAddress: c.key.local, RemoteAddress: c.key.remote,
+			Passive: c.passive, Forwarded: c.forwarded,
+		})
 		controller.setMaximumPacingRate(maximumPacingRate)
 		undo.active = false
 		for index := range outstanding {
 			outstanding[index].delivery = tcpDeliverySnapshot{}
 			outstanding[index].congestionPacketState = 0
 		}
-		now := time.Now()
 		congestionWindow, slowStartThreshold = controller.initialize(now, rtt.minimum, rtt.srtt, congestionWindow, slowStartThreshold, peerMSS, monotonicStampAt(c.stack.timestampEpoch, now))
 		hyStart.disable()
 		pacing = false
@@ -5387,7 +5414,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 	}
 	applyPathMTU := func(mtu int, retransmit bool) error {
 		options := c.socketOptions()
-		changeCongestionController(options.congestion, options.maximumPacingRate)
+		changeCongestionController(options.congestionFactory, options.maximumPacingRate)
 		priorMTU := c.mtu
 		c.mtu = mtu
 		if mtu < priorMTU {
@@ -6192,7 +6219,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				// The established connection's cwnd and ssthresh remain transport
 				// state across a TCP_CONGESTION change.
 				options := c.socketOptions()
-				changeCongestionController(options.congestion, options.maximumPacingRate)
+				changeCongestionController(options.congestionFactory, options.maximumPacingRate)
 				keepAliveProbes = 0
 				lastKeepAlive = time.Time{}
 				armLiveness()

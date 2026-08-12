@@ -19,7 +19,8 @@ The suite covers:
   reopening, and SYN, SYN-ACK, final-ACK, FIN, and data retransmission after
   deterministic loss or reordering;
 - Reno, CUBIC, BBR, and BBRv3 mipstack senders recovering from loss against
-  both active and passive gVisor connections;
+  both active and passive gVisor connections, plus an unregistered local
+  congestion-control factory receiving correct IPv4/IPv6 connection context;
 - connected and unconnected UDP in both arrangements, connected-peer
   filtering, zero-length and maximum-size datagrams, wildcard dual-stack
   sockets, IPv4 zero-checksum acceptance, mandatory IPv6 checksums, invalid

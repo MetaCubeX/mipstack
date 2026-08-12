@@ -2,6 +2,7 @@ package mipstack
 
 import (
 	"fmt"
+	"net/netip"
 	"sort"
 	"sync"
 	"time"
@@ -21,13 +22,28 @@ const (
 	CongestionControlBBR3 CongestionControl = "bbr3"
 )
 
+// CongestionControlContext identifies the TCP connection for which a
+// controller is being created. It is an immutable, by-value snapshot; dynamic
+// transport state is supplied by CongestionEventInitialize and later events.
+type CongestionControlContext struct {
+	// LocalAddress is the connection's local TCP endpoint.
+	LocalAddress netip.AddrPort
+	// RemoteAddress is the connection's peer TCP endpoint.
+	RemoteAddress netip.AddrPort
+	// Passive reports whether the connection was accepted rather than dialed.
+	Passive bool
+	// Forwarded reports whether a TCP forwarder accepted the connection for an
+	// intercepted destination. Every forwarded connection is also passive.
+	Forwarded bool
+}
+
 // CongestionController is one connection's congestion-control policy.
 // HandleCongestionEvent is called serially by the connection actor. It must
 // return promptly, must not retain event or references reachable from it, and
 // must ignore event types it does not recognize. The event storage is reused
 // as soon as HandleCongestionEvent returns. The first call for each controller
-// is CongestionEventInitialize. No callback is made after the connection drops
-// the controller, so an implementation must not start work that outlives it.
+// is CongestionEventInitialize and the final call is CongestionEventRelease.
+// An implementation must not start work that outlives the release callback.
 // Different connections own different controller instances and may invoke
 // them concurrently; package-level state therefore requires synchronization.
 //
@@ -73,75 +89,138 @@ const congestionControlKnownFeatures = CongestionControlFeatureDeliveryRate |
 	CongestionControlFeatureCustomRecovery |
 	CongestionControlFeatureLossEvents
 
-// CongestionControlDefinition describes an algorithm registered with the
-// package. New may be called concurrently, must return promptly, and must
-// return a non-nil, independent controller on every call. SendBufferMultiplier
-// requests automatic send-buffer growth to this multiple of cwnd; zero retains
-// the ordinary socket auto-tuning policy.
+// CongestionControlDefinition describes a congestion-control implementation
+// before it is validated and frozen into a CongestionControlFactory. New may
+// be called concurrently for different connections, must return promptly, and
+// must return a non-nil, independent controller on every call. It must not
+// retain references to mutable connection state; the context is an immutable
+// value. SendBufferMultiplier requests automatic send-buffer growth to this
+// multiple of cwnd; zero retains the ordinary socket auto-tuning policy.
 type CongestionControlDefinition struct {
-	// New creates one independent controller for a connection.
-	New func() CongestionController
+	// Name is the diagnostic name and, when registered, the process-registry key.
+	Name CongestionControl
+	// New creates one independent controller for the supplied connection.
+	New func(CongestionControlContext) CongestionController
 	// Features requests optional transport work for the controller.
 	Features CongestionControlFeatures
 	// SendBufferMultiplier requests a send buffer sized as a multiple of cwnd.
 	SendBufferMultiplier uint32
 }
 
-// congestionControlRegistry holds built-in and application-registered algorithms.
+// CongestionControlFactory is an immutable, reusable per-connection controller
+// factory. It may be shared by stacks, listeners, and connections; every use
+// invokes its definition's New function to create an independent controller.
+// Factory pointer identity determines whether a live connection's selected
+// implementation changed.
+type CongestionControlFactory struct {
+	definition CongestionControlDefinition
+}
+
+// NewCongestionControlFactory validates definition and returns a local factory
+// without registering it process-wide. Definition.Name is used for diagnostics
+// and need not be globally unique. Reuse the returned pointer when successive
+// configurations should identify the same implementation.
+func NewCongestionControlFactory(definition CongestionControlDefinition) (*CongestionControlFactory, error) {
+	if err := validateCongestionControlDefinition(definition); err != nil {
+		return nil, err
+	}
+	return &CongestionControlFactory{definition: definition}, nil
+}
+
+// Name returns the diagnostic name reported by TCPInfo. A nil factory has an
+// empty name and is not a valid connection policy.
+func (f *CongestionControlFactory) Name() CongestionControl {
+	if f == nil {
+		return ""
+	}
+	return f.definition.Name
+}
+
+// valid reports whether f could have been returned by the public constructor.
+func (f *CongestionControlFactory) valid() bool {
+	return f != nil && validateCongestionControlDefinition(f.definition) == nil
+}
+
+// validateCongestionControlDefinition checks one factory description.
+func validateCongestionControlDefinition(definition CongestionControlDefinition) error {
+	if definition.Name == "" {
+		return fmt.Errorf("mipstack: congestion control name is empty")
+	}
+	if definition.New == nil {
+		return fmt.Errorf("mipstack: congestion control %q has no factory", definition.Name)
+	}
+	if unknown := definition.Features &^ congestionControlKnownFeatures; unknown != 0 {
+		return fmt.Errorf("mipstack: congestion control %q has unknown features %#x", definition.Name, uint32(unknown))
+	}
+	if definition.Features&CongestionControlFeatureCustomPacing != 0 && definition.Features&CongestionControlFeatureTransmissionEvents == 0 {
+		return fmt.Errorf("mipstack: congestion control %q custom pacing requires transmission events", definition.Name)
+	}
+	if definition.Features&CongestionControlFeatureLossEvents != 0 && definition.Features&CongestionControlFeatureTransmissionEvents == 0 {
+		return fmt.Errorf("mipstack: congestion control %q loss events require transmission events", definition.Name)
+	}
+	return nil
+}
+
+// congestionControlRegistry holds built-in and application-registered factories.
 var congestionControlRegistry = struct {
 	sync.RWMutex
-	definitions map[CongestionControl]CongestionControlDefinition
-}{definitions: map[CongestionControl]CongestionControlDefinition{
-	CongestionControlCUBIC: {
-		New:      func() CongestionController { return newCUBICCongestionControl() },
+	factories map[CongestionControl]*CongestionControlFactory
+}{factories: map[CongestionControl]*CongestionControlFactory{
+	CongestionControlCUBIC: mustCongestionControlFactory(CongestionControlDefinition{
+		Name:     CongestionControlCUBIC,
+		New:      func(CongestionControlContext) CongestionController { return newCUBICCongestionControl() },
 		Features: CongestionControlFeatureTransmissionEvents,
-	},
-	CongestionControlReno: {New: func() CongestionController { return newRenoCongestionControl() }},
-	CongestionControlBBR: {
-		New: func() CongestionController { return newBBRCongestionControl() },
+	}),
+	CongestionControlReno: mustCongestionControlFactory(CongestionControlDefinition{
+		Name: CongestionControlReno,
+		New:  func(CongestionControlContext) CongestionController { return newRenoCongestionControl() },
+	}),
+	CongestionControlBBR: mustCongestionControlFactory(CongestionControlDefinition{
+		Name: CongestionControlBBR,
+		New:  func(CongestionControlContext) CongestionController { return newBBRCongestionControl() },
 		Features: CongestionControlFeatureDeliveryRate |
 			CongestionControlFeatureCustomPacing |
 			CongestionControlFeatureTransmissionEvents |
 			CongestionControlFeatureCustomRecovery,
 		SendBufferMultiplier: 3,
-	},
-	CongestionControlBBR3: {
-		New: func() CongestionController { return newBBR3CongestionControl() },
+	}),
+	CongestionControlBBR3: mustCongestionControlFactory(CongestionControlDefinition{
+		Name: CongestionControlBBR3,
+		New:  func(CongestionControlContext) CongestionController { return newBBR3CongestionControl() },
 		Features: CongestionControlFeatureDeliveryRate |
 			CongestionControlFeatureCustomPacing |
 			CongestionControlFeatureTransmissionEvents |
 			CongestionControlFeatureCustomRecovery |
 			CongestionControlFeatureLossEvents,
 		SendBufferMultiplier: 3,
-	},
+	}),
 }}
 
-// RegisterCongestionControl makes definition available to future stack
+// mustCongestionControlFactory constructs one statically defined built-in.
+func mustCongestionControlFactory(definition CongestionControlDefinition) *CongestionControlFactory {
+	factory, err := NewCongestionControlFactory(definition)
+	if err != nil {
+		panic(err)
+	}
+	return factory
+}
+
+// RegisterCongestionControl makes factory available by name to future stack
 // configurations and connections. Registration is concurrency-safe and
 // permanent for the process lifetime, so active connections can keep using
-// their factory without an unregister race. A name cannot be replaced.
-func RegisterCongestionControl(name CongestionControl, definition CongestionControlDefinition) error {
-	if name == "" {
-		return fmt.Errorf("mipstack: congestion control name is empty")
-	}
-	if definition.New == nil {
-		return fmt.Errorf("mipstack: congestion control %q has no factory", name)
-	}
-	if unknown := definition.Features &^ congestionControlKnownFeatures; unknown != 0 {
-		return fmt.Errorf("mipstack: congestion control %q has unknown features %#x", name, uint32(unknown))
-	}
-	if definition.Features&CongestionControlFeatureCustomPacing != 0 && definition.Features&CongestionControlFeatureTransmissionEvents == 0 {
-		return fmt.Errorf("mipstack: congestion control %q custom pacing requires transmission events", name)
-	}
-	if definition.Features&CongestionControlFeatureLossEvents != 0 && definition.Features&CongestionControlFeatureTransmissionEvents == 0 {
-		return fmt.Errorf("mipstack: congestion control %q loss events require transmission events", name)
+// the factory without an unregister race. A name cannot be replaced. Factory
+// remains valid for direct local use if registration fails.
+func RegisterCongestionControl(factory *CongestionControlFactory) error {
+	if !factory.valid() {
+		return fmt.Errorf("mipstack: invalid congestion control factory")
 	}
 	congestionControlRegistry.Lock()
 	defer congestionControlRegistry.Unlock()
-	if _, exists := congestionControlRegistry.definitions[name]; exists {
+	name := factory.definition.Name
+	if _, exists := congestionControlRegistry.factories[name]; exists {
 		return fmt.Errorf("mipstack: congestion control %q is already registered", name)
 	}
-	congestionControlRegistry.definitions[name] = definition
+	congestionControlRegistry.factories[name] = factory
 	return nil
 }
 
@@ -149,8 +228,8 @@ func RegisterCongestionControl(name CongestionControl, definition CongestionCont
 // lexical order. The returned slice is independent of the registry.
 func AvailableCongestionControls() []CongestionControl {
 	congestionControlRegistry.RLock()
-	controls := make([]CongestionControl, 0, len(congestionControlRegistry.definitions))
-	for name := range congestionControlRegistry.definitions {
+	controls := make([]CongestionControl, 0, len(congestionControlRegistry.factories))
+	for name := range congestionControlRegistry.factories {
 		controls = append(controls, name)
 	}
 	congestionControlRegistry.RUnlock()
@@ -158,18 +237,12 @@ func AvailableCongestionControls() []CongestionControl {
 	return controls
 }
 
-// congestionControlDefinition returns one immutable registry entry.
-func congestionControlDefinition(name CongestionControl) (CongestionControlDefinition, bool) {
+// registeredCongestionControlFactory returns one stable registry entry.
+func registeredCongestionControlFactory(name CongestionControl) (*CongestionControlFactory, bool) {
 	congestionControlRegistry.RLock()
-	definition, exists := congestionControlRegistry.definitions[name]
+	factory, exists := congestionControlRegistry.factories[name]
 	congestionControlRegistry.RUnlock()
-	return definition, exists
-}
-
-// valid reports whether c names a registered algorithm.
-func (c CongestionControl) valid() bool {
-	_, exists := congestionControlDefinition(c)
-	return exists
+	return factory, exists
 }
 
 // CongestionEventType identifies why a controller is being called. New event
@@ -231,6 +304,10 @@ const (
 	// the repaired range and PacketState is its pre-probe transmission state.
 	// State is observational.
 	CongestionEventTailLossProbeRecovered
+	// CongestionEventRelease is the final callback before TCP drops or replaces
+	// a controller. State is observational. Implementations must release any
+	// controller-owned resources and must not retain event or references from it.
+	CongestionEventRelease
 )
 
 // CongestionPhase is TCP's high-level congestion state, corresponding to the

@@ -50,8 +50,9 @@ func (c *testDeliveryCongestionControl) HandleCongestionEvent(event *CongestionE
 
 func TestCongestionControllerComposesPacingWithoutDeliverySampling(t *testing.T) {
 	implementation := &testPacedCongestionControl{}
-	controller := newTCPCongestionControllerFromDefinition("test-paced", CongestionControlDefinition{
-		New:      func() CongestionController { return implementation },
+	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+		Name:     "test-paced",
+		New:      func(CongestionControlContext) CongestionController { return implementation },
 		Features: CongestionControlFeatureCustomPacing | CongestionControlFeatureTransmissionEvents,
 	})
 	if controller.usesDeliveryRate() || !controller.customPacing() {
@@ -69,8 +70,9 @@ func TestCongestionControllerComposesPacingWithoutDeliverySampling(t *testing.T)
 
 func TestCongestionControllerComposesDeliverySamplingWithCommonPacing(t *testing.T) {
 	implementation := &testDeliveryCongestionControl{}
-	controller := newTCPCongestionControllerFromDefinition("test-delivery", CongestionControlDefinition{
-		New: func() CongestionController { return implementation }, Features: CongestionControlFeatureDeliveryRate,
+	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+		Name: "test-delivery",
+		New:  func(CongestionControlContext) CongestionController { return implementation }, Features: CongestionControlFeatureDeliveryRate,
 	})
 	if !controller.usesDeliveryRate() || controller.customPacing() {
 		t.Fatalf("capabilities = delivery %t custom pacing %t", controller.usesDeliveryRate(), controller.customPacing())

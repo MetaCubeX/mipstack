@@ -21,6 +21,12 @@ import (
 	"github.com/metacubex/mipstack"
 )
 
+// interopCongestionController leaves TCP's transport-owned initial state
+// unchanged while exercising the public custom-controller event path.
+type interopCongestionController struct{}
+
+func (*interopCongestionController) HandleCongestionEvent(*mipstack.CongestionEvent) {}
+
 // TestTCPInterop verifies active and passive opens in both directions for each
 // address family.
 func TestTCPInterop(t *testing.T) {
@@ -100,6 +106,70 @@ func TestTCPCongestionControlInterop(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+// TestTCPLocalCongestionControlFactoryInterop verifies that an unregistered
+// local factory receives the correct connection identity and interoperates
+// with gVisor after real data loss in both active and passive roles.
+func TestTCPLocalCongestionControlFactoryInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mipstackListens := range []bool{false, true} {
+			mipstackListens := mipstackListens
+			role := "active"
+			if mipstackListens {
+				role = "passive"
+			}
+			t.Run(family.name+"/"+role, func(t *testing.T) {
+				contexts := make(chan mipstack.CongestionControlContext, 1)
+				name := mipstack.CongestionControl("interop-local-" + family.name + "-" + role)
+				factory, err := mipstack.NewCongestionControlFactory(mipstack.CongestionControlDefinition{
+					Name: name,
+					New: func(context mipstack.CongestionControlContext) mipstack.CongestionController {
+						contexts <- context
+						return &interopCongestionController{}
+					},
+					Features: mipstack.CongestionControlFeatureTransmissionEvents,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var dropped atomic.Bool
+				network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 1500,
+					tcp:              mipstack.TCPSocketDefaults{CongestionControlFactory: factory},
+					mipstackToGVisor: newTCPDropHook(&dropped),
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+				defer listener.Close()
+				defer client.Close()
+				defer server.Close()
+				exerciseFullDuplexTCP(t, client, server, 256*1024)
+				if !dropped.Load() {
+					t.Fatal("mipstack local-controller data-loss hook did not match a segment")
+				}
+				connection := client
+				if mipstackListens {
+					connection = server
+				}
+				info := connection.(*mipstack.TCPConn).Info()
+				if info.CongestionControl != name || info.Retransmissions == 0 {
+					t.Fatalf("local controller/retransmissions = %s/%d, want %s/nonzero", info.CongestionControl, info.Retransmissions, name)
+				}
+				select {
+				case factoryContext := <-contexts:
+					if factoryContext.LocalAddress.Addr() != family.mipstackAddress || factoryContext.RemoteAddress.Addr() != family.gvisorAddress ||
+						factoryContext.Passive != mipstackListens || factoryContext.Forwarded {
+						t.Fatalf("local factory context = %+v", factoryContext)
+					}
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			})
 		}
 	}
 }

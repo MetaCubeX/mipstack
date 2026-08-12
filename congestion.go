@@ -31,7 +31,7 @@ const (
 // tcpCongestionController adapts the selected implementation to TCP's common
 // pacing, recovery, and delivery-sampling machinery.
 type tcpCongestionController struct {
-	name               CongestionControl
+	factory            *CongestionControlFactory
 	algorithm          CongestionController
 	features           CongestionControlFeatures
 	sendBufferMultiple uint32
@@ -182,29 +182,41 @@ func (h *tcpHyStart) onACK(acknowledgement, sendNext, acknowledged uint32, sampl
 }
 
 // newTCPCongestionController constructs one per-connection controller from the
-// immutable registry definition. Invalid internal input retains CUBIC's
+// immutable registered factory. Invalid internal input retains CUBIC's
 // historical fallback; public configuration is validated before this point.
 func newTCPCongestionController(algorithm CongestionControl) tcpCongestionController {
-	definition, exists := congestionControlDefinition(algorithm)
+	factory, exists := registeredCongestionControlFactory(algorithm)
 	if !exists {
-		algorithm = CongestionControlCUBIC
-		definition, _ = congestionControlDefinition(algorithm)
+		factory, _ = registeredCongestionControlFactory(CongestionControlCUBIC)
 	}
-	return newTCPCongestionControllerFromDefinition(algorithm, definition)
+	return newTCPCongestionControllerFromFactory(factory, CongestionControlContext{})
 }
 
-// newTCPCongestionControllerFromDefinition constructs an adapter from an
-// already validated definition. Tests use it without mutating the registry.
-func newTCPCongestionControllerFromDefinition(algorithm CongestionControl, definition CongestionControlDefinition) tcpCongestionController {
-	implementation := definition.New()
+// newTCPCongestionControllerFromDefinition constructs an adapter from a
+// definition. Tests use it without mutating the registry.
+func newTCPCongestionControllerFromDefinition(definition CongestionControlDefinition) tcpCongestionController {
+	factory, err := NewCongestionControlFactory(definition)
+	if err != nil {
+		panic(err)
+	}
+	return newTCPCongestionControllerFromFactory(factory, CongestionControlContext{})
+}
+
+// newTCPCongestionControllerFromFactory constructs an adapter and one
+// connection-private implementation from an immutable factory.
+func newTCPCongestionControllerFromFactory(factory *CongestionControlFactory, context CongestionControlContext) tcpCongestionController {
+	if factory == nil {
+		factory, _ = registeredCongestionControlFactory(CongestionControlCUBIC)
+	}
+	implementation := factory.definition.New(context)
 	if implementation == nil {
 		panic("mipstack: congestion control factory returned nil")
 	}
 	controller := tcpCongestionController{
-		name:               algorithm,
+		factory:            factory,
 		algorithm:          implementation,
-		features:           definition.Features,
-		sendBufferMultiple: definition.SendBufferMultiplier,
+		features:           factory.definition.Features,
+		sendBufferMultiple: factory.definition.SendBufferMultiplier,
 	}
 	if controller.usesDeliveryRate() {
 		// Match Linux's initial app-limited bubble: the first rate sample may
@@ -212,6 +224,19 @@ func newTCPCongestionControllerFromDefinition(algorithm CongestionControl, defin
 		controller.delivery.applicationLimitedUntil = 1
 	}
 	return controller
+}
+
+// release delivers the final serialized callback before this controller is
+// replaced or its owning connection actor exits.
+func (c *tcpCongestionController) release(now time.Time, window, threshold, flight uint32, mss int, smoothedRTT, minimumRTT time.Duration) {
+	if c.algorithm == nil || !c.initialized {
+		return
+	}
+	c.syncTransportState(window, threshold, flight, mss, smoothedRTT)
+	c.state.MinimumRTT = minimumRTT
+	c.prepareEvent(CongestionEventRelease, now)
+	c.handleEvent()
+	c.initialized = false
 }
 
 // prepareEvent attaches the latest common state without clearing unrelated
@@ -684,7 +709,7 @@ func (c *tcpCongestionController) onMTUChange(window, slowStartThreshold uint32,
 
 // algorithmName reports the selected public algorithm identifier.
 func (c *tcpCongestionController) algorithmName() CongestionControl {
-	return c.name
+	return c.factory.Name()
 }
 
 // usesDeliveryRate reports whether per-transmission delivery sampling is active.

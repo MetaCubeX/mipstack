@@ -376,10 +376,11 @@ second. The initial data burst and control packets are not strictly shaped, so
 this policy is not a byte-exact traffic shaper.
 Congestion control accepts
 `CongestionControlCUBIC`, `CongestionControlReno`, `CongestionControlBBR`, or
-`CongestionControlBBR3`;
-its zero value selects CUBIC. `UpdateConfig` applies a changed congestion
-controller to established connections without an explicit per-connection
-override. Existing sockets retain the other inherited policies. Receive window
+`CongestionControlBBR3`; its zero value selects CUBIC. A programmatic caller
+may instead supply a local `CongestionControlFactory`, described below.
+`UpdateConfig` applies a changed congestion controller to established
+connections without an explicit per-connection override. Existing sockets
+retain the other inherited policies. Receive window
 scale is selected per connection from the configured receive ceiling,
 so deliberate small-buffer policies retain window precision while large-BDP
 connections can use their full automatic maximum. Calling `SetReadBuffer` or
@@ -387,8 +388,10 @@ connections can use their full automatic maximum. Calling `SetReadBuffer` or
 automatic growth, matching the user-locked behavior of operating-system TCP
 stacks. Automatic growth follows application-consumed and acknowledged bytes
 per RTT rather than queue size or cwnd alone, so short-RTT scheduler batches do
-not inflate buffers. `SetCongestionControl`, `SetMaximumPacingRate`, and
-`SetTrafficClass` provide per-connection overrides. Passing zero to
+not inflate buffers. `SetCongestionControl`,
+`SetCongestionControlFactory`, `SetMaximumPacingRate`, and `SetTrafficClass`
+provide per-connection overrides. An explicit named or local factory choice is
+not replaced by later `UpdateConfig` default changes. Passing zero to
 `SetMaximumPacingRate` removes the limit without resetting the controller's
 path model. BBR pacing groups whole Linux-style send quanta to amortize
 userspace actor scheduling; a group never exceeds four send quanta, and only
@@ -514,15 +517,37 @@ not require protocol-specific branches in the TCP actor, and delivery-rate
 controllers can reuse the common sampler without duplicating TCP sequence or
 scoreboard logic.
 
-Custom algorithms are registered process-wide with
-`RegisterCongestionControl` and selected through the existing
-`TCPSocketDefaults.CongestionControl` field. Registration is permanent and
-cannot replace an existing name, so live connections never race an unloaded
-factory. The factory creates one independent controller per connection. Its
-first callback is `CongestionEventInitialize`; later callbacks are serialized
-on that connection's actor, reuse the `CongestionEvent` storage, and must not
-block or retain it. Factories and controller instances belonging to different
-connections may run concurrently. Implementations must ignore unknown event
+Custom algorithms may be registered process-wide with
+`RegisterCongestionControl` and selected by name through
+`TCPSocketDefaults.CongestionControl`. Registration is permanent and cannot
+replace an existing name, so live connections never race an unloaded factory.
+Programmatic users may instead create an immutable local
+`CongestionControlFactory` from a named `CongestionControlDefinition` with
+`NewCongestionControlFactory`, install it in
+`TCPSocketDefaults.CongestionControlFactory`, or select it for one live
+connection with `SetCongestionControlFactory`. Local factories are not entered
+in the process registry unless explicitly passed to
+`RegisterCongestionControl`, may use the same diagnostic name with different
+configuration, and compare by pointer identity when a live connection applies
+an update. The constructor copies and privately retains the definition, so
+later changes to the caller's value cannot alter the factory. The name and
+factory fields in `TCPSocketDefaults` are mutually exclusive.
+
+Every factory invocation receives a by-value `CongestionControlContext` with
+the local and remote endpoints and the connection's active, passive, or
+forwarded role. The context is an immutable identity snapshot rather than a
+`TCPConn`, so a factory cannot reenter and deadlock the connection actor.
+Dynamic MSS, RTT, window, pacing, delivery, loss, and recovery state arrives
+through events. A factory may capture shared read-only configuration but must
+create one independent controller per connection; factory calls and controller
+instances belonging to different connections may run concurrently.
+
+The first controller callback is `CongestionEventInitialize`; later callbacks
+are serialized on that connection's actor, reuse the `CongestionEvent` storage,
+and must not block or retain it. `CongestionEventRelease` is the final,
+observational callback before an implementation is replaced or its connection
+actor exits. It permits controller-owned cleanup but must return promptly and
+must not start work that outlives it. Implementations must ignore unknown event
 types so a newer stack can add observations without changing the one-method
 controller interface.
 

@@ -47,6 +47,58 @@ type congestionAPILossRecorder struct {
 	nextState     uint64
 }
 
+type congestionFactoryProbe struct {
+	mu          sync.Mutex
+	contexts    []CongestionControlContext
+	controllers []*congestionFactoryController
+}
+
+type congestionFactoryController struct {
+	mu     sync.Mutex
+	events []CongestionEventType
+}
+
+func (p *congestionFactoryProbe) New(context CongestionControlContext) CongestionController {
+	controller := &congestionFactoryController{}
+	p.mu.Lock()
+	p.contexts = append(p.contexts, context)
+	p.controllers = append(p.controllers, controller)
+	p.mu.Unlock()
+	return controller
+}
+
+func (p *congestionFactoryProbe) snapshot() ([]CongestionControlContext, []*congestionFactoryController) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]CongestionControlContext(nil), p.contexts...), append([]*congestionFactoryController(nil), p.controllers...)
+}
+
+func (c *congestionFactoryController) HandleCongestionEvent(event *CongestionEvent) {
+	c.mu.Lock()
+	c.events = append(c.events, event.Type)
+	c.mu.Unlock()
+	if event.Type == CongestionEventRelease {
+		// Release is observational; mutations must remain confined to the old
+		// adapter that is about to be discarded.
+		event.State.CongestionWindow = 1
+		event.State.SlowStartThreshold = 1
+		event.State.UsePacingRate = true
+		event.State.PacingRate = 1
+	}
+}
+
+func (c *congestionFactoryController) eventCount(eventType CongestionEventType) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := 0
+	for _, current := range c.events {
+		if current == eventType {
+			count++
+		}
+	}
+	return count
+}
+
 func (c *congestionAPILossRecorder) HandleCongestionEvent(event *CongestionEvent) {
 	c.events = append(c.events, event.Type)
 	switch event.Type {
@@ -111,37 +163,49 @@ func TestCongestionControlRegistry(t *testing.T) {
 		}
 	}
 
-	if err := RegisterCongestionControl("", CongestionControlDefinition{New: func() CongestionController { return &congestionAPIRecorder{} }}); err == nil {
+	if _, err := NewCongestionControlFactory(CongestionControlDefinition{New: func(CongestionControlContext) CongestionController { return &congestionAPIRecorder{} }}); err == nil {
 		t.Fatal("empty congestion-control name was accepted")
 	}
-	if err := RegisterCongestionControl(nextCongestionAPITestName(), CongestionControlDefinition{}); err == nil {
+	if _, err := NewCongestionControlFactory(CongestionControlDefinition{Name: nextCongestionAPITestName()}); err == nil {
 		t.Fatal("nil congestion-control factory was accepted")
 	}
-	if err := RegisterCongestionControl(nextCongestionAPITestName(), CongestionControlDefinition{
-		New:      func() CongestionController { return &congestionAPIRecorder{} },
+	if _, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name:     nextCongestionAPITestName(),
+		New:      func(CongestionControlContext) CongestionController { return &congestionAPIRecorder{} },
 		Features: CongestionControlFeatures(1 << 31),
 	}); err == nil {
 		t.Fatal("unknown congestion-control feature was accepted")
 	}
-	if err := RegisterCongestionControl(nextCongestionAPITestName(), CongestionControlDefinition{
-		New:      func() CongestionController { return &congestionAPIRecorder{} },
+	if _, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name:     nextCongestionAPITestName(),
+		New:      func(CongestionControlContext) CongestionController { return &congestionAPIRecorder{} },
 		Features: CongestionControlFeatureCustomPacing,
 	}); err == nil {
 		t.Fatal("custom pacing without transmission events was accepted")
 	}
-	if err := RegisterCongestionControl(nextCongestionAPITestName(), CongestionControlDefinition{
-		New:      func() CongestionController { return &congestionAPIRecorder{} },
+	if _, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name:     nextCongestionAPITestName(),
+		New:      func(CongestionControlContext) CongestionController { return &congestionAPIRecorder{} },
 		Features: CongestionControlFeatureLossEvents,
 	}); err == nil {
 		t.Fatal("loss events without transmission events were accepted")
 	}
+	if err := RegisterCongestionControl(nil); err == nil {
+		t.Fatal("nil congestion-control factory was registered")
+	}
 
 	name := nextCongestionAPITestName()
-	definition := CongestionControlDefinition{New: func() CongestionController { return &congestionAPIRecorder{} }}
-	if err := RegisterCongestionControl(name, definition); err != nil {
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: name,
+		New:  func(CongestionControlContext) CongestionController { return &congestionAPIRecorder{} },
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := RegisterCongestionControl(name, definition); err == nil {
+	if err = RegisterCongestionControl(factory); err != nil {
+		t.Fatal(err)
+	}
+	if err = RegisterCongestionControl(factory); err == nil {
 		t.Fatal("duplicate congestion-control registration was accepted")
 	}
 	if _, err := normalizeTCPSocketDefaults(TCPSocketDefaults{CongestionControl: name}); err != nil {
@@ -149,10 +213,357 @@ func TestCongestionControlRegistry(t *testing.T) {
 	}
 }
 
+func TestLocalCongestionControlFactoryValidation(t *testing.T) {
+	name := nextCongestionAPITestName()
+	probe := &congestionFactoryProbe{}
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: name, New: probe.New, Features: CongestionControlFeatureDeliveryRate,
+		SendBufferMultiplier: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if factory.Name() != name {
+		t.Fatalf("local factory name = %q, want %q", factory.Name(), name)
+	}
+	definition := CongestionControlDefinition{Name: "changed", New: func(CongestionControlContext) CongestionController { return nil }}
+	copied, err := NewCongestionControlFactory(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition.Name = "changed-again"
+	definition.New = nil
+	if copied.Name() != "changed" || !copied.valid() {
+		t.Fatal("factory changed with its caller-owned definition")
+	}
+	for _, available := range AvailableCongestionControls() {
+		if available == name {
+			t.Fatalf("local factory %q appeared in the process registry", name)
+		}
+	}
+	defaults, err := normalizeTCPSocketDefaults(TCPSocketDefaults{CongestionControlFactory: factory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.CongestionControl != "" || defaults.CongestionControlFactory != factory {
+		t.Fatalf("normalized local factory = name %q factory %p", defaults.CongestionControl, defaults.CongestionControlFactory)
+	}
+	if repeated, repeatErr := normalizeTCPSocketDefaults(defaults); repeatErr != nil || repeated.CongestionControlFactory != factory {
+		t.Fatalf("re-normalized local factory = %p, %v", repeated.CongestionControlFactory, repeatErr)
+	}
+	registered, err := normalizeTCPSocketDefaults(TCPSocketDefaults{CongestionControl: CongestionControlReno})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if registered.CongestionControl != "" || registered.CongestionControlFactory.Name() != CongestionControlReno {
+		t.Fatalf("normalized registered factory = name %q factory %q", registered.CongestionControl, registered.CongestionControlFactory.Name())
+	}
+	if repeated, repeatErr := normalizeTCPSocketDefaults(registered); repeatErr != nil || repeated.CongestionControl != "" || repeated.CongestionControlFactory != registered.CongestionControlFactory {
+		t.Fatalf("re-normalized registered factory = name %q factory %p, %v", repeated.CongestionControl, repeated.CongestionControlFactory, repeatErr)
+	}
+	if _, err = normalizeTCPSocketDefaults(TCPSocketDefaults{
+		CongestionControl: CongestionControlCUBIC, CongestionControlFactory: factory,
+	}); err == nil {
+		t.Fatal("simultaneous congestion-control name and local factory were accepted")
+	}
+	if _, err = NewCongestionControlFactory(CongestionControlDefinition{New: probe.New}); err == nil {
+		t.Fatal("empty local factory name was accepted")
+	}
+	if _, err = NewCongestionControlFactory(CongestionControlDefinition{Name: name}); err == nil {
+		t.Fatal("local factory without New was accepted")
+	}
+}
+
+func TestLocalCongestionControlFactoryConnectionContexts(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.182")
+	serverAddress := netip.MustParseAddr("192.0.2.183")
+	probe := &congestionFactoryProbe{}
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{Name: nextCongestionAPITestName(), New: probe.New})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, server := newStackPair(t, clientAddress, serverAddress, 1400)
+	for _, configured := range []struct {
+		stack   *Stack
+		address netip.Addr
+	}{{client, clientAddress}, {server, serverAddress}} {
+		if err = configured.stack.UpdateConfig(Config{
+			LocalAddresses: []netip.Prefix{netip.PrefixFrom(configured.address, 32)}, MTU: 1400,
+			TCP: TCPSocketDefaults{CongestionControlFactory: factory},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newStackBridge(t, client, server)
+	listener, err := server.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(serverAddress, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	accepted := make(chan *TCPConn, 1)
+	acceptErrors := make(chan error, 1)
+	go func() {
+		connection, acceptErr := listener.AcceptTCP()
+		if acceptErr != nil {
+			acceptErrors <- acceptErr
+			return
+		}
+		accepted <- connection
+	}()
+	clientConnection, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, listener.local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var serverConnection *TCPConn
+	select {
+	case serverConnection = <-accepted:
+	case err = <-acceptErrors:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out accepting local-factory TCP connection")
+	}
+	waitFor(t, time.Second, func() bool {
+		contexts, _ := probe.snapshot()
+		return len(contexts) == 2
+	})
+	contexts, controllers := probe.snapshot()
+	if len(controllers) != 2 {
+		t.Fatalf("factory created %d controllers, want 2", len(controllers))
+	}
+	if controllers[0] == controllers[1] {
+		t.Fatalf("factory reused controller %p", controllers[0])
+	}
+	for _, context := range contexts {
+		switch {
+		case context.LocalAddress.Addr() == clientAddress:
+			if context.RemoteAddress != listener.local || context.Passive || context.Forwarded {
+				t.Fatalf("active factory context = %+v", context)
+			}
+		case context.LocalAddress == listener.local:
+			if context.RemoteAddress != clientConnection.(*TCPConn).key.local || !context.Passive || context.Forwarded {
+				t.Fatalf("passive factory context = %+v", context)
+			}
+		default:
+			t.Fatalf("unexpected factory context = %+v", context)
+		}
+	}
+	if err = client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, connection := range []*TCPConn{clientConnection.(*TCPConn), serverConnection} {
+		select {
+		case <-connection.done:
+		case <-time.After(time.Second):
+			t.Fatal("TCP actor did not release its local congestion controller")
+		}
+	}
+	for _, controller := range controllers {
+		if controller.eventCount(CongestionEventInitialize) != 1 || controller.eventCount(CongestionEventRelease) != 1 {
+			t.Fatalf("controller initialization/release = %d/%d", controller.eventCount(CongestionEventInitialize), controller.eventCount(CongestionEventRelease))
+		}
+	}
+}
+
+func TestLocalCongestionControlFactorySwitchAndOverride(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.184")
+	remote := netip.MustParseAddr("192.0.2.185")
+	link, stack := newTestStack(t, local, remote)
+	link.mu.Lock()
+	link.echoTCP = true
+	link.mu.Unlock()
+	name := nextCongestionAPITestName()
+	newFactory := func(probe *congestionFactoryProbe) *CongestionControlFactory {
+		factory, err := NewCongestionControlFactory(CongestionControlDefinition{Name: name, New: probe.New})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return factory
+	}
+	firstProbe, secondProbe, explicitProbe := new(congestionFactoryProbe), new(congestionFactoryProbe), new(congestionFactoryProbe)
+	first, second, explicit := newFactory(firstProbe), newFactory(secondProbe), newFactory(explicitProbe)
+	if err := stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400,
+		TCP: TCPSocketDefaults{CongestionControlFactory: first},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 443))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConnection := connection.(*TCPConn)
+	waitFor(t, time.Second, func() bool { _, controllers := firstProbe.snapshot(); return len(controllers) == 1 })
+	if err = stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400,
+		TCP: TCPSocketDefaults{CongestionControlFactory: second},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		_, firstControllers := firstProbe.snapshot()
+		_, secondControllers := secondProbe.snapshot()
+		return len(secondControllers) == 1 && firstControllers[0].eventCount(CongestionEventRelease) == 1
+	})
+	if info := tcpConnection.Info(); info.CongestionControl != name || info.CongestionWindow <= 1 || info.SlowStartThreshold <= 1 {
+		t.Fatalf("same-name factory switch diagnostics = %+v", info)
+	}
+	if err = tcpConnection.SetCongestionControlFactory(nil); err == nil {
+		t.Fatal("nil per-connection congestion factory was accepted")
+	}
+	if err = tcpConnection.SetCongestionControlFactory(explicit); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		_, secondControllers := secondProbe.snapshot()
+		_, explicitControllers := explicitProbe.snapshot()
+		return len(explicitControllers) == 1 && secondControllers[0].eventCount(CongestionEventRelease) == 1
+	})
+	if err = stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400,
+		TCP: TCPSocketDefaults{CongestionControlFactory: first},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if options := tcpConnection.socketOptions(); options.congestionFactory != explicit {
+		t.Fatalf("explicit local factory was replaced by stack default: %p", options.congestionFactory)
+	}
+	if err = stack.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-tcpConnection.done:
+	case <-time.After(time.Second):
+		t.Fatal("TCP actor did not terminate after local factory test")
+	}
+	_, explicitControllers := explicitProbe.snapshot()
+	if explicitControllers[0].eventCount(CongestionEventInitialize) != 1 || explicitControllers[0].eventCount(CongestionEventRelease) != 1 {
+		t.Fatalf("explicit controller initialization/release = %d/%d", explicitControllers[0].eventCount(CongestionEventInitialize), explicitControllers[0].eventCount(CongestionEventRelease))
+	}
+}
+
+func TestLocalCongestionControlFactoryConcurrentSwitchAndClose(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.188")
+	remote := netip.MustParseAddr("192.0.2.189")
+	link, stack := newTestStack(t, local, remote)
+	link.mu.Lock()
+	link.echoTCP = true
+	link.mu.Unlock()
+	probes := []*congestionFactoryProbe{{}, {}, {}}
+	factories := make([]*CongestionControlFactory, len(probes))
+	for index, probe := range probes {
+		factory, err := NewCongestionControlFactory(CongestionControlDefinition{Name: nextCongestionAPITestName(), New: probe.New})
+		if err != nil {
+			t.Fatal(err)
+		}
+		factories[index] = factory
+	}
+	if err := stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400,
+		TCP: TCPSocketDefaults{CongestionControlFactory: factories[0]},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := stack.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 443))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConnection := connection.(*TCPConn)
+	waitFor(t, time.Second, func() bool { _, controllers := probes[0].snapshot(); return len(controllers) == 1 })
+	start := make(chan struct{})
+	var setters sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		setters.Add(1)
+		go func(worker int) {
+			defer setters.Done()
+			<-start
+			for update := 0; update < 64; update++ {
+				_ = tcpConnection.SetCongestionControlFactory(factories[(worker+update)%len(factories)])
+			}
+		}(worker)
+	}
+	close(start)
+	if err = stack.Close(); err != nil {
+		t.Fatal(err)
+	}
+	setters.Wait()
+	select {
+	case <-tcpConnection.done:
+	case <-time.After(time.Second):
+		t.Fatal("TCP actor did not terminate after concurrent factory switches")
+	}
+	for _, probe := range probes {
+		_, controllers := probe.snapshot()
+		for _, controller := range controllers {
+			if controller.eventCount(CongestionEventInitialize) != 1 || controller.eventCount(CongestionEventRelease) != 1 {
+				t.Fatalf("concurrent controller initialization/release = %d/%d", controller.eventCount(CongestionEventInitialize), controller.eventCount(CongestionEventRelease))
+			}
+		}
+	}
+}
+
+func TestLocalCongestionControlFactoryForwardedContext(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.186")
+	serverAddress := netip.MustParseAddr("192.0.2.187")
+	intercepted := netip.MustParseAddrPort("198.51.100.187:8080")
+	client := newForwarderTestStack(t, clientAddress, false)
+	server := newForwarderTestStack(t, serverAddress, true)
+	probe := &congestionFactoryProbe{}
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{Name: nextCongestionAPITestName(), New: probe.New})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = server.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(serverAddress, 32)},
+		Promiscuous:    true, MTU: 1400,
+		TCP: TCPSocketDefaults{CongestionControlFactory: factory},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newStackBridge(t, client, server)
+	accepted := make(chan *TCPConn, 1)
+	acceptErrors := make(chan error, 1)
+	forwarder, err := NewTCPForwarder(server, TCPForwarderOptions{}, func(request *TCPForwarderRequest) {
+		connection, acceptErr := request.Accept(context.Background())
+		if acceptErr != nil {
+			acceptErrors <- acceptErr
+			return
+		}
+		accepted <- connection
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	clientConnection, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, intercepted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConnection.Close()
+	var serverConnection *TCPConn
+	select {
+	case serverConnection = <-accepted:
+		defer serverConnection.Close()
+	case err = <-acceptErrors:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out accepting forwarded local-factory connection")
+	}
+	waitFor(t, time.Second, func() bool { contexts, _ := probe.snapshot(); return len(contexts) == 1 })
+	contexts, _ := probe.snapshot()
+	context := contexts[0]
+	if context.LocalAddress != intercepted || context.RemoteAddress != clientConnection.(*TCPConn).key.local || !context.Passive || !context.Forwarded {
+		t.Fatalf("forwarded congestion factory context = %+v", context)
+	}
+}
+
 func TestCongestionPacketStateFollowsTransmissionGeneration(t *testing.T) {
 	recorder := &congestionAPILossRecorder{}
-	controller := newTCPCongestionControllerFromDefinition("loss-events", CongestionControlDefinition{
-		New: func() CongestionController { return recorder },
+	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+		Name: "loss-events",
+		New:  func(CongestionControlContext) CongestionController { return recorder },
 		Features: CongestionControlFeatureTransmissionEvents |
 			CongestionControlFeatureLossEvents,
 	})
@@ -219,7 +630,13 @@ func TestSentTCPSegmentLayout(t *testing.T) {
 
 func TestCongestionControlRegistryConcurrentDuplicate(t *testing.T) {
 	name := nextCongestionAPITestName()
-	definition := CongestionControlDefinition{New: func() CongestionController { return &congestionAPIRecorder{} }}
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: name,
+		New:  func(CongestionControlContext) CongestionController { return &congestionAPIRecorder{} },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	const contenders = 32
 	var successes atomic.Int32
 	var wait sync.WaitGroup
@@ -227,7 +644,7 @@ func TestCongestionControlRegistryConcurrentDuplicate(t *testing.T) {
 	for contender := 0; contender < contenders; contender++ {
 		go func() {
 			defer wait.Done()
-			if RegisterCongestionControl(name, definition) == nil {
+			if RegisterCongestionControl(factory) == nil {
 				successes.Add(1)
 			}
 		}()
@@ -241,11 +658,16 @@ func TestCongestionControlRegistryConcurrentDuplicate(t *testing.T) {
 func TestCongestionControlFactoryCreatesIndependentControllers(t *testing.T) {
 	name := nextCongestionAPITestName()
 	definition := CongestionControlDefinition{
-		New:                  func() CongestionController { return &congestionAPIRecorder{windowGrowth: 7} },
+		Name:                 name,
+		New:                  func(CongestionControlContext) CongestionController { return &congestionAPIRecorder{windowGrowth: 7} },
 		Features:             CongestionControlFeatureDeliveryRate,
 		SendBufferMultiplier: 5,
 	}
-	if err := RegisterCongestionControl(name, definition); err != nil {
+	factory, err := NewCongestionControlFactory(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = RegisterCongestionControl(factory); err != nil {
 		t.Fatal(err)
 	}
 	first := newTCPCongestionController(name)
@@ -279,10 +701,15 @@ func TestCongestionControlFactoryCreatesIndependentControllers(t *testing.T) {
 
 func TestRegisteredCongestionControllerRunsOnTCPConnection(t *testing.T) {
 	name := nextCongestionAPITestName()
-	if err := RegisterCongestionControl(name, CongestionControlDefinition{
-		New:                  func() CongestionController { return &congestionAPIRecorder{windowGrowth: 1000} },
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name:                 name,
+		New:                  func(CongestionControlContext) CongestionController { return &congestionAPIRecorder{windowGrowth: 1000} },
 		SendBufferMultiplier: 128,
-	}); err != nil {
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = RegisterCongestionControl(factory); err != nil {
 		t.Fatal(err)
 	}
 	local := netip.MustParseAddr("192.0.2.180")
@@ -336,8 +763,9 @@ func TestCongestionControllerCanUseCommonPacerAtExplicitRate(t *testing.T) {
 		rate = 100_000
 	)
 	recorder := &congestionAPIRecorder{fixedRate: rate}
-	controller := newTCPCongestionControllerFromDefinition("fixed-rate", CongestionControlDefinition{
-		New: func() CongestionController { return recorder },
+	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+		Name: "fixed-rate",
+		New:  func(CongestionControlContext) CongestionController { return recorder },
 	})
 	start := time.Unix(100, 0)
 	window := controller.onACK(10*mss, mss, mss, start, 20*time.Millisecond, 10*time.Millisecond, 10*mss, false)
@@ -351,8 +779,9 @@ func TestCongestionControllerCanUseCommonPacerAtExplicitRate(t *testing.T) {
 
 func TestCongestionControllerLifecycleAndMutableInitialState(t *testing.T) {
 	lifecycle := &congestionAPILifecycle{}
-	controller := newTCPCongestionControllerFromDefinition("lifecycle", CongestionControlDefinition{
-		New:      func() CongestionController { return lifecycle },
+	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+		Name:     "lifecycle",
+		New:      func(CongestionControlContext) CongestionController { return lifecycle },
 		Features: CongestionControlFeatureCustomPacing | CongestionControlFeatureTransmissionEvents,
 	})
 	if !controller.setMaximumPacingRate(500_000) {
@@ -376,8 +805,9 @@ func TestCongestionControllerLifecycleAndMutableInitialState(t *testing.T) {
 
 func TestCongestionRecoveryUsesStableEventStages(t *testing.T) {
 	recorder := &congestionAPIRecorder{}
-	controller := newTCPCongestionControllerFromDefinition("recovery-events", CongestionControlDefinition{
-		New: func() CongestionController { return recorder }, Features: CongestionControlFeatureCustomRecovery,
+	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+		Name: "recovery-events",
+		New:  func(CongestionControlContext) CongestionController { return recorder }, Features: CongestionControlFeatureCustomRecovery,
 	})
 	_, _ = controller.initialize(time.Unix(99, 0), 10*time.Millisecond, 20*time.Millisecond, 20_000, 10_000, 1000, 1)
 	controller.checkpointRecovery(time.Unix(100, 0), 20_000, 10_000, 15_000, 1000)
@@ -430,8 +860,9 @@ func TestCongestionRecoveryUsesStableEventStages(t *testing.T) {
 
 func TestCongestionControllerSkipsOptionalEventFamilies(t *testing.T) {
 	recorder := &congestionAPIRecorder{}
-	controller := newTCPCongestionControllerFromDefinition("default-events", CongestionControlDefinition{
-		New: func() CongestionController { return recorder },
+	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
+		Name: "default-events",
+		New:  func(CongestionControlContext) CongestionController { return recorder },
 	})
 	start := time.Unix(100, 0)
 	controller.initialize(start, 10*time.Millisecond, 20*time.Millisecond, 20_000, 10_000, 1000, 1)

@@ -278,11 +278,23 @@ func (state *networkState) acceptsNonlocalDestination(address netip.Addr) bool {
 // normalizeTCPSocketDefaults validates optional limits and fills the policy
 // used by new sockets without changing Config's useful zero value.
 func normalizeTCPSocketDefaults(value TCPSocketDefaults) (TCPSocketDefaults, error) {
-	if value.CongestionControl == "" {
-		value.CongestionControl = CongestionControlCUBIC
-	}
-	if !value.CongestionControl.valid() {
-		return TCPSocketDefaults{}, errors.New("mipstack: unsupported congestion control")
+	if value.CongestionControlFactory != nil {
+		if value.CongestionControl != "" {
+			return TCPSocketDefaults{}, errors.New("mipstack: TCP congestion control name and factory are mutually exclusive")
+		}
+		if !value.CongestionControlFactory.valid() {
+			return TCPSocketDefaults{}, errors.New("mipstack: invalid TCP congestion control factory")
+		}
+	} else {
+		if value.CongestionControl == "" {
+			value.CongestionControl = CongestionControlCUBIC
+		}
+		factory, exists := registeredCongestionControlFactory(value.CongestionControl)
+		if !exists {
+			return TCPSocketDefaults{}, errors.New("mipstack: unsupported congestion control")
+		}
+		value.CongestionControl = ""
+		value.CongestionControlFactory = factory
 	}
 	if value.ReceiveBuffer < 0 || value.MaximumReceiveBuffer < 0 || value.SendBuffer < 0 || value.MaximumSendBuffer < 0 ||
 		value.AcceptQueue < 0 || value.SYNBacklog < 0 || value.IdleTimeout < 0 || value.UserTimeout < 0 {

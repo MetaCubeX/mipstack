@@ -276,15 +276,20 @@ func TestTCPBBR3ObservesAmbiguousTailLossProbeACK(t *testing.T) {
 	remote := netip.MustParseAddr("192.0.2.191")
 	recorder := &bbr3TailProbeRecorder{algorithm: newBBR3CongestionControl()}
 	name := nextCongestionAPITestName()
-	if err := RegisterCongestionControl(name, CongestionControlDefinition{
-		New: func() CongestionController { return recorder },
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: name,
+		New:  func(CongestionControlContext) CongestionController { return recorder },
 		Features: CongestionControlFeatureDeliveryRate |
 			CongestionControlFeatureTransmissionEvents |
 			CongestionControlFeatureCustomPacing |
 			CongestionControlFeatureCustomRecovery |
 			CongestionControlFeatureLossEvents,
 		SendBufferMultiplier: 3,
-	}); err != nil {
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = RegisterCongestionControl(factory); err != nil {
 		t.Fatal(err)
 	}
 	link, stack := newTestStack(t, local, remote)
