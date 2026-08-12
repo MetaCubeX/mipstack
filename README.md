@@ -225,18 +225,41 @@ sources through `ReadFrom` and replies through `WriteTo`. Both actions offer
 the first datagram to the new socket's capacity-bounded receive queue; a queue
 drop does not undo endpoint registration. The handler must wait for `Accept` or
 `Listen` to return, but the returned connection remains valid after the
-callback. `Reply` writes one reverse datagram without retaining a flow. Its
-first call selects synchronous reply mode, and it may then be repeated or
-retried until the callback returns. Stateless replies inherit the current
-`Config.UDP` output defaults.
+callback. `Reply` writes one reverse datagram without retaining a flow and uses
+`Flow().Destination` as its default source. `ReplyFrom` selects any valid
+same-family source address and UDP port. Source membership in `LocalAddresses`
+and unicast, multicast, or broadcast classification are not policy checks; a
+zero source port is preserved. This is stateless transparent output, not
+arbitrary destination selection: every reply still targets `Flow().Source`.
+Replies may be repeated or retried and do not prevent a later `Accept`,
+`Listen`, `Detach`, `Drop`, or `Reject`.
+Stateless replies inherit the current `Config.UDP` output defaults.
 
 ICMP requests similarly expose a checksum-validated complete message and
-provide a repeatable, checksum-repairing reverse `Reply`. `IsEchoRequest`
-identifies an IPv4 or IPv6 Echo Request, while `ReplyEcho` constructs its reply
-directly, preserving the identifier, sequence, and data. A detached ICMP
-snapshot permits `Payload` modification, but its `Type` and `Code` retain the
-original classification; changing the corresponding `Payload` bytes makes
-`IsEchoRequest` false and causes `ReplyEcho` to report `syscall.EINVAL`.
+provide a repeatable, checksum-repairing reverse `Reply`. `IPPacket` exposes the
+complete reassembled L3 packet: request-scoped storage is read-only and valid
+only during the callback, while a detached responder owns its mutable snapshot.
+In both forms `Message().Payload` aliases the ICMP region. Detached `Source`,
+`Destination`, `Type`, and `Code` remain the original metadata; changing the
+corresponding payload bytes makes `IsEchoRequest` false but changing IP header
+bytes does not reclassify that metadata.
+
+`ReplyIPPacket` is a restricted header-included ICMP reply, not arbitrary raw
+packet injection. Its destination must be the triggering packet's source; its
+source may be any valid same-family address, without stack-membership or address
+classification policy. The stack copies caller storage, normalizes IPv4 Total
+Length or IPv6 Payload Length, repairs
+the outer IPv4 and ICMP checksum, and preserves other supported header fields.
+A fitting IPv6 atomic Fragment header is retained with reserved fields cleared.
+If the packet must be fragmented, an existing atomic header is replaced rather
+than nested, and the Fragment header is inserted after the RFC 8200
+unfragmentable chain.
+IPv4 DF reports `syscall.EMSGSIZE`; otherwise source fragmentation preserves
+copied IPv4 options. ICMPv6 errors larger than the 1280-byte minimum IPv6 MTU
+are rejected as required by RFC 4443, while informational messages may be
+fragmented. `IsEchoRequest` identifies an IPv4 or IPv6 Echo Request, and
+`ReplyEcho` constructs its reply directly, preserving identifier, sequence,
+and data.
 
 IP requests cover valid, reassembled upper-layer protocols that matched no
 `IPConn` and are not TCP, UDP, ICMP, or IPv6 No Next Header. A matching raw
@@ -253,33 +276,39 @@ packet delivery. They may be invoked concurrently by concurrent writers and
 must return promptly; waiting for traffic that depends on the same delivery
 call would deadlock it. Request values and payloads returned by request methods
 are borrowed and valid only during the callback. Detached responders instead
-own their payload or message snapshot. Every handler must select one terminal
-action or make at least one `Reply` call before returning; otherwise MIPS
-applies `Drop`. After Reply mode begins, further Reply calls are allowed but
-other request actions report `ErrForwarderReplyActive`. Every call must finish
-before the callback returns.
+own their payload or message snapshot. `Reply`, `ReplyFrom`, `ReplyIPPacket`,
+and `ReplyEcho` are repeatable output operations, not terminal actions. A
+handler may make zero or more reply attempts and then select at most one
+terminal action. Returning after at least one reply attempt without a terminal
+action simply completes the request; returning without either applies an
+implicit `Drop`. Every request method call must finish before the callback
+returns.
 
-`Detach` instead finishes the callback-scoped ownership transfer and returns a
-responder with its own payload or message snapshot. That responder may be
-retained or handed to another goroutine, while concurrent access to its mutable
-snapshot remains the application's responsibility. Repeated or invalidated
-terminal request actions report `ErrForwarderRequestCompleted`.
+For UDP, terminal actions are `Accept`, `Listen`, `Detach`, `Drop`, and
+`Reject`; for IP and ICMP they are `Detach`, `Drop`, and `Reject`. `Detach`
+transfers ownership out of the callback and returns a responder with its own
+payload or message snapshot. That responder may be retained or handed to
+another goroutine, while concurrent access to its mutable snapshot remains the
+application's responsibility. A reply that began before a terminal action may
+finish, but a reply begun after it reports `ErrForwarderRequestCompleted`.
+Repeated or invalidated terminal request actions report the same error.
 
-A detached UDP, IP, or ICMP responder starts pending. Its first `Reply` selects
-reply mode, after which `Reply` may be called repeatedly or concurrently until
-`Close`; concurrent calls have no ordering guarantee. Reply mode is selected
-before output validation, so an output error does not change the legal next
-operations and may be retried.
+A detached UDP, IP, or ICMP responder permits repeated or concurrent reply
+operations until a terminal action. An argument, forwarder, configuration,
+route, PMTU, queue, or stack error fails only that call and may be followed by
+another reply or a terminal action. Concurrent calls have no ordering
+guarantee.
 
-`Reject` and `Drop` are available only before the first `Reply`. `Close` before
-reply mode is equivalent to `Drop`, while closing an active responder prevents
-new replies and permits already started calls to finish. `Drop` or `Reject` in
-reply mode reports `ErrForwarderReplyActive`; actions after closure report
-`net.ErrClosed`. The forwarder does not retain the responder, create a timer,
-or impose a detached-request capacity. The application owns its memory,
-concurrency bound, cancellation, timeout, and eventual logical closure. Every
-output call revalidates forwarder closure, the current destination policy, and
-the return route.
+`Drop`, `Reject`, and `Close` remain available after any number of responder
+replies and exactly one of them may terminate the responder. `Close` before any
+reply is counted as an implicit `Drop`; after a reply it only closes the
+lifecycle. A reply that began before the terminal action may finish, while a
+later reply or terminal action reports `net.ErrClosed`. The terminal action
+does not wait for calls already in progress. The forwarder does not retain the
+responder, create a timer, or impose a detached-request capacity. The
+application owns its memory, concurrency bound, cancellation, timeout, and
+eventual logical closure. Every output call revalidates forwarder closure, the
+current destination policy, and the return route.
 `Done` lets asynchronous work observe permanent forwarder or stack closure;
 configuration changes remain dynamic and are reported by individual calls.
 
@@ -293,9 +322,13 @@ pressure. Applications that need ordinary UDP write backpressure should use
 
 `ForwarderInfo.Pending` excludes caller-owned responders and handlers that
 continue running after selecting an action. `Accepted` counts created TCP/UDP
-endpoints, `Replies` counts successfully queued replies, and `ReplyErrors`
-counts failed attempts after reply mode was selected. Consequently reply
-counters may exceed `Requests` when one request produces several packets.
+endpoints, `Replies` counts successfully queued reply calls, and `ReplyErrors`
+counts failed output attempts, including argument and packet validation
+failures. Calls rejected because a terminal action already completed the
+request or responder are lifecycle misuse rather than output attempts and do
+not increment `ReplyErrors`. Reply counters may exceed `Requests` when one
+request produces several replies, and a request may contribute to both reply
+counters and one terminal-action counter.
 
 Only a forwarded endpoint, request-scoped reply, or detached responder may use
 an intercepted destination as an output source. Removing that destination's

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -1163,8 +1164,11 @@ func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 			if _, replyErr := request.Reply([]byte("second answer")); replyErr != nil {
 				t.Errorf("second Reply UDP: %v", replyErr)
 			}
-			if dropErr := request.Drop(); !errors.Is(dropErr, ErrForwarderReplyActive) {
-				t.Errorf("Drop UDP request in reply mode: %v", dropErr)
+			if dropErr := request.Drop(); dropErr != nil {
+				t.Errorf("Drop UDP request after replies: %v", dropErr)
+			}
+			if _, replyErr := request.Reply([]byte("after drop")); !errors.Is(replyErr, ErrForwarderRequestCompleted) {
+				t.Errorf("Reply UDP after Drop: %v", replyErr)
 			}
 		})
 		if err != nil {
@@ -1184,7 +1188,7 @@ func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 		if !ok || string(parsed.payload[udpHeaderSize:]) != "second answer" {
 			t.Fatalf("second forwarded UDP reply = %x", response)
 		}
-		if info := forwarder.Info(); info.Replies != 2 || info.ReplyErrors != 0 {
+		if info := forwarder.Info(); info.Replies != 2 || info.ReplyErrors != 0 || info.Dropped != 1 {
 			t.Fatalf("multi-reply UDP forwarder info = %+v", info)
 		}
 	})
@@ -1238,6 +1242,385 @@ func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 				t.Fatalf("forwarded ICMP rejection = %x", response)
 			}
 		})
+	}
+}
+
+func TestUDPForwarderReplyAllowsTerminalActions(t *testing.T) {
+	actions := []struct {
+		name, request, responder string
+	}{
+		{name: "Accept", request: "Accept"},
+		{name: "Listen", request: "Listen"},
+		{name: "Drop", request: "Drop"},
+		{name: "Reject", request: "Reject"},
+		{name: "Detach/Drop", request: "Detach", responder: "Drop"},
+		{name: "Detach/Reject", request: "Detach", responder: "Reject"},
+		{name: "Detach/Close", request: "Detach", responder: "Close"},
+	}
+	for _, action := range actions {
+		t.Run(action.name, func(t *testing.T) {
+			local := netip.MustParseAddr("192.0.2.188")
+			remote := netip.MustParseAddr("192.0.2.189")
+			target := netip.MustParseAddr("198.51.100.188")
+			stack := newForwarderTestStack(t, local, true)
+			var connection *UDPConn
+			var responder *UDPForwarderResponder
+			result := make(chan error, 1)
+			forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+				if _, replyErr := request.Reply([]byte("request reply")); replyErr != nil {
+					result <- fmt.Errorf("Reply: %w", replyErr)
+					return
+				}
+				var actionErr error
+				switch action.request {
+				case "Accept":
+					connection, actionErr = request.Accept()
+				case "Listen":
+					connection, actionErr = request.Listen()
+				case "Detach":
+					responder, actionErr = request.Detach()
+				case "Drop":
+					actionErr = request.Drop()
+				case "Reject":
+					actionErr = request.Reject()
+				}
+				if actionErr != nil {
+					result <- fmt.Errorf("%s after Reply: %w", action.request, actionErr)
+					return
+				}
+				if _, replyErr := request.Reply([]byte("late")); !errors.Is(replyErr, ErrForwarderRequestCompleted) {
+					result <- fmt.Errorf("Reply after %s = %v", action.request, replyErr)
+					return
+				}
+				result <- nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			if err = writeTestPacket(stack, buildTestUDP(remote, target, 55188, 53, []byte("query"))); err != nil {
+				t.Fatal(err)
+			}
+			if err = <-result; err != nil {
+				t.Fatal(err)
+			}
+
+			packet := readForwarderTestPacket(t, stack)
+			parsed, ok := parseIPPacket(packet)
+			if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != protocolUDP || string(parsed.payload[udpHeaderSize:]) != "request reply" {
+				t.Fatalf("request Reply output = %x", packet)
+			}
+			if connection != nil {
+				defer connection.Close()
+				if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				buffer := make([]byte, 16)
+				if n, readErr := connection.Read(buffer); readErr != nil || string(buffer[:n]) != "query" {
+					t.Fatalf("%s initial datagram = %q, %v", action.request, buffer[:n], readErr)
+				}
+			}
+
+			if responder != nil {
+				if _, err = responder.Reply([]byte("responder reply")); err != nil {
+					t.Fatalf("responder Reply after request Reply: %v", err)
+				}
+				packet = readForwarderTestPacket(t, stack)
+				parsed, ok = parseIPPacket(packet)
+				if !ok || string(parsed.payload[udpHeaderSize:]) != "responder reply" {
+					t.Fatalf("responder Reply output = %x", packet)
+				}
+				switch action.responder {
+				case "Drop":
+					err = responder.Drop()
+				case "Reject":
+					err = responder.Reject()
+				case "Close":
+					err = responder.Close()
+				}
+				if err != nil {
+					t.Fatalf("responder %s after replies: %v", action.responder, err)
+				}
+				if _, err = responder.Reply([]byte("late")); !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("responder Reply after %s = %v", action.responder, err)
+				}
+			}
+
+			if action.request == "Reject" || action.responder == "Reject" {
+				packet = readForwarderTestPacket(t, stack)
+				parsed, ok = parseIPPacket(packet)
+				if !ok || parsed.protocol != protocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 3 {
+					t.Fatalf("UDP rejection after Reply = %x", packet)
+				}
+			}
+			info := forwarder.Info()
+			wantReplies := uint64(1)
+			if responder != nil {
+				wantReplies = 2
+			}
+			wantAccepted, wantDropped, wantRejected := uint64(0), uint64(0), uint64(0)
+			switch {
+			case action.request == "Accept" || action.request == "Listen":
+				wantAccepted = 1
+			case action.request == "Drop" || action.responder == "Drop":
+				wantDropped = 1
+			case action.request == "Reject" || action.responder == "Reject":
+				wantRejected = 1
+			}
+			if info.Pending != 0 || info.Requests != 1 || info.Accepted != wantAccepted || info.Replies != wantReplies ||
+				info.ReplyErrors != 0 || info.Dropped != wantDropped || info.Rejected != wantRejected {
+				t.Fatalf("%s diagnostics = %+v", action.name, info)
+			}
+		})
+	}
+}
+
+func TestIPAndICMPForwarderReplyAllowsTerminalActions(t *testing.T) {
+	for _, protocol := range []string{"IP", "ICMP"} {
+		for _, action := range []string{"Drop", "Reject", "Detach/Drop", "Detach/Reject", "Detach/Close"} {
+			t.Run(protocol+"/"+action, func(t *testing.T) {
+				local := netip.MustParseAddr("192.0.2.190")
+				remote := netip.MustParseAddr("192.0.2.191")
+				target := netip.MustParseAddr("198.51.100.190")
+				stack := newForwarderTestStack(t, local, true)
+				result := make(chan error, 1)
+				var responderReply func() error
+				var responderFinish func() error
+				var responderReplyAfterFinish func() error
+				var forwarder interface {
+					Close() error
+					Info() ForwarderInfo
+				}
+				var err error
+				if protocol == "IP" {
+					forwarder, err = NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+						if replyErr := request.Reply([]byte("request reply")); replyErr != nil {
+							result <- fmt.Errorf("Reply: %w", replyErr)
+							return
+						}
+						var actionErr error
+						switch action {
+						case "Drop":
+							actionErr = request.Drop()
+						case "Reject":
+							actionErr = request.Reject()
+						default:
+							responder, detachErr := request.Detach()
+							actionErr = detachErr
+							if detachErr == nil {
+								responderReply = func() error { return responder.Reply([]byte("responder reply")) }
+								responderReplyAfterFinish = func() error { return responder.Reply([]byte("late")) }
+								switch action {
+								case "Detach/Drop":
+									responderFinish = responder.Drop
+								case "Detach/Reject":
+									responderFinish = responder.Reject
+								case "Detach/Close":
+									responderFinish = responder.Close
+								}
+							}
+						}
+						if actionErr != nil {
+							result <- fmt.Errorf("%s after Reply: %w", action, actionErr)
+							return
+						}
+						if replyErr := request.Reply([]byte("late")); !errors.Is(replyErr, ErrForwarderRequestCompleted) {
+							result <- fmt.Errorf("Reply after %s = %v", action, replyErr)
+							return
+						}
+						result <- nil
+					})
+				} else {
+					forwarder, err = NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+						if replyErr := request.ReplyEcho(); replyErr != nil {
+							result <- fmt.Errorf("ReplyEcho: %w", replyErr)
+							return
+						}
+						var actionErr error
+						switch action {
+						case "Drop":
+							actionErr = request.Drop()
+						case "Reject":
+							actionErr = request.Reject()
+						default:
+							responder, detachErr := request.Detach()
+							actionErr = detachErr
+							if detachErr == nil {
+								responderReply = responder.ReplyEcho
+								responderReplyAfterFinish = responder.ReplyEcho
+								switch action {
+								case "Detach/Drop":
+									responderFinish = responder.Drop
+								case "Detach/Reject":
+									responderFinish = responder.Reject
+								case "Detach/Close":
+									responderFinish = responder.Close
+								}
+							}
+						}
+						if actionErr != nil {
+							result <- fmt.Errorf("%s after Reply: %w", action, actionErr)
+							return
+						}
+						if replyErr := request.ReplyEcho(); !errors.Is(replyErr, ErrForwarderRequestCompleted) {
+							result <- fmt.Errorf("ReplyEcho after %s = %v", action, replyErr)
+							return
+						}
+						result <- nil
+					})
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer forwarder.Close()
+				var input []byte
+				if protocol == "IP" {
+					input = buildIPPacket(remote, target, 99, []byte("request"), 1, true)
+				} else {
+					message := []byte{8, 0, 0, 0, 1, 2, 3, 4}
+					binary.BigEndian.PutUint16(message[2:4], checksum(message))
+					input = buildIPPacket(remote, target, protocolICMPv4, message, 1, true)
+				}
+				if err = writeTestPacket(stack, input); err != nil {
+					t.Fatal(err)
+				}
+				if err = <-result; err != nil {
+					t.Fatal(err)
+				}
+
+				packet := readForwarderTestPacket(t, stack)
+				parsed, ok := parseIPPacket(packet)
+				if !ok || parsed.source != target || parsed.target != remote {
+					t.Fatalf("request Reply output = %x", packet)
+				}
+				if protocol == "IP" {
+					if parsed.protocol != 99 || string(parsed.payload) != "request reply" {
+						t.Fatalf("IP request Reply output = %+v", parsed)
+					}
+				} else if parsed.protocol != protocolICMPv4 || parsed.payload[0] != 0 {
+					t.Fatalf("ICMP request Reply output = %+v", parsed)
+				}
+
+				if responderReply != nil {
+					if err = responderReply(); err != nil {
+						t.Fatalf("responder Reply after request Reply: %v", err)
+					}
+					packet = readForwarderTestPacket(t, stack)
+					parsed, ok = parseIPPacket(packet)
+					if !ok || parsed.source != target || parsed.target != remote {
+						t.Fatalf("responder Reply output = %x", packet)
+					}
+					if err = responderFinish(); err != nil {
+						t.Fatalf("responder %s after replies: %v", action, err)
+					}
+					if err = responderReplyAfterFinish(); !errors.Is(err, net.ErrClosed) {
+						t.Fatalf("responder Reply after %s = %v", action, err)
+					}
+				}
+				if action == "Reject" || action == "Detach/Reject" {
+					packet = readForwarderTestPacket(t, stack)
+					parsed, ok = parseIPPacket(packet)
+					if !ok || parsed.protocol != protocolICMPv4 {
+						t.Fatalf("%s rejection after Reply = %x", protocol, packet)
+					}
+				}
+				info := forwarder.Info()
+				wantReplies := uint64(1)
+				if responderReply != nil {
+					wantReplies = 2
+				}
+				wantDropped, wantRejected := uint64(0), uint64(0)
+				if action == "Drop" || action == "Detach/Drop" {
+					wantDropped = 1
+				} else if action == "Reject" || action == "Detach/Reject" {
+					wantRejected = 1
+				}
+				if info.Pending != 0 || info.Requests != 1 || info.Replies != wantReplies || info.ReplyErrors != 0 ||
+					info.Dropped != wantDropped || info.Rejected != wantRejected {
+					t.Fatalf("%s/%s diagnostics = %+v", protocol, action, info)
+				}
+			})
+		}
+	}
+}
+
+func TestUDPForwarderRequestConcurrentReplyAndTerminalAction(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.192")
+	remote := netip.MustParseAddr("192.0.2.193")
+	target := netip.MustParseAddr("198.51.100.192")
+	stack := newForwarderTestStack(t, local, true)
+	type result struct {
+		replies int
+		err     error
+	}
+	results := make(chan result, 1)
+	forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+		const attempts = 32
+		start := make(chan struct{})
+		errorsCh := make(chan error, attempts)
+		for index := 0; index < attempts; index++ {
+			go func(index int) {
+				<-start
+				_, replyErr := request.Reply([]byte{byte(index)})
+				errorsCh <- replyErr
+			}(index)
+		}
+		dropped := make(chan error, 1)
+		go func() {
+			<-start
+			dropped <- request.Drop()
+		}()
+		close(start)
+		succeeded := 0
+		for index := 0; index < attempts; index++ {
+			replyErr := <-errorsCh
+			if replyErr == nil {
+				succeeded++
+			} else if !errors.Is(replyErr, ErrForwarderRequestCompleted) {
+				results <- result{err: fmt.Errorf("concurrent Reply: %w", replyErr)}
+				return
+			}
+		}
+		if dropErr := <-dropped; dropErr != nil {
+			results <- result{err: fmt.Errorf("concurrent Drop: %w", dropErr)}
+			return
+		}
+		if _, replyErr := request.Reply([]byte("late")); !errors.Is(replyErr, ErrForwarderRequestCompleted) {
+			results <- result{err: fmt.Errorf("Reply after Drop = %v", replyErr)}
+			return
+		}
+		results <- result{replies: succeeded}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	if err = writeTestPacket(stack, buildTestUDP(remote, target, 55192, 53, []byte("race"))); err != nil {
+		t.Fatal(err)
+	}
+	got := <-results
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	queued := 0
+	for stack.outbound.len() != 0 {
+		entry, ok := stack.outbound.tryDequeue()
+		if !ok {
+			break
+		}
+		packet := consumeTestPacket(&stack.outbound, entry)
+		parsed, valid := parseIPPacket(packet)
+		if !valid || parsed.source != target || parsed.target != remote || parsed.protocol != protocolUDP || len(parsed.payload) != udpHeaderSize+1 {
+			t.Fatalf("concurrent Reply output = %x", packet)
+		}
+		queued++
+	}
+	if queued != got.replies {
+		t.Fatalf("concurrent Reply queued %d packets for %d successes", queued, got.replies)
+	}
+	if info := forwarder.Info(); info.Pending != 0 || info.Requests != 1 || info.Replies != uint64(got.replies) ||
+		info.ReplyErrors != 0 || info.Dropped != 1 || info.Rejected != 0 {
+		t.Fatalf("concurrent request diagnostics = %+v, replies=%d", info, got.replies)
 	}
 }
 
@@ -1561,20 +1944,377 @@ func TestUDPForwarderDetachedReply(t *testing.T) {
 	if !ok || string(parsed.payload[udpHeaderSize:]) != "second answer" {
 		t.Fatalf("second detached UDP response = %x", response)
 	}
-	if err = responder.Drop(); !errors.Is(err, ErrForwarderReplyActive) {
-		t.Fatalf("Drop active detached UDP responder = %v", err)
+	if err = responder.Drop(); err != nil {
+		t.Fatalf("Drop detached UDP responder after replies = %v", err)
 	}
-	if err = responder.Reject(); !errors.Is(err, ErrForwarderReplyActive) {
-		t.Fatalf("Reject active detached UDP responder = %v", err)
+	if err = responder.Reject(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Reject dropped detached UDP responder = %v", err)
 	}
-	if err = responder.Close(); err != nil {
-		t.Fatal(err)
+	if err = responder.Close(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Close dropped detached UDP responder = %v", err)
 	}
 	if _, err = responder.Reply([]byte("closed")); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Reply closed detached UDP responder = %v", err)
 	}
-	if info := forwarder.Info(); info.Pending != 0 || info.Replies != 2 || info.Dropped != 0 {
+	if info := forwarder.Info(); info.Pending != 0 || info.Replies != 2 || info.Dropped != 1 {
 		t.Fatalf("completed detached UDP forwarder info = %+v", info)
+	}
+}
+
+func TestUDPForwarderReplyFrom(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		local, remote  netip.Addr
+		target, source netip.Addr
+	}{
+		{"IPv4", netip.MustParseAddr("192.0.2.146"), netip.MustParseAddr("192.0.2.147"), netip.MustParseAddr("198.51.100.146"), netip.MustParseAddr("203.0.113.146")},
+		{"IPv6", netip.MustParseAddr("2001:db8::146"), netip.MustParseAddr("2001:db8::147"), netip.MustParseAddr("2001:db8:1::146"), netip.MustParseAddr("2001:db8:2::146")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack := newForwarderTestStack(t, test.local, true)
+			const remotePort, targetPort, sourcePort = 55146, 53, 0
+			results := make(chan error, 1)
+			forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+				for _, invalid := range []netip.AddrPort{
+					{},
+					netip.MustParseAddrPort("[2001:db8::1]:1"),
+				} {
+					if test.local.Is6() {
+						if invalid.IsValid() {
+							invalid = netip.MustParseAddrPort("192.0.2.1:1")
+						}
+					}
+					if _, replyErr := request.ReplyFrom([]byte("invalid"), invalid); !errors.Is(replyErr, syscall.EINVAL) {
+						results <- replyErr
+						return
+					}
+				}
+				_, replyErr := request.ReplyFrom([]byte("selected"), netip.AddrPortFrom(test.source, sourcePort))
+				results <- replyErr
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			if err = writeTestPacket(stack, buildTestUDP(test.remote, test.target, remotePort, targetPort, []byte("query"))); err != nil {
+				t.Fatal(err)
+			}
+			if err = <-results; err != nil {
+				t.Fatal(err)
+			}
+			response := readForwarderTestPacket(t, stack)
+			parsed, ok := parseIPPacket(response)
+			if !ok || parsed.source != test.source || parsed.target != test.remote || parsed.protocol != protocolUDP ||
+				binary.BigEndian.Uint16(parsed.payload[:2]) != sourcePort || binary.BigEndian.Uint16(parsed.payload[2:4]) != remotePort ||
+				string(parsed.payload[udpHeaderSize:]) != "selected" || transportChecksum(parsed.source, parsed.target, protocolUDP, parsed.payload) != 0 {
+				t.Fatalf("ReplyFrom output = %x", response)
+			}
+			if info := forwarder.Info(); info.Replies != 1 || info.ReplyErrors != 2 || info.Dropped != 0 {
+				t.Fatalf("ReplyFrom diagnostics = %+v", info)
+			}
+		})
+	}
+}
+
+func TestUDPForwarderReplyFromPreservesConfiguredBroadcastSource(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.146")
+	remote := netip.MustParseAddr("198.51.100.147")
+	target := netip.MustParseAddr("203.0.113.146")
+	broadcast := netip.MustParseAddr("192.0.2.255")
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 24)},
+		Promiscuous:    true,
+		MTU:            1400,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	result := make(chan [2]error, 1)
+	forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+		_, replyErr := request.ReplyFrom([]byte("answer"), netip.AddrPortFrom(broadcast, 53))
+		result <- [2]error{replyErr, request.Drop()}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	if err = writeTestPacket(stack, buildTestUDP(remote, target, 55146, 53, []byte("query"))); err != nil {
+		t.Fatal(err)
+	}
+	resultErrors := <-result
+	if resultErrors[0] != nil {
+		t.Fatalf("configured-broadcast ReplyFrom = %v", resultErrors[0])
+	}
+	if resultErrors[1] != nil {
+		t.Fatalf("Drop after configured-broadcast ReplyFrom = %v", resultErrors[1])
+	}
+	response := readForwarderTestPacket(t, stack)
+	parsed, ok := parseIPPacket(response)
+	if !ok || parsed.source != broadcast || parsed.target != remote || string(parsed.payload[udpHeaderSize:]) != "answer" {
+		t.Fatalf("configured-broadcast ReplyFrom output = %x", response)
+	}
+	if info := forwarder.Info(); info.Requests != 1 || info.Replies != 1 || info.ReplyErrors != 0 || info.Dropped != 1 {
+		t.Fatalf("configured-broadcast ReplyFrom diagnostics = %+v", info)
+	}
+}
+
+func TestICMPForwarderReplyIPPacketPreservesConfiguredBroadcastSource(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.150")
+	remote := netip.MustParseAddr("198.51.100.151")
+	target := netip.MustParseAddr("203.0.113.150")
+	broadcast := netip.MustParseAddr("192.0.2.255")
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 24)},
+		Promiscuous:    true,
+		MTU:            1400,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	result := make(chan [2]error, 1)
+	forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+		reply := makeForwarderICMPEchoReplyPacket(broadcast, remote, []byte("answer"))
+		result <- [2]error{request.ReplyIPPacket(reply), request.Drop()}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	icmp := make([]byte, 8+len("query"))
+	icmp[0] = 8
+	copy(icmp[8:], "query")
+	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	resultErrors := <-result
+	if resultErrors[0] != nil {
+		t.Fatalf("configured-broadcast ReplyIPPacket = %v", resultErrors[0])
+	}
+	if resultErrors[1] != nil {
+		t.Fatalf("Drop after configured-broadcast ReplyIPPacket = %v", resultErrors[1])
+	}
+	response := readForwarderTestPacket(t, stack)
+	parsed, ok := parseIPPacket(response)
+	if !ok || parsed.source != broadcast || parsed.target != remote || string(parsed.payload[8:]) != "answer" {
+		t.Fatalf("configured-broadcast ReplyIPPacket output = %x", response)
+	}
+	if info := forwarder.Info(); info.Requests != 1 || info.Replies != 1 || info.ReplyErrors != 0 || info.Dropped != 1 {
+		t.Fatalf("configured-broadcast ReplyIPPacket diagnostics = %+v", info)
+	}
+}
+
+func TestUDPForwarderReplyFromPreservesSpecialSources(t *testing.T) {
+	for _, test := range []struct {
+		name                          string
+		local, remote, target, source netip.Addr
+	}{
+		{"IPv4 configured unicast", netip.MustParseAddr("192.0.2.178"), netip.MustParseAddr("192.0.2.179"), netip.MustParseAddr("198.51.100.178"), netip.MustParseAddr("192.0.2.178")},
+		{"IPv4 unspecified", netip.MustParseAddr("192.0.2.180"), netip.MustParseAddr("192.0.2.181"), netip.MustParseAddr("198.51.100.180"), netip.IPv4Unspecified()},
+		{"IPv4 multicast", netip.MustParseAddr("192.0.2.182"), netip.MustParseAddr("192.0.2.183"), netip.MustParseAddr("198.51.100.182"), netip.MustParseAddr("224.0.0.1")},
+		{"IPv4 loopback", netip.MustParseAddr("192.0.2.184"), netip.MustParseAddr("192.0.2.185"), netip.MustParseAddr("198.51.100.184"), netip.MustParseAddr("127.0.0.1")},
+		{"IPv4 limited broadcast", netip.MustParseAddr("192.0.2.186"), netip.MustParseAddr("192.0.2.187"), netip.MustParseAddr("198.51.100.186"), netip.MustParseAddr("255.255.255.255")},
+		{"IPv6 configured unicast", netip.MustParseAddr("2001:db8::178"), netip.MustParseAddr("2001:db8::179"), netip.MustParseAddr("2001:db8:1::178"), netip.MustParseAddr("2001:db8::178")},
+		{"IPv6 unspecified", netip.MustParseAddr("2001:db8::180"), netip.MustParseAddr("2001:db8::181"), netip.MustParseAddr("2001:db8:1::180"), netip.IPv6Unspecified()},
+		{"IPv6 multicast", netip.MustParseAddr("2001:db8::182"), netip.MustParseAddr("2001:db8::183"), netip.MustParseAddr("2001:db8:1::182"), netip.MustParseAddr("ff02::1")},
+		{"IPv6 loopback", netip.MustParseAddr("2001:db8::184"), netip.MustParseAddr("2001:db8::185"), netip.MustParseAddr("2001:db8:1::184"), netip.IPv6Loopback()},
+		{"IPv6 zoned link-local", netip.MustParseAddr("2001:db8::186"), netip.MustParseAddr("2001:db8::187"), netip.MustParseAddr("2001:db8:1::186"), netip.MustParseAddr("fe80::1").WithZone("test")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack := newForwarderTestStack(t, test.local, true)
+			result := make(chan [2]error, 1)
+			forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+				_, replyErr := request.ReplyFrom([]byte("answer"), netip.AddrPortFrom(test.source, 53))
+				result <- [2]error{replyErr, request.Drop()}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			if err = writeTestPacket(stack, buildTestUDP(test.remote, test.target, 55180, 53, []byte("query"))); err != nil {
+				t.Fatal(err)
+			}
+			for index, actionErr := range <-result {
+				if actionErr != nil {
+					t.Fatalf("action %d = %v", index, actionErr)
+				}
+			}
+			packet := readForwarderTestPacket(t, stack)
+			parsed, ok := parseIPPacket(packet)
+			if !ok || parsed.source != test.source.WithZone("").Unmap() || parsed.target != test.remote || string(parsed.payload[udpHeaderSize:]) != "answer" {
+				t.Fatalf("special-source ReplyFrom output = %x", packet)
+			}
+			if info := forwarder.Info(); info.Replies != 1 || info.ReplyErrors != 0 || info.Dropped != 1 {
+				t.Fatalf("special-source ReplyFrom diagnostics = %+v", info)
+			}
+		})
+	}
+}
+
+func TestUDPForwarderReplyFromLoopback(t *testing.T) {
+	for _, test := range []struct {
+		name, network string
+		address       netip.Addr
+	}{
+		{"IPv4", "udp4", netip.MustParseAddr("127.0.0.1")},
+		{"IPv6", "udp6", netip.IPv6Loopback()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bits := 32
+			if test.address.Is6() {
+				bits = 128
+			}
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.address, bits)}, MTU: 1400})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+
+			const clientPort, targetPort = 55146, 55147
+			result := make(chan error, 1)
+			forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+				if flow := request.Flow(); !flow.Source.Addr().IsLoopback() || flow.Destination != netip.AddrPortFrom(test.address, targetPort) {
+					result <- fmt.Errorf("loopback flow = %+v", flow)
+					return
+				}
+				_, replyErr := request.ReplyFrom([]byte("answer"), request.Flow().Destination)
+				result <- replyErr
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+
+			client, err := stack.DialUDP(context.Background(), test.network, netip.AddrPortFrom(test.address, clientPort), netip.AddrPortFrom(test.address, targetPort))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			if err = client.SetDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = client.Write([]byte("query")); err != nil {
+				t.Fatal(err)
+			}
+			buffer := make([]byte, 16)
+			n, err := client.Read(buffer)
+			if err != nil || string(buffer[:n]) != "answer" {
+				t.Fatalf("loopback ReplyFrom = %q, %v", buffer[:n], err)
+			}
+			if err = <-result; err != nil {
+				t.Fatal(err)
+			}
+			if info := forwarder.Info(); info.Requests != 1 || info.Replies != 1 || info.ReplyErrors != 0 || info.Dropped != 0 {
+				t.Fatalf("loopback ReplyFrom diagnostics = %+v", info)
+			}
+		})
+	}
+}
+
+func TestUDPForwarderReplyPreservesLoopbackSourceForRemotePeer(t *testing.T) {
+	local := netip.MustParseAddr("127.0.0.1")
+	remote := netip.MustParseAddr("192.0.2.147")
+	stack := newForwarderTestStack(t, local, false)
+	result := make(chan [3]error, 1)
+	forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+		_, replyErr := request.Reply([]byte("answer"))
+		_, replyFromErr := request.ReplyFrom([]byte("answer"), request.Flow().Destination)
+		result <- [3]error{replyErr, replyFromErr, request.Drop()}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	if err = writeTestPacket(stack, buildTestUDP(remote, local, 55148, 53, []byte("query"))); err != nil {
+		t.Fatal(err)
+	}
+	resultErrors := <-result
+	for index, replyErr := range resultErrors[:2] {
+		if replyErr != nil {
+			t.Fatalf("loopback source reply %d = %v", index, replyErr)
+		}
+	}
+	if resultErrors[2] != nil {
+		t.Fatalf("Drop after static loopback failures = %v", resultErrors[2])
+	}
+	for index := 0; index < 2; index++ {
+		packet := readForwarderTestPacket(t, stack)
+		parsed, ok := parseIPPacket(packet)
+		if !ok || parsed.source != local || parsed.target != remote || string(parsed.payload[udpHeaderSize:]) != "answer" {
+			t.Fatalf("loopback source reply %d output = %x", index, packet)
+		}
+	}
+	if info := forwarder.Info(); info.Requests != 1 || info.Replies != 2 || info.ReplyErrors != 0 || info.Dropped != 1 {
+		t.Fatalf("loopback source diagnostics = %+v", info)
+	}
+}
+
+func TestUDPForwarderDetachedReplyFromConcurrent(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.148")
+	remote := netip.MustParseAddr("192.0.2.149")
+	target := netip.MustParseAddr("198.51.100.148")
+	stack := newForwarderTestStack(t, local, true)
+	detached := make(chan *UDPForwarderResponder, 1)
+	forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+		responder, detachErr := request.Detach()
+		if detachErr != nil {
+			t.Errorf("Detach UDP: %v", detachErr)
+			return
+		}
+		detached <- responder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	if err = writeTestPacket(stack, buildTestUDP(remote, target, 55148, 53, []byte("query"))); err != nil {
+		t.Fatal(err)
+	}
+	responder := <-detached
+	sources := []netip.AddrPort{
+		netip.MustParseAddrPort("203.0.113.148:1001"),
+		netip.MustParseAddrPort("203.0.113.149:1002"),
+	}
+	errorsCh := make(chan error, len(sources))
+	for index, source := range sources {
+		go func(index int, source netip.AddrPort) {
+			_, replyErr := responder.ReplyFrom([]byte{byte(index)}, source)
+			errorsCh <- replyErr
+		}(index, source)
+	}
+	for range sources {
+		if err = <-errorsCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := make(map[netip.AddrPort]byte, len(sources))
+	for range sources {
+		parsed, ok := parseIPPacket(readForwarderTestPacket(t, stack))
+		if !ok || parsed.protocol != protocolUDP || parsed.target != remote || len(parsed.payload) != udpHeaderSize+1 {
+			t.Fatalf("detached ReplyFrom output = %+v", parsed)
+		}
+		seen[netip.AddrPortFrom(parsed.source, binary.BigEndian.Uint16(parsed.payload[:2]))] = parsed.payload[udpHeaderSize]
+	}
+	for index, source := range sources {
+		if seen[source] != byte(index) {
+			t.Fatalf("detached ReplyFrom source %v payload = %d, want %d", source, seen[source], index)
+		}
+	}
+	if err = responder.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1670,6 +2410,11 @@ func TestICMPForwarderDetachedReply(t *testing.T) {
 	if message.Source != remote || message.Destination != target || message.Type != 8 || message.Code != 0 || string(message.Payload[8:]) != "ping" {
 		t.Fatalf("detached ICMP message = %+v", message)
 	}
+	fullPacket := responder.IPPacket()
+	parsedSnapshot, ok := parseIPPacket(fullPacket)
+	if !ok || !bytes.Equal(fullPacket, parsedSnapshot.original) || len(message.Payload) == 0 || &message.Payload[0] != &parsedSnapshot.payload[0] {
+		t.Fatal("detached ICMP packet and message do not share one owned snapshot")
+	}
 	result := make(chan error, 1)
 	go func() { result <- responder.ReplyEcho() }()
 	if err = <-result; err != nil {
@@ -1693,6 +2438,759 @@ func TestICMPForwarderDetachedReply(t *testing.T) {
 	}
 	if info := forwarder.Info(); info.Pending != 0 || info.Replies != 2 {
 		t.Fatalf("completed detached ICMP forwarder info = %+v", info)
+	}
+}
+
+func TestICMPForwarderIPPacketRequestLifetime(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.150")
+	remote := netip.MustParseAddr("192.0.2.151")
+	target := netip.MustParseAddr("198.51.100.150")
+	stack := newForwarderTestStack(t, local, true)
+	result := make(chan error, 1)
+	forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+		message := request.Message()
+		packet := request.IPPacket()
+		parsed, ok := parseIPPacket(packet)
+		if !ok || parsed.source != remote || parsed.target != target || len(message.Payload) == 0 || &message.Payload[0] != &parsed.payload[0] {
+			result <- syscall.EINVAL
+			return
+		}
+		result <- request.Drop()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	icmp := []byte{13, 0, 0, 0, 1, 2, 3, 4}
+	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-result; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func makeForwarderICMPErrorPacket(source, target netip.Addr, quoted []byte) []byte {
+	icmp := make([]byte, 8+len(quoted))
+	copy(icmp[8:], quoted)
+	protocol := protocolICMPv6
+	if source.Is4() {
+		protocol = protocolICMPv4
+		icmp[0], icmp[1] = 3, 1
+		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+	} else {
+		icmp[0] = 1
+		binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(source, target, protocol, icmp))
+	}
+	return buildIPPacket(source, target, protocol, icmp, 0, false)
+}
+
+// makeForwarderICMPEchoReplyPacket builds a minimal header-included Echo Reply.
+func makeForwarderICMPEchoReplyPacket(source, target netip.Addr, payload []byte) []byte {
+	icmp := make([]byte, 8+len(payload))
+	copy(icmp[8:], payload)
+	protocol := byte(protocolICMPv6)
+	icmp[0] = 129
+	if source.Is4() {
+		protocol = protocolICMPv4
+		icmp[0] = 0
+		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+	} else {
+		binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(source, target, protocol, icmp))
+	}
+	return buildIPPacket(source, target, protocol, icmp, 0, false)
+}
+
+// prependIPv6AtomicFragment inserts an atomic Fragment header immediately
+// after the fixed IPv6 header. Calling it twice constructs a duplicate-header
+// chain for static validation tests.
+func prependIPv6AtomicFragment(packet []byte, identification uint32) []byte {
+	result := make([]byte, len(packet)+8)
+	copy(result[:40], packet[:40])
+	result[6] = 44
+	result[40] = packet[6]
+	result[41] = 0xa5
+	binary.BigEndian.PutUint16(result[42:44], 6)
+	binary.BigEndian.PutUint32(result[44:48], identification)
+	copy(result[48:], packet[40:])
+	binary.BigEndian.PutUint16(result[4:6], uint16(len(result)-40))
+	return result
+}
+
+// makeNoncanonicalIPv6AtomicFragmentPacket constructs the receiver-valid
+// Destination Options, Fragment, Routing, ICMP order. Source refragmentation
+// must remove the atomic header and emit the RFC 8200 canonical order.
+func makeNoncanonicalIPv6AtomicFragmentPacket(packet []byte, identification uint32) []byte {
+	result := make([]byte, len(packet)+24)
+	copy(result[:40], packet[:40])
+	result[6] = 60
+	result[40] = 44
+	result[48] = 43
+	result[49] = 0xa5
+	binary.BigEndian.PutUint16(result[50:52], 6)
+	binary.BigEndian.PutUint32(result[52:56], identification)
+	result[56] = protocolICMPv6
+	copy(result[64:], packet[40:])
+	binary.BigEndian.PutUint16(result[4:6], uint16(len(result)-40))
+	return result
+}
+
+func TestICMPForwarderReplyIPPacketNormalization(t *testing.T) {
+	for _, test := range []struct {
+		name                  string
+		local, remote, target netip.Addr
+	}{
+		{"IPv4", netip.MustParseAddr("192.0.2.152"), netip.MustParseAddr("192.0.2.153"), netip.MustParseAddr("198.51.100.152")},
+		{"IPv6", netip.MustParseAddr("2001:db8::152"), netip.MustParseAddr("2001:db8::153"), netip.MustParseAddr("2001:db8:1::152")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack := newForwarderTestStack(t, test.local, true)
+			results := make(chan error, 1)
+			var callerPacket []byte
+			forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+				quoted := append([]byte(nil), request.IPPacket()...)
+				callerPacket = makeForwarderICMPErrorPacket(test.target, test.remote, quoted)
+				headerSize := 40
+				if test.remote.Is4() {
+					headerSize = 20
+					callerPacket[1], callerPacket[8] = 0x2e, 37
+					binary.BigEndian.PutUint16(callerPacket[2:4], 1)
+					callerPacket[10], callerPacket[11] = 0x12, 0x34
+				} else {
+					callerPacket[0], callerPacket[1], callerPacket[7] = 0x62, 0xe0, 37
+					binary.BigEndian.PutUint16(callerPacket[4:6], 1)
+				}
+				callerPacket[headerSize+2], callerPacket[headerSize+3] = 0x12, 0x34
+				copy(callerPacket[len(callerPacket)-len(quoted):], quoted)
+				replyErr := request.ReplyIPPacket(callerPacket)
+				for index := range callerPacket {
+					callerPacket[index] = 0xa5
+				}
+				results <- replyErr
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			requestICMP := []byte{13, 0, 0, 0, 1, 2, 3, 4}
+			protocol := protocolICMPv6
+			if test.remote.Is4() {
+				protocol = protocolICMPv4
+				binary.BigEndian.PutUint16(requestICMP[2:4], checksum(requestICMP))
+			} else {
+				binary.BigEndian.PutUint16(requestICMP[2:4], transportChecksum(test.remote, test.target, protocol, requestICMP))
+			}
+			requestPacket := buildIPPacket(test.remote, test.target, protocol, requestICMP, 1, true)
+			if err = writeTestPacket(stack, requestPacket); err != nil {
+				t.Fatal(err)
+			}
+			if err = <-results; err != nil {
+				t.Fatal(err)
+			}
+			output := readForwarderTestPacket(t, stack)
+			parsed, ok := parseIPPacket(output)
+			if !ok || parsed.source != test.target || parsed.target != test.remote || !bytes.Equal(parsed.payload[8:], requestPacket) {
+				t.Fatalf("ReplyIPPacket output = %x", output)
+			}
+			if parsed.source.Is4() {
+				if parsed.hopLimit != 37 || parsed.trafficClass != 0x2e || checksum(parsed.payload) != 0 || binary.BigEndian.Uint16(output[4:6]) == 0 {
+					t.Fatalf("normalized IPv4 ReplyIPPacket = %x", output)
+				}
+			} else if parsed.hopLimit != 37 || parsed.trafficClass != 0x2e || transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0 {
+				t.Fatalf("normalized IPv6 ReplyIPPacket = %x", output)
+			}
+			if bytes.Contains(output, bytes.Repeat([]byte{0xa5}, 16)) {
+				t.Fatal("ReplyIPPacket retained caller storage")
+			}
+		})
+	}
+}
+
+func TestICMPForwarderReplyIPPacketValidationAllowsLaterAction(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.154")
+	remote := netip.MustParseAddr("192.0.2.155")
+	target := netip.MustParseAddr("198.51.100.154")
+	stack := newForwarderTestStack(t, local, true)
+	result := make(chan error, 1)
+	forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+		invalid := [][]byte{
+			nil,
+			make([]byte, 19),
+			buildIPPacket(target, netip.MustParseAddr("192.0.2.156"), protocolICMPv4, make([]byte, 8), 0, false),
+			buildIPPacket(target, remote, protocolUDP, make([]byte, 8), 0, false),
+		}
+		for _, packet := range invalid {
+			if replyErr := request.ReplyIPPacket(packet); !errors.Is(replyErr, syscall.EINVAL) {
+				result <- replyErr
+				return
+			}
+		}
+		if replyErr := request.ReplyIPPacket(makeForwarderICMPEchoReplyPacket(netip.MustParseAddr("127.0.0.1"), remote, nil)); replyErr != nil {
+			result <- replyErr
+			return
+		}
+		result <- request.Drop()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	icmp := []byte{13, 0, 0, 0, 1, 2, 3, 4}
+	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-result; err != nil {
+		t.Fatal(err)
+	}
+	response := readForwarderTestPacket(t, stack)
+	parsed, ok := parseIPPacket(response)
+	if !ok || parsed.source != netip.MustParseAddr("127.0.0.1") || parsed.target != remote {
+		t.Fatalf("loopback-source ReplyIPPacket output = %x", response)
+	}
+	if info := forwarder.Info(); info.Replies != 1 || info.ReplyErrors != 4 || info.Dropped != 1 {
+		t.Fatalf("ReplyIPPacket validation diagnostics = %+v", info)
+	}
+}
+
+func TestICMPForwarderReplyIPPacketFragmentation(t *testing.T) {
+	for _, test := range []struct {
+		name                  string
+		local, remote, target netip.Addr
+	}{
+		{"IPv4", netip.MustParseAddr("192.0.2.156"), netip.MustParseAddr("192.0.2.157"), netip.MustParseAddr("198.51.100.156")},
+		{"IPv6", netip.MustParseAddr("2001:db8::156"), netip.MustParseAddr("2001:db8::157"), netip.MustParseAddr("2001:db8:1::156")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack := newForwarderTestStack(t, test.local, true)
+			result := make(chan error, 1)
+			quoted := bytes.Repeat([]byte{0x5a}, 2500)
+			forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+				reply := makeForwarderICMPErrorPacket(test.target, test.remote, quoted)
+				if test.remote.Is4() {
+					options := []byte{7, 7, 8, 0, 0, 0, 0, 148, 4, 0, 0, 0}
+					headerSize := 20 + len(options)
+					withOptions := make([]byte, headerSize+len(reply)-20)
+					copy(withOptions[:20], reply[:20])
+					copy(withOptions[20:headerSize], options)
+					copy(withOptions[headerSize:], reply[20:])
+					withOptions[0] = 0x40 | byte(headerSize/4)
+					reply = withOptions
+				} else {
+					// RFC 4443 limits ICMPv6 errors to 1280 bytes. Use an
+					// informational Echo Reply to exercise legal IPv6 source
+					// fragmentation while IPv4 continues to cover error output.
+					reply[40] = 129
+					extension := []byte{protocolICMPv6, 0, 0, 0, 0, 0, 0, 0}
+					reply[6] = 60
+					reply = append(append(reply[:40:40], extension...), reply[40:]...)
+				}
+				result <- request.ReplyIPPacket(reply)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			request := []byte{13, 0, 0, 0, 1, 2, 3, 4}
+			protocol := protocolICMPv6
+			if test.remote.Is4() {
+				protocol = protocolICMPv4
+				binary.BigEndian.PutUint16(request[2:4], checksum(request))
+			} else {
+				binary.BigEndian.PutUint16(request[2:4], transportChecksum(test.remote, test.target, protocol, request))
+			}
+			if err = writeTestPacket(stack, buildIPPacket(test.remote, test.target, protocol, request, 1, true)); err != nil {
+				t.Fatal(err)
+			}
+			if err = <-result; err != nil {
+				t.Fatal(err)
+			}
+			var reassembled []byte
+			fragments := 0
+			for stack.outbound.len() != 0 {
+				entry, ok := stack.outbound.tryDequeue()
+				if !ok {
+					break
+				}
+				packet := consumeTestPacket(&stack.outbound, entry)
+				fragments++
+				if test.remote.Is4() && fragments > 1 {
+					headerSize := int(packet[0]&0x0f) * 4
+					for _, option := range packet[20:27] {
+						if option != 1 {
+							t.Fatalf("non-copied IPv4 option survived later fragment: %x", packet[20:headerSize])
+						}
+					}
+					if !bytes.Equal(packet[27:31], []byte{148, 4, 0, 0}) {
+						t.Fatalf("copied IPv4 option missing from later fragment: %x", packet[20:headerSize])
+					}
+				}
+				if completed := stack.reassemblePacket(packet, time.Now()); completed != nil {
+					reassembled = completed
+				}
+			}
+			if fragments < 2 || len(reassembled) == 0 {
+				t.Fatalf("ReplyIPPacket fragments = %d, reassembled=%d", fragments, len(reassembled))
+			}
+			parsed, ok := parseIPPacket(reassembled)
+			if !ok || parsed.source != test.target || parsed.target != test.remote || !bytes.Equal(parsed.payload[8:], quoted) {
+				t.Fatalf("reassembled ReplyIPPacket = %x", reassembled)
+			}
+		})
+	}
+}
+
+func TestICMPForwarderReplyIPPacketIPv6AtomicFragment(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::160")
+	remote := netip.MustParseAddr("2001:db8::161")
+	target := netip.MustParseAddr("2001:db8:1::160")
+	for _, test := range []struct {
+		name           string
+		payloadSize    int
+		noncanonical   bool
+		identification uint32
+	}{
+		{name: "fitting", payloadSize: 32, identification: 0x12345678},
+		{name: "refragment noncanonical zero ID", payloadSize: 2500, noncanonical: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack := newForwarderTestStack(t, local, true)
+			payload := bytes.Repeat([]byte{0x6d}, test.payloadSize)
+			reply := makeForwarderICMPEchoReplyPacket(target, remote, payload)
+			if test.noncanonical {
+				reply = makeNoncanonicalIPv6AtomicFragmentPacket(reply, test.identification)
+			} else {
+				reply = prependIPv6AtomicFragment(reply, test.identification)
+			}
+			result := make(chan error, 1)
+			forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+				result <- request.ReplyIPPacket(reply)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			request := []byte{128, 0, 0, 0, 1, 2, 3, 4}
+			binary.BigEndian.PutUint16(request[2:4], transportChecksum(remote, target, protocolICMPv6, request))
+			if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv6, request, 1, true)); err != nil {
+				t.Fatal(err)
+			}
+			if err = <-result; err != nil {
+				t.Fatal(err)
+			}
+			if !test.noncanonical {
+				output := readForwarderTestPacket(t, stack)
+				if output[6] != 44 || output[40] != protocolICMPv6 || output[41] != 0 || binary.BigEndian.Uint16(output[42:44]) != 0 || binary.BigEndian.Uint32(output[44:48]) != test.identification {
+					t.Fatalf("fitting atomic Fragment header = %x", output[40:48])
+				}
+				parsed, ok := parseIPPacket(output)
+				if !ok || !bytes.Equal(parsed.payload[8:], payload) || transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0 {
+					t.Fatalf("fitting atomic ReplyIPPacket = %x", output)
+				}
+				return
+			}
+			fragments := 0
+			var reassembled []byte
+			for stack.outbound.len() != 0 {
+				entry, ok := stack.outbound.tryDequeue()
+				if !ok {
+					break
+				}
+				fragment := consumeTestPacket(&stack.outbound, entry)
+				fragments++
+				// Destination Options, Routing, Fragment, ICMP is the canonical
+				// result after replacing the noncanonical atomic header.
+				if fragment[6] != 60 || fragment[40] != 43 || fragment[48] != 44 || fragment[56] != protocolICMPv6 || binary.BigEndian.Uint32(fragment[60:64]) != test.identification {
+					t.Fatalf("refragmented IPv6 chain = %x", fragment[:64])
+				}
+				if completed := stack.reassemblePacket(fragment, time.Now()); completed != nil {
+					reassembled = completed
+				}
+			}
+			if fragments < 2 || len(reassembled) == 0 {
+				t.Fatalf("atomic refragmentation produced %d fragments and %d reassembled bytes", fragments, len(reassembled))
+			}
+			parsed, ok := parseIPPacket(reassembled)
+			if !ok || !bytes.Equal(parsed.payload[8:], payload) || transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0 {
+				t.Fatalf("reassembled atomic ReplyIPPacket = %x", reassembled)
+			}
+		})
+	}
+}
+
+func TestICMPForwarderReplyIPPacketIPv6StaticValidation(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::162")
+	remote := netip.MustParseAddr("2001:db8::163")
+	target := netip.MustParseAddr("2001:db8:1::162")
+	stack := newForwarderTestStack(t, local, true)
+	result := make(chan error, 1)
+	forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+		oversizedError := makeForwarderICMPErrorPacket(target, remote, make([]byte, ipv6MinimumMTU-47))
+		if replyErr := request.ReplyIPPacket(oversizedError); !errors.Is(replyErr, syscall.EMSGSIZE) {
+			result <- replyErr
+			return
+		}
+		duplicate := makeForwarderICMPEchoReplyPacket(target, remote, nil)
+		duplicate = prependIPv6AtomicFragment(prependIPv6AtomicFragment(duplicate, 1), 2)
+		if replyErr := request.ReplyIPPacket(duplicate); !errors.Is(replyErr, syscall.EINVAL) {
+			result <- replyErr
+			return
+		}
+		loopback := makeForwarderICMPEchoReplyPacket(netip.IPv6Loopback(), remote, nil)
+		if replyErr := request.ReplyIPPacket(loopback); replyErr != nil {
+			result <- replyErr
+			return
+		}
+		result <- request.Drop()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	request := []byte{128, 0, 0, 0, 1, 2, 3, 4}
+	binary.BigEndian.PutUint16(request[2:4], transportChecksum(remote, target, protocolICMPv6, request))
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv6, request, 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-result; err != nil {
+		t.Fatal(err)
+	}
+	response := readForwarderTestPacket(t, stack)
+	parsed, ok := parseIPPacket(response)
+	if !ok || parsed.source != netip.IPv6Loopback() || parsed.target != remote {
+		t.Fatalf("IPv6 loopback-source ReplyIPPacket output = %x", response)
+	}
+	if info := forwarder.Info(); info.Replies != 1 || info.ReplyErrors != 2 || info.Dropped != 1 {
+		t.Fatalf("IPv6 static ReplyIPPacket diagnostics = %+v", info)
+	}
+}
+
+func TestICMPForwarderReplyRejectsOversizedIPv6Error(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::172")
+	remote := netip.MustParseAddr("2001:db8::173")
+	target := netip.MustParseAddr("2001:db8:1::172")
+	for _, detached := range []bool{false, true} {
+		name := "callback"
+		if detached {
+			name = "detached"
+		}
+		t.Run(name, func(t *testing.T) {
+			stack := newForwarderTestStack(t, local, true)
+			result := make(chan error, 1)
+			forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+				oversized := make([]byte, ipv6MinimumMTU-39)
+				oversized[0] = 1
+				if !detached {
+					if replyErr := request.Reply(oversized); !errors.Is(replyErr, syscall.EMSGSIZE) {
+						result <- replyErr
+						return
+					}
+					result <- request.Drop()
+					return
+				}
+				responder, detachErr := request.Detach()
+				if detachErr != nil {
+					result <- detachErr
+					return
+				}
+				if replyErr := responder.Reply(oversized); !errors.Is(replyErr, syscall.EMSGSIZE) {
+					result <- replyErr
+					return
+				}
+				result <- responder.Drop()
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			request := []byte{128, 0, 0, 0, 1, 2, 3, 4}
+			binary.BigEndian.PutUint16(request[2:4], transportChecksum(remote, target, protocolICMPv6, request))
+			if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv6, request, 1, true)); err != nil {
+				t.Fatal(err)
+			}
+			if err = <-result; err != nil {
+				t.Fatal(err)
+			}
+			if info := forwarder.Info(); info.Replies != 0 || info.ReplyErrors != 1 || info.Dropped != 1 {
+				t.Fatalf("oversized ICMPv6 error diagnostics = %+v", info)
+			}
+		})
+	}
+}
+
+func TestICMPForwarderReplyIPPacketDFAndAtomicQueue(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.158")
+	remote := netip.MustParseAddr("192.0.2.159")
+	target := netip.MustParseAddr("198.51.100.158")
+	for _, test := range []struct {
+		name string
+		fill bool
+		want error
+	}{
+		{"DF", false, syscall.EMSGSIZE},
+		{"queue", true, ErrResourceLimit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack := newForwarderTestStack(t, local, true)
+			if test.fill {
+				fillTestPacketQueue(t, &stack.outbound, []byte{0})
+				entry, ok := stack.outbound.tryDequeue()
+				if !ok {
+					t.Fatal("filled queue could not release one slot")
+				}
+				stack.outbound.release(entry)
+			}
+			before := stack.outbound.len()
+			result := make(chan error, 1)
+			forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+				reply := makeForwarderICMPErrorPacket(target, remote, bytes.Repeat([]byte{0x6b}, 2500))
+				if !test.fill {
+					binary.BigEndian.PutUint16(reply[6:8], 0x4000)
+				}
+				result <- request.ReplyIPPacket(reply)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			request := []byte{13, 0, 0, 0, 1, 2, 3, 4}
+			binary.BigEndian.PutUint16(request[2:4], checksum(request))
+			if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, request, 1, true)); err != nil {
+				t.Fatal(err)
+			}
+			if err = <-result; !errors.Is(err, test.want) {
+				t.Fatalf("ReplyIPPacket = %v, want %v", err, test.want)
+			}
+			if got := stack.outbound.len(); got != before {
+				t.Fatalf("failed ReplyIPPacket changed queue length %d -> %d", before, got)
+			}
+			if info := forwarder.Info(); info.Replies != 0 || info.ReplyErrors != 1 || info.Dropped != 0 {
+				t.Fatalf("dynamic ReplyIPPacket failure diagnostics = %+v", info)
+			}
+		})
+	}
+}
+
+func FuzzICMPForwarderReplyIPPacket(f *testing.F) {
+	v4Source := netip.MustParseAddr("198.51.100.190")
+	v4Target := netip.MustParseAddr("192.0.2.190")
+	v6Source := netip.MustParseAddr("2001:db8:1::190")
+	v6Target := netip.MustParseAddr("2001:db8::190")
+	f.Add(makeForwarderICMPEchoReplyPacket(v4Source, v4Target, []byte("IPv4")), false)
+	f.Add(makeForwarderICMPEchoReplyPacket(v6Source, v6Target, []byte("IPv6")), true)
+	f.Add(prependIPv6AtomicFragment(makeForwarderICMPEchoReplyPacket(v6Source, v6Target, nil), 190), true)
+	f.Fuzz(func(t *testing.T, input []byte, ipv6 bool) {
+		if len(input) > 65575 {
+			input = input[:65575]
+		}
+		original := append([]byte(nil), input...)
+		destination := v4Target
+		protocol := byte(protocolICMPv4)
+		if ipv6 {
+			destination = v6Target
+			protocol = protocolICMPv6
+		}
+		reply, err := prepareICMPForwarderIPPacket(input, destination)
+		if !bytes.Equal(input, original) {
+			t.Fatal("ReplyIPPacket validation modified caller storage")
+		}
+		if err != nil {
+			return
+		}
+		parsed, ok := parseIPPacket(reply.packet)
+		if !ok || parsed.parameterError || parsed.target != destination || parsed.protocol != protocol || len(parsed.payload) < 8 {
+			t.Fatalf("accepted ReplyIPPacket is not parseable: %+v, valid=%t", parsed, ok)
+		}
+		if parsed.source.Is4() {
+			if checksum(parsed.payload) != 0 || checksum(reply.packet[:int(reply.packet[0]&0x0f)*4]) != 0 {
+				t.Fatal("accepted IPv4 ReplyIPPacket has an invalid checksum")
+			}
+		} else if transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0 {
+			t.Fatal("accepted IPv6 ReplyIPPacket has an invalid checksum")
+		}
+	})
+}
+
+func TestForwarderFailedRequestReplyAllowsTerminalAction(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.168")
+	remote := netip.MustParseAddr("192.0.2.169")
+	target := netip.MustParseAddr("198.51.100.168")
+	for _, test := range []struct {
+		name     string
+		register func(*Stack, chan<- error) (interface{ Close() error }, error)
+		packet   []byte
+	}{
+		{
+			name: "UDP",
+			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
+				return NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+					if _, err := request.Reply(make([]byte, 65508)); !errors.Is(err, syscall.EMSGSIZE) {
+						result <- err
+						return
+					}
+					result <- request.Drop()
+				})
+			},
+			packet: buildTestUDP(remote, target, 55168, 53, []byte("request")),
+		},
+		{
+			name: "IP",
+			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
+				return NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+					if err := request.Reply(make([]byte, 65516)); !errors.Is(err, syscall.EMSGSIZE) {
+						result <- err
+						return
+					}
+					result <- request.Drop()
+				})
+			},
+			packet: buildIPPacket(remote, target, 99, []byte("request"), 1, true),
+		},
+		{
+			name: "ICMP",
+			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
+				return NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+					if err := request.Reply(make([]byte, 65516)); !errors.Is(err, syscall.EMSGSIZE) {
+						result <- err
+						return
+					}
+					result <- request.Drop()
+				})
+			},
+			packet: func() []byte {
+				icmp := []byte{13, 0, 0, 0, 1, 2, 3, 4}
+				binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+				return buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)
+			}(),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack := newForwarderTestStack(t, local, true)
+			result := make(chan error, 1)
+			forwarder, err := test.register(stack, result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			if err = writeTestPacket(stack, test.packet); err != nil {
+				t.Fatal(err)
+			}
+			if err = <-result; err != nil {
+				t.Fatal(err)
+			}
+			type informer interface{ Info() ForwarderInfo }
+			info := forwarder.(informer).Info()
+			if info.Replies != 0 || info.ReplyErrors != 1 || info.Dropped != 1 {
+				t.Fatalf("oversized request Reply diagnostics = %+v", info)
+			}
+		})
+	}
+}
+
+func TestForwarderFailedResponderReplyAllowsTerminalAction(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.170")
+	remote := netip.MustParseAddr("192.0.2.171")
+	target := netip.MustParseAddr("198.51.100.170")
+	type detachedReply struct {
+		reply func() error
+		drop  func() error
+	}
+	for _, test := range []struct {
+		name     string
+		register func(*Stack, chan<- detachedReply) (interface {
+			Close() error
+			Info() ForwarderInfo
+		}, error)
+		packet []byte
+	}{
+		{
+			name: "UDP",
+			register: func(stack *Stack, result chan<- detachedReply) (interface {
+				Close() error
+				Info() ForwarderInfo
+			}, error) {
+				return NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+					responder, err := request.Detach()
+					if err != nil {
+						t.Errorf("Detach UDP: %v", err)
+						return
+					}
+					result <- detachedReply{
+						reply: func() error { _, err = responder.Reply(make([]byte, 65508)); return err },
+						drop:  responder.Drop,
+					}
+				})
+			},
+			packet: buildTestUDP(remote, target, 55170, 53, []byte("request")),
+		},
+		{
+			name: "IP",
+			register: func(stack *Stack, result chan<- detachedReply) (interface {
+				Close() error
+				Info() ForwarderInfo
+			}, error) {
+				return NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+					responder, err := request.Detach()
+					if err != nil {
+						t.Errorf("Detach IP: %v", err)
+						return
+					}
+					result <- detachedReply{
+						reply: func() error { return responder.Reply(make([]byte, 65516)) },
+						drop:  responder.Drop,
+					}
+				})
+			},
+			packet: buildIPPacket(remote, target, 99, []byte("request"), 1, true),
+		},
+		{
+			name: "ICMP",
+			register: func(stack *Stack, result chan<- detachedReply) (interface {
+				Close() error
+				Info() ForwarderInfo
+			}, error) {
+				return NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+					responder, err := request.Detach()
+					if err != nil {
+						t.Errorf("Detach ICMP: %v", err)
+						return
+					}
+					result <- detachedReply{
+						reply: func() error { return responder.Reply(make([]byte, 65516)) },
+						drop:  responder.Drop,
+					}
+				})
+			},
+			packet: func() []byte {
+				icmp := []byte{13, 0, 0, 0, 1, 2, 3, 4}
+				binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+				return buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)
+			}(),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack := newForwarderTestStack(t, local, true)
+			result := make(chan detachedReply, 1)
+			forwarder, err := test.register(stack, result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			if err = writeTestPacket(stack, test.packet); err != nil {
+				t.Fatal(err)
+			}
+			responder := <-result
+			if err = responder.reply(); !errors.Is(err, syscall.EMSGSIZE) {
+				t.Fatalf("oversized responder Reply = %v", err)
+			}
+			if err = responder.drop(); err != nil {
+				t.Fatalf("Drop after oversized responder Reply = %v", err)
+			}
+			if info := forwarder.Info(); info.Replies != 0 || info.ReplyErrors != 1 || info.Dropped != 1 {
+				t.Fatalf("oversized responder Reply diagnostics = %+v", info)
+			}
+		})
 	}
 }
 
@@ -1760,6 +3258,45 @@ func TestICMPForwarderDetachedTerminalActions(t *testing.T) {
 	}
 }
 
+func TestICMPForwarderDetachedRejectUsesIndependentQuote(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.164")
+	remote := netip.MustParseAddr("192.0.2.165")
+	target := netip.MustParseAddr("198.51.100.164")
+	stack := newForwarderTestStack(t, local, true)
+	detached := make(chan *ICMPForwarderResponder, 1)
+	forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+		responder, detachErr := request.Detach()
+		if detachErr != nil {
+			t.Errorf("Detach ICMP: %v", detachErr)
+			return
+		}
+		detached <- responder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	icmp := []byte{8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8}
+	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+	requestPacket := buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)
+	wantQuote := append([]byte(nil), requestPacket[:28]...)
+	if err = writeTestPacket(stack, requestPacket); err != nil {
+		t.Fatal(err)
+	}
+	responder := <-detached
+	for index := range responder.IPPacket() {
+		responder.IPPacket()[index] = 0xa5
+	}
+	if err = responder.Reject(); err != nil {
+		t.Fatal(err)
+	}
+	response := readForwarderTestPacket(t, stack)
+	parsed, ok := parseIPPacket(response)
+	if !ok || parsed.protocol != protocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 13 || checksum(parsed.payload) != 0 || !bytes.Equal(parsed.payload[8:], wantQuote) {
+		t.Fatalf("detached rejection did not preserve its independent quote: %x", response)
+	}
+}
+
 func TestUDPForwarderDetachedReplyCanRetry(t *testing.T) {
 	owned := netip.MustParseAddr("192.0.2.132")
 	remote := netip.MustParseAddr("192.0.2.133")
@@ -1785,9 +3322,6 @@ func TestUDPForwarderDetachedReplyCanRetry(t *testing.T) {
 	if _, err = responder.Reply([]byte("answer")); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("full-queue detached UDP Reply = %v", err)
 	}
-	if err = responder.Drop(); !errors.Is(err, ErrForwarderReplyActive) {
-		t.Fatalf("Drop active detached UDP responder = %v", err)
-	}
 	for {
 		entry, ok := stack.outbound.tryDequeue()
 		if !ok {
@@ -1803,10 +3337,13 @@ func TestUDPForwarderDetachedReplyCanRetry(t *testing.T) {
 	if !ok || string(parsed.payload[udpHeaderSize:]) != "answer" {
 		t.Fatalf("retried detached UDP response = %x", response)
 	}
-	if err = responder.Close(); err != nil {
-		t.Fatal(err)
+	if err = responder.Drop(); err != nil {
+		t.Fatalf("Drop detached UDP responder after retry = %v", err)
 	}
-	if info := forwarder.Info(); info.Replies != 1 || info.ReplyErrors != 1 {
+	if _, err = responder.Reply([]byte("closed")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Reply after detached UDP Drop = %v", err)
+	}
+	if info := forwarder.Info(); info.Replies != 1 || info.ReplyErrors != 1 || info.Dropped != 1 {
 		t.Fatalf("retried detached UDP forwarder info = %+v", info)
 	}
 }
@@ -1820,7 +3357,10 @@ func TestUDPForwarderRequestReplyCanRetry(t *testing.T) {
 	results := make(chan [3]error, 1)
 	forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
 		_, firstErr := request.Reply([]byte("answer"))
-		_, acceptErr := request.Accept()
+		connection, acceptErr := request.Accept()
+		if connection != nil {
+			_ = connection.Close()
+		}
 		for {
 			entry, ok := stack.outbound.tryDequeue()
 			if !ok {
@@ -1841,18 +3381,13 @@ func TestUDPForwarderRequestReplyCanRetry(t *testing.T) {
 	if !errors.Is(result[0], ErrResourceLimit) {
 		t.Fatalf("full-queue request Reply = %v", result[0])
 	}
-	if !errors.Is(result[1], ErrForwarderReplyActive) {
-		t.Fatalf("Accept request in reply mode = %v", result[1])
+	if result[1] != nil {
+		t.Fatalf("Accept request after failed Reply = %v", result[1])
 	}
-	if result[2] != nil {
-		t.Fatalf("retry request Reply = %v", result[2])
+	if !errors.Is(result[2], ErrForwarderRequestCompleted) {
+		t.Fatalf("Reply request after Accept = %v", result[2])
 	}
-	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
-	if !ok || string(parsed.payload[udpHeaderSize:]) != "answer" {
-		t.Fatalf("retried request UDP response = %x", response)
-	}
-	if info := forwarder.Info(); info.Replies != 1 || info.ReplyErrors != 1 || info.Dropped != 0 {
+	if info := forwarder.Info(); info.Accepted != 1 || info.Replies != 0 || info.ReplyErrors != 1 || info.Dropped != 0 {
 		t.Fatalf("retried request UDP forwarder info = %+v", info)
 	}
 }
@@ -1941,16 +3476,22 @@ func TestDetachedForwarderResponderRevalidatesLifecycle(t *testing.T) {
 		default:
 			t.Fatal("UDP responder Done remained open after forwarder Close")
 		}
+		if _, err = responder.ReplyFrom([]byte("invalid"), netip.AddrPort{}); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("invalid detached UDP ReplyFrom after forwarder Close = %v", err)
+		}
 		if _, err = responder.Reply([]byte("late")); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("detached UDP Reply after Close = %v", err)
 		}
-		if err = responder.Close(); err != nil {
-			t.Fatal(err)
+		if err = responder.Drop(); err != nil {
+			t.Fatalf("Drop detached UDP responder after failed replies = %v", err)
+		}
+		if err = responder.Close(); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Close dropped detached UDP responder = %v", err)
 		}
 		if err = responder.Drop(); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("Drop closed detached UDP responder = %v", err)
 		}
-		if info := forwarder.Info(); !info.Closed || info.Pending != 0 || info.Dropped != 0 || info.ReplyErrors != 1 {
+		if info := forwarder.Info(); !info.Closed || info.Pending != 0 || info.Dropped != 1 || info.ReplyErrors != 2 {
 			t.Fatalf("closed detached UDP forwarder info = %+v", info)
 		}
 	})
@@ -2090,6 +3631,87 @@ func TestDetachedForwarderResponderConcurrentReplyAndClose(t *testing.T) {
 	}
 	if info := forwarder.Info(); info.Replies != uint64(succeeded) {
 		t.Fatalf("concurrent Reply forwarder info = %+v, succeeded=%d", info, succeeded)
+	}
+}
+
+func TestICMPForwarderResponderConcurrentReplyIPPacketAndClose(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.166")
+	remote := netip.MustParseAddr("192.0.2.167")
+	target := netip.MustParseAddr("198.51.100.166")
+	stack := newForwarderTestStack(t, local, true)
+	detached := make(chan *ICMPForwarderResponder, 1)
+	forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+		responder, detachErr := request.Detach()
+		if detachErr != nil {
+			t.Errorf("Detach ICMP: %v", detachErr)
+			return
+		}
+		detached <- responder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	request := []byte{8, 0, 0, 0, 1, 2, 3, 4}
+	binary.BigEndian.PutUint16(request[2:4], checksum(request))
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, request, 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	responder := <-detached
+	reply := makeForwarderICMPEchoReplyPacket(target, remote, []byte("concurrent"))
+	const attempts = 32
+	start := make(chan struct{})
+	results := make(chan error, attempts)
+	for index := 0; index < attempts; index++ {
+		go func() {
+			<-start
+			results <- responder.ReplyIPPacket(reply)
+		}()
+	}
+	closed := make(chan error, 1)
+	go func() {
+		<-start
+		closed <- responder.Close()
+	}()
+	close(start)
+	if err = <-closed; err != nil {
+		t.Fatal(err)
+	}
+	succeeded := 0
+	for index := 0; index < attempts; index++ {
+		replyErr := <-results
+		if replyErr == nil {
+			succeeded++
+		} else if !errors.Is(replyErr, net.ErrClosed) {
+			t.Fatalf("concurrent ReplyIPPacket = %v", replyErr)
+		}
+	}
+	if err = responder.ReplyIPPacket(reply); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("ReplyIPPacket after Close = %v", err)
+	}
+	queued := 0
+	for stack.outbound.len() != 0 {
+		entry, ok := stack.outbound.tryDequeue()
+		if !ok {
+			break
+		}
+		packet := consumeTestPacket(&stack.outbound, entry)
+		parsed, valid := parseIPPacket(packet)
+		if !valid || parsed.source != target || parsed.target != remote || string(parsed.payload[8:]) != "concurrent" {
+			t.Fatalf("concurrent ReplyIPPacket output = %x", packet)
+		}
+		queued++
+	}
+	if queued != succeeded {
+		t.Fatalf("concurrent ReplyIPPacket queued %d packets for %d successes", queued, succeeded)
+	}
+	info := forwarder.Info()
+	wantDropped := uint64(0)
+	if succeeded == 0 {
+		wantDropped = 1
+	}
+	if info.Replies != uint64(succeeded) || info.ReplyErrors != 0 || info.Dropped != wantDropped {
+		t.Fatalf("concurrent ReplyIPPacket diagnostics = %+v, succeeded=%d", info, succeeded)
 	}
 }
 
@@ -2661,13 +4283,39 @@ func TestICMPReplyEchoLifecycleAndSnapshotValidation(t *testing.T) {
 	if err := responder.ReplyEcho(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("ReplyEcho after responder closure = %v", err)
 	}
-	responder.lifecycle.state.Store(uint32(forwarderResponderPending))
-	responder.message.Payload[0] = 8
+
+	local := netip.MustParseAddr("192.0.2.90")
+	remote := netip.MustParseAddr("192.0.2.91")
+	target := netip.MustParseAddr("198.51.100.90")
+	stack := newForwarderTestStack(t, local, true)
+	detached := make(chan *ICMPForwarderResponder, 1)
+	forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+		responder, detachErr := request.Detach()
+		if detachErr != nil {
+			t.Errorf("Detach ICMP: %v", detachErr)
+			return
+		}
+		detached <- responder
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	echo := []byte{8, 0, 0, 0, 0, 1, 0, 2}
+	binary.BigEndian.PutUint16(echo[2:4], checksum(echo))
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, echo, 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	responder = <-detached
+	responder.message.Payload[1] = 1
 	if responder.message.IsEchoRequest() {
 		t.Fatal("mutated detached message has inconsistent Echo metadata")
 	}
 	if err := responder.ReplyEcho(); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("ReplyEcho with inconsistent detached message = %v", err)
+	}
+	if err = responder.Drop(); err != nil {
+		t.Fatalf("Drop after invalid ReplyEcho = %v", err)
 	}
 }
 
@@ -2702,7 +4350,7 @@ func TestICMPForwarderRejectsShortReply(t *testing.T) {
 		stack.outbound.release(entry)
 		t.Fatal("short ICMP Reply emitted a packet")
 	}
-	if info := forwarder.Info(); info.Replies != 0 || info.ReplyErrors != 4 {
+	if info := forwarder.Info(); info.Replies != 0 || info.ReplyErrors != 4 || info.Dropped != 0 {
 		t.Fatalf("short ICMP Reply diagnostics = %+v", info)
 	}
 }
@@ -2746,6 +4394,51 @@ func BenchmarkUDPForwarderReply(b *testing.B) {
 		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
 		if !ok {
 			b.Fatal("timed out waiting for UDP forwarder reply")
+		}
+		stack.outbound.release(entry)
+	}
+}
+
+func BenchmarkUDPForwarderReplyFrom(b *testing.B) {
+	local := netip.MustParseAddr("192.0.2.204")
+	remote := netip.MustParseAddr("192.0.2.205")
+	target := netip.MustParseAddr("198.51.100.204")
+	selected := netip.MustParseAddrPort("203.0.113.204:5353")
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, Promiscuous: true, MTU: 1400,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		b.Fatal(err)
+	}
+	reply := []byte("benchmark answer")
+	var replyErr error
+	forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+		_, replyErr = request.ReplyFrom(reply, selected)
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() {
+		_ = forwarder.Close()
+		_ = stack.Close()
+	})
+	packet := buildTestUDP(remote, target, 53000, 53, []byte("benchmark query"))
+	b.ReportAllocs()
+	b.SetBytes(int64(len(packet) + len(reply)))
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		if _, err = stack.Write([][]byte{packet}, 0); err != nil {
+			b.Fatal(err)
+		}
+		if replyErr != nil {
+			b.Fatal(replyErr)
+		}
+		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !ok {
+			b.Fatal("timed out waiting for UDP forwarder ReplyFrom")
 		}
 		stack.outbound.release(entry)
 	}
@@ -2795,6 +4488,66 @@ func BenchmarkICMPForwarderReplyEcho(b *testing.B) {
 			b.Fatal("timed out waiting for ICMP forwarder reply")
 		}
 		stack.outbound.release(entry)
+	}
+}
+
+func BenchmarkICMPForwarderReplyIPPacket(b *testing.B) {
+	for _, size := range []int{256, 4096} {
+		b.Run(fmt.Sprintf("IPv4/%d", size), func(b *testing.B) {
+			local := netip.MustParseAddr("192.0.2.206")
+			remote := netip.MustParseAddr("192.0.2.207")
+			target := netip.MustParseAddr("198.51.100.206")
+			selected := netip.MustParseAddr("203.0.113.206")
+			stack, err := New(Config{
+				LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, Promiscuous: true, MTU: 1400,
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				b.Fatal(err)
+			}
+			icmp := make([]byte, size-20)
+			icmp[0] = 0
+			binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+			reply := buildIPPacket(selected, remote, protocolICMPv4, icmp, 1, false)
+			requestICMP := []byte{8, 0, 0, 0, 0, 1, 0, 1}
+			binary.BigEndian.PutUint16(requestICMP[2:4], checksum(requestICMP))
+			packet := buildIPPacket(remote, target, protocolICMPv4, requestICMP, 1, true)
+			var replyErr error
+			forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+				replyErr = request.ReplyIPPacket(reply)
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() {
+				_ = forwarder.Close()
+				_ = stack.Close()
+			})
+			fragments := 1
+			if size > 1400 {
+				fragments = (size - 20 + 1375) / 1376
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(len(packet) + len(reply)))
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if _, err = stack.Write([][]byte{packet}, 0); err != nil {
+					b.Fatal(err)
+				}
+				if replyErr != nil {
+					b.Fatal(replyErr)
+				}
+				for fragment := 0; fragment < fragments; fragment++ {
+					entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+					if !ok {
+						b.Fatal("timed out waiting for ICMP forwarder ReplyIPPacket")
+					}
+					stack.outbound.release(entry)
+				}
+			}
+		})
 	}
 }
 

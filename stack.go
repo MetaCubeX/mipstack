@@ -85,11 +85,8 @@ var (
 	ErrResourceLimit = errors.New("mipstack: resource limit reached")
 	// ErrForwarderRequestCompleted reports an action on a forwarder request that
 	// was already accepted, detached, dropped, rejected, invalidated, or whose
-	// callback-scoped reply lifetime has ended.
+	// callback lifetime has ended.
 	ErrForwarderRequestCompleted = errors.New("mipstack: forwarder request is already completed")
-	// ErrForwarderReplyActive reports an action that conflicts with reply mode
-	// after a forwarder request or responder has begun replying.
-	ErrForwarderReplyActive = errors.New("mipstack: forwarder reply mode is active")
 )
 
 // TCPSocketDefaults configures policies inherited by newly created TCP
@@ -1170,6 +1167,7 @@ type packetQueue struct {
 	buffers   chan []byte
 	epoch     time.Time
 	scheduler *fairPacketScheduler
+	batchMu   sync.Mutex
 	closed    atomic.Bool
 }
 
@@ -1468,11 +1466,14 @@ func (q *packetQueue) release(entry packetQueueEntry) {
 }
 
 // close rejects future publications and discards all currently published
-// packets and reusable buffers. Publishers racing closure discard themselves
-// after publication, so close never waits for them.
+// packets and reusable buffers. batchMu lets a previously admitted multi-packet
+// datagram finish publication before closure; ordinary single-packet publishers
+// racing closure discard themselves without making close wait.
 func (q *packetQueue) close() {
+	q.batchMu.Lock()
 	q.closed.Store(true)
 	q.discard()
+	q.batchMu.Unlock()
 }
 
 // discard releases every packet and reusable buffer currently owned by q.
@@ -2723,6 +2724,8 @@ func (s *Stack) tryWritePackets(packets [][]byte) error {
 		}
 		slots[reserved] = slot
 	}
+	queue.batchMu.Lock()
+	defer queue.batchMu.Unlock()
 	select {
 	case <-s.closeCh:
 		for _, slot := range slots {
@@ -2730,6 +2733,12 @@ func (s *Stack) tryWritePackets(packets [][]byte) error {
 		}
 		return ErrClosed
 	default:
+	}
+	if queue.closed.Load() {
+		for _, slot := range slots {
+			queue.releaseReserved(slot)
+		}
+		return ErrClosed
 	}
 	for index, packet := range packets {
 		if !queue.enqueueReservedPacket(slots[index], packet, false) {

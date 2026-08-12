@@ -535,6 +535,51 @@ func TestPacketQueueConcurrentWritersMakeBoundedProgress(t *testing.T) {
 	}
 }
 
+func TestTryWritePacketsCloseBeforeBatchPublication(t *testing.T) {
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/24")},
+		MTU:            1400,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	packets := [][]byte{
+		buildIPPacket(netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("198.51.100.1"), 253, []byte{1}, 1, true),
+		buildIPPacket(netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("198.51.100.1"), 253, []byte{2}, 2, true),
+	}
+	stack.outbound.batchMu.Lock()
+	writeResult := make(chan error, 1)
+	go func() { writeResult <- stack.tryWritePackets(packets) }()
+	wantFree := cap(stack.outbound.free) - len(packets)
+	waitFor(t, time.Second, func() bool { return len(stack.outbound.free) == wantFree })
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- stack.Close() }()
+	select {
+	case <-stack.closeCh:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not publish stack closure")
+	}
+	stack.outbound.batchMu.Unlock()
+
+	if err = <-writeResult; !errors.Is(err, ErrClosed) {
+		t.Fatalf("tryWritePackets during Close = %v, want ErrClosed", err)
+	}
+	if err = <-closeResult; err != nil {
+		t.Fatal(err)
+	}
+	if got := stack.outbound.len(); got != 0 {
+		t.Fatalf("closed batch exposed %d packets", got)
+	}
+	if got, want := len(stack.outbound.free), cap(stack.outbound.free); got != want {
+		t.Fatalf("closed batch free slots = %d, want %d", got, want)
+	}
+}
+
 func TestDatagramQueueRetainsOnlySmallBacking(t *testing.T) {
 	var queue datagramQueue[int]
 	for value := 0; value < datagramQueueRetain; value++ {

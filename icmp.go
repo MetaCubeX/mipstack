@@ -33,6 +33,133 @@ type ICMPError struct {
 	QuotedTargetPort uint16
 }
 
+// icmpForwarderIPPacket is one caller-owned, normalized header-included ICMP
+// reply. parsed and ipv6Fragment describe slices within packet.
+type icmpForwarderIPPacket struct {
+	packet       []byte
+	parsed       ipPacket
+	ipv4DF       bool
+	ipv6Fragment ipv6ForwarderFragmentPoint
+}
+
+// validateICMPForwarderReplyPayload applies the ICMP message and address-family
+// size limits. RFC 4443 requires an ICMPv6 error to fit the 1280-byte minimum
+// IPv6 MTU even when informational messages may use source fragmentation.
+func validateICMPForwarderReplyPayload(ipv6 bool, payload []byte) error {
+	if len(payload) < 8 {
+		return syscall.EINVAL
+	}
+	maximum := 65535
+	if !ipv6 {
+		maximum -= 20
+	}
+	if len(payload) > maximum {
+		return syscall.EMSGSIZE
+	}
+	if ipv6 && payload[0] < 128 && len(payload) > ipv6MinimumMTU-40 {
+		return syscall.EMSGSIZE
+	}
+	return nil
+}
+
+// prepareICMPForwarderIPPacket validates and normalizes a restricted raw ICMP
+// reply without consulting mutable stack state. The input is copied before any
+// field is changed.
+func prepareICMPForwarderIPPacket(input []byte, destination netip.Addr) (icmpForwarderIPPacket, error) {
+	destination = destination.Unmap()
+	if !destination.IsValid() || len(input) == 0 {
+		return icmpForwarderIPPacket{}, syscall.EINVAL
+	}
+	switch input[0] >> 4 {
+	case 4:
+		if len(input) > 65535 {
+			return icmpForwarderIPPacket{}, syscall.EMSGSIZE
+		}
+	case 6:
+		if len(input)-40 > 65535 {
+			return icmpForwarderIPPacket{}, syscall.EMSGSIZE
+		}
+	default:
+		return icmpForwarderIPPacket{}, syscall.EINVAL
+	}
+	packet := append([]byte(nil), input...)
+	result := icmpForwarderIPPacket{packet: packet}
+	switch packet[0] >> 4 {
+	case 4:
+		if destination.Is6() || len(packet) < 28 || len(packet) > 65535 {
+			return icmpForwarderIPPacket{}, syscall.EINVAL
+		}
+		headerSize := int(packet[0]&0x0f) * 4
+		field := binary.BigEndian.Uint16(packet[6:8])
+		if headerSize < 20 || headerSize > len(packet)-8 || field&0xbfff != 0 || packet[9] != protocolICMPv4 {
+			return icmpForwarderIPPacket{}, syscall.EINVAL
+		}
+		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+		packet[10], packet[11] = 0, 0
+		binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:headerSize]))
+		result.ipv4DF = field&0x4000 != 0
+	case 6:
+		if destination.Is4() || len(packet) < 48 || len(packet)-40 > 65535 {
+			return icmpForwarderIPPacket{}, syscall.EINVAL
+		}
+		binary.BigEndian.PutUint16(packet[4:6], uint16(len(packet)-40))
+		point, ok := inspectIPv6ForwarderFragmentPoint(packet)
+		if !ok {
+			return icmpForwarderIPPacket{}, syscall.EINVAL
+		}
+		result.ipv6Fragment = point
+		if point.atomicOffset >= 0 {
+			// Reserved bits are ignored by receivers but must be zero in output.
+			packet[point.atomicOffset+1] = 0
+			binary.BigEndian.PutUint16(packet[point.atomicOffset+2:point.atomicOffset+4], 0)
+		}
+	default:
+		return icmpForwarderIPPacket{}, syscall.EINVAL
+	}
+	parsed, ok := parseIPPacket(packet)
+	if !ok || parsed.parameterError || len(parsed.payload) < 8 || parsed.target != destination {
+		return icmpForwarderIPPacket{}, syscall.EINVAL
+	}
+	if parsed.source.Is4() {
+		if parsed.protocol != protocolICMPv4 {
+			return icmpForwarderIPPacket{}, syscall.EINVAL
+		}
+		parsed.payload[2], parsed.payload[3] = 0, 0
+		binary.BigEndian.PutUint16(parsed.payload[2:4], checksum(parsed.payload))
+	} else {
+		if parsed.protocol != protocolICMPv6 {
+			return icmpForwarderIPPacket{}, syscall.EINVAL
+		}
+		// RFC 4443 requires every ICMPv6 error to fit the 1280-byte minimum
+		// IPv6 MTU. Informational messages may still use source fragmentation.
+		if parsed.payload[0] < 128 && len(packet) > ipv6MinimumMTU {
+			return icmpForwarderIPPacket{}, syscall.EMSGSIZE
+		}
+		parsed.payload[2], parsed.payload[3] = 0, 0
+		binary.BigEndian.PutUint16(parsed.payload[2:4], transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload))
+	}
+	result.parsed = parsed
+	return result, nil
+}
+
+// writeICMPForwarderIPPacket revalidates interception and return routing,
+// applies current PMTU state, and atomically enqueues the normalized
+// header-included packet or all of its fragments.
+func (s *Stack) writeICMPForwarderIPPacket(request ipPacket, reply icmpForwarderIPPacket) error {
+	state := s.network.Load()
+	if !state.acceptsInboundDestination(request.target) {
+		return syscall.EADDRNOTAVAIL
+	}
+	if _, routed := state.routeFor(reply.parsed.target); !routed {
+		return syscall.ENETUNREACH
+	}
+	packets, err := s.icmpForwarderIPPackets(reply, s.mtuFor(reply.parsed.target))
+	if err != nil {
+		return err
+	}
+	return s.tryWritePackets(packets)
+}
+
 // Error formats the remote ICMP failure.
 func (e ICMPError) Error() string {
 	if e.MTU != 0 {
@@ -224,8 +351,8 @@ func (s *Stack) writeICMPReply(packet ipPacket, payload []byte) error {
 // writeOwnedICMPReply repairs and emits a caller-owned payload that may be
 // modified in place. It avoids copying replies constructed inside the stack.
 func (s *Stack) writeOwnedICMPReply(packet ipPacket, reply []byte) error {
-	if len(reply) < 8 {
-		return syscall.EINVAL
+	if err := validateICMPForwarderReplyPayload(packet.source.Is6(), reply); err != nil {
+		return err
 	}
 	state := s.network.Load()
 	if _, routed := state.routeFor(packet.source); !routed {

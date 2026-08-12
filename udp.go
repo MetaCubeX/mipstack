@@ -455,15 +455,38 @@ func (f *UDPForwarder) listenUDP(request *UDPForwarderRequest) (*UDPConn, error)
 	return connection, nil
 }
 
-// replyUDP sends one reverse-flow response without retaining a registered
-// endpoint after the write completes.
-func (f *UDPForwarder) replyUDP(request *UDPForwarderRequest, payload []byte) (int, error) {
-	return f.replyUDPFlow(request.flow, payload)
+// validateUDPForwarderReply normalizes one caller-selected source and checks
+// only properties required to serialize a reverse-flow UDP datagram.
+func validateUDPForwarderReply(flow TransportFlow, payload []byte, source netip.AddrPort) (netip.AddrPort, error) {
+	address := source.Addr()
+	if !source.IsValid() {
+		return netip.AddrPort{}, syscall.EINVAL
+	}
+	address = address.WithZone("").Unmap()
+	if address.Is6() != flow.Source.Addr().Unmap().Is6() {
+		return netip.AddrPort{}, syscall.EINVAL
+	}
+	if err := validateUDPForwarderReplyPayload(address.Is6(), payload); err != nil {
+		return netip.AddrPort{}, err
+	}
+	return netip.AddrPortFrom(address, source.Port()), nil
 }
 
-// replyUDPFlow sends one reverse-flow response without retaining a registered
-// endpoint after the write completes.
-func (f *UDPForwarder) replyUDPFlow(flow TransportFlow, payload []byte) (int, error) {
+// validateUDPForwarderReplyPayload checks the address-family datagram limit.
+func validateUDPForwarderReplyPayload(ipv6 bool, payload []byte) error {
+	maximumPayload := 65535 - udpHeaderSize
+	if !ipv6 {
+		maximumPayload -= 20
+	}
+	if len(payload) > maximumPayload {
+		return syscall.EMSGSIZE
+	}
+	return nil
+}
+
+// replyUDPFlow sends one reverse-flow response from a validated caller-selected
+// source without retaining a registered endpoint after the write completes.
+func (f *UDPForwarder) replyUDPFlow(flow TransportFlow, payload []byte, source netip.AddrPort) (int, error) {
 	local, remote := flow.Destination, flow.Source
 	state := f.stack.network.Load()
 	if !state.acceptsInboundDestination(local.Addr()) {
@@ -472,19 +495,12 @@ func (f *UDPForwarder) replyUDPFlow(flow TransportFlow, payload []byte) (int, er
 	if _, routed := state.routeFor(remote.Addr()); !routed {
 		return 0, syscall.ENETUNREACH
 	}
-	maximumPayload := 65535 - udpHeaderSize
-	if local.Addr().Is4() {
-		maximumPayload -= 20
-	}
-	if len(payload) > maximumPayload {
-		return 0, syscall.EMSGSIZE
-	}
 	defaults := state.udpDefaults
 	options := ipPacketOptions{
 		hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
 		flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
 	}
-	if err := f.stack.tryWriteUDPDatagram(local.Addr(), remote.Addr(), local.Port(), remote.Port(), payload, options, defaults.PathMTUDiscovery); err != nil {
+	if err := f.stack.tryWriteUDPDatagram(source.Addr(), remote.Addr(), source.Port(), remote.Port(), payload, options, defaults.PathMTUDiscovery); err != nil {
 		return 0, err
 	}
 	return len(payload), nil

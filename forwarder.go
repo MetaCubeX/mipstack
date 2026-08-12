@@ -57,7 +57,7 @@ type TCPForwarderHandler func(*TCPForwarderRequest)
 // undecided, concurrent datagrams for the same four-tuple are dropped. The
 // handler must call Accept, Listen, Detach, Drop, Reject, or at least one Reply
 // before returning; returning without an action drops the datagram. Reply may
-// be repeated after it selects callback-scoped reply mode. Except for Detach,
+// be repeated and does not prevent a later terminal action. Except for Detach,
 // every action and Reply call must finish before the handler returns. The
 // request and its Payload must not be retained after that point, but a UDPConn
 // returned by Accept or Listen and a responder returned by Detach have
@@ -77,7 +77,7 @@ type IPForwarderHandler func(*IPForwarderRequest)
 // concurrent-call, and blocking rules are the same as UDPForwarderHandler.
 // The handler must call Detach, Drop, Reject, or at least one Reply before
 // returning; returning without an action drops the message. Reply may be
-// repeated after it selects callback-scoped reply mode. Except for Detach,
+// repeated and does not prevent a later terminal action. Except for Detach,
 // every action and Reply call must finish before the handler returns. The
 // request and Message.Payload must not be retained after that point, but a
 // responder returned by Detach has an independent lifetime.
@@ -102,7 +102,9 @@ type ForwarderInfo struct {
 	Accepted uint64
 	// Replies counts successfully queued request and responder replies.
 	Replies uint64
-	// ReplyErrors counts failed reply attempts after reply mode was selected.
+	// ReplyErrors counts argument, state, and output failures after a Reply call
+	// has entered its request or responder lifetime. Calls rejected because a
+	// terminal action already completed that lifetime are not output attempts.
 	ReplyErrors uint64
 	// Dropped counts explicit, implicit, invalidated, and capacity drops.
 	Dropped uint64
@@ -110,8 +112,8 @@ type ForwarderInfo struct {
 	Rejected uint64
 }
 
-// forwarderRequestState serializes the exactly-once action selected for a
-// request while allowing configuration and forwarder closure to invalidate it.
+// forwarderRequestState serializes the exactly-once terminal action selected
+// for a request while separately remembering whether a reply was attempted.
 type forwarderRequestState uint32
 
 const (
@@ -120,9 +122,9 @@ const (
 	// forwarderRequestClaimed is performing a terminal endpoint or ownership
 	// action.
 	forwarderRequestClaimed
-	// forwarderRequestReplying permits repeatable Reply calls until the
-	// synchronous handler returns.
-	forwarderRequestReplying
+	// forwarderRequestReplyStarted records that at least one Reply call began. It
+	// permits more replies and one later terminal action until the handler ends.
+	forwarderRequestReplyStarted
 	// forwarderRequestDetached transferred ownership to an asynchronous
 	// responder and prevents further use of the callback-scoped request.
 	forwarderRequestDetached
@@ -132,58 +134,41 @@ const (
 	forwarderRequestDropped
 	// forwarderRequestRejected selected an explicit protocol rejection.
 	forwarderRequestRejected
-	// forwarderRequestCompleted ended callback-scoped reply mode regardless of
-	// individual output results.
+	// forwarderRequestCompleted ended a callback that replied without selecting
+	// a later terminal action.
 	forwarderRequestCompleted
 )
 
-// forwarderResponderState separates a detached responder's repeatable output
-// lifetime from the callback-scoped request action that created it.
+// forwarderResponderState serializes a detached responder's terminal action
+// while retaining whether at least one Reply call began.
 type forwarderResponderState uint32
 
 const (
-	// forwarderResponderPending has not selected reply, rejection, or drop.
+	// forwarderResponderPending has not begun a reply or terminal action.
 	forwarderResponderPending forwarderResponderState = iota
-	// forwarderResponderActive permits repeatable and concurrent Reply calls.
-	forwarderResponderActive
+	// forwarderResponderReplyStarted records a reply attempt and permits more
+	// replies or one later terminal action.
+	forwarderResponderReplyStarted
 	// forwarderResponderClosed rejects every later action.
 	forwarderResponderClosed
 )
 
-// forwarderRequestActionError distinguishes active reply mode from a terminal
-// or invalidated callback-scoped request.
-func forwarderRequestActionError(state uint32) error {
-	if forwarderRequestState(state) == forwarderRequestReplying {
-		return ErrForwarderReplyActive
-	}
-	return ErrForwarderRequestCompleted
-}
-
-// forwarderResponderActionError distinguishes active reply mode from a closed
-// caller-owned responder.
-func forwarderResponderActionError(state uint32) error {
-	if forwarderResponderState(state) == forwarderResponderActive {
-		return ErrForwarderReplyActive
-	}
-	return net.ErrClosed
-}
-
-// forwarderResponderLifecycle owns the protocol-independent Pending, Active,
-// and Closed transitions of one caller-owned responder.
+// forwarderResponderLifecycle owns the protocol-independent pending,
+// reply-started, and closed transitions of one caller-owned responder.
 type forwarderResponderLifecycle struct {
 	state atomic.Uint32
 }
 
-// beginReply selects or continues repeatable reply mode.
+// beginReply records a reply attempt or permits another attempt before closure.
 func (l *forwarderResponderLifecycle) beginReply() error {
 	for {
 		switch forwarderResponderState(l.state.Load()) {
 		case forwarderResponderPending:
-			if !l.state.CompareAndSwap(uint32(forwarderResponderPending), uint32(forwarderResponderActive)) {
+			if !l.state.CompareAndSwap(uint32(forwarderResponderPending), uint32(forwarderResponderReplyStarted)) {
 				continue
 			}
 			return nil
-		case forwarderResponderActive:
+		case forwarderResponderReplyStarted:
 			return nil
 		default:
 			return net.ErrClosed
@@ -191,25 +176,29 @@ func (l *forwarderResponderLifecycle) beginReply() error {
 	}
 }
 
-// closePending selects a terminal action only before reply mode begins.
-func (l *forwarderResponderLifecycle) closePending() error {
-	if !l.state.CompareAndSwap(uint32(forwarderResponderPending), uint32(forwarderResponderClosed)) {
-		return forwarderResponderActionError(l.state.Load())
+// finish selects a terminal action before or after reply attempts.
+func (l *forwarderResponderLifecycle) finish() error {
+	for {
+		state := forwarderResponderState(l.state.Load())
+		if state == forwarderResponderClosed {
+			return net.ErrClosed
+		}
+		if l.state.CompareAndSwap(uint32(state), uint32(forwarderResponderClosed)) {
+			return nil
+		}
 	}
-	return nil
 }
 
-// close terminates either Pending or Active state and reports which one ended.
+// close terminates the responder and reports whether no reply began.
 func (l *forwarderResponderLifecycle) close() (pending bool, err error) {
 	for {
 		state := forwarderResponderState(l.state.Load())
 		if state == forwarderResponderClosed {
 			return false, net.ErrClosed
 		}
-		if !l.state.CompareAndSwap(uint32(state), uint32(forwarderResponderClosed)) {
-			continue
+		if l.state.CompareAndSwap(uint32(state), uint32(forwarderResponderClosed)) {
+			return state == forwarderResponderPending, nil
 		}
-		return state == forwarderResponderPending, nil
 	}
 }
 
@@ -267,8 +256,8 @@ type UDPForwarder struct {
 }
 
 // UDPForwarderRequest is one valid datagram that did not match an ordinary or
-// previously forwarded UDP endpoint. The handler may select one terminal
-// action or enter repeatable reply mode. Payload is valid only until the
+// previously forwarded UDP endpoint. The handler may reply repeatedly before
+// selecting at most one terminal action. Payload is valid only until the
 // handler returns; Accept and Listen offer a copy to the returned UDPConn's
 // capacity-bounded receive queue.
 type UDPForwarderRequest struct {
@@ -280,9 +269,9 @@ type UDPForwarderRequest struct {
 }
 
 // UDPForwarderResponder owns one detached datagram snapshot. It may outlive
-// the handler and permits repeatable Reply calls until Close. Reject and Drop
-// are available only before the first Reply begins. The caller owns its
-// lifetime, concurrency bound, and timeout; the forwarder does not retain it.
+// the handler and permits repeatable Reply calls until Reject, Drop, or Close.
+// The caller owns its lifetime, concurrency bound, and timeout; the forwarder
+// does not retain it.
 type UDPForwarderResponder struct {
 	forwarder *UDPForwarder
 	flow      TransportFlow
@@ -330,8 +319,8 @@ type IPForwarder struct {
 }
 
 // IPForwarderRequest is one upper-layer IP payload not consumed by a raw IP
-// socket or built-in protocol. The handler may select one terminal action or
-// enter repeatable reply mode.
+// socket or built-in protocol. The handler may reply repeatedly before
+// selecting at most one terminal action.
 type IPForwarderRequest struct {
 	forwarder *IPForwarder
 	packet    ipPacket
@@ -339,8 +328,8 @@ type IPForwarderRequest struct {
 }
 
 // IPForwarderResponder owns one detached IP message snapshot. It may outlive
-// the handler and permits repeatable Reply calls until Close. The caller owns
-// its lifetime, concurrency bound, and timeout.
+// the handler and permits repeatable Reply calls until Drop, Reject, or Close.
+// The caller owns its lifetime, concurrency bound, and timeout.
 type IPForwarderResponder struct {
 	forwarder *IPForwarder
 	message   IPMessage
@@ -403,8 +392,8 @@ type ICMPForwarder struct {
 }
 
 // ICMPForwarderRequest is one checksum-valid ICMP message not consumed by
-// built-in protocol handling. The handler may select one terminal action or
-// enter repeatable reply mode.
+// built-in protocol handling. The handler may reply repeatedly before
+// selecting at most one terminal action.
 type ICMPForwarderRequest struct {
 	forwarder *ICMPForwarder
 	packet    ipPacket
@@ -412,15 +401,16 @@ type ICMPForwarderRequest struct {
 }
 
 // ICMPForwarderResponder owns one detached message snapshot. It may outlive
-// the handler and permits repeatable Reply calls until Close. Reject and Drop
-// are available only before the first Reply begins. The caller owns its
-// lifetime, concurrency bound, and timeout; the forwarder does not retain it.
+// the handler and permits repeatable Reply calls until Reject, Drop, or Close.
+// The caller owns its lifetime, concurrency bound, and timeout; the forwarder
+// does not retain it.
 type ICMPForwarderResponder struct {
-	forwarder  *ICMPForwarder
-	message    ICMPMessage
-	packet     ipPacket
-	rejectable bool
-	lifecycle  forwarderResponderLifecycle
+	forwarder    *ICMPForwarder
+	message      ICMPMessage
+	packet       ipPacket
+	rejectPacket ipPacket
+	rejectable   bool
+	lifecycle    forwarderResponderLifecycle
 }
 
 // tcpForwarderEndpoints is the small dispatch surface retained by Stack.
@@ -604,7 +594,7 @@ func (r *TCPForwarderRequest) Accept(ctx context.Context) (*TCPConn, error) {
 		panic("nil Context")
 	}
 	if !r.claim() {
-		return nil, forwarderRequestActionError(r.state.Load())
+		return nil, ErrForwarderRequestCompleted
 	}
 	connection, result, err := r.forwarder.acceptTCP(r)
 	if err != nil {
@@ -634,7 +624,7 @@ func (r *TCPForwarderRequest) Accept(ctx context.Context) (*TCPConn, error) {
 // forwarder bookkeeping but does not wait for the network or output queue.
 func (r *TCPForwarderRequest) Drop() error {
 	if !r.complete(forwarderRequestDropped) {
-		return forwarderRequestActionError(r.state.Load())
+		return ErrForwarderRequestCompleted
 	}
 	return nil
 }
@@ -646,7 +636,7 @@ func (r *TCPForwarderRequest) Drop() error {
 // the rejection decision remains terminal.
 func (r *TCPForwarderRequest) Reject() error {
 	if !r.complete(forwarderRequestRejected) {
-		return forwarderRequestActionError(r.state.Load())
+		return ErrForwarderRequestCompleted
 	}
 	return r.forwarder.stack.rejectTCPSegment(r.key, r.segment)
 }
@@ -672,10 +662,11 @@ func (r *UDPForwarderRequest) Payload() []byte { return r.packet.payload[udpHead
 // then retain the connection or hand it to another goroutine. The triggering
 // datagram may be dropped when it exceeds the configured receive capacity;
 // later datagrams still use the registered endpoint. Accept consumes the
-// request even when it returns an error.
+// request even when it returns an error and may be called after any number of
+// Reply or ReplyFrom attempts.
 func (r *UDPForwarderRequest) Accept() (*UDPConn, error) {
-	if !r.claim() {
-		return nil, forwarderRequestActionError(r.state.Load())
+	if _, ok := r.claim(); !ok {
+		return nil, ErrForwarderRequestCompleted
 	}
 	connection, err := r.forwarder.acceptUDP(r)
 	if err != nil {
@@ -697,10 +688,11 @@ func (r *UDPForwarderRequest) Accept() (*UDPConn, error) {
 // retain the connection or hand it to another goroutine. The triggering
 // datagram may be dropped when it exceeds the configured receive capacity;
 // later datagrams still use the registered endpoint. Listen consumes the
-// request even when it returns an error.
+// request even when it returns an error and may be called after any number of
+// Reply or ReplyFrom attempts.
 func (r *UDPForwarderRequest) Listen() (*UDPConn, error) {
-	if !r.claim() {
-		return nil, forwarderRequestActionError(r.state.Load())
+	if _, ok := r.claim(); !ok {
+		return nil, ErrForwarderRequestCompleted
 	}
 	connection, err := r.forwarder.listenUDP(r)
 	if err != nil {
@@ -712,20 +704,40 @@ func (r *UDPForwarderRequest) Listen() (*UDPConn, error) {
 }
 
 // Reply sends one reverse-flow datagram from Destination to Source without
-// retaining a UDP endpoint. The first call selects reply mode; calls may be
-// repeated or concurrent but must all finish before the handler returns. Each
-// call atomically queues the complete datagram without waiting for outbound
-// capacity and may be retried after any error. Once reply mode begins, other
-// request actions report ErrForwarderReplyActive.
+// retaining a UDP endpoint. Use ReplyFrom to select a different source. The
+// method may be called repeatedly or concurrently, including before a later
+// terminal action, but every call must finish before the handler returns. Each
+// call atomically queues the complete datagram or all of its fragments without
+// waiting for outbound capacity and may be retried after any error.
 func (r *UDPForwarderRequest) Reply(payload []byte) (int, error) {
+	return r.replyFrom(payload, r.flow.Destination)
+}
+
+// ReplyFrom sends one datagram to Flow().Source using source as its IP address
+// and UDP port, without retaining an endpoint. Source may be any valid address
+// in the same family as Flow().Source; it need not belong to LocalAddresses and
+// is not classified as unicast, multicast, or broadcast here. It is unzoned and
+// unmapped, and port zero is preserved on the wire. ReplyFrom has the same
+// lifecycle, ownership, and output behavior as Reply.
+func (r *UDPForwarderRequest) ReplyFrom(payload []byte, source netip.AddrPort) (int, error) {
+	return r.replyFrom(payload, source)
+}
+
+// replyFrom records one request-scoped output attempt and emits its datagram.
+func (r *UDPForwarderRequest) replyFrom(payload []byte, source netip.AddrPort) (int, error) {
 	if err := r.beginReply(); err != nil {
+		return 0, err
+	}
+	validated, err := validateUDPForwarderReply(r.flow, payload, source)
+	if err != nil {
+		r.forwarder.replyErrors.Add(1)
 		return 0, err
 	}
 	if r.forwarder.closed.Load() {
 		r.forwarder.replyErrors.Add(1)
 		return 0, net.ErrClosed
 	}
-	n, err := r.forwarder.replyUDP(r, payload)
+	n, err := r.forwarder.replyUDPFlow(r.flow, payload, validated)
 	if err != nil {
 		r.forwarder.replyErrors.Add(1)
 		return n, err
@@ -734,11 +746,12 @@ func (r *UDPForwarderRequest) Reply(payload []byte) (int, error) {
 	return n, nil
 }
 
-// Drop consumes the UDP datagram without packet I/O. It may wait briefly for
-// forwarder bookkeeping but does not wait for the network or output queue.
+// Drop consumes the UDP datagram without packet I/O. It may follow any number
+// of Reply or ReplyFrom attempts, may wait briefly for forwarder bookkeeping,
+// and does not wait for the network or output queue.
 func (r *UDPForwarderRequest) Drop() error {
 	if !r.complete(forwarderRequestDropped) {
-		return forwarderRequestActionError(r.state.Load())
+		return ErrForwarderRequestCompleted
 	}
 	return nil
 }
@@ -747,10 +760,11 @@ func (r *UDPForwarderRequest) Drop() error {
 // Unreachable without waiting for outbound capacity. It reports
 // ErrResourceLimit when the queue is full, syscall.EADDRNOTAVAIL when the
 // intercepted destination is no longer admitted, and syscall.ENETUNREACH when
-// no return route remains; the rejection decision remains terminal.
+// no return route remains. It may follow any number of Reply or ReplyFrom
+// attempts; the rejection decision remains terminal.
 func (r *UDPForwarderRequest) Reject() error {
 	if !r.complete(forwarderRequestRejected) {
-		return forwarderRequestActionError(r.state.Load())
+		return ErrForwarderRequestCompleted
 	}
 	return r.forwarder.stack.sendPortUnreachable(r.packet)
 }
@@ -762,10 +776,10 @@ func (r *IPForwarderRequest) Message() IPMessage {
 	return ipForwarderMessage(r.packet, r.packet.payload)
 }
 
-// Reply sends one payload with the triggering protocol number from
-// Destination to Source. The first call selects callback-scoped reply mode;
-// calls may then be repeated but must finish before the handler returns. Each
-// reply atomically queues all required fragments without waiting for capacity.
+// Reply sends one payload with the triggering protocol number from Destination
+// to Source. Calls may be repeated or concurrent before a later terminal action
+// and must finish before the handler returns. Each reply atomically queues all
+// required fragments without waiting for capacity and may be retried on error.
 func (r *IPForwarderRequest) Reply(payload []byte) error {
 	if err := r.beginReply(); err != nil {
 		return err
@@ -783,10 +797,11 @@ func (r *IPForwarderRequest) Reply(payload []byte) error {
 	return nil
 }
 
-// Drop consumes the IP payload without packet I/O.
+// Drop consumes the IP payload without packet I/O and may follow any number of
+// Reply attempts.
 func (r *IPForwarderRequest) Drop() error {
 	if !r.complete(forwarderRequestDropped) {
-		return forwarderRequestActionError(r.state.Load())
+		return ErrForwarderRequestCompleted
 	}
 	return nil
 }
@@ -794,10 +809,11 @@ func (r *IPForwarderRequest) Drop() error {
 // Reject consumes the IP payload and attempts to enqueue the address-family
 // protocol-unreachable response without waiting for outbound capacity. It
 // reports syscall.EADDRNOTAVAIL when the intercepted destination is no longer
-// admitted and syscall.ENETUNREACH when no return route remains.
+// admitted and syscall.ENETUNREACH when no return route remains. It may follow
+// any number of Reply attempts.
 func (r *IPForwarderRequest) Reject() error {
 	if !r.complete(forwarderRequestRejected) {
-		return forwarderRequestActionError(r.state.Load())
+		return ErrForwarderRequestCompleted
 	}
 	return r.forwarder.stack.sendProtocolUnreachable(r.packet)
 }
@@ -812,22 +828,33 @@ func (r *ICMPForwarderRequest) Message() ICMPMessage {
 	}
 }
 
+// IPPacket returns the complete, reassembled L3 packet that contains Message.
+// The returned slice aliases packet-delivery storage, is read-only, and is
+// valid only until the handler returns. Message().Payload aliases the ICMP
+// portion of the same packet.
+func (r *ICMPForwarderRequest) IPPacket() []byte { return r.packet.original }
+
 // Reply sends a complete ICMP protocol message from Destination to Source. The
-// first call selects reply mode; calls may be repeated or concurrent but must
-// all finish before the handler returns. The stack copies payload, recalculates
-// its checksum, and atomically queues every required fragment without waiting
-// for outbound capacity. A call may be retried after any error; once reply mode
-// begins, other request actions report ErrForwarderReplyActive.
+// method may be called repeatedly or concurrently, including before a later
+// terminal action, but every call must finish before the handler returns. The
+// stack copies payload, recalculates its checksum, and atomically queues every
+// required fragment without waiting for outbound capacity. A call may be
+// retried after any error.
 func (r *ICMPForwarderRequest) Reply(payload []byte) error {
 	return r.reply(payload, false)
 }
 
-// reply selects callback-scoped reply mode and writes either borrowed or
-// stack-owned payload storage.
+// reply records one callback-scoped output attempt and writes either borrowed
+// or stack-owned payload storage.
 func (r *ICMPForwarderRequest) reply(payload []byte, owned bool) error {
 	if err := r.beginReply(); err != nil {
 		return err
 	}
+	return r.writeReply(payload, owned)
+}
+
+// writeReply emits one reply after the request output attempt was recorded.
+func (r *ICMPForwarderRequest) writeReply(payload []byte, owned bool) error {
 	if r.forwarder.closed.Load() {
 		r.forwarder.replyErrors.Add(1)
 		return net.ErrClosed
@@ -846,29 +873,62 @@ func (r *ICMPForwarderRequest) reply(payload []byte, owned bool) error {
 	return nil
 }
 
+// ReplyIPPacket sends a complete IPv4 ICMP or IPv6 ICMP packet whose final
+// destination is the triggering packet's source. It is a restricted
+// header-included ICMP operation, not arbitrary packet injection. Its source may
+// be any valid same-family address; it need not belong to LocalAddresses and is
+// not classified as unicast, multicast, or broadcast here. MIPS copies packet,
+// normalizes its IP length and outer IPv4 and ICMP checksums,
+// preserves other legal header fields and extension headers, and atomically
+// source-fragments it when permitted. A non-atomic input fragment is invalid.
+// An IPv6 atomic Fragment header is preserved when the packet fits; when
+// fragmentation is required, it is replaced by the emitted fragment sequence
+// instead of nesting another header. The method may be retried after validation
+// or output failure and does not prevent a later terminal action.
+func (r *ICMPForwarderRequest) ReplyIPPacket(packet []byte) error {
+	if err := r.beginReply(); err != nil {
+		return err
+	}
+	reply, err := prepareICMPForwarderIPPacket(packet, r.packet.source)
+	if err != nil {
+		r.forwarder.replyErrors.Add(1)
+		return err
+	}
+	if r.forwarder.closed.Load() {
+		r.forwarder.replyErrors.Add(1)
+		return net.ErrClosed
+	}
+	if err = r.forwarder.stack.writeICMPForwarderIPPacket(r.packet, reply); err != nil {
+		r.forwarder.replyErrors.Add(1)
+		return err
+	}
+	r.forwarder.replies.Add(1)
+	return nil
+}
+
 // ReplyEcho copies the triggering Echo Request into an Echo Reply, preserving
-// its identifier, sequence, and data. It reports syscall.EINVAL without
-// selecting an action when the triggering message is not an IPv4 or IPv6 Echo
-// Request. Like Reply, it may be repeated but every call must finish before the
-// handler returns.
+// its identifier, sequence, and data. It reports syscall.EINVAL when the
+// triggering message is not an IPv4 or IPv6 Echo Request. Like Reply, it may be
+// retried and does not prevent a later terminal action; every call must finish
+// before the handler returns.
 func (r *ICMPForwarderRequest) ReplyEcho() error {
-	switch forwarderRequestState(r.state.Load()) {
-	case forwarderRequestPending, forwarderRequestReplying:
-	default:
-		return forwarderRequestActionError(r.state.Load())
+	if err := r.beginReply(); err != nil {
+		return err
 	}
 	reply, ok := makeICMPEchoReply(r.packet.protocol, r.packet.payload)
 	if !ok {
+		r.forwarder.replyErrors.Add(1)
 		return syscall.EINVAL
 	}
-	return r.reply(reply, true)
+	return r.writeReply(reply, true)
 }
 
-// Drop consumes the ICMP message without packet I/O. It may wait briefly for
-// forwarder bookkeeping but does not wait for the network or output queue.
+// Drop consumes the ICMP message without packet I/O. It may follow any number
+// of Reply, ReplyIPPacket, or ReplyEcho attempts, may wait briefly for forwarder
+// bookkeeping, and does not wait for the network or output queue.
 func (r *ICMPForwarderRequest) Drop() error {
 	if !r.complete(forwarderRequestDropped) {
-		return forwarderRequestActionError(r.state.Load())
+		return ErrForwarderRequestCompleted
 	}
 	return nil
 }
@@ -878,10 +938,10 @@ func (r *ICMPForwarderRequest) Drop() error {
 // outbound capacity and reports ErrResourceLimit when the queue is full,
 // syscall.EADDRNOTAVAIL when the intercepted destination is no longer admitted,
 // and syscall.ENETUNREACH when no return route remains. The rejection decision
-// remains terminal.
+// remains terminal and may follow any number of reply attempts.
 func (r *ICMPForwarderRequest) Reject() error {
 	if !r.complete(forwarderRequestRejected) {
-		return forwarderRequestActionError(r.state.Load())
+		return ErrForwarderRequestCompleted
 	}
 	return r.forwarder.stack.sendAdministrativeUnreachable(r.packet)
 }
@@ -1134,23 +1194,30 @@ func (f *TCPForwarder) removeHandler(request *TCPForwarderRequest) {
 	f.mu.Unlock()
 }
 
-// claim reserves the UDP request for a non-Reply action.
-func (r *UDPForwarderRequest) claim() bool {
-	return r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestClaimed))
+// claim reserves the UDP request for a terminal action and reports whether a
+// reply began first. A reply that linearized first may still finish.
+func (r *UDPForwarderRequest) claim() (replied, ok bool) {
+	for {
+		state := forwarderRequestState(r.state.Load())
+		if state != forwarderRequestPending && state != forwarderRequestReplyStarted {
+			return false, false
+		}
+		if r.state.CompareAndSwap(uint32(state), uint32(forwarderRequestClaimed)) {
+			return state == forwarderRequestReplyStarted, true
+		}
+	}
 }
 
-// beginReply selects repeatable callback-scoped reply mode and releases the
-// tuple so later datagrams need not wait for this handler to return.
+// beginReply records the first UDP reply or continues callback-scoped output.
 func (r *UDPForwarderRequest) beginReply() error {
 	for {
 		switch forwarderRequestState(r.state.Load()) {
 		case forwarderRequestPending:
-			if !r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestReplying)) {
+			if !r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestReplyStarted)) {
 				continue
 			}
-			r.forwarder.remove(r)
 			return nil
-		case forwarderRequestReplying:
+		case forwarderRequestReplyStarted:
 			return nil
 		default:
 			return ErrForwarderRequestCompleted
@@ -1158,18 +1225,28 @@ func (r *UDPForwarderRequest) beginReply() error {
 	}
 }
 
-// finishHandler closes reply mode or implicitly drops an undecided datagram.
+// finishHandler drops an undecided datagram or completes a reply-only handler.
 func (r *UDPForwarderRequest) finishHandler() {
-	if r.complete(forwarderRequestDropped) {
+	if r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestDropped)) {
+		r.forwarder.remove(r)
+		r.forwarder.count(forwarderRequestDropped)
 		return
 	}
-	r.state.CompareAndSwap(uint32(forwarderRequestReplying), uint32(forwarderRequestCompleted))
+	if r.state.CompareAndSwap(uint32(forwarderRequestReplyStarted), uint32(forwarderRequestCompleted)) {
+		r.forwarder.remove(r)
+	}
 }
 
 // complete publishes an immediate terminal UDP action.
 func (r *UDPForwarderRequest) complete(state forwarderRequestState) bool {
-	if !r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(state)) {
-		return false
+	for {
+		current := forwarderRequestState(r.state.Load())
+		if current != forwarderRequestPending && current != forwarderRequestReplyStarted {
+			return false
+		}
+		if r.state.CompareAndSwap(uint32(current), uint32(state)) {
+			break
+		}
 	}
 	r.forwarder.remove(r)
 	r.forwarder.count(state)
@@ -1193,23 +1270,30 @@ func (f *UDPForwarder) remove(request *UDPForwarderRequest) {
 	f.mu.Unlock()
 }
 
-// claim reserves the IP request for a non-Reply action.
-func (r *IPForwarderRequest) claim() bool {
-	return r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestClaimed))
+// claim reserves the IP request for a terminal action and reports whether a
+// reply began first. A reply that linearized first may still finish.
+func (r *IPForwarderRequest) claim() (replied, ok bool) {
+	for {
+		state := forwarderRequestState(r.state.Load())
+		if state != forwarderRequestPending && state != forwarderRequestReplyStarted {
+			return false, false
+		}
+		if r.state.CompareAndSwap(uint32(state), uint32(forwarderRequestClaimed)) {
+			return state == forwarderRequestReplyStarted, true
+		}
+	}
 }
 
-// beginReply selects repeatable callback-scoped reply mode and releases the
-// request from forwarder bookkeeping.
+// beginReply records the first IP reply or continues callback-scoped output.
 func (r *IPForwarderRequest) beginReply() error {
 	for {
 		switch forwarderRequestState(r.state.Load()) {
 		case forwarderRequestPending:
-			if !r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestReplying)) {
+			if !r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestReplyStarted)) {
 				continue
 			}
-			r.forwarder.remove(r)
 			return nil
-		case forwarderRequestReplying:
+		case forwarderRequestReplyStarted:
 			return nil
 		default:
 			return ErrForwarderRequestCompleted
@@ -1217,18 +1301,28 @@ func (r *IPForwarderRequest) beginReply() error {
 	}
 }
 
-// finishHandler closes reply mode or implicitly drops an undecided payload.
+// finishHandler drops an undecided payload or completes a reply-only handler.
 func (r *IPForwarderRequest) finishHandler() {
-	if r.complete(forwarderRequestDropped) {
+	if r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestDropped)) {
+		r.forwarder.remove(r)
+		r.forwarder.count(forwarderRequestDropped)
 		return
 	}
-	r.state.CompareAndSwap(uint32(forwarderRequestReplying), uint32(forwarderRequestCompleted))
+	if r.state.CompareAndSwap(uint32(forwarderRequestReplyStarted), uint32(forwarderRequestCompleted)) {
+		r.forwarder.remove(r)
+	}
 }
 
 // complete publishes an immediate terminal IP action.
 func (r *IPForwarderRequest) complete(state forwarderRequestState) bool {
-	if !r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(state)) {
-		return false
+	for {
+		current := forwarderRequestState(r.state.Load())
+		if current != forwarderRequestPending && current != forwarderRequestReplyStarted {
+			return false
+		}
+		if r.state.CompareAndSwap(uint32(current), uint32(state)) {
+			break
+		}
 	}
 	r.forwarder.remove(r)
 	r.forwarder.count(state)
@@ -1249,23 +1343,30 @@ func (f *IPForwarder) remove(request *IPForwarderRequest) {
 	f.mu.Unlock()
 }
 
-// claim reserves the ICMP request for a non-Reply action.
-func (r *ICMPForwarderRequest) claim() bool {
-	return r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestClaimed))
+// claim reserves the ICMP request for a terminal action and reports whether a
+// reply began first. A reply that linearized first may still finish.
+func (r *ICMPForwarderRequest) claim() (replied, ok bool) {
+	for {
+		state := forwarderRequestState(r.state.Load())
+		if state != forwarderRequestPending && state != forwarderRequestReplyStarted {
+			return false, false
+		}
+		if r.state.CompareAndSwap(uint32(state), uint32(forwarderRequestClaimed)) {
+			return state == forwarderRequestReplyStarted, true
+		}
+	}
 }
 
-// beginReply selects repeatable callback-scoped reply mode and releases the
-// request from forwarder bookkeeping.
+// beginReply records the first ICMP reply or continues callback-scoped output.
 func (r *ICMPForwarderRequest) beginReply() error {
 	for {
 		switch forwarderRequestState(r.state.Load()) {
 		case forwarderRequestPending:
-			if !r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestReplying)) {
+			if !r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestReplyStarted)) {
 				continue
 			}
-			r.forwarder.remove(r)
 			return nil
-		case forwarderRequestReplying:
+		case forwarderRequestReplyStarted:
 			return nil
 		default:
 			return ErrForwarderRequestCompleted
@@ -1273,18 +1374,28 @@ func (r *ICMPForwarderRequest) beginReply() error {
 	}
 }
 
-// finishHandler closes reply mode or implicitly drops an undecided message.
+// finishHandler drops an undecided message or completes a reply-only handler.
 func (r *ICMPForwarderRequest) finishHandler() {
-	if r.complete(forwarderRequestDropped) {
+	if r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestDropped)) {
+		r.forwarder.remove(r)
+		r.forwarder.count(forwarderRequestDropped)
 		return
 	}
-	r.state.CompareAndSwap(uint32(forwarderRequestReplying), uint32(forwarderRequestCompleted))
+	if r.state.CompareAndSwap(uint32(forwarderRequestReplyStarted), uint32(forwarderRequestCompleted)) {
+		r.forwarder.remove(r)
+	}
 }
 
 // complete publishes an immediate terminal ICMP action.
 func (r *ICMPForwarderRequest) complete(state forwarderRequestState) bool {
-	if !r.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(state)) {
-		return false
+	for {
+		current := forwarderRequestState(r.state.Load())
+		if current != forwarderRequestPending && current != forwarderRequestReplyStarted {
+			return false
+		}
+		if r.state.CompareAndSwap(uint32(current), uint32(state)) {
+			break
+		}
 	}
 	r.forwarder.remove(r)
 	r.forwarder.count(state)
@@ -1377,6 +1488,8 @@ func (f *UDPForwarder) updateConfig(network *networkState) {
 		if request.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestDropped)) {
 			delete(f.requests, key)
 			f.dropped.Add(1)
+		} else if request.state.CompareAndSwap(uint32(forwarderRequestReplyStarted), uint32(forwarderRequestCompleted)) {
+			delete(f.requests, key)
 		}
 	}
 	f.mu.Unlock()
@@ -1393,6 +1506,8 @@ func (f *IPForwarder) updateConfig(network *networkState) {
 		if request.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestDropped)) {
 			delete(f.requests, request)
 			f.dropped.Add(1)
+		} else if request.state.CompareAndSwap(uint32(forwarderRequestReplyStarted), uint32(forwarderRequestCompleted)) {
+			delete(f.requests, request)
 		}
 	}
 	f.mu.Unlock()
@@ -1409,6 +1524,8 @@ func (f *ICMPForwarder) updateConfig(network *networkState) {
 		if request.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestDropped)) {
 			delete(f.requests, request)
 			f.dropped.Add(1)
+		} else if request.state.CompareAndSwap(uint32(forwarderRequestReplyStarted), uint32(forwarderRequestCompleted)) {
+			delete(f.requests, request)
 		}
 	}
 	f.mu.Unlock()
@@ -1460,6 +1577,8 @@ func (f *UDPForwarder) closeFromStack() {
 	for _, request := range requests {
 		if request.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestDropped)) {
 			f.dropped.Add(1)
+		} else {
+			request.state.CompareAndSwap(uint32(forwarderRequestReplyStarted), uint32(forwarderRequestCompleted))
 		}
 	}
 }
@@ -1481,6 +1600,8 @@ func (f *IPForwarder) closeFromStack() {
 	for _, request := range requests {
 		if request.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestDropped)) {
 			f.dropped.Add(1)
+		} else {
+			request.state.CompareAndSwap(uint32(forwarderRequestReplyStarted), uint32(forwarderRequestCompleted))
 		}
 	}
 }
@@ -1502,6 +1623,8 @@ func (f *ICMPForwarder) closeFromStack() {
 	for _, request := range requests {
 		if request.state.CompareAndSwap(uint32(forwarderRequestPending), uint32(forwarderRequestDropped)) {
 			f.dropped.Add(1)
+		} else {
+			request.state.CompareAndSwap(uint32(forwarderRequestReplyStarted), uint32(forwarderRequestCompleted))
 		}
 	}
 }
@@ -1511,15 +1634,21 @@ func (f *ICMPForwarder) closeFromStack() {
 // may be handed to another goroutine. The forwarder does not retain the
 // responder or impose a capacity or timeout; the caller must bound its
 // lifetime and eventually close it. Detach itself is the request's action and
-// consumes the request even when it returns an error.
+// consumes the request even when it returns an error. It may be called after
+// any number of Reply or ReplyFrom attempts; the responder remains available
+// for further replies.
 func (r *UDPForwarderRequest) Detach() (*UDPForwarderResponder, error) {
-	if !r.claim() {
-		return nil, forwarderRequestActionError(r.state.Load())
+	replied, ok := r.claim()
+	if !ok {
+		return nil, ErrForwarderRequestCompleted
 	}
 	responder, err := r.forwarder.detach(r)
 	if err != nil {
 		r.finish(forwarderRequestDropped)
 		return nil, err
+	}
+	if replied {
+		responder.lifecycle.state.Store(uint32(forwarderResponderReplyStarted))
 	}
 	return responder, nil
 }
@@ -1539,6 +1668,17 @@ func copyForwarderRejectPacket(packet ipPacket) ipPacket {
 	packet.payload = nil
 	packet.original = append([]byte(nil), packet.original[:quoteLength]...)
 	return packet
+}
+
+// copyForwarderPacket returns one independently owned packet whose parsed
+// slices all refer to the same backing storage.
+func copyForwarderPacket(packet ipPacket) ipPacket {
+	original := append([]byte(nil), packet.original...)
+	copied, ok := parseIPPacket(original)
+	if !ok || copied.parameterError {
+		return ipPacket{}
+	}
+	return copied
 }
 
 // detach copies one UDP request into caller-owned storage while holding the
@@ -1571,8 +1711,8 @@ func (r *UDPForwarderResponder) Flow() TransportFlow { return r.flow }
 // The caller may retain or modify it and must synchronize concurrent access.
 func (r *UDPForwarderResponder) Payload() []byte { return r.payload }
 
-// beginReply atomically enters or continues repeatable reply mode before
-// validating the current output policy.
+// beginReply records or continues repeatable output before validating the
+// current output policy.
 func (r *UDPForwarderResponder) beginReply() error {
 	if err := r.lifecycle.beginReply(); err != nil {
 		return err
@@ -1588,18 +1728,38 @@ func (r *UDPForwarderResponder) beginReply() error {
 	return nil
 }
 
-// Reply atomically queues one reverse-flow datagram without waiting for
-// outbound capacity. It reports ErrResourceLimit without emitting partial
-// fragments when the queue is full. Calls may be repeated or concurrent until
-// Close, with no ordering guarantee between concurrent calls. The first call
-// selects reply mode before validation, and an output error does not close the
-// responder. Each call revalidates the forwarder and current destination
-// policy and copies payload before returning.
+// Reply atomically queues one reverse-flow datagram from Destination to Source
+// without waiting for outbound capacity. Use ReplyFrom to select a different
+// source. It reports ErrResourceLimit without emitting partial fragments when
+// the queue is full. Calls may be repeated or concurrent until Drop, Reject, or
+// Close, with no ordering guarantee between concurrent calls. Any call may be
+// retried after failure; each call revalidates the forwarder and current
+// destination policy and copies payload before returning.
 func (r *UDPForwarderResponder) Reply(payload []byte) (int, error) {
+	return r.replyFrom(payload, r.flow.Destination)
+}
+
+// ReplyFrom sends one datagram to Flow().Source with the caller-selected source
+// IP address and UDP port. Source may be any valid address in the same family as
+// Flow().Source; it need not belong to LocalAddresses and is not classified as
+// unicast, multicast, or broadcast here. It is unzoned and unmapped, and port
+// zero is preserved on the wire. Its lifecycle, ownership, concurrency, and
+// output behavior match Reply.
+func (r *UDPForwarderResponder) ReplyFrom(payload []byte, source netip.AddrPort) (int, error) {
+	return r.replyFrom(payload, source)
+}
+
+// replyFrom records one detached output attempt and emits its datagram.
+func (r *UDPForwarderResponder) replyFrom(payload []byte, source netip.AddrPort) (int, error) {
 	if err := r.beginReply(); err != nil {
 		return 0, err
 	}
-	n, err := r.forwarder.replyUDPFlow(r.flow, payload)
+	validated, err := validateUDPForwarderReply(r.flow, payload, source)
+	if err != nil {
+		r.forwarder.replyErrors.Add(1)
+		return 0, err
+	}
+	n, err := r.forwarder.replyUDPFlow(r.flow, payload, validated)
 	if err != nil {
 		r.forwarder.replyErrors.Add(1)
 		return n, err
@@ -1608,25 +1768,22 @@ func (r *UDPForwarderResponder) Reply(payload []byte) (int, error) {
 	return n, nil
 }
 
-// Drop completes the detached datagram without packet I/O. It is valid only
-// before the first Reply begins; use Close to finish an active responder.
-// Drop reports ErrForwarderReplyActive in reply mode and net.ErrClosed after
-// closure.
+// Drop terminates the detached datagram without packet I/O. It remains valid
+// after replies and reports net.ErrClosed after another terminal action.
 func (r *UDPForwarderResponder) Drop() error {
-	if err := r.lifecycle.closePending(); err != nil {
+	if err := r.lifecycle.finish(); err != nil {
 		return err
 	}
 	r.forwarder.count(forwarderRequestDropped)
 	return nil
 }
 
-// Reject attempts to enqueue ICMP Port Unreachable without waiting for
-// outbound capacity. It is valid only before the first Reply begins and
-// revalidates the forwarder and current destination policy. Once selected,
-// the rejection decision remains terminal on output error. Reject reports
-// ErrForwarderReplyActive in reply mode and net.ErrClosed after closure.
+// Reject terminates the detached datagram and attempts to enqueue ICMP Port
+// Unreachable without waiting for outbound capacity. It remains valid after
+// replies and revalidates the forwarder and current destination policy. Once
+// selected, the rejection decision remains terminal on output error.
 func (r *UDPForwarderResponder) Reject() error {
-	if err := r.lifecycle.closePending(); err != nil {
+	if err := r.lifecycle.finish(); err != nil {
 		return err
 	}
 	r.forwarder.count(forwarderRequestRejected)
@@ -1660,15 +1817,21 @@ func (r *UDPForwarderResponder) Done() <-chan struct{} { return r.forwarder.done
 
 // Detach transfers one IP request out of the synchronous handler lifetime and
 // returns an independently owned message snapshot. The caller must bound the
-// responder's lifetime and eventually close it.
+// responder's lifetime and eventually close it. It may be called after any
+// number of Reply attempts; the responder remains available for further
+// replies.
 func (r *IPForwarderRequest) Detach() (*IPForwarderResponder, error) {
-	if !r.claim() {
-		return nil, forwarderRequestActionError(r.state.Load())
+	replied, ok := r.claim()
+	if !ok {
+		return nil, ErrForwarderRequestCompleted
 	}
 	responder, err := r.forwarder.detach(r)
 	if err != nil {
 		r.finish(forwarderRequestDropped)
 		return nil, err
+	}
+	if replied {
+		responder.lifecycle.state.Store(uint32(forwarderResponderReplyStarted))
 	}
 	return responder, nil
 }
@@ -1732,8 +1895,8 @@ func (f *IPForwarder) reply(packet ipPacket, payload []byte) error {
 // caller may retain or modify Payload and must synchronize concurrent access.
 func (r *IPForwarderResponder) Message() IPMessage { return r.message }
 
-// beginReply atomically enters or continues repeatable reply mode before
-// validating current forwarder and destination policy.
+// beginReply records or continues repeatable output before validating current
+// forwarder and destination policy.
 func (r *IPForwarderResponder) beginReply() error {
 	if err := r.lifecycle.beginReply(); err != nil {
 		return err
@@ -1750,8 +1913,9 @@ func (r *IPForwarderResponder) beginReply() error {
 }
 
 // Reply atomically queues one reverse protocol payload without waiting for
-// outbound capacity. Calls may be repeated or concurrent until Close, with no
-// ordering guarantee between concurrent calls.
+// outbound capacity. Calls may be repeated or concurrent until a terminal
+// action, with no ordering guarantee between concurrent calls. Failed calls may
+// be retried, and Drop, Reject, or Close may follow any number of replies.
 func (r *IPForwarderResponder) Reply(payload []byte) error {
 	if err := r.beginReply(); err != nil {
 		return err
@@ -1765,21 +1929,21 @@ func (r *IPForwarderResponder) Reply(payload []byte) error {
 	return nil
 }
 
-// Drop completes the detached payload without packet I/O. It is valid only
-// before the first Reply begins.
+// Drop terminates the detached payload without packet I/O. It remains valid
+// after replies.
 func (r *IPForwarderResponder) Drop() error {
-	if err := r.lifecycle.closePending(); err != nil {
+	if err := r.lifecycle.finish(); err != nil {
 		return err
 	}
 	r.forwarder.count(forwarderRequestDropped)
 	return nil
 }
 
-// Reject attempts to enqueue a protocol-unreachable response. It is valid
-// only before the first Reply begins and revalidates current destination
-// policy.
+// Reject terminates the detached payload and attempts to enqueue a protocol-
+// unreachable response. It remains valid after replies and revalidates current
+// destination policy.
 func (r *IPForwarderResponder) Reject() error {
-	if err := r.lifecycle.closePending(); err != nil {
+	if err := r.lifecycle.finish(); err != nil {
 		return err
 	}
 	r.forwarder.count(forwarderRequestRejected)
@@ -1793,7 +1957,7 @@ func (r *IPForwarderResponder) Reject() error {
 }
 
 // Close prevents new Reply calls. A Reply that began before Close may finish;
-// closing before the first Reply is equivalent to Drop.
+// closing before any Reply attempt is equivalent to Drop.
 func (r *IPForwarderResponder) Close() error {
 	pending, err := r.lifecycle.close()
 	if err != nil {
@@ -1814,15 +1978,21 @@ func (r *IPForwarderResponder) Done() <-chan struct{} { return r.forwarder.done 
 // handed to another goroutine. The forwarder does not retain the responder or
 // impose a capacity or timeout; the caller must bound its lifetime and
 // eventually close it. Detach itself is the request's action and consumes the
-// request even when it returns an error.
+// request even when it returns an error. It may be called after any number of
+// Reply, ReplyIPPacket, or ReplyEcho attempts; the responder remains available
+// for further replies.
 func (r *ICMPForwarderRequest) Detach() (*ICMPForwarderResponder, error) {
-	if !r.claim() {
-		return nil, forwarderRequestActionError(r.state.Load())
+	replied, ok := r.claim()
+	if !ok {
+		return nil, ErrForwarderRequestCompleted
 	}
 	responder, err := r.forwarder.detach(r)
 	if err != nil {
 		r.finish(forwarderRequestDropped)
 		return nil, err
+	}
+	if replied {
+		responder.lifecycle.state.Store(uint32(forwarderResponderReplyStarted))
 	}
 	return responder, nil
 }
@@ -1838,15 +2008,19 @@ func (f *ICMPForwarder) detach(request *ICMPForwarderRequest) (*ICMPForwarderRes
 	if !f.stack.network.Load().acceptsInboundDestination(request.packet.target) {
 		return nil, syscall.EADDRNOTAVAIL
 	}
-	payload := append([]byte(nil), request.packet.payload...)
+	packet := copyForwarderPacket(request.packet)
+	if len(packet.original) == 0 {
+		return nil, syscall.EINVAL
+	}
 	responder := &ICMPForwarderResponder{
 		forwarder: f,
 		message: ICMPMessage{
-			Source: request.packet.source, Destination: request.packet.target,
-			Type: payload[0], Code: payload[1], Payload: payload,
+			Source: packet.source, Destination: packet.target,
+			Type: packet.payload[0], Code: packet.payload[1], Payload: packet.payload,
 		},
-		packet:     copyForwarderRejectPacket(request.packet),
-		rejectable: !packetInvokesICMPError(request.packet.original),
+		packet:       packet,
+		rejectPacket: copyForwarderRejectPacket(request.packet),
+		rejectable:   !packetInvokesICMPError(request.packet.original),
 	}
 	delete(f.requests, request)
 	request.state.Store(uint32(forwarderRequestDetached))
@@ -1860,8 +2034,13 @@ func (f *ICMPForwarder) detach(request *ICMPForwarderRequest) (*ICMPForwarderRes
 // report syscall.EINVAL.
 func (r *ICMPForwarderResponder) Message() ICMPMessage { return r.message }
 
-// beginReply atomically enters or continues repeatable reply mode before
-// validating the current output policy.
+// IPPacket returns the complete, reassembled packet snapshot retained by
+// Detach. The caller owns the slice and may retain or modify it, but must
+// synchronize concurrent access. Message().Payload aliases its ICMP region.
+func (r *ICMPForwarderResponder) IPPacket() []byte { return r.packet.original }
+
+// beginReply records or continues repeatable output before validating the
+// current output policy.
 func (r *ICMPForwarderResponder) beginReply() error {
 	if err := r.lifecycle.beginReply(); err != nil {
 		return err
@@ -1880,20 +2059,24 @@ func (r *ICMPForwarderResponder) beginReply() error {
 // Reply atomically queues one reverse ICMP message without waiting for
 // outbound capacity. It reports ErrResourceLimit without emitting partial
 // fragments when the queue is full. Calls may be repeated or concurrent until
-// Close, with no ordering guarantee between concurrent calls. The first call
-// selects reply mode before validation, and an output error does not close the
-// responder. Each call revalidates the forwarder and current destination
-// policy and copies payload before returning.
+// a terminal action, with no ordering guarantee between concurrent calls. Any
+// call may be retried after failure; each call revalidates the forwarder and
+// current destination policy and copies payload before returning.
 func (r *ICMPForwarderResponder) Reply(payload []byte) error {
 	return r.reply(payload, false)
 }
 
-// reply selects detached reply mode and writes either borrowed or stack-owned
-// payload storage.
+// reply records one detached output attempt and writes either borrowed or
+// stack-owned payload storage.
 func (r *ICMPForwarderResponder) reply(payload []byte, owned bool) error {
 	if err := r.beginReply(); err != nil {
 		return err
 	}
+	return r.writeReply(payload, owned)
+}
+
+// writeReply emits one reply after the detached output attempt was recorded.
+func (r *ICMPForwarderResponder) writeReply(payload []byte, owned bool) error {
 	var err error
 	if owned {
 		err = r.forwarder.stack.writeOwnedICMPReply(r.packet, payload)
@@ -1908,43 +2091,64 @@ func (r *ICMPForwarderResponder) reply(payload []byte, owned bool) error {
 	return nil
 }
 
+// ReplyIPPacket is the detached form of ICMPForwarderRequest.ReplyIPPacket.
+// Calls may be repeated or concurrent until a terminal action. The packet is
+// copied before return, concurrent calls have no ordering guarantee, and a
+// failed call may be retried or followed by Drop, Reject, or Close.
+func (r *ICMPForwarderResponder) ReplyIPPacket(packet []byte) error {
+	if err := r.beginReply(); err != nil {
+		return err
+	}
+	reply, err := prepareICMPForwarderIPPacket(packet, r.packet.source)
+	if err != nil {
+		r.forwarder.replyErrors.Add(1)
+		return err
+	}
+	if err = r.forwarder.stack.writeICMPForwarderIPPacket(r.packet, reply); err != nil {
+		r.forwarder.replyErrors.Add(1)
+		return err
+	}
+	r.forwarder.replies.Add(1)
+	return nil
+}
+
 // ReplyEcho copies the detached Echo Request into an Echo Reply, preserving its
-// identifier, sequence, and data. It reports syscall.EINVAL without selecting
-// reply mode when the retained message is not an IPv4 or IPv6 Echo Request.
-// Calls may be repeated or concurrent until Close.
+// identifier, sequence, and data. It reports syscall.EINVAL when the retained
+// message is not an IPv4 or IPv6 Echo Request. Calls may be repeated or
+// concurrent until a terminal action and may be followed by Drop or Reject.
 func (r *ICMPForwarderResponder) ReplyEcho() error {
-	if forwarderResponderState(r.lifecycle.state.Load()) == forwarderResponderClosed {
-		return net.ErrClosed
+	if err := r.beginReply(); err != nil {
+		return err
 	}
 	if !r.message.IsEchoRequest() {
+		r.forwarder.replyErrors.Add(1)
 		return syscall.EINVAL
 	}
 	reply, ok := makeICMPEchoReply(r.packet.protocol, r.message.Payload)
 	if !ok {
+		r.forwarder.replyErrors.Add(1)
 		return syscall.EINVAL
 	}
-	return r.reply(reply, true)
+	return r.writeReply(reply, true)
 }
 
-// Drop completes the detached message without packet I/O. It is valid only
-// before the first Reply begins; use Close to finish an active responder.
-// Drop reports ErrForwarderReplyActive in reply mode and net.ErrClosed after
-// closure.
+// Drop terminates the detached message without packet I/O. It remains valid
+// after replies and reports net.ErrClosed after another terminal action.
 func (r *ICMPForwarderResponder) Drop() error {
-	if err := r.lifecycle.closePending(); err != nil {
+	if err := r.lifecycle.finish(); err != nil {
 		return err
 	}
 	r.forwarder.count(forwarderRequestDropped)
 	return nil
 }
 
-// Reject attempts to enqueue an administratively prohibited response without
-// waiting for outbound capacity. It is valid only before the first Reply
-// begins and revalidates the forwarder and current destination policy. Once
-// selected, the decision remains terminal on output error. Reject reports
-// ErrForwarderReplyActive in reply mode and net.ErrClosed after closure.
+// Reject terminates the detached message and attempts to enqueue an
+// administratively prohibited response without waiting for outbound capacity.
+// It remains valid after replies and revalidates the forwarder and current
+// destination policy. Once selected, the decision remains terminal on output
+// error.
 func (r *ICMPForwarderResponder) Reject() error {
-	if err := r.lifecycle.closePending(); err != nil {
+	if err := r.lifecycle.finish(); err != nil {
 		return err
 	}
 	r.forwarder.count(forwarderRequestRejected)
@@ -1956,7 +2160,7 @@ func (r *ICMPForwarderResponder) Reject() error {
 	}
 	var err error
 	if r.rejectable {
-		err = r.forwarder.stack.sendAdministrativeUnreachable(r.packet)
+		err = r.forwarder.stack.sendAdministrativeUnreachable(r.rejectPacket)
 	}
 	return err
 }
