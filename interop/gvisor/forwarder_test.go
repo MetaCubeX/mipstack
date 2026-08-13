@@ -670,9 +670,6 @@ func TestUDPForwarderReplyInterop(t *testing.T) {
 						if err != nil || written != len(result.responses[1]) {
 							t.Fatalf("write detached UDP reply: n=%d, error=%v", written, err)
 						}
-						if err = result.responder.Close(); err != nil {
-							t.Fatalf("close detached UDP responder: %v", err)
-						}
 					}
 					buffer := make([]byte, 65535)
 					for index, response := range result.responses {
@@ -756,7 +753,6 @@ func TestUDPForwarderReplyFromInterop(t *testing.T) {
 							t.Fatal(err)
 						}
 					}
-					defer prepared.responder.Close()
 				}
 				seen := map[uint16]byte{}
 				buffer := make([]byte, 8)
@@ -861,7 +857,6 @@ func TestICMPForwarderReplyIPPacketInterop(t *testing.T) {
 						if err = prepared.responder.ReplyIPPacket(prepared.packet); err != nil {
 							t.Fatal(err)
 						}
-						defer prepared.responder.Close()
 					}
 					wantReplies := 1
 					if detached {
@@ -956,7 +951,6 @@ func TestICMPForwarderReplyIPPacketErrorInterop(t *testing.T) {
 					if err = prepared.responder.ReplyIPPacket(prepared.packet); err != nil {
 						t.Fatal(err)
 					}
-					defer prepared.responder.Close()
 				}
 				packet, remote, readErr := readGVisorEndpoint(ctx, monitor, notifications, 2048)
 				if readErr != nil {
@@ -1103,9 +1097,6 @@ func TestICMPForwarderInterop(t *testing.T) {
 							if err = result.responder.ReplyEcho(); err != nil {
 								t.Fatalf("write detached ICMP echo reply: %v", err)
 							}
-							if err = result.responder.Close(); err != nil {
-								t.Fatalf("close detached ICMP responder: %v", err)
-							}
 						}
 						wantReplies := 1
 						if detached {
@@ -1217,9 +1208,6 @@ func TestIPForwarderInterop(t *testing.T) {
 					if detached {
 						if err = result.responder.Reply(result.response); err != nil {
 							t.Fatalf("write detached IP reply: %v", err)
-						}
-						if err = result.responder.Close(); err != nil {
-							t.Fatalf("close detached IP responder: %v", err)
 						}
 					}
 					responses := [][]byte{result.response}

@@ -486,7 +486,7 @@ func validateUDPForwarderReplyPayload(ipv6 bool, payload []byte) error {
 
 // replyUDPFlow sends one reverse-flow response from a validated caller-selected
 // source without retaining a registered endpoint after the write completes.
-func (f *UDPForwarder) replyUDPFlow(flow TransportFlow, payload []byte, source netip.AddrPort) (int, error) {
+func (f *forwarderRuntime) replyUDPFlow(flow TransportFlow, payload []byte, source netip.AddrPort) (int, error) {
 	local, remote := flow.Destination, flow.Source
 	state := f.stack.network.Load()
 	if !state.acceptsInboundDestination(local.Addr()) {

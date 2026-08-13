@@ -1096,7 +1096,8 @@ func TestICMPForwarderDetachFailureCleansRequest(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.69")
 	stack := newForwarderTestStack(t, local, false)
 	forwarder := &ICMPForwarder{
-		stack: stack, done: make(chan struct{}), requests: make(map[*ICMPForwarderRequest]struct{}),
+		forwarderRuntime: &forwarderRuntime{stack: stack, done: make(chan struct{})},
+		requests:         make(map[*ICMPForwarderRequest]struct{}),
 	}
 	forwarder.closed.Store(true)
 	request := &ICMPForwarderRequest{
@@ -1255,7 +1256,6 @@ func TestUDPForwarderReplyAllowsTerminalActions(t *testing.T) {
 		{name: "Reject", request: "Reject"},
 		{name: "Detach/Drop", request: "Detach", responder: "Drop"},
 		{name: "Detach/Reject", request: "Detach", responder: "Reject"},
-		{name: "Detach/Close", request: "Detach", responder: "Close"},
 	}
 	for _, action := range actions {
 		t.Run(action.name, func(t *testing.T) {
@@ -1335,8 +1335,6 @@ func TestUDPForwarderReplyAllowsTerminalActions(t *testing.T) {
 					err = responder.Drop()
 				case "Reject":
 					err = responder.Reject()
-				case "Close":
-					err = responder.Close()
 				}
 				if err != nil {
 					t.Fatalf("responder %s after replies: %v", action.responder, err)
@@ -1377,7 +1375,7 @@ func TestUDPForwarderReplyAllowsTerminalActions(t *testing.T) {
 
 func TestIPAndICMPForwarderReplyAllowsTerminalActions(t *testing.T) {
 	for _, protocol := range []string{"IP", "ICMP"} {
-		for _, action := range []string{"Drop", "Reject", "Detach/Drop", "Detach/Reject", "Detach/Close"} {
+		for _, action := range []string{"Drop", "Reject", "Detach/Drop", "Detach/Reject"} {
 			t.Run(protocol+"/"+action, func(t *testing.T) {
 				local := netip.MustParseAddr("192.0.2.190")
 				remote := netip.MustParseAddr("192.0.2.191")
@@ -1415,8 +1413,6 @@ func TestIPAndICMPForwarderReplyAllowsTerminalActions(t *testing.T) {
 									responderFinish = responder.Drop
 								case "Detach/Reject":
 									responderFinish = responder.Reject
-								case "Detach/Close":
-									responderFinish = responder.Close
 								}
 							}
 						}
@@ -1453,8 +1449,6 @@ func TestIPAndICMPForwarderReplyAllowsTerminalActions(t *testing.T) {
 									responderFinish = responder.Drop
 								case "Detach/Reject":
 									responderFinish = responder.Reject
-								case "Detach/Close":
-									responderFinish = responder.Close
 								}
 							}
 						}
@@ -1947,11 +1941,14 @@ func TestUDPForwarderDetachedReply(t *testing.T) {
 	if err = responder.Drop(); err != nil {
 		t.Fatalf("Drop detached UDP responder after replies = %v", err)
 	}
+	if err = responder.RestrictToReplies(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("RestrictToReplies after Drop = %v", err)
+	}
+	if got := string(responder.Payload()); got != "async query" {
+		t.Fatalf("failed restriction changed UDP payload = %q", got)
+	}
 	if err = responder.Reject(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Reject dropped detached UDP responder = %v", err)
-	}
-	if err = responder.Close(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("Close dropped detached UDP responder = %v", err)
 	}
 	if _, err = responder.Reply([]byte("closed")); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Reply closed detached UDP responder = %v", err)
@@ -2313,9 +2310,6 @@ func TestUDPForwarderDetachedReplyFromConcurrent(t *testing.T) {
 			t.Fatalf("detached ReplyFrom source %v payload = %d, want %d", source, seen[source], index)
 		}
 	}
-	if err = responder.Close(); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestUDPForwarderDetachedTerminalActions(t *testing.T) {
@@ -2349,9 +2343,6 @@ func TestUDPForwarderDetachedTerminalActions(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("%s detached UDP: %v", action, err)
-			}
-			if err = responder.Close(); !errors.Is(err, net.ErrClosed) {
-				t.Fatalf("Close after detached UDP %s = %v", action, err)
 			}
 			info := forwarder.Info()
 			if action == "Drop" {
@@ -2432,9 +2423,6 @@ func TestICMPForwarderDetachedReply(t *testing.T) {
 	parsed, ok = parseIPPacket(response)
 	if !ok || parsed.payload[0] != 0 || checksum(parsed.payload) != 0 {
 		t.Fatalf("second detached ICMP response = %x", response)
-	}
-	if err = responder.Close(); err != nil {
-		t.Fatal(err)
 	}
 	if info := forwarder.Info(); info.Pending != 0 || info.Replies != 2 {
 		t.Fatalf("completed detached ICMP forwarder info = %+v", info)
@@ -3228,9 +3216,6 @@ func TestICMPForwarderDetachedTerminalActions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s detached ICMP: %v", action, err)
 			}
-			if err = responder.Close(); !errors.Is(err, net.ErrClosed) {
-				t.Fatalf("Close after detached ICMP %s = %v", action, err)
-			}
 			info := forwarder.Info()
 			if action == "Drop" {
 				if info.Dropped != 1 || info.Rejected != 0 {
@@ -3425,9 +3410,6 @@ func TestUDPForwarderDetachedResponderIsCallerOwned(t *testing.T) {
 	if _, err = responder.Reply([]byte("late")); !errors.Is(err, syscall.EADDRNOTAVAIL) {
 		t.Fatalf("config-invalidated UDP responder action = %v", err)
 	}
-	if err = responder.Close(); err != nil {
-		t.Fatal(err)
-	}
 	if info := forwarder.Info(); info.Pending != 0 || info.Dropped != 0 || info.ReplyErrors != 1 {
 		t.Fatalf("invalidated UDP forwarder info = %+v", info)
 	}
@@ -3485,11 +3467,8 @@ func TestDetachedForwarderResponderRevalidatesLifecycle(t *testing.T) {
 		if err = responder.Drop(); err != nil {
 			t.Fatalf("Drop detached UDP responder after failed replies = %v", err)
 		}
-		if err = responder.Close(); !errors.Is(err, net.ErrClosed) {
-			t.Fatalf("Close dropped detached UDP responder = %v", err)
-		}
 		if err = responder.Drop(); !errors.Is(err, net.ErrClosed) {
-			t.Fatalf("Drop closed detached UDP responder = %v", err)
+			t.Fatalf("second Drop detached UDP responder = %v", err)
 		}
 		if info := forwarder.Info(); !info.Closed || info.Pending != 0 || info.Dropped != 1 || info.ReplyErrors != 2 {
 			t.Fatalf("closed detached UDP forwarder info = %+v", info)
@@ -3525,9 +3504,6 @@ func TestDetachedForwarderResponderRevalidatesLifecycle(t *testing.T) {
 		}
 		if err = responder.Reply(icmp); !errors.Is(err, syscall.EADDRNOTAVAIL) {
 			t.Fatalf("detached ICMP Reply after configuration removal = %v", err)
-		}
-		if err = responder.Close(); err != nil {
-			t.Fatal(err)
 		}
 		if info := forwarder.Info(); info.Pending != 0 || info.Dropped != 0 || info.ReplyErrors != 1 {
 			t.Fatalf("invalidated detached ICMP forwarder info = %+v", info)
@@ -3577,7 +3553,7 @@ func TestDetachedForwarderResponderConcurrentAction(t *testing.T) {
 	}
 }
 
-func TestDetachedForwarderResponderConcurrentReplyAndClose(t *testing.T) {
+func TestDetachedForwarderResponderConcurrentReplyAndDrop(t *testing.T) {
 	owned := netip.MustParseAddr("192.0.2.136")
 	remote := netip.MustParseAddr("192.0.2.137")
 	target := netip.MustParseAddr("198.51.100.136")
@@ -3608,13 +3584,13 @@ func TestDetachedForwarderResponderConcurrentReplyAndClose(t *testing.T) {
 			results <- replyErr
 		}()
 	}
-	closed := make(chan error, 1)
+	dropped := make(chan error, 1)
 	go func() {
 		<-start
-		closed <- responder.Close()
+		dropped <- responder.Drop()
 	}()
 	close(start)
-	if err = <-closed; err != nil {
+	if err = <-dropped; err != nil {
 		t.Fatal(err)
 	}
 	succeeded := 0
@@ -3627,14 +3603,14 @@ func TestDetachedForwarderResponderConcurrentReplyAndClose(t *testing.T) {
 		}
 	}
 	if _, err = responder.Reply([]byte("late")); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("Reply after concurrent Close = %v", err)
+		t.Fatalf("Reply after concurrent Drop = %v", err)
 	}
-	if info := forwarder.Info(); info.Replies != uint64(succeeded) {
+	if info := forwarder.Info(); info.Replies != uint64(succeeded) || info.Dropped != 1 {
 		t.Fatalf("concurrent Reply forwarder info = %+v, succeeded=%d", info, succeeded)
 	}
 }
 
-func TestICMPForwarderResponderConcurrentReplyIPPacketAndClose(t *testing.T) {
+func TestICMPForwarderResponderConcurrentReplyIPPacketAndDrop(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.166")
 	remote := netip.MustParseAddr("192.0.2.167")
 	target := netip.MustParseAddr("198.51.100.166")
@@ -3668,13 +3644,13 @@ func TestICMPForwarderResponderConcurrentReplyIPPacketAndClose(t *testing.T) {
 			results <- responder.ReplyIPPacket(reply)
 		}()
 	}
-	closed := make(chan error, 1)
+	dropped := make(chan error, 1)
 	go func() {
 		<-start
-		closed <- responder.Close()
+		dropped <- responder.Drop()
 	}()
 	close(start)
-	if err = <-closed; err != nil {
+	if err = <-dropped; err != nil {
 		t.Fatal(err)
 	}
 	succeeded := 0
@@ -3687,7 +3663,7 @@ func TestICMPForwarderResponderConcurrentReplyIPPacketAndClose(t *testing.T) {
 		}
 	}
 	if err = responder.ReplyIPPacket(reply); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("ReplyIPPacket after Close = %v", err)
+		t.Fatalf("ReplyIPPacket after Drop = %v", err)
 	}
 	queued := 0
 	for stack.outbound.len() != 0 {
@@ -3706,11 +3682,7 @@ func TestICMPForwarderResponderConcurrentReplyIPPacketAndClose(t *testing.T) {
 		t.Fatalf("concurrent ReplyIPPacket queued %d packets for %d successes", queued, succeeded)
 	}
 	info := forwarder.Info()
-	wantDropped := uint64(0)
-	if succeeded == 0 {
-		wantDropped = 1
-	}
-	if info.Replies != uint64(succeeded) || info.ReplyErrors != 0 || info.Dropped != wantDropped {
+	if info.Replies != uint64(succeeded) || info.ReplyErrors != 0 || info.Dropped != 1 {
 		t.Fatalf("concurrent ReplyIPPacket diagnostics = %+v, succeeded=%d", info, succeeded)
 	}
 }
@@ -4066,11 +4038,11 @@ func TestIPForwarderDetachAndReject(t *testing.T) {
 	if !ok || parsed.source != local || parsed.target != remote || parsed.protocol != 100 || string(parsed.payload) != "async" {
 		t.Fatalf("detached IP reply = %+v", parsed)
 	}
-	if err = responder.Close(); err != nil {
+	if err = responder.Drop(); err != nil {
 		t.Fatal(err)
 	}
 	if err = responder.Reply(nil); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("Reply after Close = %v", err)
+		t.Fatalf("Reply after Drop = %v", err)
 	}
 
 	if err = forwarder.Close(); err != nil {
@@ -4163,9 +4135,6 @@ func TestDetachedIPForwarderResponderRevalidatesConfiguration(t *testing.T) {
 	}
 	if err = second.Reject(); !errors.Is(err, syscall.EADDRNOTAVAIL) {
 		t.Fatalf("configuration-invalidated IP Reject = %v", err)
-	}
-	if err = first.Close(); err != nil {
-		t.Fatal(err)
 	}
 	if info := forwarder.Info(); info.Pending != 0 || info.Requests != 2 || info.ReplyErrors != 1 || info.Rejected != 1 {
 		t.Fatalf("configuration-invalidated IP responder info = %+v", info)
@@ -4273,13 +4242,13 @@ func TestICMPReplyEchoLifecycleAndSnapshotValidation(t *testing.T) {
 		t.Fatalf("ReplyEcho after request completion = %v", err)
 	}
 	responder := &ICMPForwarderResponder{
+		forwarderResponder: forwarderResponder{packet: ipPacket{protocol: protocolICMPv4}},
 		message: ICMPMessage{
 			Source: netip.MustParseAddr("192.0.2.91"), Destination: netip.MustParseAddr("198.51.100.91"),
 			Payload: nonEcho,
 		},
-		packet: ipPacket{protocol: protocolICMPv4},
 	}
-	responder.lifecycle.state.Store(uint32(forwarderResponderClosed))
+	responder.state.Store(uint32(forwarderResponderDropped))
 	if err := responder.ReplyEcho(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("ReplyEcho after responder closure = %v", err)
 	}
@@ -4352,6 +4321,272 @@ func TestICMPForwarderRejectsShortReply(t *testing.T) {
 	}
 	if info := forwarder.Info(); info.Replies != 0 || info.ReplyErrors != 4 || info.Dropped != 0 {
 		t.Fatalf("short ICMP Reply diagnostics = %+v", info)
+	}
+}
+
+func TestUDPForwarderRepliesOnlyResponder(t *testing.T) {
+	for _, direct := range []bool{true, false} {
+		name := "RestrictToReplies"
+		if direct {
+			name = "DetachForReplies"
+		}
+		t.Run(name, func(t *testing.T) {
+			local := netip.MustParseAddr("192.0.2.200")
+			remote := netip.MustParseAddr("198.51.100.201")
+			target := netip.MustParseAddr("203.0.113.200")
+			alternate := netip.MustParseAddr("203.0.113.201")
+			stack := newForwarderTestStack(t, local, true)
+			detached := make(chan *UDPForwarderResponder, 1)
+			forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+				var responder *UDPForwarderResponder
+				var detachErr error
+				if direct {
+					responder, detachErr = request.DetachForReplies()
+				} else {
+					responder, detachErr = request.Detach()
+				}
+				if detachErr != nil {
+					t.Errorf("detach UDP replies-only responder: %v", detachErr)
+					return
+				}
+				detached <- responder
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			if err = writeTestPacket(stack, buildTestUDP(remote, target, 56000, 53, []byte("retained query"))); err != nil {
+				t.Fatal(err)
+			}
+			responder := <-detached
+			var retained []byte
+			if !direct {
+				retained = responder.Payload()
+				if err = responder.RestrictToReplies(); err != nil {
+					t.Fatal(err)
+				}
+				if string(retained) != "retained query" {
+					t.Fatalf("previously returned UDP payload = %q", retained)
+				}
+			}
+			if payload := responder.Payload(); payload != nil {
+				t.Fatalf("replies-only UDP payload = %q", payload)
+			}
+			if responder.packet.payload != nil || responder.packet.original != nil {
+				t.Fatal("replies-only UDP responder retained packet storage")
+			}
+			if got := responder.Flow(); got != (TransportFlow{Source: netip.AddrPortFrom(remote, 56000), Destination: netip.AddrPortFrom(target, 53)}) {
+				t.Fatalf("replies-only UDP flow = %+v", got)
+			}
+			if _, err = responder.Reply([]byte("default source")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = responder.ReplyFrom([]byte("selected source"), netip.AddrPortFrom(alternate, 5353)); err != nil {
+				t.Fatal(err)
+			}
+			response := readForwarderTestPacket(t, stack)
+			parsed, ok := parseIPPacket(response)
+			if !ok || parsed.source != target || parsed.target != remote || string(parsed.payload[udpHeaderSize:]) != "default source" {
+				t.Fatalf("replies-only UDP Reply output = %x", response)
+			}
+			response = readForwarderTestPacket(t, stack)
+			parsed, ok = parseIPPacket(response)
+			if !ok || parsed.source != alternate || parsed.target != remote || binary.BigEndian.Uint16(parsed.payload[:2]) != 5353 || string(parsed.payload[udpHeaderSize:]) != "selected source" {
+				t.Fatalf("replies-only UDP ReplyFrom output = %x", response)
+			}
+			if err = responder.RestrictToReplies(); err != nil {
+				t.Fatalf("idempotent UDP RestrictToReplies = %v", err)
+			}
+			if err = responder.Drop(); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("UDP Drop after restriction = %v", err)
+			}
+			if err = responder.Reject(); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("UDP Reject after restriction = %v", err)
+			}
+			if err = forwarder.Close(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-responder.Done():
+			default:
+				t.Fatal("replies-only UDP responder Done remained open after forwarder close")
+			}
+			if _, err = responder.Reply([]byte("closed")); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("replies-only UDP Reply after forwarder close = %v", err)
+			}
+			if info := forwarder.Info(); !info.Closed || info.Pending != 0 || info.Requests != 1 || info.Replies != 2 || info.ReplyErrors != 1 || info.Dropped != 0 || info.Rejected != 0 {
+				t.Fatalf("replies-only UDP diagnostics = %+v", info)
+			}
+		})
+	}
+}
+
+func TestIPForwarderRepliesOnlyResponder(t *testing.T) {
+	for _, direct := range []bool{true, false} {
+		name := "RestrictToReplies"
+		if direct {
+			name = "DetachForReplies"
+		}
+		t.Run(name, func(t *testing.T) {
+			local := netip.MustParseAddr("192.0.2.202")
+			remote := netip.MustParseAddr("198.51.100.203")
+			target := netip.MustParseAddr("203.0.113.202")
+			stack := newForwarderTestStack(t, local, true)
+			detached := make(chan *IPForwarderResponder, 1)
+			forwarder, err := NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+				var responder *IPForwarderResponder
+				var detachErr error
+				if direct {
+					responder, detachErr = request.DetachForReplies()
+				} else {
+					responder, detachErr = request.Detach()
+				}
+				if detachErr != nil {
+					t.Errorf("detach IP replies-only responder: %v", detachErr)
+					return
+				}
+				detached <- responder
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			if err = writeTestPacket(stack, buildIPPacket(remote, target, 100, []byte("retained payload"), 1, true)); err != nil {
+				t.Fatal(err)
+			}
+			responder := <-detached
+			var retained []byte
+			if !direct {
+				retained = responder.Message().Payload
+				if err = responder.RestrictToReplies(); err != nil {
+					t.Fatal(err)
+				}
+				if string(retained) != "retained payload" {
+					t.Fatalf("previously returned IP payload = %q", retained)
+				}
+			}
+			message := responder.Message()
+			if message.Source != remote || message.Destination != target || message.Protocol != 100 || message.Payload != nil {
+				t.Fatalf("replies-only IP message = %+v", message)
+			}
+			if responder.packet.payload != nil || responder.packet.original != nil {
+				t.Fatal("replies-only IP responder retained packet storage")
+			}
+			if err = responder.Reply([]byte("asynchronous reply")); err != nil {
+				t.Fatal(err)
+			}
+			response := readForwarderTestPacket(t, stack)
+			parsed, ok := parseIPPacket(response)
+			if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != 100 || string(parsed.payload) != "asynchronous reply" {
+				t.Fatalf("replies-only IP Reply output = %x", response)
+			}
+			if err = responder.RestrictToReplies(); err != nil {
+				t.Fatalf("idempotent IP RestrictToReplies = %v", err)
+			}
+			if err = responder.Drop(); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("IP Drop after restriction = %v", err)
+			}
+			if err = responder.Reject(); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("IP Reject after restriction = %v", err)
+			}
+			if info := forwarder.Info(); info.Pending != 0 || info.Requests != 1 || info.Replies != 1 || info.ReplyErrors != 0 || info.Dropped != 0 || info.Rejected != 0 {
+				t.Fatalf("replies-only IP diagnostics = %+v", info)
+			}
+		})
+	}
+}
+
+func TestICMPForwarderRepliesOnlyResponder(t *testing.T) {
+	for _, direct := range []bool{true, false} {
+		name := "RestrictToReplies"
+		if direct {
+			name = "DetachForReplies"
+		}
+		t.Run(name, func(t *testing.T) {
+			local := netip.MustParseAddr("192.0.2.204")
+			remote := netip.MustParseAddr("198.51.100.205")
+			target := netip.MustParseAddr("203.0.113.204")
+			stack := newForwarderTestStack(t, local, true)
+			detached := make(chan *ICMPForwarderResponder, 1)
+			forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+				var responder *ICMPForwarderResponder
+				var detachErr error
+				if direct {
+					responder, detachErr = request.DetachForReplies()
+				} else {
+					responder, detachErr = request.Detach()
+				}
+				if detachErr != nil {
+					t.Errorf("detach ICMP replies-only responder: %v", detachErr)
+					return
+				}
+				detached <- responder
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			icmp := []byte{8, 0, 0, 0, 1, 2, 3, 4}
+			binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+			if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+				t.Fatal(err)
+			}
+			responder := <-detached
+			var retainedMessage, retainedPacket []byte
+			if !direct {
+				retainedMessage = responder.Message().Payload
+				retainedPacket = responder.IPPacket()
+				if err = responder.RestrictToReplies(); err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(retainedMessage, icmp) {
+					t.Fatalf("previously returned ICMP message = %x", retainedMessage)
+				}
+				if parsed, ok := parseIPPacket(retainedPacket); !ok || !bytes.Equal(parsed.payload, icmp) {
+					t.Fatalf("previously returned ICMP packet = %x", retainedPacket)
+				}
+			}
+			message := responder.Message()
+			if message.Source != remote || message.Destination != target || message.Type != 8 || message.Code != 0 || message.Payload != nil {
+				t.Fatalf("replies-only ICMP message = %+v", message)
+			}
+			if responder.IPPacket() != nil || responder.packet.payload != nil || responder.packet.original != nil || responder.rejectPacket.original != nil {
+				t.Fatal("replies-only ICMP responder retained packet storage")
+			}
+			reply := []byte{0, 0, 0, 0, 5, 6, 7, 8}
+			if err = responder.Reply(reply); err != nil {
+				t.Fatal(err)
+			}
+			response := readForwarderTestPacket(t, stack)
+			parsed, ok := parseIPPacket(response)
+			if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != protocolICMPv4 || !bytes.Equal(parsed.payload[4:], reply[4:]) || checksum(parsed.payload) != 0 {
+				t.Fatalf("replies-only ICMP Reply output = %x", response)
+			}
+			rawReply := makeForwarderICMPEchoReplyPacket(target, remote, []byte("raw reply"))
+			if err = responder.ReplyIPPacket(rawReply); err != nil {
+				t.Fatal(err)
+			}
+			response = readForwarderTestPacket(t, stack)
+			parsed, ok = parseIPPacket(response)
+			if !ok || parsed.source != target || parsed.target != remote || string(parsed.payload[8:]) != "raw reply" || checksum(parsed.payload) != 0 {
+				t.Fatalf("replies-only ICMP ReplyIPPacket output = %x", response)
+			}
+			if err = responder.ReplyEcho(); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("ICMP ReplyEcho after restriction = %v", err)
+			}
+			if err = responder.RestrictToReplies(); err != nil {
+				t.Fatalf("idempotent ICMP RestrictToReplies = %v", err)
+			}
+			if err = responder.Drop(); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("ICMP Drop after restriction = %v", err)
+			}
+			if err = responder.Reject(); !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("ICMP Reject after restriction = %v", err)
+			}
+			if info := forwarder.Info(); info.Pending != 0 || info.Requests != 1 || info.Replies != 2 || info.ReplyErrors != 0 || info.Dropped != 0 || info.Rejected != 0 {
+				t.Fatalf("replies-only ICMP diagnostics = %+v", info)
+			}
+		})
 	}
 }
 

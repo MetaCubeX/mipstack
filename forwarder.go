@@ -55,32 +55,36 @@ type TCPForwarderHandler func(*TCPForwarderRequest)
 // on the blocked call. Concurrent Stack.Write calls may invoke the handler
 // concurrently, so shared state must be synchronized. While one request is
 // undecided, concurrent datagrams for the same four-tuple are dropped. The
-// handler must call Accept, Listen, Detach, Drop, Reject, or at least one Reply
-// before returning; returning without an action drops the datagram. Reply may
-// be repeated and does not prevent a later terminal action. Except for Detach,
-// every action and Reply call must finish before the handler returns. The
-// request and its Payload must not be retained after that point, but a UDPConn
-// returned by Accept or Listen and a responder returned by Detach have
-// independent lifetimes. The initial datagram remains subject to the returned
-// UDPConn's configured receive capacity.
+// handler must call Accept, Listen, Detach, DetachForReplies, Drop, Reject, or
+// at least one Reply before returning; returning without an action drops the
+// datagram. Reply may be repeated and does not prevent a later terminal action.
+// Except for Detach and DetachForReplies, every action and Reply call must
+// finish before the handler returns. The request and its Payload must not be
+// retained after that point, but a UDPConn returned by Accept or Listen and a
+// responder returned by either detach method may outlive the callback.
+// Responder output remains subject to the originating forwarder's state. The
+// initial datagram remains subject to the returned UDPConn's configured receive
+// capacity.
 type UDPForwarderHandler func(*UDPForwarderRequest)
 
 // IPForwarderHandler processes one valid, reassembled upper-layer IP payload
 // that matched neither a raw IP socket nor a built-in protocol. MIPS
 // calls it synchronously with the same concurrency, blocking, ownership, and
-// action rules as ICMPForwarderHandler. The handler must call Detach, Drop,
-// Reject, or at least one Reply before returning.
+// action rules as ICMPForwarderHandler. The handler must call Detach,
+// DetachForReplies, Drop, Reject, or at least one Reply before returning.
 type IPForwarderHandler func(*IPForwarderRequest)
 
 // ICMPForwarderHandler processes one checksum-valid ICMP message not consumed
 // by the stack's built-in echo or asynchronous-error handling. Its synchronous,
 // concurrent-call, and blocking rules are the same as UDPForwarderHandler.
-// The handler must call Detach, Drop, Reject, or at least one Reply before
-// returning; returning without an action drops the message. Reply may be
-// repeated and does not prevent a later terminal action. Except for Detach,
-// every action and Reply call must finish before the handler returns. The
-// request and Message.Payload must not be retained after that point, but a
-// responder returned by Detach has an independent lifetime.
+// The handler must call Detach, DetachForReplies, Drop, Reject, or at least one
+// Reply before returning; returning without an action drops the message. Reply
+// may be repeated and does not prevent a later terminal action. Except for
+// Detach and DetachForReplies, every action and Reply call must finish before
+// the handler returns. The request and Message.Payload must not be retained
+// after that point, but a responder returned by either detach method may
+// outlive the callback. Responder output remains subject to the originating
+// forwarder's state.
 type ICMPForwarderHandler func(*ICMPForwarderRequest)
 
 // ForwarderInfo is a diagnostic snapshot of endpoint, request, and reply
@@ -139,81 +143,40 @@ const (
 	forwarderRequestCompleted
 )
 
-// forwarderResponderState serializes a detached responder's terminal action
-// while retaining whether at least one Reply call began.
+// forwarderResponderState controls the capabilities retained by a detached
+// responder. Unlike request state, it remains reply-capable after input
+// ownership has been discarded.
 type forwarderResponderState uint32
 
 const (
-	// forwarderResponderPending has not begun a reply or terminal action.
-	forwarderResponderPending forwarderResponderState = iota
-	// forwarderResponderReplyStarted records a reply attempt and permits more
-	// replies or one later terminal action.
-	forwarderResponderReplyStarted
-	// forwarderResponderClosed rejects every later action.
-	forwarderResponderClosed
+	// forwarderResponderActive retains the input snapshot and all detached
+	// responder actions.
+	forwarderResponderActive forwarderResponderState = iota
+	// forwarderResponderRepliesOnly retains only asynchronous reply operations.
+	forwarderResponderRepliesOnly
+	// forwarderResponderDropped selected explicit input disposal.
+	forwarderResponderDropped
+	// forwarderResponderRejected selected an explicit protocol rejection.
+	forwarderResponderRejected
 )
 
-// forwarderResponderLifecycle owns the protocol-independent pending,
-// reply-started, and closed transitions of one caller-owned responder.
-type forwarderResponderLifecycle struct {
-	state atomic.Uint32
-}
+// forwarderDetachMode selects whether detachment retains caller-visible input
+// storage and rejection capabilities.
+type forwarderDetachMode uint8
 
-// beginReply records a reply attempt or permits another attempt before closure.
-func (l *forwarderResponderLifecycle) beginReply() error {
-	for {
-		switch forwarderResponderState(l.state.Load()) {
-		case forwarderResponderPending:
-			if !l.state.CompareAndSwap(uint32(forwarderResponderPending), uint32(forwarderResponderReplyStarted)) {
-				continue
-			}
-			return nil
-		case forwarderResponderReplyStarted:
-			return nil
-		default:
-			return net.ErrClosed
-		}
-	}
-}
+const (
+	// forwarderDetachWithInput retains the caller-visible snapshot and Reject.
+	forwarderDetachWithInput forwarderDetachMode = iota
+	// forwarderDetachForReplies omits all input-dependent capabilities.
+	forwarderDetachForReplies
+)
 
-// finish selects a terminal action before or after reply attempts.
-func (l *forwarderResponderLifecycle) finish() error {
-	for {
-		state := forwarderResponderState(l.state.Load())
-		if state == forwarderResponderClosed {
-			return net.ErrClosed
-		}
-		if l.state.CompareAndSwap(uint32(state), uint32(forwarderResponderClosed)) {
-			return nil
-		}
-	}
-}
-
-// close terminates the responder and reports whether no reply began.
-func (l *forwarderResponderLifecycle) close() (pending bool, err error) {
-	for {
-		state := forwarderResponderState(l.state.Load())
-		if state == forwarderResponderClosed {
-			return false, net.ErrClosed
-		}
-		if l.state.CompareAndSwap(uint32(state), uint32(forwarderResponderClosed)) {
-			return state == forwarderResponderPending, nil
-		}
-	}
-}
-
-// TCPForwarder owns the single fallback TCP handler installed on a stack. It
-// may be installed before or after Stack.Start.
-type TCPForwarder struct {
-	stack       *Stack
-	handler     TCPForwarderHandler
-	maxInFlight int
-
-	mu       sync.Mutex
-	closed   atomic.Bool
-	done     chan struct{}
-	requests map[tcpKey]*TCPForwarderRequest
-	handlers map[*TCPForwarderRequest]struct{}
+// forwarderRuntime owns state and diagnostics shared by every protocol
+// forwarder. Protocol-specific request tracking remains on the outer type.
+type forwarderRuntime struct {
+	stack  *Stack
+	closed atomic.Bool
+	done   chan struct{}
 
 	requestCount atomic.Uint64
 	accepted     atomic.Uint64
@@ -221,6 +184,171 @@ type TCPForwarder struct {
 	replyErrors  atomic.Uint64
 	dropped      atomic.Uint64
 	rejected     atomic.Uint64
+}
+
+// validateDestination checks state shared by responder output operations.
+func (f *forwarderRuntime) validateDestination(destination netip.Addr) error {
+	if f.closed.Load() {
+		return net.ErrClosed
+	}
+	if !f.stack.network.Load().acceptsInboundDestination(destination) {
+		return syscall.EADDRNOTAVAIL
+	}
+	return nil
+}
+
+// count records one successfully selected terminal action.
+func (f *forwarderRuntime) count(state forwarderRequestState) {
+	switch state {
+	case forwarderRequestAccepted:
+		f.accepted.Add(1)
+	case forwarderRequestDropped:
+		f.dropped.Add(1)
+	case forwarderRequestRejected:
+		f.rejected.Add(1)
+	}
+}
+
+// info returns the common portion of a forwarder diagnostic snapshot.
+func (f *forwarderRuntime) info(pending, maxInFlight int) ForwarderInfo {
+	return ForwarderInfo{
+		Closed:      f.closed.Load(),
+		Pending:     pending,
+		MaxInFlight: maxInFlight,
+		Requests:    f.requestCount.Load(),
+		Accepted:    f.accepted.Load(),
+		Replies:     f.replies.Load(),
+		ReplyErrors: f.replyErrors.Load(),
+		Dropped:     f.dropped.Load(),
+		Rejected:    f.rejected.Load(),
+	}
+}
+
+// close publishes permanent forwarder closure exactly once. Callers serialize
+// it with protocol-specific request removal before releasing their lock.
+func (f *forwarderRuntime) close() bool {
+	if f.closed.Swap(true) {
+		return false
+	}
+	close(f.done)
+	return true
+}
+
+// Done is closed when the forwarder is closed directly or by Stack.Close.
+func (f *forwarderRuntime) Done() <-chan struct{} { return f.done }
+
+// forwarderResponder owns state common to detached UDP, IP, and ICMP
+// responders. runtime is the responder's one-way reference to its originating
+// forwarder state; neither the forwarder nor the stack retains the responder.
+// packet always retains reply direction metadata and, while active, may also
+// retain the protocol-specific input needed for rejection.
+type forwarderResponder struct {
+	runtime *forwarderRuntime
+	packet  ipPacket
+	state   atomic.Uint32
+}
+
+// beginReply admits an output operation in either reply-capable state.
+func (r *forwarderResponder) beginReply() error {
+	state := forwarderResponderState(r.state.Load())
+	if state != forwarderResponderActive && state != forwarderResponderRepliesOnly {
+		return net.ErrClosed
+	}
+	if err := r.runtime.validateDestination(r.packet.target); err != nil {
+		r.runtime.replyErrors.Add(1)
+		return err
+	}
+	return nil
+}
+
+// beginInputReply admits an output operation that requires the retained input
+// snapshot. It is used by ReplyEcho, whose source data is discarded when a
+// responder is restricted to replies.
+func (r *forwarderResponder) beginInputReply() error {
+	if forwarderResponderState(r.state.Load()) != forwarderResponderActive {
+		return net.ErrClosed
+	}
+	if err := r.runtime.validateDestination(r.packet.target); err != nil {
+		r.runtime.replyErrors.Add(1)
+		return err
+	}
+	return nil
+}
+
+// recordReply records the result of an admitted output operation.
+func (r *forwarderResponder) recordReply(err error) error {
+	if err != nil {
+		r.runtime.replyErrors.Add(1)
+	} else {
+		r.runtime.replies.Add(1)
+	}
+	return err
+}
+
+// finish selects exactly one responder terminal action and records it.
+func (r *forwarderResponder) finish(state forwarderResponderState) error {
+	if state != forwarderResponderDropped && state != forwarderResponderRejected {
+		panic("invalid forwarder responder terminal state")
+	}
+	if !r.state.CompareAndSwap(uint32(forwarderResponderActive), uint32(state)) {
+		return net.ErrClosed
+	}
+	switch state {
+	case forwarderResponderDropped:
+		r.runtime.dropped.Add(1)
+	case forwarderResponderRejected:
+		r.runtime.rejected.Add(1)
+	}
+	return nil
+}
+
+// restrictToReplies irreversibly removes input-dependent responder actions.
+func (r *forwarderResponder) restrictToReplies() error {
+	for {
+		switch forwarderResponderState(r.state.Load()) {
+		case forwarderResponderRepliesOnly:
+			return nil
+		case forwarderResponderActive:
+			if r.state.CompareAndSwap(uint32(forwarderResponderActive), uint32(forwarderResponderRepliesOnly)) {
+				return nil
+			}
+		default:
+			return net.ErrClosed
+		}
+	}
+}
+
+// beginReject selects rejection and validates its current output policy.
+func (r *forwarderResponder) beginReject() error {
+	if err := r.finish(forwarderResponderRejected); err != nil {
+		return err
+	}
+	return r.runtime.validateDestination(r.packet.target)
+}
+
+// Drop terminates the detached input without packet I/O. It remains valid
+// after replies while the responder is active. It reports net.ErrClosed when
+// the responder is already terminal or restricted to replies, including one
+// returned by DetachForReplies.
+func (r *forwarderResponder) Drop() error {
+	return r.finish(forwarderResponderDropped)
+}
+
+// Done is closed when the originating protocol forwarder is closed directly
+// or by Stack.Close.
+func (r *forwarderResponder) Done() <-chan struct{} { return r.runtime.done }
+
+// TCPForwarder owns the single fallback TCP handler installed on a stack. It
+// may be installed before or after Stack.Start.
+type TCPForwarder struct {
+	*forwarderRuntime
+
+	handler     TCPForwarderHandler
+	maxInFlight int
+
+	mu       sync.Mutex
+	requests map[tcpKey]*TCPForwarderRequest
+	handlers map[*TCPForwarderRequest]struct{}
 }
 
 // TCPForwarderRequest is one valid initial SYN that did not match an ordinary
@@ -239,20 +367,12 @@ type TCPForwarderRequest struct {
 // UDPForwarder owns the single fallback UDP handler installed on a stack. It
 // may be installed before or after Stack.Start.
 type UDPForwarder struct {
-	stack   *Stack
+	*forwarderRuntime
+
 	handler UDPForwarderHandler
 
 	mu       sync.Mutex
-	closed   atomic.Bool
-	done     chan struct{}
 	requests map[udpFlowKey]*UDPForwarderRequest
-
-	requestCount atomic.Uint64
-	accepted     atomic.Uint64
-	replies      atomic.Uint64
-	replyErrors  atomic.Uint64
-	dropped      atomic.Uint64
-	rejected     atomic.Uint64
 }
 
 // UDPForwarderRequest is one valid datagram that did not match an ordinary or
@@ -268,16 +388,19 @@ type UDPForwarderRequest struct {
 	state     atomic.Uint32
 }
 
-// UDPForwarderResponder owns one detached datagram snapshot. It may outlive
-// the handler and permits repeatable Reply calls until Reject, Drop, or Close.
-// The caller owns its lifetime, concurrency bound, and timeout; the forwarder
-// does not retain it.
+// UDPForwarderResponder owns one detached datagram. A responder returned by
+// Detach owns its payload snapshot; DetachForReplies omits that snapshot. It
+// may outlive the handler because the caller, not the forwarder, owns it. It
+// retains access to the originating forwarder's state for output, diagnostics,
+// and Done; neither the forwarder nor the stack retains the responder. Reply
+// calls may be repeated while active or restricted to replies; Reject and Drop
+// are available only while active. The responder may be discarded without a
+// terminal action.
 type UDPForwarderResponder struct {
-	forwarder *UDPForwarder
-	flow      TransportFlow
-	payload   []byte
-	packet    ipPacket
-	lifecycle forwarderResponderLifecycle
+	forwarderResponder
+
+	flow    TransportFlow
+	payload []byte
 }
 
 // IPMessage describes one valid, reassembled upper-layer IP payload. Its
@@ -303,19 +426,12 @@ type IPMessage struct {
 // protocols installed on a stack. It may be installed before or after
 // Stack.Start.
 type IPForwarder struct {
-	stack   *Stack
+	*forwarderRuntime
+
 	handler IPForwarderHandler
 
 	mu       sync.Mutex
-	closed   atomic.Bool
-	done     chan struct{}
 	requests map[*IPForwarderRequest]struct{}
-
-	requestCount atomic.Uint64
-	replies      atomic.Uint64
-	replyErrors  atomic.Uint64
-	dropped      atomic.Uint64
-	rejected     atomic.Uint64
 }
 
 // IPForwarderRequest is one upper-layer IP payload not consumed by a raw IP
@@ -327,14 +443,18 @@ type IPForwarderRequest struct {
 	state     atomic.Uint32
 }
 
-// IPForwarderResponder owns one detached IP message snapshot. It may outlive
-// the handler and permits repeatable Reply calls until Drop, Reject, or Close.
-// The caller owns its lifetime, concurrency bound, and timeout.
+// IPForwarderResponder owns one detached IP message. A responder returned by
+// Detach owns its payload snapshot; DetachForReplies omits that snapshot. It
+// may outlive the handler because the caller, not the forwarder, owns it. It
+// retains access to the originating forwarder's state for output, diagnostics,
+// and Done; neither the forwarder nor the stack retains the responder. Reply
+// calls may be repeated while active or restricted to replies; Reject and Drop
+// are available only while active. The responder may be discarded without a
+// terminal action.
 type IPForwarderResponder struct {
-	forwarder *IPForwarder
-	message   IPMessage
-	packet    ipPacket
-	lifecycle forwarderResponderLifecycle
+	forwarderResponder
+
+	message IPMessage
 }
 
 // ICMPMessage describes one checksum-validated, reassembled ICMP protocol
@@ -376,19 +496,12 @@ func (m ICMPMessage) IsEchoRequest() bool {
 // ICMPForwarder owns the single fallback ICMP handler installed on a stack. It
 // may be installed before or after Stack.Start.
 type ICMPForwarder struct {
-	stack   *Stack
+	*forwarderRuntime
+
 	handler ICMPForwarderHandler
 
 	mu       sync.Mutex
-	closed   atomic.Bool
-	done     chan struct{}
 	requests map[*ICMPForwarderRequest]struct{}
-
-	requestCount atomic.Uint64
-	replies      atomic.Uint64
-	replyErrors  atomic.Uint64
-	dropped      atomic.Uint64
-	rejected     atomic.Uint64
 }
 
 // ICMPForwarderRequest is one checksum-valid ICMP message not consumed by
@@ -400,17 +513,20 @@ type ICMPForwarderRequest struct {
 	state     atomic.Uint32
 }
 
-// ICMPForwarderResponder owns one detached message snapshot. It may outlive
-// the handler and permits repeatable Reply calls until Reject, Drop, or Close.
-// The caller owns its lifetime, concurrency bound, and timeout; the forwarder
-// does not retain it.
+// ICMPForwarderResponder owns one detached message. A responder returned by
+// Detach owns its packet snapshot; DetachForReplies omits that snapshot. It may
+// outlive the handler because the caller, not the forwarder, owns it. It retains
+// access to the originating forwarder's state for output, diagnostics, and
+// Done; neither the forwarder nor the stack retains the responder. Reply and
+// ReplyIPPacket calls may be repeated while active or restricted to replies;
+// ReplyEcho, Reject, and Drop are available only while active. The responder
+// may be discarded without a terminal action.
 type ICMPForwarderResponder struct {
-	forwarder    *ICMPForwarder
+	forwarderResponder
+
 	message      ICMPMessage
-	packet       ipPacket
 	rejectPacket ipPacket
 	rejectable   bool
-	lifecycle    forwarderResponderLifecycle
 }
 
 // tcpForwarderEndpoints is the small dispatch surface retained by Stack.
@@ -470,9 +586,11 @@ func NewTCPForwarder(stack *Stack, options TCPForwarderOptions, handler TCPForwa
 		maximum = stack.network.Load().tcpDefaults.SYNBacklog
 	}
 	forwarder := &TCPForwarder{
-		stack: stack, handler: handler, maxInFlight: maximum,
-		done: make(chan struct{}), requests: make(map[tcpKey]*TCPForwarderRequest),
-		handlers: make(map[*TCPForwarderRequest]struct{}),
+		forwarderRuntime: &forwarderRuntime{stack: stack, done: make(chan struct{})},
+		handler:          handler,
+		maxInFlight:      maximum,
+		requests:         make(map[tcpKey]*TCPForwarderRequest),
+		handlers:         make(map[*TCPForwarderRequest]struct{}),
 	}
 	stack.mu.Lock()
 	defer stack.mu.Unlock()
@@ -496,8 +614,9 @@ func NewUDPForwarder(stack *Stack, options UDPForwarderOptions, handler UDPForwa
 		return nil, syscall.EINVAL
 	}
 	forwarder := &UDPForwarder{
-		stack: stack, handler: handler,
-		done: make(chan struct{}), requests: make(map[udpFlowKey]*UDPForwarderRequest),
+		forwarderRuntime: &forwarderRuntime{stack: stack, done: make(chan struct{})},
+		handler:          handler,
+		requests:         make(map[udpFlowKey]*UDPForwarderRequest),
 	}
 	stack.mu.Lock()
 	defer stack.mu.Unlock()
@@ -521,8 +640,9 @@ func NewIPForwarder(stack *Stack, options IPForwarderOptions, handler IPForwarde
 		return nil, syscall.EINVAL
 	}
 	forwarder := &IPForwarder{
-		stack: stack, handler: handler,
-		done: make(chan struct{}), requests: make(map[*IPForwarderRequest]struct{}),
+		forwarderRuntime: &forwarderRuntime{stack: stack, done: make(chan struct{})},
+		handler:          handler,
+		requests:         make(map[*IPForwarderRequest]struct{}),
 	}
 	stack.mu.Lock()
 	defer stack.mu.Unlock()
@@ -546,8 +666,9 @@ func NewICMPForwarder(stack *Stack, options ICMPForwarderOptions, handler ICMPFo
 		return nil, syscall.EINVAL
 	}
 	forwarder := &ICMPForwarder{
-		stack: stack, handler: handler,
-		done: make(chan struct{}), requests: make(map[*ICMPForwarderRequest]struct{}),
+		forwarderRuntime: &forwarderRuntime{stack: stack, done: make(chan struct{})},
+		handler:          handler,
+		requests:         make(map[*ICMPForwarderRequest]struct{}),
 	}
 	stack.mu.Lock()
 	defer stack.mu.Unlock()
@@ -788,7 +909,7 @@ func (r *IPForwarderRequest) Reply(payload []byte) error {
 		r.forwarder.replyErrors.Add(1)
 		return net.ErrClosed
 	}
-	err := r.forwarder.reply(r.packet, payload)
+	err := r.forwarder.replyIPPayload(r.packet, payload)
 	if err != nil {
 		r.forwarder.replyErrors.Add(1)
 		return err
@@ -1007,60 +1128,36 @@ func (f *ICMPForwarder) Close() error {
 	return nil
 }
 
-// Done is closed when the TCP forwarder is closed directly or by Stack.Close.
-func (f *TCPForwarder) Done() <-chan struct{} { return f.done }
-
-// Done is closed when the UDP forwarder is closed directly or by Stack.Close.
-func (f *UDPForwarder) Done() <-chan struct{} { return f.done }
-
-// Done is closed when the IP forwarder is closed directly or by Stack.Close.
-func (f *IPForwarder) Done() <-chan struct{} { return f.done }
-
-// Done is closed when the ICMP forwarder is closed directly or by Stack.Close.
-func (f *ICMPForwarder) Done() <-chan struct{} { return f.done }
-
 // Info returns one TCP forwarder diagnostic snapshot.
 func (f *TCPForwarder) Info() ForwarderInfo {
 	f.mu.Lock()
-	info := ForwarderInfo{Closed: f.closed.Load(), Pending: len(f.requests), MaxInFlight: f.maxInFlight}
+	pending := len(f.requests)
 	f.mu.Unlock()
-	info.Requests, info.Accepted = f.requestCount.Load(), f.accepted.Load()
-	info.Replies, info.ReplyErrors = f.replies.Load(), f.replyErrors.Load()
-	info.Dropped, info.Rejected = f.dropped.Load(), f.rejected.Load()
-	return info
+	return f.info(pending, f.maxInFlight)
 }
 
 // Info returns one UDP forwarder diagnostic snapshot.
 func (f *UDPForwarder) Info() ForwarderInfo {
 	f.mu.Lock()
-	info := ForwarderInfo{Closed: f.closed.Load(), Pending: len(f.requests)}
+	pending := len(f.requests)
 	f.mu.Unlock()
-	info.Requests, info.Accepted = f.requestCount.Load(), f.accepted.Load()
-	info.Replies, info.ReplyErrors = f.replies.Load(), f.replyErrors.Load()
-	info.Dropped, info.Rejected = f.dropped.Load(), f.rejected.Load()
-	return info
+	return f.info(pending, 0)
 }
 
 // Info returns one IP forwarder diagnostic snapshot.
 func (f *IPForwarder) Info() ForwarderInfo {
 	f.mu.Lock()
-	info := ForwarderInfo{Closed: f.closed.Load(), Pending: len(f.requests)}
+	pending := len(f.requests)
 	f.mu.Unlock()
-	info.Requests = f.requestCount.Load()
-	info.Replies, info.ReplyErrors = f.replies.Load(), f.replyErrors.Load()
-	info.Dropped, info.Rejected = f.dropped.Load(), f.rejected.Load()
-	return info
+	return f.info(pending, 0)
 }
 
 // Info returns one ICMP forwarder diagnostic snapshot.
 func (f *ICMPForwarder) Info() ForwarderInfo {
 	f.mu.Lock()
-	info := ForwarderInfo{Closed: f.closed.Load(), Pending: len(f.requests)}
+	pending := len(f.requests)
 	f.mu.Unlock()
-	info.Requests = f.requestCount.Load()
-	info.Replies, info.ReplyErrors = f.replies.Load(), f.replyErrors.Load()
-	info.Dropped, info.Rejected = f.dropped.Load(), f.rejected.Load()
-	return info
+	return f.info(pending, 0)
 }
 
 // handleSegment coalesces one valid initial SYN into the bounded request set.
@@ -1416,50 +1513,6 @@ func (f *ICMPForwarder) remove(request *ICMPForwarderRequest) {
 	f.mu.Unlock()
 }
 
-// count updates the TCP action counter for one terminal state.
-func (f *TCPForwarder) count(state forwarderRequestState) {
-	switch state {
-	case forwarderRequestAccepted:
-		f.accepted.Add(1)
-	case forwarderRequestDropped:
-		f.dropped.Add(1)
-	case forwarderRequestRejected:
-		f.rejected.Add(1)
-	}
-}
-
-// count updates the UDP action counter for one terminal state.
-func (f *UDPForwarder) count(state forwarderRequestState) {
-	switch state {
-	case forwarderRequestAccepted:
-		f.accepted.Add(1)
-	case forwarderRequestDropped:
-		f.dropped.Add(1)
-	case forwarderRequestRejected:
-		f.rejected.Add(1)
-	}
-}
-
-// count updates the IP action counter for one terminal state.
-func (f *IPForwarder) count(state forwarderRequestState) {
-	switch state {
-	case forwarderRequestDropped:
-		f.dropped.Add(1)
-	case forwarderRequestRejected:
-		f.rejected.Add(1)
-	}
-}
-
-// count updates the ICMP action counter for one terminal state.
-func (f *ICMPForwarder) count(state forwarderRequestState) {
-	switch state {
-	case forwarderRequestDropped:
-		f.dropped.Add(1)
-	case forwarderRequestRejected:
-		f.rejected.Add(1)
-	}
-}
-
 // updateConfig invalidates pending TCP requests whose intercepted destination
 // is no longer admitted by the current network configuration.
 func (f *TCPForwarder) updateConfig(network *networkState) {
@@ -1534,11 +1587,10 @@ func (f *ICMPForwarder) updateConfig(network *networkState) {
 // closeFromStack detaches the TCP handler and drops undecided requests.
 func (f *TCPForwarder) closeFromStack() {
 	f.mu.Lock()
-	if f.closed.Swap(true) {
+	if !f.forwarderRuntime.close() {
 		f.mu.Unlock()
 		return
 	}
-	close(f.done)
 	requests := make([]*TCPForwarderRequest, 0, len(f.requests))
 	for _, request := range f.requests {
 		requests = append(requests, request)
@@ -1563,11 +1615,10 @@ func (f *TCPForwarder) closeFromStack() {
 // closeFromStack detaches the UDP handler and drops undecided requests.
 func (f *UDPForwarder) closeFromStack() {
 	f.mu.Lock()
-	if f.closed.Swap(true) {
+	if !f.forwarderRuntime.close() {
 		f.mu.Unlock()
 		return
 	}
-	close(f.done)
 	requests := make([]*UDPForwarderRequest, 0, len(f.requests))
 	for _, request := range f.requests {
 		requests = append(requests, request)
@@ -1586,11 +1637,10 @@ func (f *UDPForwarder) closeFromStack() {
 // closeFromStack detaches the IP handler and drops undecided requests.
 func (f *IPForwarder) closeFromStack() {
 	f.mu.Lock()
-	if f.closed.Swap(true) {
+	if !f.forwarderRuntime.close() {
 		f.mu.Unlock()
 		return
 	}
-	close(f.done)
 	requests := make([]*IPForwarderRequest, 0, len(f.requests))
 	for request := range f.requests {
 		requests = append(requests, request)
@@ -1609,11 +1659,10 @@ func (f *IPForwarder) closeFromStack() {
 // closeFromStack detaches the ICMP handler and drops undecided requests.
 func (f *ICMPForwarder) closeFromStack() {
 	f.mu.Lock()
-	if f.closed.Swap(true) {
+	if !f.forwarderRuntime.close() {
 		f.mu.Unlock()
 		return
 	}
-	close(f.done)
 	requests := make([]*ICMPForwarderRequest, 0, len(f.requests))
 	for request := range f.requests {
 		requests = append(requests, request)
@@ -1630,25 +1679,42 @@ func (f *ICMPForwarder) closeFromStack() {
 }
 
 // Detach transfers one UDP request out of the synchronous handler lifetime.
-// It returns an independently owned flow and payload snapshot whose responder
-// may be handed to another goroutine. The forwarder does not retain the
-// responder or impose a capacity or timeout; the caller must bound its
-// lifetime and eventually close it. Detach itself is the request's action and
-// consumes the request even when it returns an error. It may be called after
-// any number of Reply or ReplyFrom attempts; the responder remains available
-// for further replies.
+// On success it removes the request from the forwarder's pending set and
+// returns a caller-owned flow and payload snapshot. The responder points back
+// to the originating forwarder's state for output and Done, but the forwarder does not
+// retain the responder or impose a capacity or timeout. The caller may hand it
+// to another goroutine or discard it without a terminal action. Detach itself
+// is the request's action and consumes the request even when it returns an
+// error. It may be called after any number of Reply or ReplyFrom attempts; the
+// responder remains available for further replies.
 func (r *UDPForwarderRequest) Detach() (*UDPForwarderResponder, error) {
-	replied, ok := r.claim()
+	_, ok := r.claim()
 	if !ok {
 		return nil, ErrForwarderRequestCompleted
 	}
-	responder, err := r.forwarder.detach(r)
+	responder, err := r.forwarder.detach(r, forwarderDetachWithInput)
 	if err != nil {
 		r.finish(forwarderRequestDropped)
 		return nil, err
 	}
-	if replied {
-		responder.lifecycle.state.Store(uint32(forwarderResponderReplyStarted))
+	return responder, nil
+}
+
+// DetachForReplies transfers the UDP request into an asynchronous responder
+// that retains only Flow, reply operations, and Done. Payload returns nil, and
+// Reject and Drop report net.ErrClosed. Unlike Detach, it does not copy the
+// triggering payload or retain an ICMP rejection quote. The caller owns the
+// responder and may discard it without a terminal action. RestrictToReplies is
+// an idempotent no-op on the returned responder.
+func (r *UDPForwarderRequest) DetachForReplies() (*UDPForwarderResponder, error) {
+	_, ok := r.claim()
+	if !ok {
+		return nil, ErrForwarderRequestCompleted
+	}
+	responder, err := r.forwarder.detach(r, forwarderDetachForReplies)
+	if err != nil {
+		r.finish(forwarderRequestDropped)
+		return nil, err
 	}
 	return responder, nil
 }
@@ -1681,9 +1747,9 @@ func copyForwarderPacket(packet ipPacket) ipPacket {
 	return copied
 }
 
-// detach copies one UDP request into caller-owned storage while holding the
-// forwarder lock. No reference to the responder is retained by the stack.
-func (f *UDPForwarder) detach(request *UDPForwarderRequest) (*UDPForwarderResponder, error) {
+// detach transfers one UDP request while holding the forwarder lock. It copies
+// input storage only when the caller retains input-dependent capabilities.
+func (f *UDPForwarder) detach(request *UDPForwarderRequest, mode forwarderDetachMode) (*UDPForwarderResponder, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed.Load() {
@@ -1692,9 +1758,25 @@ func (f *UDPForwarder) detach(request *UDPForwarderRequest) (*UDPForwarderRespon
 	if !f.stack.network.Load().acceptsInboundDestination(request.flow.Destination.Addr()) {
 		return nil, syscall.EADDRNOTAVAIL
 	}
+	packet := request.packet
+	var payload []byte
+	if mode == forwarderDetachForReplies {
+		packet.payload = nil
+		packet.original = nil
+	} else {
+		packet = copyForwarderRejectPacket(packet)
+		payload = append([]byte(nil), request.Payload()...)
+	}
 	responder := &UDPForwarderResponder{
-		forwarder: f, flow: request.flow, payload: append([]byte(nil), request.Payload()...),
-		packet: copyForwarderRejectPacket(request.packet),
+		forwarderResponder: forwarderResponder{
+			runtime: f.forwarderRuntime,
+			packet:  packet,
+		},
+		flow:    request.flow,
+		payload: payload,
+	}
+	if mode == forwarderDetachForReplies {
+		responder.state.Store(uint32(forwarderResponderRepliesOnly))
 	}
 	key := udpFlowKey{local: request.flow.Destination, remote: request.flow.Source}
 	if f.requests[key] == request {
@@ -1708,33 +1790,38 @@ func (f *UDPForwarder) detach(request *UDPForwarderRequest) (*UDPForwarderRespon
 func (r *UDPForwarderResponder) Flow() TransportFlow { return r.flow }
 
 // Payload returns an independently owned copy of the triggering UDP payload.
-// The caller may retain or modify it and must synchronize concurrent access.
+// It returns nil after DetachForReplies or RestrictToReplies. The caller may
+// retain or modify a returned slice and must synchronize concurrent access.
 func (r *UDPForwarderResponder) Payload() []byte { return r.payload }
 
-// beginReply records or continues repeatable output before validating the
-// current output policy.
-func (r *UDPForwarderResponder) beginReply() error {
-	if err := r.lifecycle.beginReply(); err != nil {
+// RestrictToReplies irreversibly discards the triggering payload and rejection
+// quote while retaining Flow, Reply, ReplyFrom, and Done. On success, Reject
+// and Drop report net.ErrClosed. Calls made after a successful restriction or
+// on a responder returned by DetachForReplies are no-ops that return nil. It
+// reports net.ErrClosed only if the responder is terminal and does not itself
+// count as a terminal action. The caller must invoke it while no other
+// responder method is running. A previously returned Payload slice remains
+// valid and keeps its storage live for as long as the caller retains it. After
+// this method returns, Reply and ReplyFrom may again be called concurrently.
+func (r *UDPForwarderResponder) RestrictToReplies() error {
+	if err := r.restrictToReplies(); err != nil {
 		return err
 	}
-	if r.forwarder.closed.Load() {
-		r.forwarder.replyErrors.Add(1)
-		return net.ErrClosed
-	}
-	if !r.forwarder.stack.network.Load().acceptsInboundDestination(r.flow.Destination.Addr()) {
-		r.forwarder.replyErrors.Add(1)
-		return syscall.EADDRNOTAVAIL
-	}
+	r.payload = nil
+	r.packet.payload = nil
+	r.packet.original = nil
 	return nil
 }
 
 // Reply atomically queues one reverse-flow datagram from Destination to Source
 // without waiting for outbound capacity. Use ReplyFrom to select a different
 // source. It reports ErrResourceLimit without emitting partial fragments when
-// the queue is full. Calls may be repeated or concurrent until Drop, Reject, or
-// Close, with no ordering guarantee between concurrent calls. Any call may be
-// retried after failure; each call revalidates the forwarder and current
-// destination policy and copies payload before returning.
+// the queue is full. Calls may be repeated or concurrent while the responder
+// is active or restricted to replies, with no ordering guarantee between
+// concurrent calls. Any call may be retried after failure; each call
+// revalidates the forwarder and current destination policy and copies payload
+// before returning. It reports net.ErrClosed after a terminal action or when
+// the originating forwarder is closed.
 func (r *UDPForwarderResponder) Reply(payload []byte) (int, error) {
 	return r.replyFrom(payload, r.flow.Destination)
 }
@@ -1756,89 +1843,68 @@ func (r *UDPForwarderResponder) replyFrom(payload []byte, source netip.AddrPort)
 	}
 	validated, err := validateUDPForwarderReply(r.flow, payload, source)
 	if err != nil {
-		r.forwarder.replyErrors.Add(1)
-		return 0, err
+		return 0, r.recordReply(err)
 	}
-	n, err := r.forwarder.replyUDPFlow(r.flow, payload, validated)
-	if err != nil {
-		r.forwarder.replyErrors.Add(1)
-		return n, err
-	}
-	r.forwarder.replies.Add(1)
-	return n, nil
-}
-
-// Drop terminates the detached datagram without packet I/O. It remains valid
-// after replies and reports net.ErrClosed after another terminal action.
-func (r *UDPForwarderResponder) Drop() error {
-	if err := r.lifecycle.finish(); err != nil {
-		return err
-	}
-	r.forwarder.count(forwarderRequestDropped)
-	return nil
+	n, err := r.runtime.replyUDPFlow(r.flow, payload, validated)
+	return n, r.recordReply(err)
 }
 
 // Reject terminates the detached datagram and attempts to enqueue ICMP Port
 // Unreachable without waiting for outbound capacity. It remains valid after
 // replies and revalidates the forwarder and current destination policy. Once
-// selected, the rejection decision remains terminal on output error.
+// selected, the rejection decision remains terminal on output error. It
+// reports net.ErrClosed if the responder is already terminal or restricted to
+// replies, including one returned by DetachForReplies, or if the originating
+// forwarder is closed.
 func (r *UDPForwarderResponder) Reject() error {
-	if err := r.lifecycle.finish(); err != nil {
+	if err := r.beginReject(); err != nil {
 		return err
 	}
-	r.forwarder.count(forwarderRequestRejected)
-	if r.forwarder.closed.Load() {
-		return net.ErrClosed
-	}
-	if !r.forwarder.stack.network.Load().acceptsInboundDestination(r.flow.Destination.Addr()) {
-		return syscall.EADDRNOTAVAIL
-	}
-	return r.forwarder.stack.sendPortUnreachable(r.packet)
+	return r.runtime.stack.sendPortUnreachable(r.packet)
 }
-
-// Close prevents new Reply calls. A Reply that began before Close may finish.
-// Closing a responder before its first Reply is equivalent to Drop. Close is
-// a logical state transition and does not wait for concurrent calls; it reports
-// net.ErrClosed after a previous terminal action.
-func (r *UDPForwarderResponder) Close() error {
-	pending, err := r.lifecycle.close()
-	if err != nil {
-		return err
-	}
-	if pending {
-		r.forwarder.count(forwarderRequestDropped)
-	}
-	return nil
-}
-
-// Done is closed when the originating UDP forwarder is closed. Configuration
-// changes remain dynamic and are revalidated by each Reply.
-func (r *UDPForwarderResponder) Done() <-chan struct{} { return r.forwarder.done }
 
 // Detach transfers one IP request out of the synchronous handler lifetime and
-// returns an independently owned message snapshot. The caller must bound the
-// responder's lifetime and eventually close it. It may be called after any
-// number of Reply attempts; the responder remains available for further
-// replies.
+// on success removes it from the forwarder's pending set. It returns a
+// caller-owned message snapshot whose responder points back to the originating
+// forwarder's state for output and Done; the forwarder does not retain the
+// responder. The caller may discard it without a terminal action. Detach may be
+// called after any number of Reply attempts; the responder remains available
+// for further replies.
 func (r *IPForwarderRequest) Detach() (*IPForwarderResponder, error) {
-	replied, ok := r.claim()
+	_, ok := r.claim()
 	if !ok {
 		return nil, ErrForwarderRequestCompleted
 	}
-	responder, err := r.forwarder.detach(r)
+	responder, err := r.forwarder.detach(r, forwarderDetachWithInput)
 	if err != nil {
 		r.finish(forwarderRequestDropped)
 		return nil, err
 	}
-	if replied {
-		responder.lifecycle.state.Store(uint32(forwarderResponderReplyStarted))
+	return responder, nil
+}
+
+// DetachForReplies transfers the IP request into an asynchronous responder
+// that retains only Message metadata, Reply, and Done. Message().Payload is
+// nil, and Reject and Drop report net.ErrClosed. Unlike Detach, it does not
+// copy the upper-layer payload or retain an ICMP rejection quote. The caller
+// owns the responder and may discard it without a terminal action.
+// RestrictToReplies is an idempotent no-op on the returned responder.
+func (r *IPForwarderRequest) DetachForReplies() (*IPForwarderResponder, error) {
+	_, ok := r.claim()
+	if !ok {
+		return nil, ErrForwarderRequestCompleted
+	}
+	responder, err := r.forwarder.detach(r, forwarderDetachForReplies)
+	if err != nil {
+		r.finish(forwarderRequestDropped)
+		return nil, err
 	}
 	return responder, nil
 }
 
-// detach copies one IP request into caller-owned storage while holding the
-// forwarder lock. No reference to the responder is retained by the stack.
-func (f *IPForwarder) detach(request *IPForwarderRequest) (*IPForwarderResponder, error) {
+// detach transfers one IP request while holding the forwarder lock. It copies
+// input storage only when the caller retains input-dependent capabilities.
+func (f *IPForwarder) detach(request *IPForwarderRequest, mode forwarderDetachMode) (*IPForwarderResponder, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed.Load() {
@@ -1847,11 +1913,24 @@ func (f *IPForwarder) detach(request *IPForwarderRequest) (*IPForwarderResponder
 	if !f.stack.network.Load().acceptsInboundDestination(request.packet.target) {
 		return nil, syscall.EADDRNOTAVAIL
 	}
-	payload := append([]byte(nil), request.packet.payload...)
+	packet := request.packet
+	var payload []byte
+	if mode == forwarderDetachForReplies {
+		packet.payload = nil
+		packet.original = nil
+	} else {
+		packet = copyForwarderRejectPacket(packet)
+		payload = append([]byte(nil), request.packet.payload...)
+	}
 	responder := &IPForwarderResponder{
-		forwarder: f,
-		message:   ipForwarderMessage(request.packet, payload),
-		packet:    copyForwarderRejectPacket(request.packet),
+		forwarderResponder: forwarderResponder{
+			runtime: f.forwarderRuntime,
+			packet:  packet,
+		},
+		message: ipForwarderMessage(packet, payload),
+	}
+	if mode == forwarderDetachForReplies {
+		responder.state.Store(uint32(forwarderResponderRepliesOnly))
 	}
 	delete(f.requests, request)
 	request.state.Store(uint32(forwarderRequestDetached))
@@ -1870,7 +1949,7 @@ func ipForwarderMessage(packet ipPacket, payload []byte) IPMessage {
 
 // reply validates current transparent-source and route policy before queuing
 // one reverse protocol payload.
-func (f *IPForwarder) reply(packet ipPacket, payload []byte) error {
+func (f *forwarderRuntime) replyIPPayload(packet ipPacket, payload []byte) error {
 	network := f.stack.network.Load()
 	if !network.acceptsInboundDestination(packet.target) {
 		return syscall.EADDRNOTAVAIL
@@ -1891,115 +1970,101 @@ func (f *IPForwarder) reply(packet ipPacket, payload []byte) error {
 	return f.stack.tryWritePackets(packets)
 }
 
-// Message returns the detached, independently owned IP message snapshot. The
-// caller may retain or modify Payload and must synchronize concurrent access.
+// Message returns the detached IP metadata and independently owned payload.
+// Payload is nil after DetachForReplies or RestrictToReplies. The caller may
+// retain or modify a returned payload and must synchronize concurrent access.
 func (r *IPForwarderResponder) Message() IPMessage { return r.message }
 
-// beginReply records or continues repeatable output before validating current
-// forwarder and destination policy.
-func (r *IPForwarderResponder) beginReply() error {
-	if err := r.lifecycle.beginReply(); err != nil {
+// RestrictToReplies irreversibly discards the upper-layer payload and rejection
+// quote while retaining Message metadata, Reply, and Done. On success, Reject
+// and Drop report net.ErrClosed. Calls made after a successful restriction or
+// on a responder returned by DetachForReplies are no-ops that return nil. It
+// reports net.ErrClosed only if the responder is terminal and does not itself
+// count as a terminal action. The caller must invoke it while no other
+// responder method is running. A previously returned Message().Payload slice
+// remains valid and keeps its storage live for as long as the caller retains
+// it. After this method returns, Reply may again be called concurrently.
+func (r *IPForwarderResponder) RestrictToReplies() error {
+	if err := r.restrictToReplies(); err != nil {
 		return err
 	}
-	if r.forwarder.closed.Load() {
-		r.forwarder.replyErrors.Add(1)
-		return net.ErrClosed
-	}
-	if !r.forwarder.stack.network.Load().acceptsInboundDestination(r.message.Destination) {
-		r.forwarder.replyErrors.Add(1)
-		return syscall.EADDRNOTAVAIL
-	}
+	r.message.Payload = nil
+	r.packet.payload = nil
+	r.packet.original = nil
 	return nil
 }
 
 // Reply atomically queues one reverse protocol payload without waiting for
 // outbound capacity. Calls may be repeated or concurrent until a terminal
-// action, with no ordering guarantee between concurrent calls. Failed calls may
-// be retried, and Drop, Reject, or Close may follow any number of replies.
+// action or while restricted to replies, with no ordering guarantee between
+// concurrent calls. Failed calls may be retried, and Drop or Reject may follow
+// any number of replies while the responder remains active. It reports
+// net.ErrClosed after a terminal action or when the originating forwarder is
+// closed.
 func (r *IPForwarderResponder) Reply(payload []byte) error {
 	if err := r.beginReply(); err != nil {
 		return err
 	}
-	err := r.forwarder.reply(r.packet, payload)
-	if err != nil {
-		r.forwarder.replyErrors.Add(1)
-		return err
-	}
-	r.forwarder.replies.Add(1)
-	return nil
-}
-
-// Drop terminates the detached payload without packet I/O. It remains valid
-// after replies.
-func (r *IPForwarderResponder) Drop() error {
-	if err := r.lifecycle.finish(); err != nil {
-		return err
-	}
-	r.forwarder.count(forwarderRequestDropped)
-	return nil
+	return r.recordReply(r.runtime.replyIPPayload(r.packet, payload))
 }
 
 // Reject terminates the detached payload and attempts to enqueue a protocol-
 // unreachable response. It remains valid after replies and revalidates current
-// destination policy.
+// destination policy. It reports net.ErrClosed if the responder is already
+// terminal or restricted to replies, including one returned by
+// DetachForReplies, or if the originating forwarder is closed.
 func (r *IPForwarderResponder) Reject() error {
-	if err := r.lifecycle.finish(); err != nil {
+	if err := r.beginReject(); err != nil {
 		return err
 	}
-	r.forwarder.count(forwarderRequestRejected)
-	if r.forwarder.closed.Load() {
-		return net.ErrClosed
-	}
-	if !r.forwarder.stack.network.Load().acceptsInboundDestination(r.message.Destination) {
-		return syscall.EADDRNOTAVAIL
-	}
-	return r.forwarder.stack.sendProtocolUnreachable(r.packet)
+	return r.runtime.stack.sendProtocolUnreachable(r.packet)
 }
-
-// Close prevents new Reply calls. A Reply that began before Close may finish;
-// closing before any Reply attempt is equivalent to Drop.
-func (r *IPForwarderResponder) Close() error {
-	pending, err := r.lifecycle.close()
-	if err != nil {
-		return err
-	}
-	if pending {
-		r.forwarder.count(forwarderRequestDropped)
-	}
-	return nil
-}
-
-// Done is closed when the originating IP forwarder is closed. Configuration
-// changes remain dynamic and are revalidated by each output call.
-func (r *IPForwarderResponder) Done() <-chan struct{} { return r.forwarder.done }
 
 // Detach transfers one ICMP request out of the synchronous handler lifetime.
-// It returns an independently owned message snapshot whose responder may be
-// handed to another goroutine. The forwarder does not retain the responder or
-// impose a capacity or timeout; the caller must bound its lifetime and
-// eventually close it. Detach itself is the request's action and consumes the
-// request even when it returns an error. It may be called after any number of
-// Reply, ReplyIPPacket, or ReplyEcho attempts; the responder remains available
-// for further replies.
+// On success it removes the request from the forwarder's pending set and
+// returns a caller-owned message snapshot. The responder points back to the
+// originating forwarder's state for output and Done, but the forwarder does
+// not retain the responder or impose a capacity or timeout. The caller may hand
+// it to another goroutine or discard it without a terminal action. Detach
+// itself is the request's action and consumes the request even when it returns
+// an error. It may be called after any number of Reply, ReplyIPPacket, or
+// ReplyEcho attempts; the responder remains available for further replies.
 func (r *ICMPForwarderRequest) Detach() (*ICMPForwarderResponder, error) {
-	replied, ok := r.claim()
+	_, ok := r.claim()
 	if !ok {
 		return nil, ErrForwarderRequestCompleted
 	}
-	responder, err := r.forwarder.detach(r)
+	responder, err := r.forwarder.detach(r, forwarderDetachWithInput)
 	if err != nil {
 		r.finish(forwarderRequestDropped)
 		return nil, err
 	}
-	if replied {
-		responder.lifecycle.state.Store(uint32(forwarderResponderReplyStarted))
+	return responder, nil
+}
+
+// DetachForReplies transfers the ICMP request into an asynchronous responder
+// that retains only Message metadata, Reply, ReplyIPPacket, and Done.
+// Message().Payload and IPPacket return nil, while ReplyEcho, Reject, and Drop
+// report net.ErrClosed. Unlike Detach, it does not copy the triggering packet
+// or retain an ICMP rejection quote. The caller owns the responder and may
+// discard it without a terminal action. RestrictToReplies is an idempotent
+// no-op on the returned responder.
+func (r *ICMPForwarderRequest) DetachForReplies() (*ICMPForwarderResponder, error) {
+	_, ok := r.claim()
+	if !ok {
+		return nil, ErrForwarderRequestCompleted
+	}
+	responder, err := r.forwarder.detach(r, forwarderDetachForReplies)
+	if err != nil {
+		r.finish(forwarderRequestDropped)
+		return nil, err
 	}
 	return responder, nil
 }
 
-// detach copies one ICMP request into caller-owned storage while holding the
-// forwarder lock. No reference to the responder is retained by the stack.
-func (f *ICMPForwarder) detach(request *ICMPForwarderRequest) (*ICMPForwarderResponder, error) {
+// detach transfers one ICMP request while holding the forwarder lock. It copies
+// input storage only when the caller retains input-dependent capabilities.
+func (f *ICMPForwarder) detach(request *ICMPForwarderRequest, mode forwarderDetachMode) (*ICMPForwarderResponder, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed.Load() {
@@ -2008,60 +2073,81 @@ func (f *ICMPForwarder) detach(request *ICMPForwarderRequest) (*ICMPForwarderRes
 	if !f.stack.network.Load().acceptsInboundDestination(request.packet.target) {
 		return nil, syscall.EADDRNOTAVAIL
 	}
-	packet := copyForwarderPacket(request.packet)
-	if len(packet.original) == 0 {
-		return nil, syscall.EINVAL
+	packet := request.packet
+	if mode == forwarderDetachForReplies {
+		packet.payload = nil
+		packet.original = nil
+	} else {
+		packet = copyForwarderPacket(packet)
+		if len(packet.original) == 0 {
+			return nil, syscall.EINVAL
+		}
 	}
 	responder := &ICMPForwarderResponder{
-		forwarder: f,
+		forwarderResponder: forwarderResponder{
+			runtime: f.forwarderRuntime,
+			packet:  packet,
+		},
 		message: ICMPMessage{
 			Source: packet.source, Destination: packet.target,
-			Type: packet.payload[0], Code: packet.payload[1], Payload: packet.payload,
+			Type: request.packet.payload[0], Code: request.packet.payload[1], Payload: packet.payload,
 		},
-		packet:       packet,
-		rejectPacket: copyForwarderRejectPacket(request.packet),
-		rejectable:   !packetInvokesICMPError(request.packet.original),
+	}
+	if mode == forwarderDetachForReplies {
+		responder.state.Store(uint32(forwarderResponderRepliesOnly))
+	} else {
+		responder.rejectPacket = copyForwarderRejectPacket(request.packet)
+		responder.rejectable = !packetInvokesICMPError(request.packet.original)
 	}
 	delete(f.requests, request)
 	request.state.Store(uint32(forwarderRequestDetached))
 	return responder, nil
 }
 
-// Message returns the detached, independently owned ICMP message snapshot.
-// The caller may retain or modify Payload and must synchronize concurrent
-// access. Type and Code remain the original classification; changing the first
-// two Payload bytes makes the snapshot inconsistent and causes ReplyEcho to
-// report syscall.EINVAL.
+// Message returns the detached ICMP metadata and independently owned payload.
+// Payload is nil after DetachForReplies or RestrictToReplies. The caller may
+// retain or modify a returned payload and must synchronize concurrent access.
+// Type and Code remain the original classification; changing the first two
+// Payload bytes makes the snapshot inconsistent and causes ReplyEcho to report
+// syscall.EINVAL.
 func (r *ICMPForwarderResponder) Message() ICMPMessage { return r.message }
 
 // IPPacket returns the complete, reassembled packet snapshot retained by
-// Detach. The caller owns the slice and may retain or modify it, but must
-// synchronize concurrent access. Message().Payload aliases its ICMP region.
+// Detach, or nil after DetachForReplies or RestrictToReplies. The caller owns a
+// returned slice and may retain or modify it, but must synchronize concurrent
+// access. Message().Payload aliases its ICMP region.
 func (r *ICMPForwarderResponder) IPPacket() []byte { return r.packet.original }
 
-// beginReply records or continues repeatable output before validating the
-// current output policy.
-func (r *ICMPForwarderResponder) beginReply() error {
-	if err := r.lifecycle.beginReply(); err != nil {
+// RestrictToReplies irreversibly discards the complete packet, message payload,
+// and rejection quote while retaining Message metadata, Reply, ReplyIPPacket,
+// and Done. On success, ReplyEcho, Reject, and Drop report net.ErrClosed.
+// Calls made after a successful restriction or on a responder returned by
+// DetachForReplies are no-ops that return nil. It reports net.ErrClosed only if
+// the responder is terminal and does not itself count as a terminal action.
+// The caller must invoke it while no other responder method is running.
+// Previously returned snapshots remain valid and keep their storage live for
+// as long as the caller retains them. After this method returns, Reply and
+// ReplyIPPacket may again be called concurrently.
+func (r *ICMPForwarderResponder) RestrictToReplies() error {
+	if err := r.restrictToReplies(); err != nil {
 		return err
 	}
-	if r.forwarder.closed.Load() {
-		r.forwarder.replyErrors.Add(1)
-		return net.ErrClosed
-	}
-	if !r.forwarder.stack.network.Load().acceptsInboundDestination(r.message.Destination) {
-		r.forwarder.replyErrors.Add(1)
-		return syscall.EADDRNOTAVAIL
-	}
+	r.message.Payload = nil
+	r.packet.payload = nil
+	r.packet.original = nil
+	r.rejectPacket = ipPacket{}
+	r.rejectable = false
 	return nil
 }
 
 // Reply atomically queues one reverse ICMP message without waiting for
 // outbound capacity. It reports ErrResourceLimit without emitting partial
 // fragments when the queue is full. Calls may be repeated or concurrent until
-// a terminal action, with no ordering guarantee between concurrent calls. Any
-// call may be retried after failure; each call revalidates the forwarder and
-// current destination policy and copies payload before returning.
+// a terminal action or while restricted to replies, with no ordering guarantee
+// between concurrent calls. Any call may be retried after failure; each call
+// revalidates the forwarder and current destination policy and copies payload
+// before returning. It reports net.ErrClosed after a terminal action or when
+// the originating forwarder is closed.
 func (r *ICMPForwarderResponder) Reply(payload []byte) error {
 	return r.reply(payload, false)
 }
@@ -2079,107 +2165,65 @@ func (r *ICMPForwarderResponder) reply(payload []byte, owned bool) error {
 func (r *ICMPForwarderResponder) writeReply(payload []byte, owned bool) error {
 	var err error
 	if owned {
-		err = r.forwarder.stack.writeOwnedICMPReply(r.packet, payload)
+		err = r.runtime.stack.writeOwnedICMPReply(r.packet, payload)
 	} else {
-		err = r.forwarder.stack.writeICMPReply(r.packet, payload)
+		err = r.runtime.stack.writeICMPReply(r.packet, payload)
 	}
-	if err != nil {
-		r.forwarder.replyErrors.Add(1)
-		return err
-	}
-	r.forwarder.replies.Add(1)
-	return nil
+	return r.recordReply(err)
 }
 
 // ReplyIPPacket is the detached form of ICMPForwarderRequest.ReplyIPPacket.
-// Calls may be repeated or concurrent until a terminal action. The packet is
-// copied before return, concurrent calls have no ordering guarantee, and a
-// failed call may be retried or followed by Drop, Reject, or Close.
+// Calls may be repeated or concurrent until a terminal action or while
+// restricted to replies. The packet is copied before return, concurrent calls
+// have no ordering guarantee, and a failed call may be retried or followed by
+// Drop or Reject while the responder remains active. It reports net.ErrClosed
+// after a terminal action or when the originating forwarder is closed.
 func (r *ICMPForwarderResponder) ReplyIPPacket(packet []byte) error {
 	if err := r.beginReply(); err != nil {
 		return err
 	}
 	reply, err := prepareICMPForwarderIPPacket(packet, r.packet.source)
 	if err != nil {
-		r.forwarder.replyErrors.Add(1)
-		return err
+		return r.recordReply(err)
 	}
-	if err = r.forwarder.stack.writeICMPForwarderIPPacket(r.packet, reply); err != nil {
-		r.forwarder.replyErrors.Add(1)
-		return err
-	}
-	r.forwarder.replies.Add(1)
-	return nil
+	return r.recordReply(r.runtime.stack.writeICMPForwarderIPPacket(r.packet, reply))
 }
 
 // ReplyEcho copies the detached Echo Request into an Echo Reply, preserving its
 // identifier, sequence, and data. It reports syscall.EINVAL when the retained
 // message is not an IPv4 or IPv6 Echo Request. Calls may be repeated or
-// concurrent until a terminal action and may be followed by Drop or Reject.
+// concurrent until a terminal action and may be followed by Drop or Reject. It
+// reports net.ErrClosed if the responder is terminal or restricted to replies,
+// including one returned by DetachForReplies, or if the originating forwarder
+// is closed.
 func (r *ICMPForwarderResponder) ReplyEcho() error {
-	if err := r.beginReply(); err != nil {
+	if err := r.beginInputReply(); err != nil {
 		return err
 	}
 	if !r.message.IsEchoRequest() {
-		r.forwarder.replyErrors.Add(1)
-		return syscall.EINVAL
+		return r.recordReply(syscall.EINVAL)
 	}
 	reply, ok := makeICMPEchoReply(r.packet.protocol, r.message.Payload)
 	if !ok {
-		r.forwarder.replyErrors.Add(1)
-		return syscall.EINVAL
+		return r.recordReply(syscall.EINVAL)
 	}
 	return r.writeReply(reply, true)
-}
-
-// Drop terminates the detached message without packet I/O. It remains valid
-// after replies and reports net.ErrClosed after another terminal action.
-func (r *ICMPForwarderResponder) Drop() error {
-	if err := r.lifecycle.finish(); err != nil {
-		return err
-	}
-	r.forwarder.count(forwarderRequestDropped)
-	return nil
 }
 
 // Reject terminates the detached message and attempts to enqueue an
 // administratively prohibited response without waiting for outbound capacity.
 // It remains valid after replies and revalidates the forwarder and current
 // destination policy. Once selected, the decision remains terminal on output
-// error.
+// error. It reports net.ErrClosed if the responder is already terminal or
+// restricted to replies, including one returned by DetachForReplies, or if the
+// originating forwarder is closed.
 func (r *ICMPForwarderResponder) Reject() error {
-	if err := r.lifecycle.finish(); err != nil {
+	if err := r.beginReject(); err != nil {
 		return err
-	}
-	r.forwarder.count(forwarderRequestRejected)
-	if r.forwarder.closed.Load() {
-		return net.ErrClosed
-	}
-	if !r.forwarder.stack.network.Load().acceptsInboundDestination(r.message.Destination) {
-		return syscall.EADDRNOTAVAIL
 	}
 	var err error
 	if r.rejectable {
-		err = r.forwarder.stack.sendAdministrativeUnreachable(r.rejectPacket)
+		err = r.runtime.stack.sendAdministrativeUnreachable(r.rejectPacket)
 	}
 	return err
 }
-
-// Close prevents new Reply calls. A Reply that began before Close may finish.
-// Closing a responder before its first Reply is equivalent to Drop. Close is
-// a logical state transition and does not wait for concurrent calls; it reports
-// net.ErrClosed after a previous terminal action.
-func (r *ICMPForwarderResponder) Close() error {
-	pending, err := r.lifecycle.close()
-	if err != nil {
-		return err
-	}
-	if pending {
-		r.forwarder.count(forwarderRequestDropped)
-	}
-	return nil
-}
-
-// Done is closed when the originating ICMP forwarder is closed. Configuration
-// changes remain dynamic and are revalidated by each Reply.
-func (r *ICMPForwarderResponder) Done() <-chan struct{} { return r.forwarder.done }

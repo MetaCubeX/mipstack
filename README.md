@@ -232,7 +232,7 @@ and unicast, multicast, or broadcast classification are not policy checks; a
 zero source port is preserved. This is stateless transparent output, not
 arbitrary destination selection: every reply still targets `Flow().Source`.
 Replies may be repeated or retried and do not prevent a later `Accept`,
-`Listen`, `Detach`, `Drop`, or `Reject`.
+`Listen`, `Detach`, `DetachForReplies`, `Drop`, or `Reject`.
 Stateless replies inherit the current `Config.UDP` output defaults.
 
 ICMP requests similarly expose a checksum-validated complete message and
@@ -275,42 +275,76 @@ UDP, IP, and ICMP handlers run synchronously inside `Stack.Write` or loopback
 packet delivery. They may be invoked concurrently by concurrent writers and
 must return promptly; waiting for traffic that depends on the same delivery
 call would deadlock it. Request values and payloads returned by request methods
-are borrowed and valid only during the callback. Detached responders instead
-own their payload or message snapshot. `Reply`, `ReplyFrom`, `ReplyIPPacket`,
-and `ReplyEcho` are repeatable output operations, not terminal actions. A
-handler may make zero or more reply attempts and then select at most one
-terminal action. Returning after at least one reply attempt without a terminal
-action simply completes the request; returning without either applies an
-implicit `Drop`. Every request method call must finish before the callback
+are borrowed and valid only during the callback. `Reply`, `ReplyFrom`,
+`ReplyIPPacket`, and `ReplyEcho` are repeatable output operations, not terminal
+actions. A handler may make zero or more reply attempts and then select at most
+one terminal action. Returning after at least one reply attempt without a
+terminal action simply completes the request; returning without either applies
+an implicit `Drop`. Every request method call must finish before the callback
 returns.
 
-For UDP, terminal actions are `Accept`, `Listen`, `Detach`, `Drop`, and
-`Reject`; for IP and ICMP they are `Detach`, `Drop`, and `Reject`. `Detach`
-transfers ownership out of the callback and returns a responder with its own
-payload or message snapshot. That responder may be retained or handed to
-another goroutine, while concurrent access to its mutable snapshot remains the
-application's responsibility. A reply that began before a terminal action may
-finish, but a reply begun after it reports `ErrForwarderRequestCompleted`.
-Repeated or invalidated terminal request actions report the same error.
+For UDP, terminal request actions are `Accept`, `Listen`, `Detach`,
+`DetachForReplies`, `Drop`, and `Reject`; for IP and ICMP they are `Detach`,
+`DetachForReplies`, `Drop`, and `Reject`. Both detach methods remove the request
+from the forwarder's pending set and transfer asynchronous reply ownership to a
+caller-owned responder. `Detach` also copies the input snapshot and retains the
+quote needed by `Reject`. `DetachForReplies` avoids those copies when the caller
+already knows it needs only replies. The ownership and reference directions
+are:
+
+```text
+Stack -> registered Forwarder -> pending callback-scoped Request
+                                   |
+                                   | Detach or DetachForReplies
+                                   v
+Caller -> detached Responder -> originating Forwarder state -> Stack
+```
+
+The lower chain is one-way: the responder retains access to its originating
+forwarder's state and stack for output, diagnostics, and `Done`, but neither the
+forwarder nor the stack retains the responder. It is therefore independent of
+the callback and request lifetime, not independent of forwarder state. The
+caller may retain it, hand it to another goroutine, or discard it; concurrent
+access to its mutable snapshot remains the caller's responsibility. A request
+reply that began before a terminal request action may finish, but a reply begun
+after it reports `ErrForwarderRequestCompleted`. Repeated or invalidated
+terminal request actions report the same error.
 
 A detached UDP, IP, or ICMP responder permits repeated or concurrent reply
-operations until a terminal action. An argument, forwarder, configuration,
-route, PMTU, queue, or stack error fails only that call and may be followed by
-another reply or a terminal action. Concurrent calls have no ordering
-guarantee.
+operations while it is active or restricted to replies. An argument,
+forwarder, configuration, route, PMTU, queue, or stack error fails only that
+call and may be followed by another reply or, while active, a terminal action.
+Concurrent calls have no ordering guarantee.
 
-`Drop`, `Reject`, and `Close` remain available after any number of responder
-replies and exactly one of them may terminate the responder. `Close` before any
-reply is counted as an implicit `Drop`; after a reply it only closes the
-lifecycle. A reply that began before the terminal action may finish, while a
-later reply or terminal action reports `net.ErrClosed`. The terminal action
-does not wait for calls already in progress. The forwarder does not retain the
-responder, create a timer, or impose a detached-request capacity. The
-application owns its memory, concurrency bound, cancellation, timeout, and
-eventual logical closure. Every output call revalidates forwarder closure, the
-current destination policy, and the return route.
-`Done` lets asynchronous work observe permanent forwarder or stack closure;
-configuration changes remain dynamic and are reported by individual calls.
+`RestrictToReplies` irreversibly converts a responder returned by `Detach` to
+the same capability set as one returned by `DetachForReplies`. It releases the
+responder's references to copied input storage and does not count as `Drop` or
+`Reject`. UDP retains `Flow`, `Reply`, `ReplyFrom`, and `Done`; IP retains
+`Message` metadata, `Reply`, and `Done`; ICMP retains `Message` metadata,
+`Reply`, `ReplyIPPacket`, and `Done`. Snapshot accessors then return nil payload
+or packet storage, while `ReplyEcho`, `Drop`, and `Reject` report
+`net.ErrClosed` where applicable. Repeated calls, including calls on a responder
+returned by `DetachForReplies`, are idempotent no-ops; only a terminal responder
+causes `RestrictToReplies` to report `net.ErrClosed`. The caller must invoke it
+while no other responder method is running. Reply operations may again run
+concurrently after it returns. A slice obtained before restriction remains
+valid and keeps its backing storage live while the caller retains it.
+
+`Drop` and `Reject` remain available after any number of responder replies, and
+exactly one of them may terminate an active responder. They are unavailable
+after restriction. A reply that began before an active responder's terminal
+action may finish, while a later reply or terminal action reports
+`net.ErrClosed`. The terminal action does not wait for calls already in
+progress. Neither action is required for resource release because no stack-side
+collection, timer, or detached-request capacity owns the responder. Discarding
+it after its final reply releases the caller's reference and contributes no
+terminal-action diagnostic count. The caller controls its retention,
+concurrency bound, cancellation, and timeout. Every output call revalidates
+forwarder closure, the current destination policy, and the return route.
+Closing the originating forwarder closes the responder's `Done` channel and
+makes later output fail with `net.ErrClosed`; it does not reclaim or mutate any
+caller-owned snapshot. Configuration changes remain dynamic and are reported
+by individual calls.
 
 Request-scoped `Reply` and every `Reject` action are nonblocking with respect to
 the outbound packet queue. They report `ErrResourceLimit` when capacity is
