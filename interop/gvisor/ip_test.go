@@ -34,6 +34,158 @@ func TestRawIPInterop(t *testing.T) {
 	}
 }
 
+// TestIPv6RawChecksumInterop verifies RFC 3542 IPV6_CHECKSUM insertion and
+// receive verification in both directions. Fragmented output is delivered to
+// gVisor's UDP transport because the pinned gVisor raw demultiplexer observes
+// the outer IPv6 Fragment header but does not revisit raw sockets after
+// reassembly.
+func TestIPv6RawChecksumInterop(t *testing.T) {
+	family := interopFamilies[1]
+	for _, mtu := range interopMTUsForFamily(family) {
+		mtu := mtu
+		t.Run(interopMTUName(mtu), func(t *testing.T) {
+			network := newFamilyInteropNetwork(t, family, mtu)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			connection, err := (&mipstack.ListenConfig{Options: []mipstack.SocketOption{
+				mipstack.SocketOptions.IPv6Checksum(true, 2),
+			}}).ListenIP(ctx, network.mipstack, family.rawNetwork, family.mipstackAddress)
+			if err != nil {
+				t.Fatalf("listen with mipstack IPv6 checksum: %v", err)
+			}
+			defer connection.Close()
+			if err = connection.SetDeadline(time.Now().Add(8 * time.Second)); err != nil {
+				t.Fatalf("set mipstack raw checksum deadline: %v", err)
+			}
+
+			var queue waiter.Queue
+			endpoint, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, interopRawIPProtocol, &queue)
+			if tcpipErr != nil {
+				t.Fatalf("create gVisor checksummed raw endpoint: %s", tcpipErr.String())
+			}
+			defer endpoint.Close()
+			if tcpipErr = endpoint.SetSockOptInt(tcpip.IPv6Checksum, 2); tcpipErr != nil {
+				t.Fatalf("enable gVisor IPv6 checksum: %s", tcpipErr.String())
+			}
+			if tcpipErr = endpoint.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+				t.Fatalf("bind gVisor checksummed raw endpoint: %s", tcpipErr.String())
+			}
+			if tcpipErr = endpoint.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+				t.Fatalf("connect gVisor checksummed raw endpoint: %s", tcpipErr.String())
+			}
+			entry, notifications := registerReadable(&queue)
+			defer queue.EventUnregister(&entry)
+
+			request := patternedPayload(257, 0x61)
+			request[2], request[3] = 0, 0
+			written, writeErr := endpoint.Write(bytes.NewReader(request), tcpip.WriteOptions{})
+			if writeErr != nil || written != int64(len(request)) {
+				t.Fatalf("write gVisor checksummed payload: n=%d, error=%s", written, tcpipErrorString(writeErr))
+			}
+			storage := make([]byte, 65535)
+			read, source, readErr := connection.ReadFromIP(storage)
+			if readErr != nil {
+				t.Fatalf("read gVisor checksummed payload in mipstack: %v", readErr)
+			}
+			sourceAddress, valid := netip.AddrFromSlice(source.IP)
+			if !valid || sourceAddress != family.gvisorAddress || !validIPv6RawChecksum(storage[:read], family.gvisorAddress, family.mipstackAddress, byte(interopRawIPProtocol)) {
+				t.Fatalf("mipstack received invalid gVisor checksum: source=%v payload=%x", source, storage[:read])
+			}
+			storage[2], storage[3] = 0, 0
+			if !bytes.Equal(storage[:read], request) {
+				t.Fatal("gVisor checksum insertion changed bytes outside its field")
+			}
+
+			response := patternedPayload(263, 0x71)
+			original := append([]byte(nil), response...)
+			writtenInt, writeToErr := connection.WriteToIP(response, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
+			if writeToErr != nil || writtenInt != len(response) {
+				t.Fatalf("write mipstack checksummed payload: n=%d, error=%v", writtenInt, writeToErr)
+			}
+			if !bytes.Equal(response, original) {
+				t.Fatal("mipstack checksum insertion mutated caller payload")
+			}
+			packet, remote, endpointErr := readGVisorEndpoint(ctx, endpoint, notifications, 65535)
+			if endpointErr != nil {
+				t.Fatalf("read mipstack checksummed payload in gVisor: %v", endpointErr)
+			}
+			if remote.Addr != gvisorAddress(family.mipstackAddress) || !validIPv6RawChecksum(packet, family.mipstackAddress, family.gvisorAddress, byte(interopRawIPProtocol)) {
+				t.Fatalf("gVisor received invalid mipstack checksum: source=%v payload=%x", remote.Addr, packet)
+			}
+			packet[2], packet[3] = 0, 0
+			original[2], original[3] = 0, 0
+			if !bytes.Equal(packet, original) {
+				t.Fatal("mipstack checksum insertion changed bytes outside its field")
+			}
+
+			testIPv6RawChecksumFragmentInterop(t, ctx, network, family, mtu)
+		})
+	}
+}
+
+// testIPv6RawChecksumFragmentInterop sends a raw UDP datagram whose checksum
+// is owned by mipstack to gVisor's native UDP endpoint. This exercises the
+// configurable offset before IPv6 source fragmentation and gVisor reassembly.
+func testIPv6RawChecksumFragmentInterop(t *testing.T, ctx context.Context, network *interopNetwork, family interopFamily, mtu uint32) {
+	t.Helper()
+	const (
+		mipstackPort = 32101
+		gvisorPort   = 32102
+		udpHeaderLen = 8
+	)
+	connection, err := (&mipstack.ListenConfig{Options: []mipstack.SocketOption{
+		mipstack.SocketOptions.IPv6Checksum(true, 6),
+	}}).ListenIP(ctx, network.mipstack, "ip6:udp", family.mipstackAddress)
+	if err != nil {
+		t.Fatalf("listen with raw UDP checksum: %v", err)
+	}
+	defer connection.Close()
+	if err = connection.SetDeadline(time.Now().Add(8 * time.Second)); err != nil {
+		t.Fatalf("set raw UDP checksum deadline: %v", err)
+	}
+	gvisorConnection := newGVisorUDPSocket(t, network, family.networkProtocol, gvisorFullAddress(family.gvisorAddress, gvisorPort), func(tcpip.Endpoint) {})
+	defer gvisorConnection.Close()
+	if err = gvisorConnection.SetDeadline(time.Now().Add(8 * time.Second)); err != nil {
+		t.Fatalf("set gVisor UDP checksum deadline: %v", err)
+	}
+
+	request := patternedPayload(211, 0x81)
+	written, writeErr := gvisorConnection.WriteTo(request, net.UDPAddrFromAddrPort(netipAddrPort(family.mipstackAddress, mipstackPort)))
+	if writeErr != nil || written != len(request) {
+		t.Fatalf("write gVisor UDP checksum request: n=%d, error=%v", written, writeErr)
+	}
+	storage := make([]byte, 65535)
+	read, source, readErr := connection.ReadFromIP(storage)
+	if readErr != nil {
+		t.Fatalf("read checksummed gVisor UDP payload: %v", readErr)
+	}
+	if read < udpHeaderLen || binary.BigEndian.Uint16(storage[0:2]) != gvisorPort ||
+		binary.BigEndian.Uint16(storage[2:4]) != mipstackPort || int(binary.BigEndian.Uint16(storage[4:6])) != read ||
+		!validIPv6RawChecksum(storage[:read], family.gvisorAddress, family.mipstackAddress, byte(udp.ProtocolNumber)) ||
+		!bytes.Equal(storage[udpHeaderLen:read], request) {
+		t.Fatalf("mipstack received invalid gVisor UDP datagram: source=%v payload=%x", source, storage[:read])
+	}
+
+	payload := patternedPayload(fragmentedInteropPayloadSize(mtu, 4096)-udpHeaderLen, 0x91)
+	datagram := make([]byte, udpHeaderLen+len(payload))
+	binary.BigEndian.PutUint16(datagram[0:2], mipstackPort)
+	binary.BigEndian.PutUint16(datagram[2:4], gvisorPort)
+	binary.BigEndian.PutUint16(datagram[4:6], uint16(len(datagram)))
+	copy(datagram[udpHeaderLen:], payload)
+	original := append([]byte(nil), datagram...)
+	written, writeErr = connection.WriteToIP(datagram, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
+	if writeErr != nil || written != len(datagram) {
+		t.Fatalf("write fragmented raw UDP checksum response: n=%d, error=%v", written, writeErr)
+	}
+	if !bytes.Equal(datagram, original) {
+		t.Fatal("fragmented raw checksum insertion mutated caller payload")
+	}
+	read, _, readErr = gvisorConnection.ReadFrom(storage)
+	if readErr != nil || !bytes.Equal(storage[:read], payload) {
+		t.Fatalf("read fragmented raw UDP checksum response in gVisor: n=%d, error=%v", read, readErr)
+	}
+}
+
 // TestIPDualStackWildcardInterop verifies that one generic mipstack raw socket
 // receives and replies to native gVisor IPv4 and IPv6 protocol payloads.
 func TestIPDualStackWildcardInterop(t *testing.T) {
@@ -527,4 +679,14 @@ func stripGVisorRawHeader(family interopFamily, packet []byte) ([]byte, error) {
 		return nil, errors.New("gVisor raw IPv4 socket returned an invalid header length")
 	}
 	return packet[headerSize:], nil
+}
+
+// validIPv6RawChecksum verifies one upper-layer payload against its IPv6
+// pseudo-header using gVisor's native checksum primitives.
+func validIPv6RawChecksum(payload []byte, source, target netip.Addr, protocol byte) bool {
+	if len(payload) > 65535 {
+		return false
+	}
+	sum := header.PseudoHeaderChecksum(tcpip.TransportProtocolNumber(protocol), gvisorAddress(source), gvisorAddress(target), uint16(len(payload)))
+	return checksum.Checksum(payload, sum) == 0xffff
 }

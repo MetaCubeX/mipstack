@@ -2533,7 +2533,7 @@ func TestGeneralReportClearsPendingSourceQueryList(t *testing.T) {
 	}
 	clearMulticastTestControl(stack)
 	state := stack.multicast.(*multicastState)
-	now := time.Unix(12345, 0)
+	now := time.Now().Add(time.Hour)
 	state.mu.Lock()
 	state.generalQuery[0] = now
 	state.groups[group].query = multicastPendingQuery{

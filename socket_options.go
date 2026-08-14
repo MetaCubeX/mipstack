@@ -41,8 +41,10 @@ type socketOptionsNamespace uint8
 //     UDPForwarderRequest.Listen.
 //   - ReuseAddress and ReusePort are valid only for ListenConfig.ListenTCP and
 //     ListenConfig.ListenUDP.
-//   - IPHeaderIncludedOnWrite and IPHeaderIncludedOnRead are valid only for
-//     ListenConfig.ListenIP and Dialer.DialIP.
+//   - IPHeaderIncludedOnWrite, IPHeaderIncludedOnRead, ICMPv4Filter,
+//     ICMPv6Filter, and IPv6Checksum are valid only for
+//     ListenConfig.ListenIP and Dialer.DialIP. The latter three are also
+//     validated against the resolved address family and IP protocol.
 //
 // Every Unset constructor is valid for every socket creation operation. It
 // removes an applicable earlier override of the same kind and otherwise has no
@@ -96,6 +98,21 @@ type ipHeaderIncludedOnWriteSocketOption socketOptionBoolOverride
 
 // ipHeaderIncludedOnReadSocketOption stores one complete-packet read policy.
 type ipHeaderIncludedOnReadSocketOption socketOptionBoolOverride
+
+// icmpV4FilterSocketOption stores one Linux-compatible ICMP_FILTER snapshot.
+type icmpV4FilterSocketOption socketOptionOverride[ICMPv4Filter]
+
+// icmpV6FilterSocketOption stores one RFC 3542 ICMP6_FILTER snapshot.
+type icmpV6FilterSocketOption socketOptionOverride[ICMPv6Filter]
+
+// ipv6ChecksumPolicy stores one IPV6_CHECKSUM enablement and field offset.
+type ipv6ChecksumPolicy struct {
+	enabled bool
+	offset  int
+}
+
+// ipv6ChecksumSocketOption stores one raw IPv6 upper-layer checksum policy.
+type ipv6ChecksumSocketOption socketOptionOverride[ipv6ChecksumPolicy]
 
 // readBufferSocketOption stores one receive-buffer capacity override.
 type readBufferSocketOption socketOptionOverride[int]
@@ -874,13 +891,13 @@ func (option ipHeaderIncludedOnWriteSocketOption) apply(set socketOptionSet, use
 		return set, syscall.EINVAL
 	}
 	if override == socketOptionBoolOverrideUnset {
-		set.ipHeaderIncludedOnWrite = false
+		set.ip.headerIncludedOnWrite = false
 		return set, nil
 	}
 	if use != socketOptionIPListen && use != socketOptionIPDial {
 		return set, syscall.ENOPROTOOPT
 	}
-	set.ipHeaderIncludedOnWrite = override == socketOptionBoolOverrideEnabled
+	set.ip.headerIncludedOnWrite = override == socketOptionBoolOverrideEnabled
 	return set, nil
 }
 
@@ -907,13 +924,110 @@ func (option ipHeaderIncludedOnReadSocketOption) apply(set socketOptionSet, use 
 		return set, syscall.EINVAL
 	}
 	if override == socketOptionBoolOverrideUnset {
-		set.ipHeaderIncludedOnRead = false
+		set.ip.headerIncludedOnRead = false
 		return set, nil
 	}
 	if use != socketOptionIPListen && use != socketOptionIPDial {
 		return set, syscall.ENOPROTOOPT
 	}
-	set.ipHeaderIncludedOnRead = override == socketOptionBoolOverrideEnabled
+	set.ip.headerIncludedOnRead = override == socketOptionBoolOverrideEnabled
+	return set, nil
+}
+
+// ICMPv4Filter installs a receive-type filter on a newly created IPv4 ICMP
+// protocol socket. A generic dual-stack ip:icmp socket applies it only to its
+// IPv4 branch. Other protocols report syscall.ENOPROTOOPT and IPv6-only
+// sockets report syscall.EAFNOSUPPORT before the endpoint is created.
+func (socketOptionsNamespace) ICMPv4Filter(filter ICMPv4Filter) SocketOption {
+	return icmpV4FilterSocketOption{value: filter, set: true}
+}
+
+// UnsetICMPv4Filter restores the all-accepting default, overriding an earlier
+// ICMPv4Filter option in the same list. The unset marker is valid for every
+// socket creation operation.
+func (socketOptionsNamespace) UnsetICMPv4Filter() SocketOption {
+	return icmpV4FilterSocketOption{}
+}
+
+// apply records one IPv4 ICMP receive filter for late protocol validation.
+func (option icmpV4FilterSocketOption) apply(set socketOptionSet, use socketOptionUse) (socketOptionSet, error) {
+	value := socketOptionOverride[ICMPv4Filter](option)
+	if !value.set {
+		set.ip.icmpV4Filter = value
+		return set, nil
+	}
+	if use != socketOptionIPListen && use != socketOptionIPDial {
+		return set, syscall.ENOPROTOOPT
+	}
+	set.ip.icmpV4Filter = value
+	return set, nil
+}
+
+// ICMPv6Filter installs a receive-type filter on a newly created ICMPv6
+// protocol socket. A generic dual-stack ip:ipv6-icmp socket applies it only to
+// its IPv6 branch. Other protocols report syscall.ENOPROTOOPT and IPv4-only
+// sockets report syscall.EAFNOSUPPORT before the endpoint is created.
+func (socketOptionsNamespace) ICMPv6Filter(filter ICMPv6Filter) SocketOption {
+	return icmpV6FilterSocketOption{value: filter, set: true}
+}
+
+// UnsetICMPv6Filter restores the all-accepting default, overriding an earlier
+// ICMPv6Filter option in the same list. The unset marker is valid for every
+// socket creation operation.
+func (socketOptionsNamespace) UnsetICMPv6Filter() SocketOption {
+	return icmpV6FilterSocketOption{}
+}
+
+// apply records one ICMPv6 receive filter for late protocol validation.
+func (option icmpV6FilterSocketOption) apply(set socketOptionSet, use socketOptionUse) (socketOptionSet, error) {
+	value := socketOptionOverride[ICMPv6Filter](option)
+	if !value.set {
+		set.ip.icmpV6Filter = value
+		return set, nil
+	}
+	if use != socketOptionIPListen && use != socketOptionIPDial {
+		return set, syscall.ENOPROTOOPT
+	}
+	set.ip.icmpV6Filter = value
+	return set, nil
+}
+
+// IPv6Checksum controls RFC 3542 IPV6_CHECKSUM processing for a newly created
+// non-ICMPv6 protocol socket. When enabled, offset is the even, non-negative
+// byte offset of the 16-bit checksum field in the upper-layer payload. When
+// disabled, offset is ignored. IPv4-only sockets report syscall.EAFNOSUPPORT;
+// ICMPv6 sockets report syscall.EINVAL because their checksum at offset 2 is
+// mandatory and cannot be configured.
+func (socketOptionsNamespace) IPv6Checksum(enabled bool, offset int) SocketOption {
+	return ipv6ChecksumSocketOption{
+		value: ipv6ChecksumPolicy{enabled: enabled, offset: offset},
+		set:   true,
+	}
+}
+
+// UnsetIPv6Checksum restores the protocol default, overriding an earlier
+// IPv6Checksum option in the same list. ICMPv6 restores mandatory processing
+// at offset 2; other protocols restore disabled processing. The unset marker
+// is valid for every socket creation operation.
+func (socketOptionsNamespace) UnsetIPv6Checksum() SocketOption {
+	return ipv6ChecksumSocketOption{}
+}
+
+// apply validates one checksum offset and records it for late protocol and
+// address-family validation.
+func (option ipv6ChecksumSocketOption) apply(set socketOptionSet, use socketOptionUse) (socketOptionSet, error) {
+	value := socketOptionOverride[ipv6ChecksumPolicy](option)
+	if !value.set {
+		set.ip.ipv6Checksum = value
+		return set, nil
+	}
+	if use != socketOptionIPListen && use != socketOptionIPDial {
+		return set, syscall.ENOPROTOOPT
+	}
+	if value.value.enabled && (value.value.offset < 0 || value.value.offset&1 != 0) {
+		return set, syscall.EINVAL
+	}
+	set.ip.ipv6Checksum = value
 	return set, nil
 }
 
@@ -948,14 +1062,22 @@ type datagramSocketOptionSet struct {
 	flowLabel         socketOptionOverride[uint32]
 }
 
+// ipSocketOptionSet contains policies meaningful only to raw IP sockets.
+type ipSocketOptionSet struct {
+	headerIncludedOnWrite bool
+	headerIncludedOnRead  bool
+	icmpV4Filter          socketOptionOverride[ICMPv4Filter]
+	icmpV6Filter          socketOptionOverride[ICMPv6Filter]
+	ipv6Checksum          socketOptionOverride[ipv6ChecksumPolicy]
+}
+
 // socketOptionSet is the validated creation-time option snapshot.
 type socketOptionSet struct {
-	tcp                     tcpSocketOptionSet
-	datagram                datagramSocketOptionSet
-	reuseAddress            bool
-	reusePort               bool
-	ipHeaderIncludedOnWrite bool
-	ipHeaderIncludedOnRead  bool
+	tcp          tcpSocketOptionSet
+	datagram     datagramSocketOptionSet
+	ip           ipSocketOptionSet
+	reuseAddress bool
+	reusePort    bool
 }
 
 // socketOptionUse identifies the protocol and creation operation against
@@ -1001,6 +1123,37 @@ func (set socketOptionSet) validateFamily(use socketOptionUse, ipv6, dual bool) 
 	}
 	if use.isDatagram() && set.datagram.hopLimit.set && set.datagram.hopLimit.value == 0 && (!ipv6 || dual) {
 		return syscall.EINVAL
+	}
+	return nil
+}
+
+// validateIPSocket applies raw options whose validity depends on the parsed
+// upper-layer protocol and the endpoint's resolved family capabilities.
+func (set socketOptionSet) validateIPSocket(protocol byte, ipv6, dual bool) error {
+	hasIPv4 := !ipv6 || dual
+	if set.ip.icmpV4Filter.set {
+		if !hasIPv4 {
+			return syscall.EAFNOSUPPORT
+		}
+		if protocol != protocolICMPv4 {
+			return syscall.ENOPROTOOPT
+		}
+	}
+	if set.ip.icmpV6Filter.set {
+		if !ipv6 {
+			return syscall.EAFNOSUPPORT
+		}
+		if protocol != protocolICMPv6 {
+			return syscall.ENOPROTOOPT
+		}
+	}
+	if set.ip.ipv6Checksum.set {
+		if !ipv6 {
+			return syscall.EAFNOSUPPORT
+		}
+		if protocol == protocolICMPv6 {
+			return syscall.EINVAL
+		}
 	}
 	return nil
 }

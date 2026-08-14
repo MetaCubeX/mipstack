@@ -24,6 +24,79 @@ const (
 	ipDatagramMetadataSize = 96
 )
 
+// ICMPv4Filter is a Linux-compatible ICMP_FILTER receive-type mask. A set bit
+// blocks the corresponding representable ICMPv4 type, so the zero value
+// accepts every type. Linux exposes 32 bits and x/net/ipv4 consequently uses
+// the low five bits of method arguments; received types above 31 are outside
+// the kernel mask and are always accepted.
+type ICMPv4Filter struct {
+	blocked uint32
+}
+
+// Accept clears the mask bit selected by the low five bits of typ. Received
+// ICMPv4 types above 31 remain unconditionally accepted by the socket.
+func (f *ICMPv4Filter) Accept(typ uint8) {
+	f.blocked &^= uint32(1) << (typ & 31)
+}
+
+// Block sets the mask bit selected by the low five bits of typ. Received
+// ICMPv4 types above 31 remain unconditionally accepted by the socket.
+func (f *ICMPv4Filter) Block(typ uint8) {
+	f.blocked |= uint32(1) << (typ & 31)
+}
+
+// SetAll blocks every representable ICMPv4 type when block is true and
+// accepts every type otherwise.
+func (f *ICMPv4Filter) SetAll(block bool) {
+	if block {
+		f.blocked = ^uint32(0)
+	} else {
+		f.blocked = 0
+	}
+}
+
+// WillBlock reports the mask bit selected by the low five bits of typ. It may
+// therefore report true for typ above 31 even though such received types are
+// outside Linux's mask and remain accepted.
+func (f *ICMPv4Filter) WillBlock(typ uint8) bool {
+	return f.blocked&(uint32(1)<<(typ&31)) != 0
+}
+
+// ICMPv6Filter is an RFC 3542 ICMP6_FILTER receive-type mask. Its 256 bits
+// cover every value of the ICMPv6 Type field. A set bit blocks that type, so
+// the zero value accepts every type.
+type ICMPv6Filter struct {
+	blocked [8]uint32
+}
+
+// Accept permits packets whose ICMPv6 type has the supplied value.
+func (f *ICMPv6Filter) Accept(typ uint8) {
+	f.blocked[typ>>5] &^= uint32(1) << (typ & 31)
+}
+
+// Block rejects packets whose ICMPv6 type has the supplied value.
+func (f *ICMPv6Filter) Block(typ uint8) {
+	f.blocked[typ>>5] |= uint32(1) << (typ & 31)
+}
+
+// SetAll blocks every ICMPv6 type when block is true and accepts every type
+// otherwise.
+func (f *ICMPv6Filter) SetAll(block bool) {
+	value := uint32(0)
+	if block {
+		value = ^uint32(0)
+	}
+	for index := range f.blocked {
+		f.blocked[index] = value
+	}
+}
+
+// WillBlock reports whether packets with the supplied ICMPv6 type are
+// rejected.
+func (f *ICMPv6Filter) WillBlock(typ uint8) bool {
+	return f.blocked[typ>>5]&(uint32(1)<<(typ&31)) != 0
+}
+
 // ipDatagram is one validated, reassembled protocol payload.
 type ipDatagram struct {
 	payload []byte
@@ -142,7 +215,8 @@ type ipEndpointState struct {
 // exchanges protocol payloads by default.
 // SocketOptions.IPHeaderIncludedOnWrite and
 // SocketOptions.IPHeaderIncludedOnRead independently expose complete packets
-// on the write and read sides.
+// on the write and read sides. ICMP receive filters and raw IPv6 checksum
+// processing may be selected at creation and updated through IPConn methods.
 type IPConn struct {
 	stack                   *Stack
 	net                     string
@@ -157,31 +231,34 @@ type IPConn struct {
 	closed chan struct{}
 	once   sync.Once
 
-	mu                sync.Mutex
-	receive           datagramQueue[ipDatagram]
-	receiveSpare      []byte
-	receiveNotify     chan struct{}
-	receiveCapacity   int
-	queuedBytes       int
-	errorQueue        datagramQueue[queuedSocketError]
-	errorQueuedBytes  int
-	receiveErrors     bool
-	readDeadline      socketDeadline
-	writeDeadline     socketDeadline
-	recentTargets     recentDestinationCache[netip.Addr]
-	defaultOptions    ipPacketOptions
-	pathMTUDiscovery  PathMTUDiscovery
-	multicastHopLimit byte
-	multicastLoopback bool
-	broadcast         bool
-	lastError         error
-	packetsSent       atomic.Uint64
-	bytesSent         atomic.Uint64
-	packetsReceived   atomic.Uint64
-	bytesReceived     atomic.Uint64
-	packetsDropped    atomic.Uint64
-	icmpErrors        atomic.Uint64
-	errorsDropped     atomic.Uint64
+	mu                 sync.Mutex
+	receive            datagramQueue[ipDatagram]
+	receiveSpare       []byte
+	receiveNotify      chan struct{}
+	receiveCapacity    int
+	queuedBytes        int
+	errorQueue         datagramQueue[queuedSocketError]
+	errorQueuedBytes   int
+	receiveErrors      bool
+	readDeadline       socketDeadline
+	writeDeadline      socketDeadline
+	recentTargets      recentDestinationCache[netip.Addr]
+	defaultOptions     ipPacketOptions
+	pathMTUDiscovery   PathMTUDiscovery
+	multicastHopLimit  byte
+	multicastLoopback  bool
+	broadcast          bool
+	icmpV4Filter       ICMPv4Filter
+	icmpV6Filter       ICMPv6Filter
+	ipv6ChecksumOffset int
+	lastError          error
+	packetsSent        atomic.Uint64
+	bytesSent          atomic.Uint64
+	packetsReceived    atomic.Uint64
+	bytesReceived      atomic.Uint64
+	packetsDropped     atomic.Uint64
+	icmpErrors         atomic.Uint64
+	errorsDropped      atomic.Uint64
 }
 
 // ipWriteParameters is one validated output-policy snapshot shared by
@@ -191,6 +268,7 @@ type ipWriteParameters struct {
 	target           netip.Addr
 	options          ipPacketOptions
 	pathMTUDiscovery PathMTUDiscovery
+	checksumOffset   int
 	nonUnicast       bool
 }
 
@@ -244,13 +322,14 @@ func (s *Stack) listenIP(ctx context.Context, network string, local netip.Addr, 
 	if err = options.validateFamily(socketOptionIPListen, local.Is6(), dual); err != nil {
 		return wrap(err)
 	}
+	if err = options.validateIPSocket(protocol, local.Is6(), dual); err != nil {
+		return wrap(err)
+	}
 	if !local.IsUnspecified() && !networkStateHasLocal(state, local) {
 		return wrap(syscall.EADDRNOTAVAIL)
 	}
-	connection := newIPConn(s, network, protocol, local, netip.Addr{}, options.datagram)
+	connection := newIPConn(s, network, protocol, local, netip.Addr{}, options)
 	connection.dual = dual
-	connection.ipHeaderIncludedOnWrite.Store(options.ipHeaderIncludedOnWrite)
-	connection.ipHeaderIncludedOnRead = options.ipHeaderIncludedOnRead
 	s.ipEndpointStateLocked().register(connection)
 	s.stats.activeIPSockets.Add(1)
 	return connection, nil
@@ -282,6 +361,9 @@ func (s *Stack) dialIP(ctx context.Context, network string, source, remote netip
 	if err = options.validateFamily(socketOptionIPDial, remote.Is6(), false); err != nil {
 		return wrap(nil, err)
 	}
+	if err = options.validateIPSocket(protocol, remote.Is6(), false); err != nil {
+		return wrap(nil, err)
+	}
 	if err := ctx.Err(); err != nil {
 		return wrap(nil, err)
 	}
@@ -309,9 +391,7 @@ func (s *Stack) dialIP(ctx context.Context, network string, source, remote netip
 	if err != nil {
 		return wrap(ipNetAddr(source), err)
 	}
-	connection := newIPConn(s, network, protocol, local, remote, options.datagram)
-	connection.ipHeaderIncludedOnWrite.Store(options.ipHeaderIncludedOnWrite)
-	connection.ipHeaderIncludedOnRead = options.ipHeaderIncludedOnRead
+	connection := newIPConn(s, network, protocol, local, remote, options)
 	s.ipEndpointStateLocked().register(connection)
 	s.stats.activeIPSockets.Add(1)
 	return connection, nil
@@ -376,28 +456,41 @@ func validateIPProtocol(protocol byte) error {
 	return nil
 }
 
-// newIPConn allocates one unregistered protocol socket.
 // newIPConn allocates one unregistered protocol socket after applying explicit
 // creation policies to the latest Stack defaults.
-func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.Addr, options datagramSocketOptionSet) *IPConn {
+func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.Addr, options socketOptionSet) *IPConn {
 	defaults := DatagramSocketDefaults{ReceiveBuffer: ipDefaultReceiveCapacity, HopLimit: 64, MulticastHopLimit: 1}
 	if stack != nil {
 		defaults = stack.network.Load().ipDefaults
 	}
-	defaults = applyDatagramSocketOptions(defaults, options, ipDatagramMetadataSize)
+	defaults = applyDatagramSocketOptions(defaults, options.datagram, ipDatagramMetadataSize)
+	checksumOffset := -1
+	if local.Is6() && protocol == protocolICMPv6 {
+		checksumOffset = 2
+	}
+	if checksum := options.ip.ipv6Checksum; checksum.set {
+		if checksum.value.enabled {
+			checksumOffset = checksum.value.offset
+		} else {
+			checksumOffset = -1
+		}
+	}
 	connection := &IPConn{
 		stack: stack, net: network, protocol: protocol, v6: local.Is6(), local: local, remote: remote,
 		closed: make(chan struct{}), receiveNotify: make(chan struct{}, 1), receiveCapacity: defaults.ReceiveBuffer,
+		ipHeaderIncludedOnRead: options.ip.headerIncludedOnRead,
 		defaultOptions: ipPacketOptions{
 			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
-			flowLabel: defaults.FlowLabel, hopLimitSet: options.hopLimit.set,
-			trafficClassSet: options.trafficClass.set, flowLabelSet: defaults.FlowLabel != 0 || options.flowLabel.set,
+			flowLabel: defaults.FlowLabel, hopLimitSet: options.datagram.hopLimit.set,
+			trafficClassSet: options.datagram.trafficClass.set, flowLabelSet: defaults.FlowLabel != 0 || options.datagram.flowLabel.set,
 		},
 		receiveErrors:     defaults.ReceiveErrors,
 		pathMTUDiscovery:  defaults.PathMTUDiscovery,
 		multicastHopLimit: byte(defaults.MulticastHopLimit), multicastLoopback: !defaults.DisableMulticastLoopback,
-		broadcast: !defaults.DisableBroadcast,
+		broadcast: !defaults.DisableBroadcast, icmpV4Filter: options.ip.icmpV4Filter.value,
+		icmpV6Filter: options.ip.icmpV6Filter.value, ipv6ChecksumOffset: checksumOffset,
 	}
+	connection.ipHeaderIncludedOnWrite.Store(options.ip.headerIncludedOnWrite)
 	return connection
 }
 
@@ -558,20 +651,23 @@ func (state *ipEndpointState) remove(connection *IPConn) bool {
 	return true
 }
 
-// enqueuePacket selects one socket's configured read representation without
-// retaining both the protocol payload and complete packet.
+// enqueuePacket applies per-socket receive policy and selects the configured
+// read representation without retaining both the protocol payload and
+// complete packet.
 func (c *IPConn) enqueuePacket(packet ipPacket, options ipPacketOptions) {
 	payload := packet.payload
 	if c.ipHeaderIncludedOnRead {
 		payload = packet.original
 	}
-	c.enqueue(payload, packet.source, packet.target, options)
-}
-
-// enqueue copies one payload unless the configured receive capacity is full.
-func (c *IPConn) enqueue(payload []byte, source, target netip.Addr, options ipPacketOptions) {
 	size := ipDatagramMetadataSize + len(payload)
 	c.mu.Lock()
+	blocked := len(packet.payload) != 0 && (packet.source.Is4() && c.protocol == protocolICMPv4 && packet.payload[0] < 32 && c.icmpV4Filter.WillBlock(packet.payload[0]) ||
+		packet.source.Is6() && c.protocol == protocolICMPv6 && c.icmpV6Filter.WillBlock(packet.payload[0]))
+	if blocked || packet.source.Is6() && c.protocol != protocolICMPv6 && c.ipv6ChecksumOffset >= 0 &&
+		(c.ipv6ChecksumOffset > len(packet.payload)-2 || transportChecksum(packet.source, packet.target, c.protocol, packet.payload) != 0) {
+		c.mu.Unlock()
+		return
+	}
 	select {
 	case <-c.closed:
 		c.mu.Unlock()
@@ -596,7 +692,7 @@ func (c *IPConn) enqueue(payload []byte, source, target netip.Addr, options ipPa
 			retained = append([]byte(nil), payload...)
 		}
 	}
-	datagram := ipDatagram{payload: retained, source: source, target: target, options: options}
+	datagram := ipDatagram{payload: retained, source: packet.source, target: packet.target, options: options}
 	c.receive.push(datagram)
 	c.queuedBytes += size
 	c.packetsReceived.Add(1)
@@ -1300,7 +1396,7 @@ func (c *IPConn) prepareWrite(target, packetInfoSource netip.Addr, options ipPac
 	if err != nil {
 		return ipWriteParameters{}, err
 	}
-	writeState, options, pathMTUDiscovery := c.writeStateAndOptions(options)
+	writeState, options, pathMTUDiscovery, checksumOffset := c.writeStateAndOptions(options)
 	if err = writeState.err(); err != nil {
 		return ipWriteParameters{}, err
 	}
@@ -1316,10 +1412,33 @@ func (c *IPConn) prepareWrite(target, packetInfoSource netip.Addr, options ipPac
 	if err != nil {
 		return ipWriteParameters{}, err
 	}
+	if !source.Is6() {
+		checksumOffset = -1
+	}
 	return ipWriteParameters{
 		source: source, target: target, options: options,
-		pathMTUDiscovery: pathMTUDiscovery, nonUnicast: nonUnicast,
+		pathMTUDiscovery: pathMTUDiscovery, checksumOffset: checksumOffset, nonUnicast: nonUnicast,
 	}, nil
+}
+
+// setIPv6PayloadChecksum writes one RFC 3542 checksum into an owned
+// upper-layer payload. A negative offset leaves the payload unchanged.
+func setIPv6PayloadChecksum(payload []byte, source, target netip.Addr, protocol byte, offset int) error {
+	if offset < 0 || !source.Is6() || !target.Is6() {
+		return nil
+	}
+	if offset > len(payload)-2 {
+		return syscall.EINVAL
+	}
+	payload[offset], payload[offset+1] = 0, 0
+	value := transportChecksum(source, target, protocol, payload)
+	if protocol == protocolUDP && value == 0 {
+		// RFC 768 assigns an all-zero UDP checksum field to the disabled
+		// state. IPv6 forbids that state, so Linux rawv6 uses negative zero.
+		value = 0xffff
+	}
+	binary.BigEndian.PutUint16(payload[offset:offset+2], value)
+	return nil
 }
 
 // writeToWith keeps routing, checksums, deadlines, accounting, and ICMP
@@ -1329,10 +1448,11 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource
 	if err != nil {
 		return 0, err
 	}
-	if c.protocol == protocolICMPv6 && len(payload) >= 4 {
+	if parameters.checksumOffset >= 0 {
 		payload = append([]byte(nil), payload...)
-		payload[2], payload[3] = 0, 0
-		binary.BigEndian.PutUint16(payload[2:4], transportChecksum(parameters.source, parameters.target, protocolICMPv6, payload))
+		if err = setIPv6PayloadChecksum(payload, parameters.source, parameters.target, c.protocol, parameters.checksumOffset); err != nil {
+			return 0, err
+		}
 	}
 	err = write(parameters.source, parameters.target, payload, parameters.options, parameters.pathMTUDiscovery, parameters.nonUnicast, dontWait)
 	if err != nil {
@@ -1369,14 +1489,13 @@ func (c *IPConn) writeBuffersTo(buffers [][]byte, payloadSize int, target, packe
 		if gatherErr != nil {
 			return 0, gatherErr
 		}
-		if c.protocol == protocolICMPv6 && len(payload) >= 4 {
-			payload[2], payload[3] = 0, 0
-			binary.BigEndian.PutUint16(payload[2:4], transportChecksum(parameters.source, parameters.target, protocolICMPv6, payload))
+		if checksumErr := setIPv6PayloadChecksum(payload, parameters.source, parameters.target, c.protocol, parameters.checksumOffset); checksumErr != nil {
+			return 0, checksumErr
 		}
 		err = c.writeNonUnicastPayload(parameters.source, parameters.target, payload, parameters.options, parameters.pathMTUDiscovery, dontWait)
 	} else {
 		mtu, fragmentation := c.stack.pathMTUOutputPolicy(parameters.target, parameters.pathMTUDiscovery)
-		err = c.writePayloadBuffersForMTU(parameters.source, parameters.target, buffers, payloadSize, parameters.options, fragmentation, mtu, dontWait)
+		err = c.writePayloadBuffersForMTU(parameters.source, parameters.target, buffers, payloadSize, parameters.options, fragmentation, mtu, parameters.checksumOffset, dontWait)
 	}
 	if err != nil {
 		if errors.Is(err, syscall.EMSGSIZE) {
@@ -1406,7 +1525,7 @@ func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options
 // writePayloadBuffersForMTU is the allocation-free scatter/gather form of
 // writePayload for a fitting packet. Fragmentation joins the payload once and
 // then uses the existing fragment writer.
-func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers [][]byte, payloadSize int, options ipPacketOptions, fragmentation sourceFragmentation, mtu int, dontWait bool) error {
+func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers [][]byte, payloadSize int, options ipPacketOptions, fragmentation sourceFragmentation, mtu, checksumOffset int, dontWait bool) error {
 	headerSize := ipHeaderSize(source, target, payloadSize)
 	if headerSize == 0 {
 		return syscall.EMSGSIZE
@@ -1419,9 +1538,8 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 		if err != nil {
 			return err
 		}
-		if c.protocol == protocolICMPv6 && len(payload) >= 4 {
-			payload[2], payload[3] = 0, 0
-			binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, protocolICMPv6, payload))
+		if err = setIPv6PayloadChecksum(payload, source, target, c.protocol, checksumOffset); err != nil {
+			return err
 		}
 		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 		return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, fragmentation, options, mtu, state)
@@ -1454,9 +1572,10 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 		queue.releaseReserved(slot)
 		return syscall.EINVAL
 	}
-	if c.protocol == protocolICMPv6 && len(payload) >= 4 {
-		payload[2], payload[3] = 0, 0
-		binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, protocolICMPv6, payload))
+	if err = setIPv6PayloadChecksum(payload, source, target, c.protocol, checksumOffset); err != nil {
+		queue.releaseBuffer(packet, reusable)
+		queue.releaseReserved(slot)
+		return err
 	}
 	if !queue.enqueueReservedPacket(slot, packet, reusable) {
 		return ErrClosed
@@ -1551,6 +1670,129 @@ func (c *IPConn) SetIPHeaderIncludedOnWrite(enabled bool) error {
 	default:
 		c.ipHeaderIncludedOnWrite.Store(enabled)
 		return nil
+	}
+}
+
+// SetICMPv4Filter atomically replaces the receive-type filter used by an
+// IPv4 ICMP socket. Packets already queued for reading are not reconsidered.
+func (c *IPConn) SetICMPv4Filter(filter ICMPv4Filter) error {
+	if c.v6 && !c.dual {
+		return c.setOperationError(syscall.EAFNOSUPPORT)
+	}
+	if c.protocol != protocolICMPv4 {
+		return c.setOperationError(syscall.ENOPROTOOPT)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return c.setOperationError(net.ErrClosed)
+	default:
+		c.icmpV4Filter = filter
+		return nil
+	}
+}
+
+// ICMPv4Filter returns an independent snapshot of the socket's current
+// receive-type filter.
+func (c *IPConn) ICMPv4Filter() (ICMPv4Filter, error) {
+	if c.v6 && !c.dual {
+		return ICMPv4Filter{}, c.setOperationError(syscall.EAFNOSUPPORT)
+	}
+	if c.protocol != protocolICMPv4 {
+		return ICMPv4Filter{}, c.setOperationError(syscall.ENOPROTOOPT)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return ICMPv4Filter{}, c.setOperationError(net.ErrClosed)
+	default:
+		return c.icmpV4Filter, nil
+	}
+}
+
+// SetICMPv6Filter atomically replaces the receive-type filter used by an
+// ICMPv6 socket. Packets already queued for reading are not reconsidered.
+func (c *IPConn) SetICMPv6Filter(filter ICMPv6Filter) error {
+	if !c.v6 {
+		return c.setOperationError(syscall.EAFNOSUPPORT)
+	}
+	if c.protocol != protocolICMPv6 {
+		return c.setOperationError(syscall.ENOPROTOOPT)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return c.setOperationError(net.ErrClosed)
+	default:
+		c.icmpV6Filter = filter
+		return nil
+	}
+}
+
+// ICMPv6Filter returns an independent snapshot of the socket's current
+// receive-type filter.
+func (c *IPConn) ICMPv6Filter() (ICMPv6Filter, error) {
+	if !c.v6 {
+		return ICMPv6Filter{}, c.setOperationError(syscall.EAFNOSUPPORT)
+	}
+	if c.protocol != protocolICMPv6 {
+		return ICMPv6Filter{}, c.setOperationError(syscall.ENOPROTOOPT)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return ICMPv6Filter{}, c.setOperationError(net.ErrClosed)
+	default:
+		return c.icmpV6Filter, nil
+	}
+}
+
+// SetIPv6Checksum controls RFC 3542 checksum insertion and verification for
+// ordinary upper-layer payloads on a non-ICMPv6 socket. When enabled, offset
+// must be the even, non-negative byte offset of a 16-bit checksum field. When
+// disabled, offset is ignored. Complete-packet writes remain caller-owned.
+func (c *IPConn) SetIPv6Checksum(enabled bool, offset int) error {
+	if !c.v6 {
+		return c.setOperationError(syscall.EAFNOSUPPORT)
+	}
+	if c.protocol == protocolICMPv6 || enabled && (offset < 0 || offset&1 != 0) {
+		return c.setOperationError(syscall.EINVAL)
+	}
+	if !enabled {
+		offset = -1
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return c.setOperationError(net.ErrClosed)
+	default:
+		c.ipv6ChecksumOffset = offset
+		return nil
+	}
+}
+
+// IPv6Checksum reports the checksum policy applied to IPv6 receive
+// verification and ordinary payload writes. A disabled policy reports offset
+// zero. ICMPv6 always reports enabled processing at offset 2.
+func (c *IPConn) IPv6Checksum() (enabled bool, offset int, err error) {
+	if !c.v6 {
+		return false, 0, c.setOperationError(syscall.EAFNOSUPPORT)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return false, 0, c.setOperationError(net.ErrClosed)
+	default:
+		if c.ipv6ChecksumOffset < 0 {
+			return false, 0, nil
+		}
+		return true, c.ipv6ChecksumOffset, nil
 	}
 }
 
@@ -1858,15 +2100,16 @@ func (c *IPConn) deliverError(target netip.Addr, err error) {
 	c.icmpErrors.Add(1)
 }
 
-// writeStateAndOptions reads the output defaults and PMTU policy and returns
-// the independent deadline and close signals observed by a blocked host-queue
-// write.
-func (c *IPConn) writeStateAndOptions(options ipPacketOptions) (socketWriteState, ipPacketOptions, PathMTUDiscovery) {
+// writeStateAndOptions reads the output defaults, PMTU policy, and raw IPv6
+// checksum offset and returns the independent deadline and close signals
+// observed by a blocked host-queue write.
+func (c *IPConn) writeStateAndOptions(options ipPacketOptions) (socketWriteState, ipPacketOptions, PathMTUDiscovery, int) {
 	c.mu.Lock()
 	options = options.withDefaults(c.defaultOptions)
 	pathMTUDiscovery := c.pathMTUDiscovery
+	checksumOffset := c.ipv6ChecksumOffset
 	c.mu.Unlock()
-	return socketWriteState{deadline: &c.writeDeadline, closed: c.closed}, options, pathMTUDiscovery
+	return socketWriteState{deadline: &c.writeDeadline, closed: c.closed}, options, pathMTUDiscovery, checksumOffset
 }
 
 // operationError wraps an error for the bound or connected socket.

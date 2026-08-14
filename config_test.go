@@ -374,7 +374,7 @@ func TestDatagramSocketDefaultConfiguration(t *testing.T) {
 	if udp.receiveCapacity != 2048 || !udp.receiveErrors || udp.defaultOptions != (ipPacketOptions{hopLimit: 31, trafficClass: 0xb8}) || udp.pathMTUDiscovery != PathMTUDiscoveryProbe {
 		t.Fatalf("UDP defaults = %d, %+v, PMTU mode %d", udp.receiveCapacity, udp.defaultOptions, udp.pathMTUDiscovery)
 	}
-	ip := newIPConn(stack, "ip4:99", 99, local.Addr(), netip.Addr{}, datagramSocketOptionSet{})
+	ip := newIPConn(stack, "ip4:99", 99, local.Addr(), netip.Addr{}, socketOptionSet{})
 	if ip.receiveCapacity != 4096 || !ip.receiveErrors || ip.defaultOptions != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e}) || ip.pathMTUDiscovery != PathMTUDiscoveryOmit {
 		t.Fatalf("IP defaults = %d, %+v, PMTU mode %d", ip.receiveCapacity, ip.defaultOptions, ip.pathMTUDiscovery)
 	}

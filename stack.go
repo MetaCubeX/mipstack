@@ -3206,10 +3206,6 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 	if closed {
 		return ErrClosed
 	}
-	multicastControl := isMulticastControlPacket(parsed)
-	if multicastControl {
-		multicast = s.multicastStateForQuery(parsed, multicast, receivedAt)
-	}
 	if parsed.parameterError {
 		s.stats.inboundDroppedPackets.Add(1)
 		if destination == inboundDestinationMulticast && !isAllHostsGroup(parsed.target) &&
@@ -3218,6 +3214,19 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 		}
 		_ = s.sendInboundParameterProblem(parsed, destination)
 		return nil
+	}
+	// RFC 3542 requires the kernel to verify every received ICMPv6 checksum
+	// before exposing the message to a raw socket. Raw fan-out precedes the
+	// built-in ICMP handler below, so this validation belongs at the common
+	// dispatch boundary rather than in the handler alone.
+	if parsed.source.Is6() && parsed.protocol == protocolICMPv6 &&
+		(len(parsed.payload) < 4 || transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0) {
+		s.stats.inboundDroppedPackets.Add(1)
+		return nil
+	}
+	multicastControl := isMulticastControlPacket(parsed)
+	if multicastControl {
+		multicast = s.multicastStateForQuery(parsed, multicast, receivedAt)
 	}
 	// UDP and raw sockets apply equivalent per-socket filters during fanout.
 	// Built-in ICMP processing needs the aggregate interface filter here.

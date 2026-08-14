@@ -5,14 +5,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/metacubex/gvisor/pkg/tcpip"
 	"github.com/metacubex/gvisor/pkg/tcpip/checksum"
 	"github.com/metacubex/gvisor/pkg/tcpip/header"
+	"github.com/metacubex/gvisor/pkg/tcpip/transport/raw"
 	"github.com/metacubex/gvisor/pkg/waiter"
+	"github.com/metacubex/mipstack"
 )
 
 // TestICMPEchoInterop verifies each stack's echo requester against the other
@@ -31,6 +35,134 @@ func TestICMPEchoInterop(t *testing.T) {
 				testGVisorICMPEcho(t, network, family, mtu)
 			})
 		}
+	}
+}
+
+// TestMipstackICMPFilterInterop verifies that native gVisor raw ICMP traffic
+// observes mipstack's Linux-compatible IPv4 and RFC 3542 IPv6 type filters.
+func TestMipstackICMPFilterInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			network := newFamilyInteropNetwork(t, family, interopDefaultMTU)
+			var option mipstack.SocketOption
+			if family.mipstackAddress.Is4() {
+				var filter mipstack.ICMPv4Filter
+				filter.Block(uint8(header.ICMPv4EchoReply))
+				option = mipstack.SocketOptions.ICMPv4Filter(filter)
+			} else {
+				var filter mipstack.ICMPv6Filter
+				filter.Block(uint8(header.ICMPv6EchoReply))
+				option = mipstack.SocketOptions.ICMPv6Filter(filter)
+			}
+			connection, err := (&mipstack.ListenConfig{Options: []mipstack.SocketOption{option}}).ListenIP(
+				context.Background(), network.mipstack, family.icmpNetwork, family.mipstackAddress,
+			)
+			if err != nil {
+				t.Fatalf("listen with mipstack ICMP filter: %v", err)
+			}
+			defer connection.Close()
+
+			var queue waiter.Queue
+			endpoint, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, family.icmpProtocol, &queue)
+			if tcpipErr != nil {
+				t.Fatalf("create gVisor raw ICMP endpoint: %s", tcpipErr.String())
+			}
+			defer endpoint.Close()
+			if tcpipErr = endpoint.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+				t.Fatalf("bind gVisor raw ICMP endpoint: %s", tcpipErr.String())
+			}
+			if tcpipErr = endpoint.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+				t.Fatalf("connect gVisor raw ICMP endpoint: %s", tcpipErr.String())
+			}
+
+			message := makeICMPEcho(family, true, 0x5310, 1, []byte("filtered"), family.gvisorAddress, family.mipstackAddress)
+			if written, writeErr := endpoint.Write(bytes.NewReader(message), tcpip.WriteOptions{}); writeErr != nil || written != int64(len(message)) {
+				t.Fatalf("write filtered gVisor ICMP: n=%d, error=%s", written, tcpipErrorString(writeErr))
+			}
+			if err = connection.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			if _, readErr := connection.Read(make([]byte, 64)); !errors.Is(readErr, os.ErrDeadlineExceeded) {
+				t.Fatalf("blocked ICMP read = %v, want deadline", readErr)
+			}
+			if err = connection.SetReadDeadline(time.Time{}); err != nil {
+				t.Fatal(err)
+			}
+			if family.mipstackAddress.Is4() {
+				err = connection.SetICMPv4Filter(mipstack.ICMPv4Filter{})
+			} else {
+				err = connection.SetICMPv6Filter(mipstack.ICMPv6Filter{})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			message = makeICMPEcho(family, true, 0x5310, 2, []byte("accepted"), family.gvisorAddress, family.mipstackAddress)
+			if written, writeErr := endpoint.Write(bytes.NewReader(message), tcpip.WriteOptions{}); writeErr != nil || written != int64(len(message)) {
+				t.Fatalf("write accepted gVisor ICMP: n=%d, error=%s", written, tcpipErrorString(writeErr))
+			}
+			storage := make([]byte, 64)
+			read, readErr := connection.Read(storage)
+			if readErr != nil || !bytes.Equal(storage[:read], message) {
+				t.Fatalf("accepted gVisor ICMP = %x, %v", storage[:read], readErr)
+			}
+		})
+	}
+}
+
+// TestGVisorICMPv6FilterInterop verifies mipstack-generated ICMPv6 against
+// gVisor's native ICMP6_FILTER implementation.
+func TestGVisorICMPv6FilterInterop(t *testing.T) {
+	family := interopFamilies[1]
+	network := newFamilyInteropNetwork(t, family, interopDefaultMTU)
+	connection, err := network.mipstack.ListenIP(context.Background(), family.icmpNetwork, family.mipstackAddress)
+	if err != nil {
+		t.Fatalf("listen with mipstack ICMPv6 socket: %v", err)
+	}
+	defer connection.Close()
+
+	var queue waiter.Queue
+	endpoint, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, family.icmpProtocol, &queue)
+	if tcpipErr != nil {
+		t.Fatalf("create gVisor raw ICMPv6 endpoint: %s", tcpipErr.String())
+	}
+	defer endpoint.Close()
+	if tcpipErr = endpoint.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+		t.Fatalf("bind gVisor raw ICMPv6 endpoint: %s", tcpipErr.String())
+	}
+	if tcpipErr = endpoint.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+		t.Fatalf("connect gVisor raw ICMPv6 endpoint: %s", tcpipErr.String())
+	}
+	var filter tcpip.ICMPv6Filter
+	filter.DenyType[uint8(header.ICMPv6EchoReply)>>5] |= uint32(1) << (uint8(header.ICMPv6EchoReply) & 31)
+	if tcpipErr = endpoint.SetSockOpt(&filter); tcpipErr != nil {
+		t.Fatalf("set gVisor ICMPv6 filter: %s", tcpipErr.String())
+	}
+	entry, notifications := registerReadable(&queue)
+	defer queue.EventUnregister(&entry)
+
+	message := makeICMPEcho(family, true, 0x5320, 1, []byte("filtered"), family.mipstackAddress, family.gvisorAddress)
+	if written, writeErr := connection.WriteToIP(message, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(message) {
+		t.Fatalf("write filtered mipstack ICMPv6: n=%d, error=%v", written, writeErr)
+	}
+	blockedContext, cancelBlocked := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	if _, _, readErr := readGVisorEndpoint(blockedContext, endpoint, notifications, 64); !errors.Is(readErr, context.DeadlineExceeded) {
+		cancelBlocked()
+		t.Fatalf("gVisor blocked ICMPv6 read = %v, want deadline", readErr)
+	}
+	cancelBlocked()
+	if tcpipErr = endpoint.SetSockOpt(&tcpip.ICMPv6Filter{}); tcpipErr != nil {
+		t.Fatalf("clear gVisor ICMPv6 filter: %s", tcpipErr.String())
+	}
+	message = makeICMPEcho(family, true, 0x5320, 2, []byte("accepted"), family.mipstackAddress, family.gvisorAddress)
+	if written, writeErr := connection.WriteToIP(message, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(message) {
+		t.Fatalf("write accepted mipstack ICMPv6: n=%d, error=%v", written, writeErr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	packet, _, readErr := readGVisorEndpoint(ctx, endpoint, notifications, 64)
+	if readErr != nil || !bytes.Equal(packet, message) {
+		t.Fatalf("accepted mipstack ICMPv6 = %x, %v", packet, readErr)
 	}
 }
 

@@ -119,7 +119,7 @@ option. The creation policies are:
 | TCP listeners | `AcceptQueue`, `SYNBacklog`, plus the TCP connection policies inherited by accepted connections |
 | UDP and IP | `ReceiveErrors`, `PathMTUDiscovery`, `HopLimit`, `Broadcast`, `MulticastHopLimit`, `MulticastLoopback` |
 | TCP and UDP listeners | `ReuseAddress`, `ReusePort` |
-| IP | `IPHeaderIncludedOnWrite`, `IPHeaderIncludedOnRead` |
+| IP | `IPHeaderIncludedOnWrite`, `IPHeaderIncludedOnRead`, `ICMPv4Filter`, `ICMPv6Filter`, `IPv6Checksum` |
 
 Every constructor is an explicit choice, including boolean `false` and valid
 numeric zero values. Every policy has a corresponding `UnsetXxx` constructor;
@@ -810,6 +810,14 @@ Raw protocol sockets receive reassembled payload copies before the built-in
 TCP, UDP, or ICMP handler runs. Multiple matching sockets receive independent
 copies. A listener for an otherwise unknown protocol suppresses Protocol
 Unreachable while its receive queue accepts or drops matching traffic.
+`ICMPv4Filter` follows Linux's 32-bit `ICMP_FILTER` receive mask, while
+`ICMPv6Filter` covers all 256 types defined by RFC 3542. Both may be installed
+at creation or atomically replaced on an `IPConn`; packets already queued are
+not reconsidered. ICMPv6 checksums are always verified and are inserted for
+ordinary payload writes. Other raw IPv6 protocols may enable RFC 3542 checksum
+insertion and verification at an even payload offset through `IPv6Checksum`.
+Checksum processing occurs before source fragmentation and after reassembly,
+and does not alter caller-owned header-included writes.
 
 `Stack.Stats` returns a lock-free snapshot of active socket counts, categorized
 IP/TCP packet and actor-queue drops, passive handshake, SYN-cookie and accept

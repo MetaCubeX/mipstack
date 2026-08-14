@@ -56,10 +56,19 @@ func TestSocketOptionCreationPolicyValidation(t *testing.T) {
 		{name: "unknown PMTU mode", option: SocketOptions.PathMTUDiscovery(PathMTUDiscoveryOmit + 1), use: socketOptionUDPDial, err: syscall.EINVAL},
 		{name: "negative hop limit", option: SocketOptions.HopLimit(-1), use: socketOptionIPDial, err: syscall.EINVAL},
 		{name: "high multicast hop limit", option: SocketOptions.MulticastHopLimit(256), use: socketOptionUDPListen, err: syscall.EINVAL},
+		{name: "negative enabled IPv6 checksum offset", option: SocketOptions.IPv6Checksum(true, -1), use: socketOptionIPDial, err: syscall.EINVAL},
+		{name: "odd enabled IPv6 checksum offset", option: SocketOptions.IPv6Checksum(true, 3), use: socketOptionIPDial, err: syscall.EINVAL},
 		{name: "TCP option on UDP", option: SocketOptions.NoDelay(true), use: socketOptionUDPDial, err: syscall.ENOPROTOOPT},
 		{name: "datagram option on TCP", option: SocketOptions.ReceiveErrors(true), use: socketOptionTCPDial, err: syscall.ENOPROTOOPT},
 		{name: "listener option on dial", option: SocketOptions.AcceptQueue(1), use: socketOptionTCPDial, err: syscall.ENOPROTOOPT},
 		{name: "write buffer on IP", option: SocketOptions.WriteBuffer(1), use: socketOptionIPDial, err: syscall.ENOPROTOOPT},
+		{name: "ICMPv4 filter on UDP", option: SocketOptions.ICMPv4Filter(ICMPv4Filter{}), use: socketOptionUDPDial, err: syscall.ENOPROTOOPT},
+		{name: "ICMPv6 filter on TCP", option: SocketOptions.ICMPv6Filter(ICMPv6Filter{}), use: socketOptionTCPDial, err: syscall.ENOPROTOOPT},
+		{name: "IPv6 checksum on UDP", option: SocketOptions.IPv6Checksum(false, -1), use: socketOptionUDPDial, err: syscall.ENOPROTOOPT},
+		{name: "invalid TCP option on UDP", option: SocketOptions.WriteBuffer(-1), use: socketOptionUDPDial, err: syscall.ENOPROTOOPT},
+		{name: "invalid datagram option on TCP", option: SocketOptions.PathMTUDiscovery(PathMTUDiscoveryOmit + 1), use: socketOptionTCPDial, err: syscall.ENOPROTOOPT},
+		{name: "invalid listener option on dial", option: SocketOptions.AcceptQueue(-1), use: socketOptionTCPDial, err: syscall.ENOPROTOOPT},
+		{name: "invalid raw IP option on UDP", option: SocketOptions.IPv6Checksum(true, -1), use: socketOptionUDPDial, err: syscall.ENOPROTOOPT},
 	}
 	for _, test := range invalid {
 		t.Run(test.name, func(t *testing.T) {
@@ -107,6 +116,24 @@ func TestSocketOptionUnsetRestoresConfiguredPolicy(t *testing.T) {
 	}
 	if parsed.datagram != (datagramSocketOptionSet{}) {
 		t.Fatalf("unset datagram policy = %+v", parsed.datagram)
+	}
+
+	var ipv4Filter ICMPv4Filter
+	ipv4Filter.Block(0)
+	var ipv6Filter ICMPv6Filter
+	ipv6Filter.Block(129)
+	parsed, err = parseSocketOptions([]SocketOption{
+		SocketOptions.IPHeaderIncludedOnWrite(true), SocketOptions.UnsetIPHeaderIncludedOnWrite(),
+		SocketOptions.IPHeaderIncludedOnRead(true), SocketOptions.UnsetIPHeaderIncludedOnRead(),
+		SocketOptions.ICMPv4Filter(ipv4Filter), SocketOptions.UnsetICMPv4Filter(),
+		SocketOptions.ICMPv6Filter(ipv6Filter), SocketOptions.UnsetICMPv6Filter(),
+		SocketOptions.IPv6Checksum(true, 2), SocketOptions.UnsetIPv6Checksum(),
+	}, socketOptionIPListen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.ip != (ipSocketOptionSet{}) {
+		t.Fatalf("unset raw IP policy = %+v", parsed.ip)
 	}
 }
 
@@ -318,6 +345,77 @@ func TestSocketOptionAddressFamilyValidationDoesNotCreateEndpoint(t *testing.T) 
 	}
 }
 
+func TestRawIPSocketOptionProtocolValidationDoesNotCreateEndpoint(t *testing.T) {
+	local4 := netip.MustParseAddr("192.0.2.236")
+	local6 := netip.MustParseAddr("2001:db8::236")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(local4, 32), netip.PrefixFrom(local6, 128),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	tests := []struct {
+		name    string
+		network string
+		local   netip.Addr
+		option  SocketOption
+		want    error
+	}{
+		{name: "IPv4 filter on IPv6-only socket", network: "ip6:icmp", local: local6, option: SocketOptions.ICMPv4Filter(ICMPv4Filter{}), want: syscall.EAFNOSUPPORT},
+		{name: "IPv4 filter on another protocol", network: "ip4:99", local: local4, option: SocketOptions.ICMPv4Filter(ICMPv4Filter{}), want: syscall.ENOPROTOOPT},
+		{name: "IPv6 filter on IPv4-only socket", network: "ip4:58", local: local4, option: SocketOptions.ICMPv6Filter(ICMPv6Filter{}), want: syscall.EAFNOSUPPORT},
+		{name: "IPv6 filter on another protocol", network: "ip6:99", local: local6, option: SocketOptions.ICMPv6Filter(ICMPv6Filter{}), want: syscall.ENOPROTOOPT},
+		{name: "IPv6 checksum on IPv4-only socket", network: "ip4:99", local: local4, option: SocketOptions.IPv6Checksum(true, 2), want: syscall.EAFNOSUPPORT},
+		{name: "enabled checksum on ICMPv6", network: "ip6:ipv6-icmp", local: local6, option: SocketOptions.IPv6Checksum(true, 2), want: syscall.EINVAL},
+		{name: "disabled checksum on ICMPv6", network: "ip6:ipv6-icmp", local: local6, option: SocketOptions.IPv6Checksum(false, 0), want: syscall.EINVAL},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			connection, callErr := (&ListenConfig{Options: []SocketOption{test.option}}).ListenIP(context.Background(), stack, test.network, test.local)
+			if connection != nil || !errors.Is(callErr, test.want) {
+				t.Fatalf("ListenIP = %v, %v, want %v", connection, callErr, test.want)
+			}
+			if active := stack.Stats().ActiveIPSockets; active != 0 {
+				t.Fatalf("late raw option validation retained %d endpoint(s)", active)
+			}
+		})
+	}
+
+	var ipv4Filter ICMPv4Filter
+	ipv4Filter.Block(0)
+	ipv4, err := (&ListenConfig{Options: []SocketOption{
+		SocketOptions.ICMPv4Filter(ipv4Filter),
+	}}).ListenIP(context.Background(), stack, "ip4:icmp", local4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current, filterErr := ipv4.ICMPv4Filter(); filterErr != nil || !current.WillBlock(0) {
+		t.Fatalf("created IPv4 filter = %+v, %v", current, filterErr)
+	}
+	_ = ipv4.Close()
+
+	var ipv6Filter ICMPv6Filter
+	ipv6Filter.Block(129)
+	ipv6, err := (&ListenConfig{Options: []SocketOption{
+		SocketOptions.ICMPv6Filter(ipv6Filter),
+		SocketOptions.IPv6Checksum(false, 0), SocketOptions.UnsetIPv6Checksum(),
+	}}).ListenIP(context.Background(), stack, "ip6:ipv6-icmp", local6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ipv6.Close()
+	if current, filterErr := ipv6.ICMPv6Filter(); filterErr != nil || !current.WillBlock(129) {
+		t.Fatalf("created IPv6 filter = %+v, %v", current, filterErr)
+	}
+	if enabled, offset, checksumErr := ipv6.IPv6Checksum(); checksumErr != nil || !enabled || offset != 2 {
+		t.Fatalf("unset ICMPv6 checksum default = %v/%d, %v", enabled, offset, checksumErr)
+	}
+}
+
 func TestSocketOptionValidationDoesNotCreateEndpoints(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.221")
 	remote := netip.MustParseAddr("198.51.100.221")
@@ -415,7 +513,7 @@ func TestSocketOptionApplicabilityMatrix(t *testing.T) {
 			disabled:    SocketOptions.IPHeaderIncludedOnWrite(false),
 			unset:       SocketOptions.UnsetIPHeaderIncludedOnWrite(),
 			valid:       func(use socketOptionUse) bool { return use == socketOptionIPListen || use == socketOptionIPDial },
-			setExpected: func(set *socketOptionSet, enabled bool) { set.ipHeaderIncludedOnWrite = enabled },
+			setExpected: func(set *socketOptionSet, enabled bool) { set.ip.headerIncludedOnWrite = enabled },
 		},
 		{
 			name:        "IPHeaderIncludedOnRead",
@@ -423,7 +521,7 @@ func TestSocketOptionApplicabilityMatrix(t *testing.T) {
 			disabled:    SocketOptions.IPHeaderIncludedOnRead(false),
 			unset:       SocketOptions.UnsetIPHeaderIncludedOnRead(),
 			valid:       func(use socketOptionUse) bool { return use == socketOptionIPListen || use == socketOptionIPDial },
-			setExpected: func(set *socketOptionSet, enabled bool) { set.ipHeaderIncludedOnRead = enabled },
+			setExpected: func(set *socketOptionSet, enabled bool) { set.ip.headerIncludedOnRead = enabled },
 		},
 	}
 	for _, option := range options {
@@ -502,6 +600,9 @@ func TestSocketOptionUnsetAcceptedByEveryOperation(t *testing.T) {
 		{name: "ReusePort", option: SocketOptions.UnsetReusePort()},
 		{name: "IPHeaderIncludedOnWrite", option: SocketOptions.UnsetIPHeaderIncludedOnWrite()},
 		{name: "IPHeaderIncludedOnRead", option: SocketOptions.UnsetIPHeaderIncludedOnRead()},
+		{name: "ICMPv4Filter", option: SocketOptions.UnsetICMPv4Filter()},
+		{name: "ICMPv6Filter", option: SocketOptions.UnsetICMPv6Filter()},
+		{name: "IPv6Checksum", option: SocketOptions.UnsetIPv6Checksum()},
 	}
 	for _, unset := range unsets {
 		for _, use := range uses {

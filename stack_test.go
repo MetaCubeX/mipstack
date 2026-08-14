@@ -169,7 +169,7 @@ func TestMessagePeekTruncationAndErrorQueue(t *testing.T) {
 		t.Fatalf("read after pending error consumption = %d, %v", count, readErr)
 	}
 
-	ipConnection := newIPConn(stack, "ip4:99", 99, local, remote.Addr(), datagramSocketOptionSet{})
+	ipConnection := newIPConn(stack, "ip4:99", 99, local, remote.Addr(), socketOptionSet{})
 	defer ipConnection.closeFromStack()
 	ipConnection.ipHeaderIncludedOnWrite.Store(true)
 	if err = ipConnection.SetReceiveErrors(true); err != nil {
@@ -1001,7 +1001,7 @@ func TestExpiredDeadlinePrecedesQueuedIO(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer connection.Close()
-		connection.enqueue([]byte("i"), remote, local, ipPacketOptions{})
+		connection.enqueuePacket(ipPacket{payload: []byte("i"), source: remote, target: local}, ipPacketOptions{})
 		if err = connection.SetReadDeadline(past); err != nil {
 			t.Fatal(err)
 		}

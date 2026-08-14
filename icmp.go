@@ -228,9 +228,6 @@ func (s *Stack) handleICMP(packet ipPacket, localDestination bool) error {
 			}
 		}
 	} else {
-		if transportChecksum(packet.source, packet.target, protocolICMPv6, icmp) != 0 {
-			return nil
-		}
 		if localDestination {
 			if reply, echoRequest := makeICMPEchoReply(packet.protocol, icmp); echoRequest {
 				if !s.allowControlResponse(controlResponseEchoReply) {
@@ -259,7 +256,7 @@ func (s *Stack) handleICMP(packet ipPacket, localDestination bool) error {
 // a unicast interface address rather than the request's multicast target.
 func (s *Stack) handleMulticastICMPv6(packet ipPacket) error {
 	icmp := packet.payload
-	if len(icmp) < 8 || transportChecksum(packet.source, packet.target, protocolICMPv6, icmp) != 0 {
+	if len(icmp) < 8 {
 		return nil
 	}
 	reply, echoRequest := makeICMPEchoReply(protocolICMPv6, icmp)

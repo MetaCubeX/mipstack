@@ -34,7 +34,8 @@ The suite covers:
   limits, keepalive and congestion selection, PMTU/error-queue policy, and
   emitted Traffic Class, Hop Limit, and IPv6 Flow Label fields;
 - ICMPv4 and ICMPv6 echo initiated by either stack, including messages that
-  require source fragmentation and receive-side reassembly;
+  require source fragmentation and receive-side reassembly, plus native raw
+  ICMP type-filter interoperability in both implementations;
 - IPv4 and IPv6 TCP, UDP, ICMP, and arbitrary-protocol Forwarders for nonlocal
   destinations, including connected, unconnected, stateless, and detached
   reply paths, plus TCP, UDP, ICMP, and arbitrary-protocol rejection observed
@@ -44,7 +45,9 @@ The suite covers:
   two gVisor source addresses;
 - bidirectional raw IP payload sockets using IANA protocol 99, mipstack
   header-included complete-packet sends, complete-packet receive reassembly,
-  and UDP ICMP error-queue delivery from a native gVisor peer;
+  RFC 3542 raw IPv6 checksum insertion and verification, checksummed raw UDP
+  output through gVisor reassembly, and UDP ICMP error-queue delivery from a
+  native gVisor peer;
 - IPv4 router-generated PMTU discovery at next-hop MTUs 68, 576, 1,280, and
   1,420, subsequent local EMSGSIZE behavior, and invalid IPv6 Packet Too Big
   rejection at 1,280 and 1,420;

@@ -3,15 +3,177 @@ package mipstack
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func TestICMPFilterValues(t *testing.T) {
+	var ipv4 ICMPv4Filter
+	if ipv4.WillBlock(0) {
+		t.Fatal("zero-value ICMPv4 filter blocks Echo Reply")
+	}
+	ipv4.Block(0)
+	ipv4.Block(31)
+	if !ipv4.WillBlock(0) || !ipv4.WillBlock(31) || !ipv4.WillBlock(32) {
+		t.Fatal("ICMPv4 filter did not preserve the Linux 32-bit mask semantics")
+	}
+	ipv4.Accept(32)
+	if ipv4.WillBlock(0) || !ipv4.WillBlock(31) {
+		t.Fatal("ICMPv4 Accept changed the wrong mask bit")
+	}
+	ipv4.SetAll(true)
+	if !ipv4.WillBlock(0) || !ipv4.WillBlock(31) {
+		t.Fatal("ICMPv4 SetAll(true) did not block every representable type")
+	}
+	ipv4.SetAll(false)
+	if ipv4.WillBlock(0) || ipv4.WillBlock(31) {
+		t.Fatal("ICMPv4 SetAll(false) did not restore the all-accepting filter")
+	}
+
+	var ipv6 ICMPv6Filter
+	for _, typ := range []uint8{0, 31, 32, 127, 128, 255} {
+		if ipv6.WillBlock(typ) {
+			t.Fatalf("zero-value ICMPv6 filter blocks type %d", typ)
+		}
+		ipv6.Block(typ)
+		if !ipv6.WillBlock(typ) {
+			t.Fatalf("ICMPv6 filter did not block type %d", typ)
+		}
+	}
+	ipv6.Accept(32)
+	if ipv6.WillBlock(32) || !ipv6.WillBlock(31) || !ipv6.WillBlock(255) {
+		t.Fatal("ICMPv6 Accept changed an adjacent mask word")
+	}
+	ipv6.SetAll(true)
+	for typ := 0; typ <= 255; typ++ {
+		if !ipv6.WillBlock(uint8(typ)) {
+			t.Fatalf("ICMPv6 SetAll(true) left type %d accepted", typ)
+		}
+	}
+	ipv6.SetAll(false)
+	for typ := 0; typ <= 255; typ++ {
+		if ipv6.WillBlock(uint8(typ)) {
+			t.Fatalf("ICMPv6 SetAll(false) left type %d blocked", typ)
+		}
+	}
+}
+
+func TestIPv6UDPChecksumNegativeZero(t *testing.T) {
+	source := netip.MustParseAddr("2001:db8::101")
+	target := netip.MustParseAddr("2001:db8::102")
+	payload := make([]byte, 8)
+	// Adding the checksum of an all-zero payload as ordinary data makes the
+	// checksum to be inserted at offset 6 evaluate to positive zero.
+	binary.BigEndian.PutUint16(payload[0:2], transportChecksum(source, target, protocolUDP, payload))
+	if value := transportChecksum(source, target, protocolUDP, payload); value != 0 {
+		t.Fatalf("constructed UDP checksum = %#x, want zero", value)
+	}
+	if err := setIPv6PayloadChecksum(payload, source, target, protocolUDP, 6); err != nil {
+		t.Fatal(err)
+	}
+	if value := binary.BigEndian.Uint16(payload[6:8]); value != 0xffff {
+		t.Fatalf("inserted zero UDP checksum = %#x, want 0xffff", value)
+	}
+	if value := transportChecksum(source, target, protocolUDP, payload); value != 0 {
+		t.Fatalf("negative-zero UDP checksum verifies as %#x", value)
+	}
+}
+
+func TestIPConnReceivePolicyConcurrentUpdates(t *testing.T) {
+	local4 := netip.MustParseAddr("192.0.2.103")
+	remote4 := netip.MustParseAddr("198.51.100.103")
+	local6 := netip.MustParseAddr("2001:db8::103")
+	remote6 := netip.MustParseAddr("2001:db8:1::103")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(local4, 32), netip.PrefixFrom(local6, 128),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	ipv4 := newIPConn(stack, "ip4:icmp", protocolICMPv4, local4, netip.Addr{}, socketOptionSet{})
+	ipv6 := newIPConn(stack, "ip6:99", 99, local6, netip.Addr{}, socketOptionSet{})
+	defer ipv4.closeFromStack()
+	defer ipv6.closeFromStack()
+
+	checksummed := []byte{0x31, 0x32, 0, 0, 0x35, 0x36, 0x37, 0x38}
+	binary.BigEndian.PutUint16(checksummed[2:4], transportChecksum(remote6, local6, 99, checksummed))
+	const iterations = 1000
+	start := make(chan struct{})
+	errors := make(chan error, 2)
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(4)
+	go func() {
+		defer waitGroup.Done()
+		<-start
+		for index := 0; index < iterations; index++ {
+			var filter ICMPv4Filter
+			if index&1 != 0 {
+				filter.Block(0)
+			}
+			if setErr := ipv4.SetICMPv4Filter(filter); setErr != nil {
+				errors <- setErr
+				return
+			}
+			if _, getErr := ipv4.ICMPv4Filter(); getErr != nil {
+				errors <- getErr
+				return
+			}
+		}
+	}()
+	go func() {
+		defer waitGroup.Done()
+		<-start
+		for index := 0; index < iterations; index++ {
+			ipv4.enqueuePacket(ipPacket{payload: []byte{0, 0, 0, 0, 1, 2, 3, 4}, source: remote4, target: local4}, ipPacketOptions{})
+		}
+	}()
+	go func() {
+		defer waitGroup.Done()
+		<-start
+		for index := 0; index < iterations; index++ {
+			if setErr := ipv6.SetIPv6Checksum(index&1 == 0, 2); setErr != nil {
+				errors <- setErr
+				return
+			}
+			if _, _, getErr := ipv6.IPv6Checksum(); getErr != nil {
+				errors <- getErr
+				return
+			}
+		}
+	}()
+	go func() {
+		defer waitGroup.Done()
+		<-start
+		for index := 0; index < iterations; index++ {
+			ipv6.enqueuePacket(ipPacket{payload: checksummed, source: remote6, target: local6}, ipPacketOptions{})
+		}
+	}()
+	close(start)
+	done := make(chan struct{})
+	go func() {
+		waitGroup.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent receive-policy operations did not finish")
+	}
+	select {
+	case operationErr := <-errors:
+		t.Fatal(operationErr)
+	default:
+	}
+}
 
 func TestIPConnFanoutAndLinuxControl(t *testing.T) {
 	for _, test := range []struct {
@@ -345,6 +507,18 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
+	ipConnection := connection.(*IPConn)
+	if enabled, offset, checksumErr := ipConnection.IPv6Checksum(); checksumErr != nil || !enabled || offset != 2 {
+		t.Fatalf("mandatory ICMPv6 checksum policy = %v/%d, %v", enabled, offset, checksumErr)
+	}
+	for _, enabled := range []bool{false, true} {
+		if checksumErr := ipConnection.SetIPv6Checksum(enabled, 2); !errors.Is(checksumErr, syscall.EINVAL) {
+			t.Fatalf("SetIPv6Checksum(%v) on ICMPv6 = %v, want EINVAL", enabled, checksumErr)
+		}
+	}
+	if _, writeErr := connection.Write([]byte{128, 0, 0}); !errors.Is(writeErr, syscall.EINVAL) {
+		t.Fatalf("short ICMPv6 write = %v, want EINVAL", writeErr)
+	}
 	payload := []byte{128, 0, 0, 0, 0, 1, 0, 1}
 	if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
 		t.Fatalf("connected IP Write = %d, %v", n, writeErr)
@@ -353,12 +527,12 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 	if !ok || transportChecksum(local, remote, protocolICMPv6, packet.payload) != 0 {
 		t.Fatalf("ICMPv6 raw checksum is invalid: %x", packet.payload)
 	}
-	if _, _, err = connection.(*IPConn).WriteMsgIP(payload, nil, nil); !errors.Is(err, net.ErrWriteToConnected) {
+	if _, _, err = ipConnection.WriteMsgIP(payload, nil, nil); !errors.Is(err, net.ErrWriteToConnected) {
 		t.Fatalf("connected IP WriteMsgIP = %v, want net.ErrWriteToConnected", err)
 	} else if operationError := checkNetOpError(t, err, "write", "ip6:ipv6-icmp"); operationError.Addr != nil {
 		t.Fatalf("connected IP WriteMsgIP error address = %v, want nil", operationError.Addr)
 	}
-	if _, err = connection.(*IPConn).WriteToIP(payload, nil); !errors.Is(err, net.ErrWriteToConnected) {
+	if _, err = ipConnection.WriteToIP(payload, nil); !errors.Is(err, net.ErrWriteToConnected) {
 		t.Fatalf("connected IP WriteToIP(nil) = %v, want net.ErrWriteToConnected", err)
 	} else if operationError := checkNetOpError(t, err, "write", "ip6:ipv6-icmp"); operationError.Addr != nil {
 		t.Fatalf("connected IP WriteToIP(nil) error address = %v, want nil", operationError.Addr)
@@ -376,6 +550,14 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 		t.Fatalf("connected remote filter error = %v, want deadline", err)
 	}
 	_ = connection.SetReadDeadline(time.Time{})
+	invalid := buildIPPacket(remote, local, protocolICMPv6, []byte{129, 0, 0, 0, 0, 1, 0, 1}, 0, true)
+	if err = writeTestPacket(stack, invalid); err != nil {
+		t.Fatal(err)
+	}
+	readMessages := []Message{{Buffers: [][]byte{make([]byte, 16)}}}
+	if count, readErr := ipConnection.ReadBatch(readMessages, MessageDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("invalid ICMPv6 checksum read = %d, %v, want EAGAIN", count, readErr)
+	}
 	reply := buildIPPacket(remote, local, protocolICMPv6, []byte{129, 0, 0, 0, 0, 1, 0, 1}, 0, true)
 	replyPayload := reply[40:]
 	replyPayload[2], replyPayload[3] = 0, 0
@@ -388,6 +570,372 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 	n, err := connection.Read(buffer)
 	if err != nil || n != len(replyPayload) || !bytes.Equal(buffer[:n], replyPayload) {
 		t.Fatalf("connected IP Read = %x, %v", buffer[:n], err)
+	}
+}
+
+func TestIPConnICMPReceiveFilters(t *testing.T) {
+	tests := []struct {
+		name        string
+		local       netip.Addr
+		remote      netip.Addr
+		network     string
+		protocol    byte
+		messageType byte
+		option      func() (SocketOption, any)
+	}{
+		{
+			name: "IPv4", local: netip.MustParseAddr("192.0.2.150"), remote: netip.MustParseAddr("198.51.100.150"),
+			network: "ip4:icmp", protocol: protocolICMPv4, messageType: 0,
+			option: func() (SocketOption, any) {
+				var filter ICMPv4Filter
+				filter.Block(0)
+				return SocketOptions.ICMPv4Filter(filter), filter
+			},
+		},
+		{
+			name: "IPv6", local: netip.MustParseAddr("2001:db8::150"), remote: netip.MustParseAddr("2001:db8:1::150"),
+			network: "ip6:ipv6-icmp", protocol: protocolICMPv6, messageType: 129,
+			option: func() (SocketOption, any) {
+				var filter ICMPv6Filter
+				filter.Block(129)
+				return SocketOptions.ICMPv6Filter(filter), filter
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.local, test.local.BitLen())}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			option, originalFilter := test.option()
+			connection, err := (&ListenConfig{Options: []SocketOption{option}}).ListenIP(context.Background(), stack, test.network, test.local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+
+			message := []byte{test.messageType, 0, 0, 0, 0x12, 0x34, 0x56, 0x78}
+			if test.protocol == protocolICMPv4 {
+				binary.BigEndian.PutUint16(message[2:4], checksum(message))
+			} else {
+				binary.BigEndian.PutUint16(message[2:4], transportChecksum(test.remote, test.local, test.protocol, message))
+			}
+			write := func() {
+				if writeErr := writeTestPacket(stack, buildIPPacket(test.remote, test.local, test.protocol, message, 1, true)); writeErr != nil {
+					t.Fatal(writeErr)
+				}
+			}
+			assertEmpty := func() {
+				messages := []Message{{Buffers: [][]byte{make([]byte, 32)}}}
+				if count, readErr := connection.ReadBatch(messages, MessageDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+					t.Fatalf("filtered read = %d, %v, want EAGAIN", count, readErr)
+				}
+			}
+			write()
+			assertEmpty()
+
+			switch filter := originalFilter.(type) {
+			case ICMPv4Filter:
+				filter.Accept(test.messageType)
+				current, filterErr := connection.ICMPv4Filter()
+				if filterErr != nil || !current.WillBlock(test.messageType) {
+					t.Fatalf("ICMPv4 creation snapshot = %+v, %v", current, filterErr)
+				}
+				current.Accept(test.messageType)
+				again, filterErr := connection.ICMPv4Filter()
+				if filterErr != nil || !again.WillBlock(test.messageType) {
+					t.Fatalf("ICMPv4 getter retained caller mutation: %+v, %v", again, filterErr)
+				}
+				var accepting ICMPv4Filter
+				if filterErr = connection.SetICMPv4Filter(accepting); filterErr != nil {
+					t.Fatal(filterErr)
+				}
+				write()
+				var blocking ICMPv4Filter
+				blocking.Block(test.messageType)
+				if filterErr = connection.SetICMPv4Filter(blocking); filterErr != nil {
+					t.Fatal(filterErr)
+				}
+				blocking.Accept(test.messageType)
+			case ICMPv6Filter:
+				filter.Accept(test.messageType)
+				current, filterErr := connection.ICMPv6Filter()
+				if filterErr != nil || !current.WillBlock(test.messageType) {
+					t.Fatalf("ICMPv6 creation snapshot = %+v, %v", current, filterErr)
+				}
+				current.Accept(test.messageType)
+				again, filterErr := connection.ICMPv6Filter()
+				if filterErr != nil || !again.WillBlock(test.messageType) {
+					t.Fatalf("ICMPv6 getter retained caller mutation: %+v, %v", again, filterErr)
+				}
+				var accepting ICMPv6Filter
+				if filterErr = connection.SetICMPv6Filter(accepting); filterErr != nil {
+					t.Fatal(filterErr)
+				}
+				write()
+				var blocking ICMPv6Filter
+				blocking.Block(test.messageType)
+				if filterErr = connection.SetICMPv6Filter(blocking); filterErr != nil {
+					t.Fatal(filterErr)
+				}
+				blocking.Accept(test.messageType)
+			}
+
+			buffer := make([]byte, len(message))
+			if read, _, readErr := connection.ReadFrom(buffer); readErr != nil || read != len(message) || !bytes.Equal(buffer, message) {
+				t.Fatalf("packet queued before filter replacement = %x, %v", buffer[:read], readErr)
+			}
+			write()
+			assertEmpty()
+			if test.protocol == protocolICMPv4 {
+				// x/net's filter methods expose the 32-bit mask through low-bit
+				// indexing, while Linux passes received types above that mask.
+				message[0], message[2], message[3] = 32, 0, 0
+				binary.BigEndian.PutUint16(message[2:4], checksum(message))
+				write()
+				buffer := make([]byte, len(message))
+				if read, _, readErr := connection.ReadFrom(buffer); readErr != nil || read != len(message) || !bytes.Equal(buffer, message) {
+					t.Fatalf("out-of-mask ICMPv4 packet = %x, %v", buffer[:read], readErr)
+				}
+			}
+			if stack.outbound.len() != 0 {
+				t.Fatal("a filtered raw ICMP packet generated output")
+			}
+		})
+	}
+}
+
+func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::151")
+	remote := netip.MustParseAddr("2001:db8:1::151")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}, MTU: 1280})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection, err := (&ListenConfig{Options: []SocketOption{
+		SocketOptions.IPv6Checksum(true, 2),
+	}}).ListenIP(context.Background(), stack, "ip6:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if enabled, offset, checksumErr := connection.IPv6Checksum(); checksumErr != nil || !enabled || offset != 2 {
+		t.Fatalf("initial IPv6 checksum policy = %v/%d, %v", enabled, offset, checksumErr)
+	}
+	if err = connection.SetIPv6Checksum(true, -1); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("negative enabled checksum offset = %v, want EINVAL", err)
+	}
+	if err = connection.SetIPv6Checksum(true, 3); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("odd enabled checksum offset = %v, want EINVAL", err)
+	}
+
+	valid := []byte{0x31, 0x32, 0, 0, 0x35, 0x36, 0x37, 0x38}
+	binary.BigEndian.PutUint16(valid[2:4], transportChecksum(remote, local, 99, valid))
+	if err = writeTestPacket(stack, buildIPPacket(remote, local, 99, valid, 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 32)
+	if read, _, readErr := connection.ReadFrom(buffer); readErr != nil || !bytes.Equal(buffer[:read], valid) {
+		t.Fatalf("checksum-valid raw receive = %x, %v", buffer[:read], readErr)
+	}
+	invalid := append([]byte(nil), valid...)
+	invalid[len(invalid)-1] ^= 0xff
+	for _, payload := range [][]byte{invalid, {1, 2, 3}} {
+		if err = writeTestPacket(stack, buildIPPacket(remote, local, 99, payload, 2, true)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	messages := []Message{{Buffers: [][]byte{buffer}}}
+	if count, readErr := connection.ReadBatch(messages, MessageDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("invalid-checksum receive = %d, %v, want EAGAIN", count, readErr)
+	}
+	if err = connection.SetIPv6Checksum(false, -99); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, offset, checksumErr := connection.IPv6Checksum(); checksumErr != nil || enabled || offset != 0 {
+		t.Fatalf("disabled IPv6 checksum policy = %v/%d, %v", enabled, offset, checksumErr)
+	}
+	if err = writeTestPacket(stack, buildIPPacket(remote, local, 99, invalid, 3, true)); err != nil {
+		t.Fatal(err)
+	}
+	if read, _, readErr := connection.ReadFrom(buffer); readErr != nil || !bytes.Equal(buffer[:read], invalid) {
+		t.Fatalf("disabled-checksum raw receive = %x, %v", buffer[:read], readErr)
+	}
+	if err = connection.SetIPv6Checksum(true, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	outbound := []byte{0x41, 0x42, 0xaa, 0xbb, 0x45, 0x46, 0x47, 0x48}
+	original := append([]byte(nil), outbound...)
+	if written, writeErr := connection.WriteToIP(outbound, ipNetAddr(remote)); writeErr != nil || written != len(outbound) {
+		t.Fatalf("checksummed WriteToIP = %d, %v", written, writeErr)
+	}
+	if !bytes.Equal(outbound, original) {
+		t.Fatalf("WriteToIP mutated caller payload: %x", outbound)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || transportChecksum(local, remote, 99, packet.payload) != 0 {
+		t.Fatalf("checksummed output = %+v, parsed=%v", packet, ok)
+	}
+
+	batchPayload := []byte{0x51, 0x52, 0xaa, 0xbb, 0x55, 0x56, 0x57, 0x58}
+	batchOriginal := append([]byte(nil), batchPayload...)
+	batch := []Message{{Buffers: [][]byte{batchPayload[:3], batchPayload[3:]}, Addr: ipNetAddr(remote)}}
+	if count, writeErr := connection.WriteBatch(batch, 0); writeErr != nil || count != 1 || batch[0].N != len(batchPayload) {
+		t.Fatalf("checksummed WriteBatch = %d, %v, message=%+v", count, writeErr, batch[0])
+	}
+	if !bytes.Equal(batchPayload, batchOriginal) {
+		t.Fatalf("WriteBatch mutated caller payload: %x", batchPayload)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || transportChecksum(local, remote, 99, packet.payload) != 0 {
+		t.Fatalf("checksummed batch output = %+v, parsed=%v", packet, ok)
+	}
+
+	fragmented := bytes.Repeat([]byte{0x6b}, 3000)
+	fragmentedOriginal := append([]byte(nil), fragmented...)
+	fragmentedBatch := []Message{{Buffers: [][]byte{fragmented[:317], fragmented[317:1301], fragmented[1301:]}, Addr: ipNetAddr(remote)}}
+	if count, writeErr := connection.WriteBatch(fragmentedBatch, 0); writeErr != nil || count != 1 {
+		t.Fatalf("checksummed fragmented WriteBatch = %d, %v", count, writeErr)
+	}
+	if !bytes.Equal(fragmented, fragmentedOriginal) {
+		t.Fatal("fragmented WriteBatch mutated caller payload")
+	}
+	receiver, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(remote, 128)}, MTU: 1280})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	var reassembled []byte
+	for count := 0; reassembled == nil && count < 16; count++ {
+		reassembled = receiver.reassemblePacket(readOutboundPacket(t, stack), time.Now())
+	}
+	packet, ok = parseIPPacket(reassembled)
+	if !ok || transportChecksum(local, remote, 99, packet.payload) != 0 || len(packet.payload) != len(fragmented) {
+		t.Fatalf("checksummed fragmented output = %+v, parsed=%v", packet, ok)
+	}
+	if _, writeErr := connection.WriteToIP([]byte{1, 2, 3}, ipNetAddr(remote)); !errors.Is(writeErr, syscall.EINVAL) {
+		t.Fatalf("short checksummed write = %v, want EINVAL", writeErr)
+	}
+}
+
+func TestIPConnDualStackIPv6ChecksumIsolation(t *testing.T) {
+	local4 := netip.MustParseAddr("192.0.2.152")
+	remote4 := netip.MustParseAddr("198.51.100.152")
+	local6 := netip.MustParseAddr("2001:db8::152")
+	remote6 := netip.MustParseAddr("2001:db8:1::152")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(local4, 32), netip.PrefixFrom(local6, 128),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection, err := (&ListenConfig{Options: []SocketOption{
+		SocketOptions.IPv6Checksum(true, 2),
+	}}).ListenIP(context.Background(), stack, "ip:99", netip.Addr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	payload4 := []byte{1, 2, 0xaa, 0xbb, 5, 6, 7, 8}
+	original4 := append([]byte(nil), payload4...)
+	if _, err = connection.WriteToIP(payload4, ipNetAddr(remote4)); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.source != local4 || !bytes.Equal(packet.payload, original4) || !bytes.Equal(payload4, original4) {
+		t.Fatalf("dual-stack IPv4 checksum isolation = %+v payload=%x", packet, payload4)
+	}
+	payload6 := []byte{1, 2, 0xaa, 0xbb, 5, 6, 7, 8}
+	original6 := append([]byte(nil), payload6...)
+	if _, err = connection.WriteToIP(payload6, ipNetAddr(remote6)); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.source != local6 || transportChecksum(local6, remote6, 99, packet.payload) != 0 || !bytes.Equal(payload6, original6) {
+		t.Fatalf("dual-stack IPv6 checksum output = %+v payload=%x", packet, payload6)
+	}
+
+	protocol58, err := stack.ListenIP(context.Background(), "ip:58", netip.Addr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer protocol58.Close()
+	icmpNumberOverIPv4 := []byte{0x81, 0, 0xaa, 0xbb, 1, 2, 3, 4}
+	want := append([]byte(nil), icmpNumberOverIPv4...)
+	if _, err = protocol58.WriteToIP(icmpNumberOverIPv4, ipNetAddr(remote4)); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.source != local4 || packet.protocol != protocolICMPv6 || !bytes.Equal(packet.payload, want) || !bytes.Equal(icmpNumberOverIPv4, want) {
+		t.Fatalf("IPv4 protocol 58 was treated as ICMPv6: %+v payload=%x", packet, icmpNumberOverIPv4)
+	}
+}
+
+func TestIPConnIPv6ChecksumHeaderIncludedOwnership(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::153")
+	remote := netip.MustParseAddr("2001:db8:1::153")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}, MTU: 1500})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection, err := (&ListenConfig{Options: []SocketOption{
+		SocketOptions.IPv6Checksum(true, 2),
+		SocketOptions.IPHeaderIncludedOnWrite(true),
+		SocketOptions.IPHeaderIncludedOnRead(true),
+	}}).ListenIP(context.Background(), stack, "ip6:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+
+	complete := buildIPPacket(local, remote, 99, []byte{1, 2, 0xaa, 0xbb, 5, 6, 7, 8}, 0, true)
+	wantComplete := append([]byte(nil), complete...)
+	if written, writeErr := connection.WriteToIP(complete, ipNetAddr(remote)); writeErr != nil || written != len(complete) {
+		t.Fatalf("header-included checksummed write = %d, %v", written, writeErr)
+	}
+	if !bytes.Equal(complete, wantComplete) {
+		t.Fatal("header-included write mutated caller packet")
+	}
+	if emitted := readOutboundPacket(t, stack); !bytes.Equal(emitted, wantComplete) {
+		t.Fatalf("header-included checksum policy changed packet:\n got %x\nwant %x", emitted, wantComplete)
+	}
+
+	payload := []byte{9, 10, 0, 0, 13, 14, 15, 16}
+	binary.BigEndian.PutUint16(payload[2:4], transportChecksum(remote, local, 99, payload))
+	inbound := buildIPPacket(remote, local, 99, payload, 0, true)
+	if err = writeTestPacket(stack, inbound); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 128)
+	if read, _, readErr := connection.ReadFrom(buffer); readErr != nil || !bytes.Equal(buffer[:read], inbound) {
+		t.Fatalf("header-included checksum-valid read = %x, %v", buffer[:read], readErr)
+	}
+	invalid := append([]byte(nil), inbound...)
+	invalid[len(invalid)-1] ^= 0xff
+	if err = writeTestPacket(stack, invalid); err != nil {
+		t.Fatal(err)
+	}
+	messages := []Message{{Buffers: [][]byte{buffer}}}
+	if count, readErr := connection.ReadBatch(messages, MessageDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("header-included invalid checksum read = %d, %v, want EAGAIN", count, readErr)
 	}
 }
 
@@ -639,7 +1187,7 @@ func TestIPExplicitErrorQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{}, datagramSocketOptionSet{})
+	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{}, socketOptionSet{})
 	defer connection.closeFromStack()
 	if err = connection.SetReceiveErrors(true); err != nil {
 		t.Fatal(err)
@@ -713,8 +1261,8 @@ func TestIPErrorQueueFanoutOwnsQuotedPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := newIPConn(stack, "ip4:99", 99, local, remote, datagramSocketOptionSet{})
-	second := newIPConn(stack, "ip4:99", 99, local, remote, datagramSocketOptionSet{})
+	first := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
+	second := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
 	defer first.closeFromStack()
 	defer second.closeFromStack()
 	for _, connection := range []*IPConn{first, second} {
@@ -972,7 +1520,7 @@ func TestIPConcurrentReadersShareDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection := newIPConn(stack, "ip4:99", 99, local, remote, datagramSocketOptionSet{})
+	connection := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
 	defer connection.closeFromStack()
 	if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
@@ -994,7 +1542,7 @@ func TestIPConcurrentReadersShareDeadline(t *testing.T) {
 	}
 	close(start)
 	for value := byte(0); value < readers; value++ {
-		connection.enqueue([]byte{value}, remote, local, ipPacketOptions{})
+		connection.enqueuePacket(ipPacket{payload: []byte{value}, source: remote, target: local}, ipPacketOptions{})
 	}
 	seen := make(map[byte]struct{}, readers)
 	for index := 0; index < readers; index++ {
@@ -1157,7 +1705,7 @@ func BenchmarkIPReceiveQueue(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	connection := newIPConn(stack, "ip4:99", 99, local, remote, datagramSocketOptionSet{})
+	connection := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
 	b.Cleanup(connection.closeFromStack)
 	payload := bytes.Repeat([]byte{0x6b}, 1200)
 	buffer := make([]byte, len(payload))
@@ -1165,7 +1713,7 @@ func BenchmarkIPReceiveQueue(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for iteration := 0; iteration < b.N; iteration++ {
-		connection.enqueue(payload, remote, local, ipPacketOptions{})
+		connection.enqueuePacket(ipPacket{payload: payload, source: remote, target: local}, ipPacketOptions{})
 		if n, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) {
 			b.Fatalf("readDatagram = %d, %v", n, readErr)
 		}
@@ -1179,9 +1727,9 @@ func TestIPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection := newIPConn(stack, "ip4:99", 99, local, remote, datagramSocketOptionSet{})
+	connection := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
 	read := func(payload []byte) {
-		connection.enqueue(payload, remote, local, ipPacketOptions{})
+		connection.enqueuePacket(ipPacket{payload: payload, source: remote, target: local}, ipPacketOptions{})
 		buffer := make([]byte, len(payload))
 		if n, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) || !bytes.Equal(buffer, payload) {
 			t.Fatalf("readDatagram = %d bytes, %v", n, readErr)
@@ -1221,11 +1769,11 @@ func TestIPConnCloseReleasesRetainedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{}, datagramSocketOptionSet{})
+	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{}, socketOptionSet{})
 	if err = connection.SetDeadline(time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	connection.enqueue(make([]byte, 1200), remote, local, ipPacketOptions{})
+	connection.enqueuePacket(ipPacket{payload: make([]byte, 1200), source: remote, target: local}, ipPacketOptions{})
 	connection.rememberTarget(remote)
 	connection.deliverError(remote, ICMPError{QuotedPayload: make([]byte, 1200)})
 	connection.mu.Lock()
@@ -1234,7 +1782,7 @@ func TestIPConnCloseReleasesRetainedState(t *testing.T) {
 	connection.closeFromStack()
 	connection.rememberTarget(remote)
 	connection.deliverError(remote, ICMPError{QuotedPayload: make([]byte, 1200)})
-	connection.enqueue(make([]byte, 1200), remote, local, ipPacketOptions{})
+	connection.enqueuePacket(ipPacket{payload: make([]byte, 1200), source: remote, target: local}, ipPacketOptions{})
 	connection.mu.Lock()
 	released := connection.receive.values == nil && connection.receiveSpare == nil && connection.queuedBytes == 0 &&
 		connection.errorQueue.values == nil && connection.errorQueuedBytes == 0 &&
