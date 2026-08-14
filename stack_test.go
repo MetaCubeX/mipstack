@@ -169,7 +169,7 @@ func TestMessagePeekTruncationAndErrorQueue(t *testing.T) {
 		t.Fatalf("read after pending error consumption = %d, %v", count, readErr)
 	}
 
-	ipConnection := newIPConn(stack, "ip4:99", 99, local, remote.Addr())
+	ipConnection := newIPConn(stack, "ip4:99", 99, local, remote.Addr(), datagramSocketOptionSet{})
 	defer ipConnection.closeFromStack()
 	ipConnection.ipHeaderIncludedOnWrite.Store(true)
 	if err = ipConnection.SetReceiveErrors(true); err != nil {

@@ -120,7 +120,8 @@ func TestTCPListenerCloseReleasesPendingOwnership(t *testing.T) {
 	connection := newTCPConn(stack, "tcp4", tcpKey{
 		local:  netip.MustParseAddrPort("192.0.2.251:443"),
 		remote: netip.MustParseAddrPort("198.51.100.251:50000"),
-	}, 1400)
+	}, 1400, tcpSocketOptionSet{})
+
 	listener := &TCPListener{
 		stack: stack, net: "tcp4", local: netip.MustParseAddrPort("192.0.2.251:443"), accept: make(chan *TCPConn, 1024), closed: make(chan struct{}),
 		pending: map[*TCPConn]struct{}{connection: {}}, handshaking: map[*TCPConn]struct{}{connection: {}},
@@ -153,7 +154,7 @@ func TestStackCloseEventuallyReleasesTCPBuffers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection := newTCPConn(stack, "tcp4", tcpKey{local: local, remote: remote}, 1400)
+	connection := newTCPConn(stack, "tcp4", tcpKey{local: local, remote: remote}, 1400, tcpSocketOptionSet{})
 	connection.connected = make(chan error, 1)
 	payload := make([]byte, 1<<20)
 	connection.mu.Lock()
@@ -292,11 +293,11 @@ func TestTCPIPv6FlowLabelPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := tcpKey{local: netip.AddrPortFrom(local, 40000), remote: netip.AddrPortFrom(remote, 443)}
-	connection := newTCPConn(stack, "tcp6", key, 1500)
+	connection := newTCPConn(stack, "tcp6", key, 1500, tcpSocketOptionSet{})
 	if connection.flowLabel == 0 {
 		t.Fatal("automatic TCP flow label is zero")
 	}
-	if second := newTCPConn(stack, "tcp6", key, 1500); second.flowLabel != connection.flowLabel {
+	if second := newTCPConn(stack, "tcp6", key, 1500, tcpSocketOptionSet{}); second.flowLabel != connection.flowLabel {
 		t.Fatalf("automatic TCP flow labels = %#x and %#x", connection.flowLabel, second.flowLabel)
 	}
 	explicit, err := New(Config{
@@ -306,7 +307,7 @@ func TestTCPIPv6FlowLabelPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if label := newTCPConn(explicit, "tcp6", key, 1500).flowLabel; label != 0x45678 {
+	if label := newTCPConn(explicit, "tcp6", key, 1500, tcpSocketOptionSet{}).flowLabel; label != 0x45678 {
 		t.Fatalf("configured TCP flow label = %#x, want 0x45678", label)
 	}
 }
@@ -530,7 +531,7 @@ type tcpTestWriterFunc func([]byte) (int, error)
 func (f tcpTestWriterFunc) Write(payload []byte) (int, error) { return f(payload) }
 
 func TestTCPWriteToKeepsDirectChunkStableWhileReceiving(t *testing.T) {
-	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	connection.mu.Lock()
 	connection.readBuffer.append([]byte("first"))
 	connection.readErr = io.EOF
@@ -559,7 +560,7 @@ func TestTCPWriteToKeepsDirectChunkStableWhileReceiving(t *testing.T) {
 }
 
 func TestTCPReadBufferAdoptsOwnedPayload(t *testing.T) {
-	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	payload := []byte("data")
 	payload = payload[:len(payload):len(payload)]
 	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
@@ -575,7 +576,7 @@ func TestTCPReadBufferAdoptsOwnedPayload(t *testing.T) {
 }
 
 func TestTCPReadCrossesReceiveChunks(t *testing.T) {
-	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	for _, payload := range [][]byte{[]byte("one"), []byte("two"), []byte("three")} {
 		if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
 			t.Fatalf("accepted %d of %d bytes", accepted, len(payload))
@@ -591,7 +592,7 @@ func TestTCPReadCrossesReceiveChunks(t *testing.T) {
 }
 
 func TestTCPWriteToBatchesReceiveChunks(t *testing.T) {
-	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	const chunks = 40
 	chunk := bytes.Repeat([]byte{0x5a}, 1024)
 	for index := 0; index < chunks; index++ {
@@ -962,7 +963,8 @@ func TestTCPPassiveHandshakeChallengeAndResetResponses(t *testing.T) {
 			link, stack := newTestStack(t, local, remote)
 			connection := newTCPConn(stack, "tcp4", tcpKey{
 				local: netip.AddrPortFrom(local, 8080), remote: netip.AddrPortFrom(remote, 45000),
-			}, 1400)
+			}, 1400, tcpSocketOptionSet{})
+
 			connection.passive = true
 			result := make(chan error, 1)
 			go func() {
@@ -1005,7 +1007,8 @@ func TestTCPPassiveHandshakeAcceptsOutOfOrderFinalACKData(t *testing.T) {
 	defer stack.Close()
 	connection := newTCPConn(stack, "tcp4", tcpKey{
 		local: netip.AddrPortFrom(local, 8080), remote: netip.AddrPortFrom(remote, 45000),
-	}, 1400)
+	}, 1400, tcpSocketOptionSet{})
+
 	connection.passive = true
 	result := make(chan error, 1)
 	go func() {
@@ -1049,7 +1052,8 @@ func TestTCPPassiveHandshakeECNFallback(t *testing.T) {
 	link, stack := newTestStack(t, local, remote)
 	connection := newTCPConn(stack, "tcp4", tcpKey{
 		local: netip.AddrPortFrom(local, 8080), remote: netip.AddrPortFrom(remote, 45000),
-	}, 1400)
+	}, 1400, tcpSocketOptionSet{})
+
 	connection.passive = true
 	result := make(chan error, 1)
 	go func() {
@@ -1097,7 +1101,8 @@ func TestTCPPassiveRetransmittedSYNUpdatesTimestampEcho(t *testing.T) {
 	link, stack := newTestStack(t, local, remote)
 	connection := newTCPConn(stack, "tcp4", tcpKey{
 		local: netip.AddrPortFrom(local, 8080), remote: netip.AddrPortFrom(remote, 45000),
-	}, 1400)
+	}, 1400, tcpSocketOptionSet{})
+
 	connection.passive = true
 	result := make(chan error, 1)
 	initialSYN := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}
@@ -1152,7 +1157,8 @@ func TestTCPHandshakeMaintenanceDoesNotConsumeRTOBudget(t *testing.T) {
 		link, stack := newTestStack(t, local, remote)
 		connection := newTCPConn(stack, "tcp4", tcpKey{
 			local: netip.AddrPortFrom(local, 45000), remote: netip.AddrPortFrom(remote, 8080),
-		}, 1400)
+		}, 1400, tcpSocketOptionSet{})
+
 		result := make(chan error, 1)
 		go func() { result <- testTCPHandshake(connection, 1000) }()
 		read := func() byte {
@@ -1199,7 +1205,8 @@ func TestTCPHandshakeMaintenanceDoesNotConsumeRTOBudget(t *testing.T) {
 		link, stack := newTestStack(t, local, remote)
 		connection := newTCPConn(stack, "tcp4", tcpKey{
 			local: netip.AddrPortFrom(local, 8080), remote: netip.AddrPortFrom(remote, 45000),
-		}, 1400)
+		}, 1400, tcpSocketOptionSet{})
+
 		connection.passive = true
 		syn := tcpSegment{sequence: 100, flags: tcpFlagSYN | tcpFlagECE | tcpFlagCWR, window: 65535}
 		result := make(chan error, 1)
@@ -2968,7 +2975,7 @@ func TestTCPBlackHoleMTUFloor(t *testing.T) {
 }
 
 func TestTCPOutOfOrderEarlierFINWins(t *testing.T) {
-	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	receiveNext := uint32(100)
 	receiveWindow := uint32(1000)
 	var pieces []tcpReceivedPiece
@@ -2985,7 +2992,7 @@ func TestTCPOutOfOrderEarlierFINWins(t *testing.T) {
 }
 
 func TestTCPOutOfOrderFINCompactsTruncatedRange(t *testing.T) {
-	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	owner := make([]byte, 32)
 	copy(owner, "abcdefghijklmnopqrstuvwxyz")
 	pieces := []tcpReceivedPiece{{sequence: 104, payload: owner}}
@@ -3041,7 +3048,7 @@ func TestTCPPartialACKCanLeaveFINOnly(t *testing.T) {
 }
 
 func TestTCPCloseWithUnreadDataIsAbortive(t *testing.T) {
-	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	connection.readBuffer.append([]byte("unread"))
 	connection.sendBuffer.append([]byte("unsent"))
 	if err := connection.Close(); err != nil {
@@ -3098,7 +3105,7 @@ func TestTCPSendBufferChunkOwnership(t *testing.T) {
 }
 
 func TestTCPCloseWithoutUnreadDataRemainsGraceful(t *testing.T) {
-	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	if err := connection.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -3315,7 +3322,7 @@ func TestTCPDispatchPreservesPacketArrivalTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := tcpKey{local: netip.AddrPortFrom(local, 8080), remote: netip.AddrPortFrom(remote, 50000)}
-	connection := newTCPConn(stack, "tcp4", key, 1500)
+	connection := newTCPConn(stack, "tcp4", key, 1500, tcpSocketOptionSet{})
 	stack.tcp[key] = connection
 	packet, ok := parseIPPacket(buildTestTCP(remote, local, key.remote.Port(), key.local.Port(), 1, 1, tcpFlagACK, 65535, nil, nil))
 	if !ok {
@@ -3821,7 +3828,7 @@ func TestTCPConnectionResourceLimit(t *testing.T) {
 
 func TestTCPInboundQueueHasByteCapacity(t *testing.T) {
 	_, stack := newTestStack(t, netip.MustParseAddr("192.0.2.76"), netip.MustParseAddr("198.51.100.76"))
-	connection := newTCPConn(stack, "tcp4", tcpKey{}, 1500)
+	connection := newTCPConn(stack, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	segment := tcpSegment{payload: make([]byte, 65535)}
 	accepted := 0
 	for connection.enqueueInbound(segment) {
@@ -3864,7 +3871,7 @@ func TestTCPInboundQueueOverloadUpdatesDiagnostics(t *testing.T) {
 		local:  netip.AddrPortFrom(local, 8080),
 		remote: netip.AddrPortFrom(remote, 45000),
 	}
-	connection := newTCPConn(stack, "tcp4", key, 1400)
+	connection := newTCPConn(stack, "tcp4", key, 1400, tcpSocketOptionSet{})
 	connection.inbound.mu.Lock()
 	connection.inbound.bytes = tcpInboundByteCapacity
 	connection.inbound.mu.Unlock()
@@ -3994,7 +4001,7 @@ func BenchmarkTCPHandlePureACK(b *testing.B) {
 		local:  netip.AddrPortFrom(local, 8443),
 		remote: netip.AddrPortFrom(remote, 49152),
 	}
-	connection := newTCPConn(stack, "tcp4", key, 1500)
+	connection := newTCPConn(stack, "tcp4", key, 1500, tcpSocketOptionSet{})
 	stack.mu.Lock()
 	stack.tcp[key] = connection
 	stack.mu.Unlock()
@@ -4051,7 +4058,8 @@ func TestTCPSegmentTimestampOptionsUseFixedWorkspace(t *testing.T) {
 	connection := newTCPConn(stack, "tcp4", tcpKey{
 		local:  netip.AddrPortFrom(local, 49152),
 		remote: netip.AddrPortFrom(remote, 8443),
-	}, 1500)
+	}, 1500, tcpSocketOptionSet{})
+
 	connection.peerTimestamp = true
 	connection.recentTimestamp = 0x10203040
 	extra := []byte{1, 1, 5, 10, 0, 0, 0, 1, 0, 0, 0, 2}
@@ -4643,7 +4651,8 @@ func TestTCPDelayedECNSYNACKDoesNotUndoFallback(t *testing.T) {
 	link, stack := newTestStack(t, local, remote)
 	connection := newTCPConn(stack, "tcp4", tcpKey{
 		local: netip.AddrPortFrom(local, 45000), remote: netip.AddrPortFrom(remote, 8080),
-	}, 1400)
+	}, 1400, tcpSocketOptionSet{})
+
 	result := make(chan error, 1)
 	go func() { result <- testTCPHandshake(connection, 1000) }()
 	readSYN := func() []byte {
@@ -5249,7 +5258,7 @@ func BenchmarkTCPReadFrom(b *testing.B) {
 }
 
 func BenchmarkTCPSetDeadline(b *testing.B) {
-	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500)
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {

@@ -241,10 +241,13 @@ func (s *Stack) listenIP(ctx context.Context, network string, local netip.Addr, 
 	if err != nil {
 		return wrap(err)
 	}
+	if err = options.validateFamily(socketOptionIPListen, local.Is6(), dual); err != nil {
+		return wrap(err)
+	}
 	if !local.IsUnspecified() && !networkStateHasLocal(state, local) {
 		return wrap(syscall.EADDRNOTAVAIL)
 	}
-	connection := newIPConn(s, network, protocol, local, netip.Addr{})
+	connection := newIPConn(s, network, protocol, local, netip.Addr{}, options.datagram)
 	connection.dual = dual
 	connection.ipHeaderIncludedOnWrite.Store(options.ipHeaderIncludedOnWrite)
 	connection.ipHeaderIncludedOnRead = options.ipHeaderIncludedOnRead
@@ -276,6 +279,9 @@ func (s *Stack) dialIP(ctx context.Context, network string, source, remote netip
 	if !remote.IsValid() || remote.IsUnspecified() || remote.Zone() != "" {
 		return wrap(nil, errors.New("mipstack: invalid IP destination"))
 	}
+	if err = options.validateFamily(socketOptionIPDial, remote.Is6(), false); err != nil {
+		return wrap(nil, err)
+	}
 	if err := ctx.Err(); err != nil {
 		return wrap(nil, err)
 	}
@@ -303,7 +309,7 @@ func (s *Stack) dialIP(ctx context.Context, network string, source, remote netip
 	if err != nil {
 		return wrap(ipNetAddr(source), err)
 	}
-	connection := newIPConn(s, network, protocol, local, remote)
+	connection := newIPConn(s, network, protocol, local, remote, options.datagram)
 	connection.ipHeaderIncludedOnWrite.Store(options.ipHeaderIncludedOnWrite)
 	connection.ipHeaderIncludedOnRead = options.ipHeaderIncludedOnRead
 	s.ipEndpointStateLocked().register(connection)
@@ -371,18 +377,23 @@ func validateIPProtocol(protocol byte) error {
 }
 
 // newIPConn allocates one unregistered protocol socket.
-func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.Addr) *IPConn {
+// newIPConn allocates one unregistered protocol socket after applying explicit
+// creation policies to the latest Stack defaults.
+func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.Addr, options datagramSocketOptionSet) *IPConn {
 	defaults := DatagramSocketDefaults{ReceiveBuffer: ipDefaultReceiveCapacity, HopLimit: 64, MulticastHopLimit: 1}
 	if stack != nil {
 		defaults = stack.network.Load().ipDefaults
 	}
+	defaults = applyDatagramSocketOptions(defaults, options, ipDatagramMetadataSize)
 	connection := &IPConn{
 		stack: stack, net: network, protocol: protocol, v6: local.Is6(), local: local, remote: remote,
 		closed: make(chan struct{}), receiveNotify: make(chan struct{}, 1), receiveCapacity: defaults.ReceiveBuffer,
 		defaultOptions: ipPacketOptions{
 			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
-			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
+			flowLabel: defaults.FlowLabel, hopLimitSet: options.hopLimit.set,
+			trafficClassSet: options.trafficClass.set, flowLabelSet: defaults.FlowLabel != 0 || options.flowLabel.set,
 		},
+		receiveErrors:     defaults.ReceiveErrors,
 		pathMTUDiscovery:  defaults.PathMTUDiscovery,
 		multicastHopLimit: byte(defaults.MulticastHopLimit), multicastLoopback: !defaults.DisableMulticastLoopback,
 		broadcast: !defaults.DisableBroadcast,

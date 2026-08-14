@@ -314,7 +314,7 @@ func TestTCPSocketDefaultConfiguration(t *testing.T) {
 	if state.tcpDefaults.TrafficClass != 0xa8 {
 		t.Fatalf("normalized traffic class = %#x, want %#x", state.tcpDefaults.TrafficClass, 0xa8)
 	}
-	connection := newTCPConn(stack, "tcp", tcpKey{}, 1500)
+	connection := newTCPConn(stack, "tcp", tcpKey{}, 1500, tcpSocketOptionSet{})
 	if connection.receiveCapacity != defaults.ReceiveBuffer || connection.receiveMaximum != defaults.MaximumReceiveBuffer ||
 		connection.sendCapacity != defaults.SendBuffer || connection.sendMaximum != defaults.MaximumSendBuffer ||
 		connection.maximumPacingRate != defaults.MaximumPacingRate || connection.noDelay || !connection.keepAlive || connection.userTimeout != defaults.UserTimeout || connection.receiveWindowScale != tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer) {
@@ -364,18 +364,18 @@ func TestDatagramSocketDefaultConfiguration(t *testing.T) {
 	}
 	stack, err := New(Config{
 		LocalAddresses: []netip.Prefix{local},
-		UDP:            DatagramSocketDefaults{ReceiveBuffer: 2048, HopLimit: 31, TrafficClass: 0xb8, PathMTUDiscovery: PathMTUDiscoveryProbe},
-		IP:             DatagramSocketDefaults{ReceiveBuffer: 4096, HopLimit: 29, TrafficClass: 0x2e, PathMTUDiscovery: PathMTUDiscoveryOmit},
+		UDP:            DatagramSocketDefaults{ReceiveBuffer: 2048, ReceiveErrors: true, HopLimit: 31, TrafficClass: 0xb8, PathMTUDiscovery: PathMTUDiscoveryProbe},
+		IP:             DatagramSocketDefaults{ReceiveBuffer: 4096, ReceiveErrors: true, HopLimit: 29, TrafficClass: 0x2e, PathMTUDiscovery: PathMTUDiscoveryOmit},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	udp := newUDPConn(stack, "udp4", 1000, false, local.Addr(), netip.AddrPort{})
-	if udp.receiveCapacity != 2048 || udp.defaultOptions != (ipPacketOptions{hopLimit: 31, trafficClass: 0xb8}) || udp.pathMTUDiscovery != PathMTUDiscoveryProbe {
+	udp := newUDPConn(stack, "udp4", 1000, false, local.Addr(), netip.AddrPort{}, datagramSocketOptionSet{})
+	if udp.receiveCapacity != 2048 || !udp.receiveErrors || udp.defaultOptions != (ipPacketOptions{hopLimit: 31, trafficClass: 0xb8}) || udp.pathMTUDiscovery != PathMTUDiscoveryProbe {
 		t.Fatalf("UDP defaults = %d, %+v, PMTU mode %d", udp.receiveCapacity, udp.defaultOptions, udp.pathMTUDiscovery)
 	}
-	ip := newIPConn(stack, "ip4:99", 99, local.Addr(), netip.Addr{})
-	if ip.receiveCapacity != 4096 || ip.defaultOptions != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e}) || ip.pathMTUDiscovery != PathMTUDiscoveryOmit {
+	ip := newIPConn(stack, "ip4:99", 99, local.Addr(), netip.Addr{}, datagramSocketOptionSet{})
+	if ip.receiveCapacity != 4096 || !ip.receiveErrors || ip.defaultOptions != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e}) || ip.pathMTUDiscovery != PathMTUDiscoveryOmit {
 		t.Fatalf("IP defaults = %d, %+v, PMTU mode %d", ip.receiveCapacity, ip.defaultOptions, ip.pathMTUDiscovery)
 	}
 }

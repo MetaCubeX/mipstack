@@ -124,7 +124,7 @@ func TestUDPExplicitErrorQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	connection := newUDPConn(stack, "udp4", 5300, false, local, netip.AddrPort{})
+	connection := newUDPConn(stack, "udp4", 5300, false, local, netip.AddrPort{}, datagramSocketOptionSet{})
 	defer connection.closeFromStack()
 	if err = connection.SetReceiveErrors(true); err != nil {
 		t.Fatal(err)
@@ -609,7 +609,7 @@ func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
 				b.Fatal(err)
 			}
 			defer stack.Close()
-			connection := newUDPConn(stack, "udp", 49152, test.source.Is6(), test.source, netip.AddrPort{})
+			connection := newUDPConn(stack, "udp", 49152, test.source.Is6(), test.source, netip.AddrPort{}, datagramSocketOptionSet{})
 			payload := bytes.Repeat([]byte{0x6d}, 60*1024)
 			maximum := (1280 - 20) &^ 7
 			if test.source.Is6() {
@@ -649,7 +649,7 @@ func TestUDPConcurrentReadersShareDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection := newUDPConn(stack, "udp4", 5300, false, local, remote)
+	connection := newUDPConn(stack, "udp4", 5300, false, local, remote, datagramSocketOptionSet{})
 	defer connection.closeFromStack()
 	if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
@@ -1633,7 +1633,7 @@ func BenchmarkUDPReceiveQueue(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	connection := newUDPConn(stack, "udp4", 5300, false, local, remote)
+	connection := newUDPConn(stack, "udp4", 5300, false, local, remote, datagramSocketOptionSet{})
 	b.Cleanup(connection.closeFromStack)
 	payload := bytes.Repeat([]byte{0x5a}, 1200)
 	buffer := make([]byte, len(payload))
@@ -1706,7 +1706,7 @@ func TestUDPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection := newUDPConn(stack, "udp4", 5300, false, local, remote)
+	connection := newUDPConn(stack, "udp4", 5300, false, local, remote, datagramSocketOptionSet{})
 	read := func(payload []byte) {
 		connection.enqueue(payload, remote, local, ipPacketOptions{})
 		buffer := make([]byte, len(payload))
@@ -1748,7 +1748,7 @@ func TestUDPConnCloseReleasesRetainedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	connection := newUDPConn(stack, "udp4", 5300, false, local, netip.AddrPort{})
+	connection := newUDPConn(stack, "udp4", 5300, false, local, netip.AddrPort{}, datagramSocketOptionSet{})
 	if err = connection.SetDeadline(time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}

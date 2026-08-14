@@ -219,6 +219,9 @@ const (
 type DatagramSocketDefaults struct {
 	// ReceiveBuffer is the approximate retained-memory receive capacity.
 	ReceiveBuffer int
+	// ReceiveErrors reserves asynchronous network errors for ReadError instead
+	// of returning them from ordinary reads after queued payloads.
+	ReceiveErrors bool
 	// PathMTUDiscovery selects the Linux-compatible source-fragmentation and
 	// destination-PMTU policy. The zero value is PathMTUDiscoveryDont.
 	PathMTUDiscovery PathMTUDiscovery
@@ -2474,12 +2477,12 @@ func (s *Stack) tcpPortListenedLocked(local netip.Addr, port uint16) bool {
 // or udp6. A wildcard with udp uses one dual-stack endpoint when both families
 // are configured. Port zero selects an automatic port.
 func (s *Stack) ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error) {
-	return s.listenUDP(ctx, network, local, exclusiveUDPSocketBinding{})
+	return s.listenUDP(ctx, network, local, exclusiveUDPSocketBinding{}, datagramSocketOptionSet{})
 }
 
 // listenUDP contains validation, automatic port allocation, and socket
 // construction shared by the ordinary and optional REUSEPORT entry points.
-func (s *Stack) listenUDP(ctx context.Context, network string, local netip.AddrPort, binding udpSocketBinding) (net.PacketConn, error) {
+func (s *Stack) listenUDP(ctx context.Context, network string, local netip.AddrPort, binding udpSocketBinding, options datagramSocketOptionSet) (net.PacketConn, error) {
 	address := local.Addr().Unmap()
 	local = netip.AddrPortFrom(address, local.Port())
 	target := net.UDPAddrFromAddrPort(local)
@@ -2511,6 +2514,9 @@ func (s *Stack) listenUDP(ctx context.Context, network string, local netip.AddrP
 	if err != nil {
 		return wrap(err)
 	}
+	if err = (socketOptionSet{datagram: options}).validateFamily(socketOptionUDPListen, address.Is6(), dual); err != nil {
+		return wrap(err)
+	}
 	if !address.IsUnspecified() && !networkStateHasLocal(state, address) {
 		return wrap(syscall.EADDRNOTAVAIL)
 	}
@@ -2524,7 +2530,7 @@ func (s *Stack) listenUDP(ctx context.Context, network string, local netip.AddrP
 	} else if !s.udpEndpointAvailableLocked(binding, address, port, dual) {
 		return wrap(syscall.EADDRINUSE)
 	}
-	connection := newUDPConn(s, network, port, address.Is6(), address, netip.AddrPort{})
+	connection := newUDPConn(s, network, port, address.Is6(), address, netip.AddrPort{}, options)
 	connection.dual = dual
 	if err = binding.register(s, connection); err != nil {
 		return wrap(err)
@@ -2537,6 +2543,11 @@ func (s *Stack) listenUDP(ctx context.Context, network string, local netip.AddrP
 // Network must be udp, udp4, or udp6. A zero source selects both address and
 // port automatically; an unspecified source address selects only the address.
 func (s *Stack) DialUDP(ctx context.Context, network string, source, remote netip.AddrPort) (net.Conn, error) {
+	return s.dialUDP(ctx, network, source, remote, datagramSocketOptionSet{})
+}
+
+// dialUDP contains connected socket construction shared by Stack and Dialer.
+func (s *Stack) dialUDP(ctx context.Context, network string, source, remote netip.AddrPort, options datagramSocketOptionSet) (net.Conn, error) {
 	remote = netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port())
 	target := net.UDPAddrFromAddrPort(remote)
 	wrap := func(source net.Addr, err error) (net.Conn, error) {
@@ -2547,6 +2558,9 @@ func (s *Stack) DialUDP(ctx context.Context, network string, source, remote neti
 	}
 	if !remote.IsValid() || remote.Addr().IsUnspecified() || remote.Addr().Zone() != "" {
 		return wrap(nil, errors.New("mipstack: invalid UDP destination"))
+	}
+	if err := (socketOptionSet{datagram: options}).validateFamily(socketOptionUDPDial, remote.Addr().Is6(), false); err != nil {
+		return wrap(nil, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return wrap(nil, err)
@@ -2574,7 +2588,7 @@ func (s *Stack) DialUDP(ctx context.Context, network string, source, remote neti
 		return wrap(localAddress, syscall.EADDRINUSE)
 	}
 	local = netip.AddrPortFrom(local.Addr(), port)
-	connection := newUDPConn(s, network, port, remote.Addr().Is6(), local.Addr(), remote)
+	connection := newUDPConn(s, network, port, remote.Addr().Is6(), local.Addr(), remote, options)
 	s.udp[udpKey{address: local.Addr(), port: port}] = connection
 	s.stats.activeUDPSockets.Add(1)
 	return connection, nil

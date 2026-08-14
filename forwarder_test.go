@@ -4860,3 +4860,125 @@ func TestIPv6TransportForwarders(t *testing.T) {
 		t.Fatalf("IPv6 forwarded UDP reply = %q, %v", buffer[:n], err)
 	}
 }
+
+func TestTCPForwarderCreationOptionsValidateBeforeClaim(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.240")
+	serverAddress := netip.MustParseAddr("192.0.2.241")
+	target := netip.MustParseAddr("198.51.100.240")
+	client := newForwarderTestStack(t, clientAddress, false)
+	server := newForwarderTestStack(t, serverAddress, true)
+	newStackBridge(t, client, server)
+	type acceptResult struct {
+		connection *TCPConn
+		invalid    error
+		err        error
+	}
+	accepted := make(chan acceptResult, 1)
+	_, err := NewTCPForwarder(server, TCPForwarderOptions{}, func(request *TCPForwarderRequest) {
+		_, invalid := request.Accept(context.Background(), SocketOptions.ReceiveErrors(true))
+		connection, acceptErr := request.Accept(context.Background(),
+			SocketOptions.ReadBuffer(6123), SocketOptions.WriteBuffer(7123),
+			SocketOptions.NoDelay(false), SocketOptions.CongestionControl(CongestionControlReno),
+			SocketOptions.MaximumPacingRate(8123), SocketOptions.TrafficClass(0xab),
+		)
+		accepted <- acceptResult{connection: connection, invalid: invalid, err: acceptErr}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConnection, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(target, 8443))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConnection.Close()
+	result := <-accepted
+	if !errors.Is(result.invalid, syscall.ENOPROTOOPT) {
+		t.Fatalf("invalid TCP Forwarder option = %v, want ENOPROTOOPT", result.invalid)
+	}
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	defer result.connection.Close()
+	if info := result.connection.Info(); info.ReceiveBufferCapacity != 6123 || info.MaximumReceiveBuffer != 6123 ||
+		info.SendBufferCapacity != 7123 || info.MaximumSendBuffer != 7123 || info.NoDelay ||
+		info.CongestionControl != CongestionControlReno || info.MaximumPacingRate != 8123 || info.TrafficClass != 0xa8 {
+		t.Fatalf("forwarded TCP creation policy = %+v", info)
+	}
+}
+
+func TestUDPForwarderCreationOptionsValidateBeforeClaim(t *testing.T) {
+	owned := netip.MustParseAddr("192.0.2.242")
+	remote := netip.MustParseAddr("198.51.100.242")
+	target := netip.MustParseAddr("203.0.113.242")
+	stack := newForwarderTestStack(t, owned, true)
+	type acceptResult struct {
+		connection *UDPConn
+		invalid    error
+		err        error
+	}
+	accepted := make(chan acceptResult, 1)
+	_, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+		_, invalid := request.Accept(SocketOptions.FlowLabel(1))
+		connection, acceptErr := request.Accept(
+			SocketOptions.ReadBuffer(123), SocketOptions.ReceiveErrors(true),
+			SocketOptions.PathMTUDiscovery(PathMTUDiscoveryDo), SocketOptions.HopLimit(23),
+			SocketOptions.Broadcast(false), SocketOptions.MulticastHopLimit(7), SocketOptions.MulticastLoopback(false),
+			SocketOptions.TrafficClass(0x5a),
+		)
+		accepted <- acceptResult{connection: connection, invalid: invalid, err: acceptErr}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writeTestPacket(stack, buildTestUDP(remote, target, 52000, 5353, []byte("options"))); err != nil {
+		t.Fatal(err)
+	}
+	result := <-accepted
+	if !errors.Is(result.invalid, syscall.EAFNOSUPPORT) {
+		t.Fatalf("invalid UDP Forwarder family option = %v, want EAFNOSUPPORT", result.invalid)
+	}
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	defer result.connection.Close()
+	if info := result.connection.Info(); info.ReceiveQueueCapacity != 123 || !info.ReceiveErrors ||
+		info.PathMTUDiscovery != PathMTUDiscoveryDo || info.HopLimit != 23 || info.Broadcast ||
+		info.MulticastHopLimit != 7 || info.MulticastLoopback || info.TrafficClass != 0x5a {
+		t.Fatalf("forwarded UDP creation policy = %+v", info)
+	}
+}
+
+func TestUDPForwarderListenCreationOptionsValidateBeforeClaim(t *testing.T) {
+	owned := netip.MustParseAddr("192.0.2.243")
+	remote := netip.MustParseAddr("198.51.100.243")
+	target := netip.MustParseAddr("203.0.113.243")
+	stack := newForwarderTestStack(t, owned, true)
+	type listenResult struct {
+		connection *UDPConn
+		invalid    error
+		err        error
+	}
+	listened := make(chan listenResult, 1)
+	_, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+		_, invalid := request.Listen(SocketOptions.ReusePort(true))
+		connection, listenErr := request.Listen(SocketOptions.ReadBuffer(321), SocketOptions.ReceiveErrors(true))
+		listened <- listenResult{connection: connection, invalid: invalid, err: listenErr}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writeTestPacket(stack, buildTestUDP(remote, target, 52001, 5353, []byte("listen options"))); err != nil {
+		t.Fatal(err)
+	}
+	result := <-listened
+	if !errors.Is(result.invalid, syscall.ENOPROTOOPT) {
+		t.Fatalf("invalid UDP Forwarder listen option = %v, want ENOPROTOOPT", result.invalid)
+	}
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	defer result.connection.Close()
+	if info := result.connection.Info(); info.RemoteAddress.IsValid() || info.ReceiveQueueCapacity != 321 || !info.ReceiveErrors {
+		t.Fatalf("forwarded UDP listener creation policy = %+v", info)
+	}
+}

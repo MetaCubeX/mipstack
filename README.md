@@ -110,20 +110,25 @@ The zero-value `ListenConfig` and `Dialer` mirror the creation-time policy
 pattern used by `net.ListenConfig` and `net.Dialer`. Their `Options` slices are
 read in order and are not retained. `SocketOptions` constructs sealed,
 strongly typed policies without adding a top-level exported type for every
-option:
+option. The creation policies are:
 
-- `ReuseAddress` selects Linux `SO_REUSEADDR` bind compatibility;
-- `ReusePort` selects Linux `SO_REUSEPORT` flow distribution;
-- `IPHeaderIncludedOnWrite` makes `IPConn` writes carry a complete IP packet;
-- `IPHeaderIncludedOnRead` makes `IPConn` reads return a complete reassembled
-  packet.
+| Scope | Options |
+| --- | --- |
+| TCP, UDP, and IP | `ReadBuffer`, `TrafficClass`, `FlowLabel` |
+| TCP connections | `WriteBuffer`, `KeepAlive`, `KeepAliveConfig`, `NoDelay`, `IdleTimeout`, `UserTimeout`, `CongestionControl`, `CongestionControlFactory`, `MaximumPacingRate` |
+| TCP listeners | `AcceptQueue`, `SYNBacklog`, plus the TCP connection policies inherited by accepted connections |
+| UDP and IP | `ReceiveErrors`, `PathMTUDiscovery`, `HopLimit`, `Broadcast`, `MulticastHopLimit`, `MulticastLoopback` |
+| TCP and UDP listeners | `ReuseAddress`, `ReusePort` |
+| IP | `IPHeaderIncludedOnWrite`, `IPHeaderIncludedOnRead` |
 
-Each boolean constructor is an explicit choice, including `false`. The
-corresponding `UnsetReuseAddress`, `UnsetReusePort`,
-`UnsetIPHeaderIncludedOnWrite`, and `UnsetIPHeaderIncludedOnRead` constructors
-remove an earlier choice of the same kind and restore the operation-specific
-default. This supports layered option slices without treating an explicit
-disable as absence.
+Every constructor is an explicit choice, including boolean `false` and valid
+numeric zero values. Every policy has a corresponding `UnsetXxx` constructor;
+the congestion-control name and factory forms share
+`UnsetCongestionControl`. An unset marker removes an earlier choice of the
+same kind and restores the operation-specific Stack default. Unset markers are
+accepted by every socket creation operation and have no effect where the
+corresponding setting is inapplicable. This supports layered option slices
+without treating an explicit disable or zero as absence.
 
 An option used with an inapplicable protocol or operation reports
 `ENOPROTOOPT` before an endpoint is created. Repeated option kinds use the last
@@ -133,6 +138,15 @@ values are consumed only during socket creation. Like Linux raw sockets, an
 ICMP error delivered after such a change uses the write representation in
 effect when the error arrives. The direct `Stack` methods remain concise
 default-policy entry points.
+
+A TCP listener retains only its explicit connection-policy overrides. Each
+accepted connection reads the current `Config.TCP` defaults at creation and
+then applies those overrides, so a later `UpdateConfig` affects future accepts
+without discarding listener-specific choices. Explicit TCP buffer capacities
+also become their auto-tuning maxima. The listener's `AcceptQueue` and
+`SYNBacklog` are fixed when it is bound, and its SYN-cookie responses use the
+same receive-window, Traffic Class, and Flow Label policy as stateful
+handshakes.
 
 The three `DialTCP`, `DialUDP`, and `DialIP` entry points mirror the netip-based
 methods available on newer `net.Dialer` versions: they accept a context,
@@ -237,7 +251,9 @@ context cancellation, or stack closure and returns a `TCPConn` whose
 connection has its own lifetime and may instead be handed to another
 goroutine. `Drop` consumes the SYN silently, while `Reject` sends the RFC 9293
 reset on a best-effort basis. Retransmitted SYNs do not create duplicate
-handler calls.
+handler calls. `Accept` takes the same variadic connection `SocketOption`
+values as `Dialer`; option validation happens before the request is claimed,
+so an invalid option does not prevent a different terminal action.
 
 `TCPForwarderRequest.Done` closes when its handler returns, a pending request
 is invalidated by configuration, or its forwarder or stack closes. Forwarder
@@ -257,7 +273,10 @@ sources through `ReadFrom` and replies through `WriteTo`. Both actions offer
 the first datagram to the new socket's capacity-bounded receive queue; a queue
 drop does not undo endpoint registration. The handler must wait for `Accept` or
 `Listen` to return, but the returned connection remains valid after the
-callback. `Reply` writes one reverse datagram without retaining a flow and uses
+callback. Both creation methods accept the UDP/IP policy `SocketOption` values
+used by `Dialer`; they validate options before claiming the request. Forwarded
+listeners retain exclusive flow ownership and therefore reject bind-reuse
+options. `Reply` writes one reverse datagram without retaining a flow and uses
 `Flow().Destination` as its default source. `ReplyFrom` selects any valid
 same-family source address and UDP port. Source membership in `LocalAddresses`
 and unicast, multicast, or broadcast classification are not policy checks; a

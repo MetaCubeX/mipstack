@@ -639,7 +639,7 @@ func TestIPExplicitErrorQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{})
+	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{}, datagramSocketOptionSet{})
 	defer connection.closeFromStack()
 	if err = connection.SetReceiveErrors(true); err != nil {
 		t.Fatal(err)
@@ -713,8 +713,8 @@ func TestIPErrorQueueFanoutOwnsQuotedPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := newIPConn(stack, "ip4:99", 99, local, remote)
-	second := newIPConn(stack, "ip4:99", 99, local, remote)
+	first := newIPConn(stack, "ip4:99", 99, local, remote, datagramSocketOptionSet{})
+	second := newIPConn(stack, "ip4:99", 99, local, remote, datagramSocketOptionSet{})
 	defer first.closeFromStack()
 	defer second.closeFromStack()
 	for _, connection := range []*IPConn{first, second} {
@@ -972,7 +972,7 @@ func TestIPConcurrentReadersShareDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection := newIPConn(stack, "ip4:99", 99, local, remote)
+	connection := newIPConn(stack, "ip4:99", 99, local, remote, datagramSocketOptionSet{})
 	defer connection.closeFromStack()
 	if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
@@ -1157,7 +1157,7 @@ func BenchmarkIPReceiveQueue(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	connection := newIPConn(stack, "ip4:99", 99, local, remote)
+	connection := newIPConn(stack, "ip4:99", 99, local, remote, datagramSocketOptionSet{})
 	b.Cleanup(connection.closeFromStack)
 	payload := bytes.Repeat([]byte{0x6b}, 1200)
 	buffer := make([]byte, len(payload))
@@ -1179,7 +1179,7 @@ func TestIPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connection := newIPConn(stack, "ip4:99", 99, local, remote)
+	connection := newIPConn(stack, "ip4:99", 99, local, remote, datagramSocketOptionSet{})
 	read := func(payload []byte) {
 		connection.enqueue(payload, remote, local, ipPacketOptions{})
 		buffer := make([]byte, len(payload))
@@ -1221,7 +1221,7 @@ func TestIPConnCloseReleasesRetainedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{})
+	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{}, datagramSocketOptionSet{})
 	if err = connection.SetDeadline(time.Now().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}

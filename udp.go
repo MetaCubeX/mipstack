@@ -199,24 +199,28 @@ type udpWriteParameters struct {
 // policy.
 type udpDatagramWriter func(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast, dontWait bool) error
 
-// newUDPConn creates an unregistered UDP socket.
-func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.Addr, remote netip.AddrPort) *UDPConn {
+// newUDPConn creates an unregistered UDP socket after applying explicit
+// creation policies to the latest Stack defaults.
+func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.Addr, remote netip.AddrPort, options datagramSocketOptionSet) *UDPConn {
 	defaults := DatagramSocketDefaults{ReceiveBuffer: udpDefaultReceiveCapacity, HopLimit: 64, MulticastHopLimit: 1}
 	if stack != nil {
 		defaults = stack.network.Load().udpDefaults
 	}
+	defaults = applyDatagramSocketOptions(defaults, options, udpDatagramMetadataSize)
 	connection := &UDPConn{
 		stack: stack, net: network, port: port, v6: v6, local: local, remote: remote,
 		closed: make(chan struct{}), receiveNotify: make(chan struct{}, 1), receiveCapacity: defaults.ReceiveBuffer,
 		defaultOptions: ipPacketOptions{
 			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
-			flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
+			flowLabel: defaults.FlowLabel, hopLimitSet: options.hopLimit.set,
+			trafficClassSet: options.trafficClass.set, flowLabelSet: defaults.FlowLabel != 0 || options.flowLabel.set,
 		},
+		receiveErrors:     defaults.ReceiveErrors,
 		pathMTUDiscovery:  defaults.PathMTUDiscovery,
 		multicastHopLimit: byte(defaults.MulticastHopLimit), multicastLoopback: !defaults.DisableMulticastLoopback,
 		broadcast: !defaults.DisableBroadcast,
 	}
-	if remote.IsValid() && stack != nil && local.Is6() && remote.Addr().Is6() && defaults.FlowLabel == 0 {
+	if remote.IsValid() && stack != nil && local.Is6() && remote.Addr().Is6() && defaults.FlowLabel == 0 && !options.flowLabel.set {
 		connection.automaticLabel = stack.automaticTransportFlowLabel(local, remote.Addr(), protocolUDP, port, remote.Port())
 	}
 	return connection
@@ -398,7 +402,7 @@ func (s *Stack) udpOrdinaryConnectionLocked(local, remote netip.AddrPort) *UDPCo
 
 // acceptUDP registers one handler-approved connected endpoint and queues its
 // triggering datagram before making the flow visible to concurrent input.
-func (f *UDPForwarder) acceptUDP(request *UDPForwarderRequest) (*UDPConn, error) {
+func (f *UDPForwarder) acceptUDP(request *UDPForwarderRequest, options datagramSocketOptionSet) (*UDPConn, error) {
 	stack := f.stack
 	stack.mu.Lock()
 	defer stack.mu.Unlock()
@@ -424,7 +428,7 @@ func (f *UDPForwarder) acceptUDP(request *UDPForwarderRequest) (*UDPConn, error)
 	if local.Addr().Is6() {
 		network = "udp6"
 	}
-	connection := newUDPConn(stack, network, local.Port(), local.Addr().Is6(), local.Addr(), remote)
+	connection := newUDPConn(stack, network, local.Port(), local.Addr().Is6(), local.Addr(), remote, options)
 	connection.forwarded = true
 	connection.enqueue(request.Payload(), remote, local.Addr(), request.options)
 	if stack.udpForwarded == nil {
@@ -438,7 +442,7 @@ func (f *UDPForwarder) acceptUDP(request *UDPForwarderRequest) (*UDPConn, error)
 // listenUDP registers one handler-approved unconnected endpoint and queues its
 // triggering datagram before making the local binding visible to concurrent
 // input.
-func (f *UDPForwarder) listenUDP(request *UDPForwarderRequest) (*UDPConn, error) {
+func (f *UDPForwarder) listenUDP(request *UDPForwarderRequest, options datagramSocketOptionSet) (*UDPConn, error) {
 	stack := f.stack
 	stack.mu.Lock()
 	defer stack.mu.Unlock()
@@ -467,7 +471,7 @@ func (f *UDPForwarder) listenUDP(request *UDPForwarderRequest) (*UDPConn, error)
 	if local.Addr().Is6() {
 		network = "udp6"
 	}
-	connection := newUDPConn(stack, network, local.Port(), local.Addr().Is6(), local.Addr(), netip.AddrPort{})
+	connection := newUDPConn(stack, network, local.Port(), local.Addr().Is6(), local.Addr(), netip.AddrPort{}, options)
 	connection.forwarded = true
 	connection.enqueue(request.Payload(), remote, local.Addr(), request.options)
 	if stack.udpForwarded == nil {

@@ -210,7 +210,7 @@ func TestIPControlMessageInterop(t *testing.T) {
 			}
 			select {
 			case packet := <-outbound:
-				validateControlledIPHeader(t, family, packet)
+				validateControlledIPHeader(t, family, packet, 41)
 			case <-ctx.Done():
 				t.Fatalf("capture mipstack raw control response: %v", ctx.Err())
 			}

@@ -9,7 +9,314 @@ import (
 	"net/netip"
 	"syscall"
 	"testing"
+	"time"
 )
+
+func TestSocketOptionCreationPolicyValidation(t *testing.T) {
+	keepAlive := KeepAliveConfig{Idle: time.Minute, Interval: time.Second, Count: 3}
+	validTCP := []SocketOption{
+		SocketOptions.ReadBuffer(4096), SocketOptions.WriteBuffer(8192),
+		SocketOptions.KeepAlive(true), SocketOptions.KeepAliveConfig(keepAlive), SocketOptions.NoDelay(false),
+		SocketOptions.IdleTimeout(0), SocketOptions.UserTimeout(0),
+		SocketOptions.CongestionControl(CongestionControlReno), SocketOptions.MaximumPacingRate(0),
+		SocketOptions.TrafficClass(255), SocketOptions.FlowLabel(0),
+	}
+	if _, err := parseSocketOptions(validTCP, socketOptionTCPDial); err != nil {
+		t.Fatal(err)
+	}
+	validDatagram := []SocketOption{
+		SocketOptions.ReadBuffer(1), SocketOptions.ReceiveErrors(true),
+		SocketOptions.PathMTUDiscovery(PathMTUDiscoveryProbe), SocketOptions.HopLimit(0),
+		SocketOptions.Broadcast(false), SocketOptions.MulticastHopLimit(0), SocketOptions.MulticastLoopback(false),
+		SocketOptions.TrafficClass(255), SocketOptions.FlowLabel(0),
+	}
+	if parsed, err := parseSocketOptions(validDatagram, socketOptionUDPDial); err != nil {
+		t.Fatal(err)
+	} else if err = parsed.validateFamily(socketOptionUDPDial, true, false); err != nil {
+		t.Fatal(err)
+	}
+
+	invalid := []struct {
+		name   string
+		option SocketOption
+		use    socketOptionUse
+		err    error
+	}{
+		{name: "read buffer zero", option: SocketOptions.ReadBuffer(0), use: socketOptionTCPDial, err: syscall.EINVAL},
+		{name: "write buffer negative", option: SocketOptions.WriteBuffer(-1), use: socketOptionTCPDial, err: syscall.EINVAL},
+		{name: "traffic class high", option: SocketOptions.TrafficClass(256), use: socketOptionUDPDial, err: syscall.EINVAL},
+		{name: "flow label high", option: SocketOptions.FlowLabel(ipv6MaximumFlowLabel + 1), use: socketOptionIPDial, err: syscall.EINVAL},
+		{name: "keepalive idle zero", option: SocketOptions.KeepAliveConfig(KeepAliveConfig{Interval: time.Second, Count: 1}), use: socketOptionTCPDial, err: syscall.EINVAL},
+		{name: "idle timeout negative", option: SocketOptions.IdleTimeout(-1), use: socketOptionTCPDial, err: syscall.EINVAL},
+		{name: "user timeout negative", option: SocketOptions.UserTimeout(-1), use: socketOptionTCPDial, err: syscall.EINVAL},
+		{name: "unknown congestion control", option: SocketOptions.CongestionControl("missing"), use: socketOptionTCPDial, err: syscall.EINVAL},
+		{name: "nil congestion factory", option: SocketOptions.CongestionControlFactory(nil), use: socketOptionTCPDial, err: syscall.EINVAL},
+		{name: "negative accept queue", option: SocketOptions.AcceptQueue(-1), use: socketOptionTCPListen, err: syscall.EINVAL},
+		{name: "negative SYN backlog", option: SocketOptions.SYNBacklog(-1), use: socketOptionTCPListen, err: syscall.EINVAL},
+		{name: "unknown PMTU mode", option: SocketOptions.PathMTUDiscovery(PathMTUDiscoveryOmit + 1), use: socketOptionUDPDial, err: syscall.EINVAL},
+		{name: "negative hop limit", option: SocketOptions.HopLimit(-1), use: socketOptionIPDial, err: syscall.EINVAL},
+		{name: "high multicast hop limit", option: SocketOptions.MulticastHopLimit(256), use: socketOptionUDPListen, err: syscall.EINVAL},
+		{name: "TCP option on UDP", option: SocketOptions.NoDelay(true), use: socketOptionUDPDial, err: syscall.ENOPROTOOPT},
+		{name: "datagram option on TCP", option: SocketOptions.ReceiveErrors(true), use: socketOptionTCPDial, err: syscall.ENOPROTOOPT},
+		{name: "listener option on dial", option: SocketOptions.AcceptQueue(1), use: socketOptionTCPDial, err: syscall.ENOPROTOOPT},
+		{name: "write buffer on IP", option: SocketOptions.WriteBuffer(1), use: socketOptionIPDial, err: syscall.ENOPROTOOPT},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parseSocketOptions([]SocketOption{test.option}, test.use); !errors.Is(err, test.err) {
+				t.Fatalf("parse error = %v, want %v", err, test.err)
+			}
+		})
+	}
+}
+
+func TestSocketOptionUnsetRestoresConfiguredPolicy(t *testing.T) {
+	parsed, err := parseSocketOptions([]SocketOption{
+		SocketOptions.ReadBuffer(1), SocketOptions.UnsetReadBuffer(),
+		SocketOptions.WriteBuffer(1), SocketOptions.UnsetWriteBuffer(),
+		SocketOptions.KeepAlive(false), SocketOptions.UnsetKeepAlive(),
+		SocketOptions.KeepAliveConfig(KeepAliveConfig{Idle: time.Second, Interval: time.Second, Count: 1}), SocketOptions.UnsetKeepAliveConfig(),
+		SocketOptions.NoDelay(false), SocketOptions.UnsetNoDelay(),
+		SocketOptions.IdleTimeout(time.Second), SocketOptions.UnsetIdleTimeout(),
+		SocketOptions.UserTimeout(time.Second), SocketOptions.UnsetUserTimeout(),
+		SocketOptions.CongestionControl(CongestionControlReno), SocketOptions.UnsetCongestionControl(),
+		SocketOptions.MaximumPacingRate(1), SocketOptions.UnsetMaximumPacingRate(),
+		SocketOptions.TrafficClass(1), SocketOptions.UnsetTrafficClass(),
+		SocketOptions.FlowLabel(1), SocketOptions.UnsetFlowLabel(),
+	}, socketOptionTCPDial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.tcp != (tcpSocketOptionSet{}) {
+		t.Fatalf("unset TCP policy = %+v", parsed.tcp)
+	}
+
+	parsed, err = parseSocketOptions([]SocketOption{
+		SocketOptions.ReadBuffer(1), SocketOptions.UnsetReadBuffer(),
+		SocketOptions.ReceiveErrors(true), SocketOptions.UnsetReceiveErrors(),
+		SocketOptions.PathMTUDiscovery(PathMTUDiscoveryDo), SocketOptions.UnsetPathMTUDiscovery(),
+		SocketOptions.HopLimit(1), SocketOptions.UnsetHopLimit(),
+		SocketOptions.Broadcast(false), SocketOptions.UnsetBroadcast(),
+		SocketOptions.MulticastHopLimit(1), SocketOptions.UnsetMulticastHopLimit(),
+		SocketOptions.MulticastLoopback(false), SocketOptions.UnsetMulticastLoopback(),
+		SocketOptions.TrafficClass(1), SocketOptions.UnsetTrafficClass(),
+		SocketOptions.FlowLabel(1), SocketOptions.UnsetFlowLabel(),
+	}, socketOptionUDPDial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.datagram != (datagramSocketOptionSet{}) {
+		t.Fatalf("unset datagram policy = %+v", parsed.datagram)
+	}
+}
+
+func TestTCPCreationOptionsApplyToDialedAndAcceptedConnections(t *testing.T) {
+	clientAddress := netip.MustParseAddr("2001:db8::230")
+	serverAddress := netip.MustParseAddr("2001:db8::231")
+	client, server := newStackPair(t, clientAddress, serverAddress, 1400)
+	_ = newStackBridge(t, client, server)
+	keepAlive := KeepAliveConfig{Idle: 3 * time.Minute, Interval: 7 * time.Second, Count: 4}
+	serverOptions := []SocketOption{
+		SocketOptions.ReadBuffer(7001), SocketOptions.WriteBuffer(8001),
+		SocketOptions.KeepAlive(true), SocketOptions.KeepAliveConfig(keepAlive), SocketOptions.NoDelay(false),
+		SocketOptions.IdleTimeout(0), SocketOptions.UserTimeout(0),
+		SocketOptions.CongestionControl(CongestionControlReno), SocketOptions.MaximumPacingRate(900001),
+		SocketOptions.TrafficClass(0xaf), SocketOptions.FlowLabel(0x12345),
+		SocketOptions.AcceptQueue(3), SocketOptions.SYNBacklog(2),
+	}
+	listener, err := (&ListenConfig{Options: serverOptions}).ListenTCP(context.Background(), server, "tcp6", netip.AddrPortFrom(serverAddress, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if info := listener.Info(); info.AcceptQueueCapacity != 3 || info.SYNBacklogCapacity != 2 {
+		t.Fatalf("listener creation policy = %+v", info)
+	}
+
+	clientKeepAlive := KeepAliveConfig{Idle: 4 * time.Minute, Interval: 9 * time.Second, Count: 5}
+	dialer := &Dialer{Options: []SocketOption{
+		SocketOptions.ReadBuffer(7002), SocketOptions.WriteBuffer(8002),
+		SocketOptions.KeepAlive(true), SocketOptions.KeepAliveConfig(clientKeepAlive), SocketOptions.NoDelay(false),
+		SocketOptions.IdleTimeout(0), SocketOptions.UserTimeout(0),
+		SocketOptions.CongestionControl(CongestionControlReno), SocketOptions.MaximumPacingRate(900002),
+		SocketOptions.TrafficClass(0xab), SocketOptions.FlowLabel(0x23456),
+	}}
+	dialedNet, err := dialer.DialTCP(context.Background(), client, "tcp6", netip.AddrPort{}, listener.Addr().(*net.TCPAddr).AddrPort())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialed := dialedNet.(*TCPConn)
+	defer dialed.Close()
+	accepted, err := listener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer accepted.Close()
+
+	check := func(name string, info TCPInfo, receive, send int, keepAliveConfig KeepAliveConfig, pacing uint64, trafficClass uint8, flowLabel uint32) {
+		t.Helper()
+		if info.ReceiveBufferCapacity != receive || info.MaximumReceiveBuffer != receive ||
+			info.SendBufferCapacity != send || info.MaximumSendBuffer != send ||
+			!info.KeepAlive || info.KeepAliveConfig != keepAliveConfig || info.NoDelay ||
+			info.IdleTimeout != 0 || info.UserTimeout != 0 || info.CongestionControl != CongestionControlReno ||
+			info.MaximumPacingRate != pacing || info.TrafficClass != trafficClass || info.FlowLabel != flowLabel {
+			t.Fatalf("%s TCP creation policy = %+v", name, info)
+		}
+	}
+	check("dialed", dialed.Info(), 7002, 8002, clientKeepAlive, 900002, 0xa8, 0x23456)
+	check("accepted", accepted.Info(), 7001, 8001, keepAlive, 900001, 0xac, 0x12345)
+}
+
+func TestTCPListenerOverridesOnlyExplicitPolicies(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.232")
+	serverAddress := netip.MustParseAddr("192.0.2.233")
+	client, server := newStackPair(t, clientAddress, serverAddress, 1400)
+	_ = newStackBridge(t, client, server)
+	listener, err := (&ListenConfig{Options: []SocketOption{
+		SocketOptions.ReadBuffer(7777), SocketOptions.NoDelay(false),
+		SocketOptions.AcceptQueue(2), SocketOptions.SYNBacklog(1),
+	}}).ListenTCP(context.Background(), server, "tcp4", netip.AddrPortFrom(serverAddress, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err = server.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(serverAddress, 32)}, MTU: 1400,
+		TCP: TCPSocketDefaults{KeepAlive: true, CongestionControl: CongestionControlBBR, MaximumPacingRate: 7654321},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clientConnection, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, listener.Addr().(*net.TCPAddr).AddrPort())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConnection.Close()
+	accepted, err := listener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer accepted.Close()
+	info := accepted.Info()
+	if info.ReceiveBufferCapacity != 7777 || info.MaximumReceiveBuffer != 7777 || info.NoDelay ||
+		!info.KeepAlive || info.CongestionControl != CongestionControlBBR || info.MaximumPacingRate != 7654321 {
+		t.Fatalf("accepted policy after UpdateConfig = %+v", info)
+	}
+	if listenerInfo := listener.Info(); listenerInfo.AcceptQueueCapacity != 2 || listenerInfo.SYNBacklogCapacity != 1 {
+		t.Fatalf("listener policy changed with Stack defaults = %+v", listenerInfo)
+	}
+}
+
+func TestDatagramCreationOptionsAndConfiguredDefaults(t *testing.T) {
+	local4 := netip.MustParseAddr("192.0.2.234")
+	local6 := netip.MustParseAddr("2001:db8::234")
+	remote6 := netip.MustParseAddr("2001:db8:1::234")
+	defaults := DatagramSocketDefaults{
+		ReceiveBuffer: 4096, ReceiveErrors: true, PathMTUDiscovery: PathMTUDiscoveryWant,
+		HopLimit: 44, MulticastHopLimit: 5, DisableMulticastLoopback: true, DisableBroadcast: true,
+		TrafficClass: 0x66, FlowLabel: 0x34567,
+	}
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local4, 32), netip.PrefixFrom(local6, 128)}, MTU: 1400,
+		UDP: defaults, IP: defaults,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	unsetPacket, err := (&ListenConfig{Options: []SocketOption{
+		SocketOptions.ReceiveErrors(false), SocketOptions.UnsetReceiveErrors(),
+		SocketOptions.FlowLabel(0), SocketOptions.UnsetFlowLabel(),
+	}}).ListenUDP(context.Background(), stack, "udp6", netip.AddrPortFrom(local6, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsetUDP := unsetPacket.(*UDPConn)
+	if info := unsetUDP.Info(); !info.ReceiveErrors || info.FlowLabel != defaults.FlowLabel {
+		t.Fatalf("unset UDP policy did not inherit defaults: %+v", info)
+	}
+	_ = unsetUDP.Close()
+
+	options := []SocketOption{
+		SocketOptions.ReadBuffer(1), SocketOptions.ReceiveErrors(false),
+		SocketOptions.PathMTUDiscovery(PathMTUDiscoveryProbe), SocketOptions.HopLimit(0),
+		SocketOptions.Broadcast(true), SocketOptions.MulticastHopLimit(0), SocketOptions.MulticastLoopback(true),
+		SocketOptions.TrafficClass(0), SocketOptions.FlowLabel(0),
+	}
+	udpNet, err := (&Dialer{Options: options}).DialUDP(context.Background(), stack, "udp6", netip.AddrPort{}, netip.AddrPortFrom(remote6, 5353))
+	if err != nil {
+		t.Fatal(err)
+	}
+	udpConnection := udpNet.(*UDPConn)
+	defer udpConnection.Close()
+	if info := udpConnection.Info(); info.ReceiveQueueCapacity != udpDatagramMetadataSize || info.ReceiveErrors ||
+		info.PathMTUDiscovery != PathMTUDiscoveryProbe || info.HopLimit != 0 || !info.Broadcast ||
+		info.MulticastHopLimit != 0 || !info.MulticastLoopback || info.TrafficClass != 0 || info.FlowLabel != 0 {
+		t.Fatalf("UDP creation policy = %+v", info)
+	}
+
+	ipConnection, err := (&ListenConfig{Options: append(options,
+		SocketOptions.IPHeaderIncludedOnWrite(true), SocketOptions.IPHeaderIncludedOnRead(true),
+	)}).ListenIP(context.Background(), stack, "ip6:99", local6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ipConnection.Close()
+	if info := ipConnection.Info(); info.ReceiveQueueCapacity != ipDatagramMetadataSize || info.ReceiveErrors ||
+		info.PathMTUDiscovery != PathMTUDiscoveryProbe || info.HopLimit != 0 || !info.Broadcast ||
+		info.MulticastHopLimit != 0 || !info.MulticastLoopback || info.TrafficClass != 0 || info.FlowLabel != 0 ||
+		!info.IPHeaderIncludedOnWrite || !info.IPHeaderIncludedOnRead {
+		t.Fatalf("IP creation policy = %+v", info)
+	}
+}
+
+func TestSocketOptionAddressFamilyValidationDoesNotCreateEndpoint(t *testing.T) {
+	local4 := netip.MustParseAddr("192.0.2.235")
+	remote4 := netip.MustParseAddr("198.51.100.235")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local4, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	tests := []struct {
+		name string
+		call func() error
+		err  error
+	}{
+		{name: "TCP IPv4 flow label", err: syscall.EAFNOSUPPORT, call: func() error {
+			_, callErr := (&Dialer{Options: []SocketOption{SocketOptions.FlowLabel(1)}}).DialTCP(context.Background(), stack, "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote4, 80))
+			return callErr
+		}},
+		{name: "UDP IPv4 flow label", err: syscall.EAFNOSUPPORT, call: func() error {
+			_, callErr := (&Dialer{Options: []SocketOption{SocketOptions.FlowLabel(1)}}).DialUDP(context.Background(), stack, "udp4", netip.AddrPort{}, netip.AddrPortFrom(remote4, 53))
+			return callErr
+		}},
+		{name: "IP IPv4 flow label", err: syscall.EAFNOSUPPORT, call: func() error {
+			_, callErr := (&ListenConfig{Options: []SocketOption{SocketOptions.FlowLabel(1)}}).ListenIP(context.Background(), stack, "ip4:99", local4)
+			return callErr
+		}},
+		{name: "UDP IPv4 zero hop limit", err: syscall.EINVAL, call: func() error {
+			_, callErr := (&ListenConfig{Options: []SocketOption{SocketOptions.HopLimit(0)}}).ListenUDP(context.Background(), stack, "udp4", netip.AddrPort{})
+			return callErr
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if callErr := test.call(); !errors.Is(callErr, test.err) {
+				t.Fatalf("creation error = %v, want %v", callErr, test.err)
+			}
+			if stats := stack.Stats(); stats.ActiveTCPConnections != 0 || stats.ActiveTCPListeners != 0 || stats.ActiveUDPSockets != 0 || stats.ActiveIPSockets != 0 {
+				t.Fatalf("family validation retained endpoint state: %+v", stats)
+			}
+		})
+	}
+}
 
 func TestSocketOptionValidationDoesNotCreateEndpoints(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.221")
@@ -53,14 +360,6 @@ func TestSocketOptionValidationDoesNotCreateEndpoints(t *testing.T) {
 		}},
 		{name: "IP dial reuse port", call: func() error {
 			_, callErr := (&Dialer{Options: []SocketOption{SocketOptions.ReusePort(true)}}).DialIP(context.Background(), stack, "ip4:99", netip.Addr{}, remote)
-			return callErr
-		}},
-		{name: "IP listen unset reuse address", call: func() error {
-			_, callErr := (&ListenConfig{Options: []SocketOption{SocketOptions.UnsetReuseAddress()}}).ListenIP(context.Background(), stack, "ip4:99", netip.Addr{})
-			return callErr
-		}},
-		{name: "UDP listen unset IP header", call: func() error {
-			_, callErr := (&ListenConfig{Options: []SocketOption{SocketOptions.UnsetIPHeaderIncludedOnRead()}}).ListenUDP(context.Background(), stack, "udp4", netip.AddrPort{})
 			return callErr
 		}},
 	}
@@ -142,7 +441,7 @@ func TestSocketOptionApplicabilityMatrix(t *testing.T) {
 			for _, variant := range variants {
 				t.Run(option.name+"/"+use.name+"/"+variant.name, func(t *testing.T) {
 					got, err := parseSocketOptions([]SocketOption{variant.value}, use.use)
-					if !option.valid(use.use) {
+					if !option.valid(use.use) && variant.explicit {
 						if !errors.Is(err, syscall.ENOPROTOOPT) || got != (socketOptionSet{}) {
 							t.Fatalf("invalid option result = %+v, %v", got, err)
 						}
@@ -160,6 +459,62 @@ func TestSocketOptionApplicabilityMatrix(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+func TestSocketOptionUnsetAcceptedByEveryOperation(t *testing.T) {
+	uses := []struct {
+		name string
+		use  socketOptionUse
+	}{
+		{name: "TCP listen", use: socketOptionTCPListen},
+		{name: "UDP listen", use: socketOptionUDPListen},
+		{name: "IP listen", use: socketOptionIPListen},
+		{name: "TCP dial", use: socketOptionTCPDial},
+		{name: "UDP dial", use: socketOptionUDPDial},
+		{name: "IP dial", use: socketOptionIPDial},
+	}
+	unsets := []struct {
+		name   string
+		option SocketOption
+	}{
+		{name: "ReadBuffer", option: SocketOptions.UnsetReadBuffer()},
+		{name: "TrafficClass", option: SocketOptions.UnsetTrafficClass()},
+		{name: "FlowLabel", option: SocketOptions.UnsetFlowLabel()},
+		{name: "WriteBuffer", option: SocketOptions.UnsetWriteBuffer()},
+		{name: "KeepAlive", option: SocketOptions.UnsetKeepAlive()},
+		{name: "KeepAliveConfig", option: SocketOptions.UnsetKeepAliveConfig()},
+		{name: "NoDelay", option: SocketOptions.UnsetNoDelay()},
+		{name: "IdleTimeout", option: SocketOptions.UnsetIdleTimeout()},
+		{name: "UserTimeout", option: SocketOptions.UnsetUserTimeout()},
+		{name: "CongestionControl", option: SocketOptions.UnsetCongestionControl()},
+		{name: "MaximumPacingRate", option: SocketOptions.UnsetMaximumPacingRate()},
+		{name: "AcceptQueue", option: SocketOptions.UnsetAcceptQueue()},
+		{name: "SYNBacklog", option: SocketOptions.UnsetSYNBacklog()},
+		{name: "ReceiveErrors", option: SocketOptions.UnsetReceiveErrors()},
+		{name: "PathMTUDiscovery", option: SocketOptions.UnsetPathMTUDiscovery()},
+		{name: "HopLimit", option: SocketOptions.UnsetHopLimit()},
+		{name: "Broadcast", option: SocketOptions.UnsetBroadcast()},
+		{name: "MulticastHopLimit", option: SocketOptions.UnsetMulticastHopLimit()},
+		{name: "MulticastLoopback", option: SocketOptions.UnsetMulticastLoopback()},
+		{name: "ReuseAddress", option: SocketOptions.UnsetReuseAddress()},
+		{name: "ReusePort", option: SocketOptions.UnsetReusePort()},
+		{name: "IPHeaderIncludedOnWrite", option: SocketOptions.UnsetIPHeaderIncludedOnWrite()},
+		{name: "IPHeaderIncludedOnRead", option: SocketOptions.UnsetIPHeaderIncludedOnRead()},
+	}
+	for _, unset := range unsets {
+		for _, use := range uses {
+			t.Run(unset.name+"/"+use.name, func(t *testing.T) {
+				got, err := parseSocketOptions([]SocketOption{unset.option}, use.use)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := socketOptionSet{reuseAddress: use.use == socketOptionTCPListen}
+				if got != want {
+					t.Fatalf("unset result = %+v, want %+v", got, want)
+				}
+			})
 		}
 	}
 }

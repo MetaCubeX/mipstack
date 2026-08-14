@@ -670,7 +670,7 @@ func TestUDPControlMessageInterop(t *testing.T) {
 			}
 			select {
 			case packet := <-outbound:
-				validateControlledIPHeader(t, family, packet)
+				validateControlledIPHeader(t, family, packet, 41)
 			case <-ctx.Done():
 				t.Fatalf("capture mipstack UDP control response: %v", ctx.Err())
 			}
@@ -694,7 +694,7 @@ func TestUDPControlMessageInterop(t *testing.T) {
 
 // validateControlledIPHeader checks per-packet fields that survive only in
 // the emitted IP header, including mipstack's explicit IPv6 Flow Label.
-func validateControlledIPHeader(t *testing.T, family interopFamily, packet []byte) {
+func validateControlledIPHeader(t *testing.T, family interopFamily, packet []byte, hopLimit uint8) {
 	t.Helper()
 	if family.mipstackAddress.Is4() {
 		if len(packet) < header.IPv4MinimumSize {
@@ -702,7 +702,7 @@ func validateControlledIPHeader(t *testing.T, family interopFamily, packet []byt
 		}
 		ipHeader := header.IPv4(packet)
 		tos, _ := ipHeader.TOS()
-		if ipHeader.TTL() != 41 || tos != 0xb8 {
+		if ipHeader.TTL() != hopLimit || tos != 0xb8 {
 			t.Fatalf("controlled IPv4 header TTL/TOS = %d/%#x", ipHeader.TTL(), tos)
 		}
 		return
@@ -712,7 +712,7 @@ func validateControlledIPHeader(t *testing.T, family interopFamily, packet []byt
 	}
 	ipHeader := header.IPv6(packet)
 	trafficClass, flowLabel := ipHeader.TOS()
-	if ipHeader.HopLimit() != 41 || trafficClass != 0xb8 || flowLabel != 0x34567 {
+	if ipHeader.HopLimit() != hopLimit || trafficClass != 0xb8 || flowLabel != 0x34567 {
 		t.Fatalf("controlled IPv6 header hop/class/label = %d/%#x/%#x", ipHeader.HopLimit(), trafficClass, flowLabel)
 	}
 }

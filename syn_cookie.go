@@ -95,8 +95,11 @@ func (state *tcpPassiveState) recentSYNCookieState(now time.Time) ([16]byte, uin
 }
 
 // sendSYNCookie replies to a SYN without allocating a TCPConn.
-func (state *tcpPassiveState) sendSYNCookie(stack *Stack, key tcpKey, syn tcpSegment, now time.Time) error {
+func (state *tcpPassiveState) sendSYNCookie(stack *Stack, listener *TCPListener, key tcpKey, syn tcpSegment, now time.Time) error {
 	defaults := stack.network.Load().tcpDefaults
+	if listener != nil {
+		defaults = applyTCPSocketOptions(defaults, listener.options)
+	}
 	configuredScale := tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer)
 	secret, period, windowScale, err := state.synCookieKey(now, configuredScale)
 	if err != nil {
@@ -127,7 +130,8 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, key tcpKey, syn tcpSeg
 		receiveWindow = 65535
 	}
 	state.noteSYNCookie(period)
-	return stack.tryWriteTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, uint16(receiveWindow), tcpOptions, nil, stack.mtuFor(key.remote.Addr()), defaults.TrafficClass, 0)
+	flowLabelSet := listener != nil && listener.options.flowLabel.set
+	return stack.tryWriteTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, uint16(receiveWindow), tcpOptions, nil, stack.mtuFor(key.remote.Addr()), defaults.TrafficClass, 0, defaults.FlowLabel, flowLabelSet)
 }
 
 // validateSYNCookie authenticates a final ACK against the current or previous

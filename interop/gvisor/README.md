@@ -29,6 +29,10 @@ The suite covers:
   and duplicate IPv4 and IPv6 fragments;
 - bidirectional UDP and raw-IP ancillary data for destination address, TTL or
   Hop Limit, TOS or Traffic Class, and emitted IPv6 Flow Label;
+- creation-time TCP, UDP, and raw-IP socket policies in both address families,
+  including TCP listener inheritance, Forwarder-created endpoints, buffer
+  limits, keepalive and congestion selection, PMTU/error-queue policy, and
+  emitted Traffic Class, Hop Limit, and IPv6 Flow Label fields;
 - ICMPv4 and ICMPv6 echo initiated by either stack, including messages that
   require source fragmentation and receive-side reassembly;
 - IPv4 and IPv6 TCP, UDP, ICMP, and arbitrary-protocol Forwarders for nonlocal

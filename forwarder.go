@@ -709,15 +709,25 @@ func (r *TCPForwarderRequest) closeDone() {
 // itself. Once Accept returns, the connection is independent of both the
 // request and the forwarder: the handler may return immediately or hand the
 // connection to another goroutine, and closing the forwarder does not close
-// it. Accept consumes the request even when it returns an error.
-func (r *TCPForwarderRequest) Accept(ctx context.Context) (*TCPConn, error) {
+// it. Options are validated before the request is claimed and are not
+// retained; an invalid option leaves the request available for another
+// action. After validation succeeds, Accept consumes the request even when
+// endpoint creation or the handshake returns an error.
+func (r *TCPForwarderRequest) Accept(ctx context.Context, options ...SocketOption) (*TCPConn, error) {
 	if ctx == nil {
 		panic("nil Context")
+	}
+	parsed, err := parseSocketOptions(options, socketOptionTCPDial)
+	if err != nil {
+		return nil, err
+	}
+	if err = parsed.validateFamily(socketOptionTCPDial, r.key.local.Addr().Is6(), false); err != nil {
+		return nil, err
 	}
 	if !r.claim() {
 		return nil, ErrForwarderRequestCompleted
 	}
-	connection, result, err := r.forwarder.acceptTCP(r)
+	connection, result, err := r.forwarder.acceptTCP(r, parsed.tcp)
 	if err != nil {
 		r.finish(forwarderRequestDropped)
 		return nil, err
@@ -783,13 +793,22 @@ func (r *UDPForwarderRequest) Payload() []byte { return r.packet.payload[udpHead
 // then retain the connection or hand it to another goroutine. The triggering
 // datagram may be dropped when it exceeds the configured receive capacity;
 // later datagrams still use the registered endpoint. Accept consumes the
-// request even when it returns an error and may be called after any number of
-// Reply or ReplyFrom attempts.
-func (r *UDPForwarderRequest) Accept() (*UDPConn, error) {
+// request even when endpoint creation returns an error and may be called after
+// any number of Reply or ReplyFrom attempts. Options are validated before the
+// request is claimed; an invalid option leaves it available for another
+// action, and the option slice is not retained.
+func (r *UDPForwarderRequest) Accept(options ...SocketOption) (*UDPConn, error) {
+	parsed, err := parseSocketOptions(options, socketOptionUDPDial)
+	if err != nil {
+		return nil, err
+	}
+	if err = parsed.validateFamily(socketOptionUDPDial, r.flow.Destination.Addr().Is6(), false); err != nil {
+		return nil, err
+	}
 	if _, ok := r.claim(); !ok {
 		return nil, ErrForwarderRequestCompleted
 	}
-	connection, err := r.forwarder.acceptUDP(r)
+	connection, err := r.forwarder.acceptUDP(r, parsed.datagram)
 	if err != nil {
 		r.finish(forwarderRequestDropped)
 		return nil, err
@@ -809,13 +828,24 @@ func (r *UDPForwarderRequest) Accept() (*UDPConn, error) {
 // retain the connection or hand it to another goroutine. The triggering
 // datagram may be dropped when it exceeds the configured receive capacity;
 // later datagrams still use the registered endpoint. Listen consumes the
-// request even when it returns an error and may be called after any number of
-// Reply or ReplyFrom attempts.
-func (r *UDPForwarderRequest) Listen() (*UDPConn, error) {
+// request even when endpoint creation returns an error and may be called after
+// any number of Reply or ReplyFrom attempts. Options are validated before the
+// request is claimed; an invalid option leaves it available for another
+// action, and the option slice is not retained.
+func (r *UDPForwarderRequest) Listen(options ...SocketOption) (*UDPConn, error) {
+	// Forwarded listeners have exclusive flow ownership, so listener reuse
+	// policies are deliberately rejected by the connected UDP option class.
+	parsed, err := parseSocketOptions(options, socketOptionUDPDial)
+	if err != nil {
+		return nil, err
+	}
+	if err = parsed.validateFamily(socketOptionUDPDial, r.flow.Destination.Addr().Is6(), false); err != nil {
+		return nil, err
+	}
 	if _, ok := r.claim(); !ok {
 		return nil, ErrForwarderRequestCompleted
 	}
-	connection, err := r.forwarder.listenUDP(r)
+	connection, err := r.forwarder.listenUDP(r, parsed.datagram)
 	if err != nil {
 		r.finish(forwarderRequestDropped)
 		return nil, err

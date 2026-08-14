@@ -222,7 +222,7 @@ func TestSYNCookieListenerCloseResetsPendingConnection(t *testing.T) {
 		local:  netip.AddrPortFrom(local, port),
 		remote: netip.AddrPortFrom(remote, 43002),
 	}
-	connection := newTCPConn(stack, "tcp4", key, 1500)
+	connection := newTCPConn(stack, "tcp4", key, 1500, tcpSocketOptionSet{})
 	connection.passive = true
 	connection.receiveNext = 0x12345679
 	if !listener.trackCompleted(connection) {
@@ -260,7 +260,7 @@ func TestSYNCookieHonorsConfiguredReceiveWindow(t *testing.T) {
 	t.Cleanup(func() { _ = stack.Close() })
 	key := tcpKey{local: netip.MustParseAddrPort("192.0.2.61:8080"), remote: netip.MustParseAddrPort("198.51.100.61:40000")}
 	syn := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}
-	if err = (&tcpPassiveState{}).sendSYNCookie(stack, key, syn, time.Now()); err != nil {
+	if err = (&tcpPassiveState{}).sendSYNCookie(stack, nil, key, syn, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	packet := readOutboundPacket(t, stack)
@@ -270,6 +270,56 @@ func TestSYNCookieHonorsConfiguredReceiveWindow(t *testing.T) {
 	}
 	if window := binary.BigEndian.Uint16(parsed.payload[14:16]); window != 4096 {
 		t.Fatalf("SYN-cookie receive window = %d, want 4096", window)
+	}
+}
+
+func TestSYNCookieHonorsListenerCreationOptions(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::62")
+	remote := netip.MustParseAddr("2001:db8:1::62")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	parsed, err := parseSocketOptions([]SocketOption{
+		SocketOptions.ReadBuffer(4321), SocketOptions.TrafficClass(0xaf), SocketOptions.FlowLabel(0x45678),
+	}, socketOptionTCPListen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := &TCPListener{options: parsed.tcp}
+	key := tcpKey{local: netip.AddrPortFrom(local, 8080), remote: netip.AddrPortFrom(remote, 40000)}
+	syn := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}
+	if err = (&tcpPassiveState{}).sendSYNCookie(stack, listener, key, syn, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	packet := readOutboundPacket(t, stack)
+	parsedPacket, ok := parseIPPacket(packet)
+	if !ok || len(parsedPacket.payload) < tcpHeaderSize {
+		t.Fatalf("invalid listener-option SYN-cookie packet: %x", packet)
+	}
+	if window := binary.BigEndian.Uint16(parsedPacket.payload[14:16]); window != 4321 {
+		t.Fatalf("listener-option SYN-cookie receive window = %d, want 4321", window)
+	}
+	if parsedPacket.trafficClass != 0xac || parsedPacket.flowLabel != 0x45678 {
+		t.Fatalf("listener-option SYN-cookie IP policy = class %#x label %#x", parsedPacket.trafficClass, parsedPacket.flowLabel)
+	}
+
+	parsed, err = parseSocketOptions([]SocketOption{SocketOptions.FlowLabel(0)}, socketOptionTCPListen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.options = parsed.tcp
+	if err = (&tcpPassiveState{}).sendSYNCookie(stack, listener, key, syn, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	packet = readOutboundPacket(t, stack)
+	parsedPacket, ok = parseIPPacket(packet)
+	if !ok || parsedPacket.flowLabel != 0 {
+		t.Fatalf("explicit zero SYN-cookie flow label = %#x, parsed=%v", parsedPacket.flowLabel, ok)
 	}
 }
 

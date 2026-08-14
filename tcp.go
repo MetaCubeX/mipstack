@@ -1800,6 +1800,7 @@ type TCPListener struct {
 	local        netip.AddrPort
 	dual         bool
 	net          string
+	options      tcpSocketOptionSet
 	reuseAddress bool
 	reusePort    bool
 
@@ -1832,12 +1833,12 @@ type TCPListener struct {
 // tcp6. A wildcard with tcp uses one dual-stack endpoint when both families
 // are configured. Port zero selects an automatic port.
 func (s *Stack) ListenTCP(ctx context.Context, network string, local netip.AddrPort) (*TCPListener, error) {
-	return s.listenTCP(ctx, network, local, exclusiveTCPListenerBinding{reuseAddress: true})
+	return s.listenTCP(ctx, network, local, exclusiveTCPListenerBinding{reuseAddress: true}, tcpSocketOptionSet{})
 }
 
 // listenTCP contains validation, automatic port allocation, and listener
 // construction shared by the ordinary and optional REUSEPORT entry points.
-func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrPort, binding tcpListenerBinding) (*TCPListener, error) {
+func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrPort, binding tcpListenerBinding, options tcpSocketOptionSet) (*TCPListener, error) {
 	address := local.Addr().Unmap()
 	local = netip.AddrPortFrom(address, local.Port())
 	target := net.TCPAddrFromAddrPort(local)
@@ -1869,6 +1870,9 @@ func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrP
 	if err != nil {
 		return wrap(err)
 	}
+	if err = (socketOptionSet{tcp: options}).validateFamily(socketOptionTCPListen, address.Is6(), dual); err != nil {
+		return wrap(err)
+	}
 	if !address.IsUnspecified() && !networkStateHasLocal(state, address) {
 		return wrap(syscall.EADDRNOTAVAIL)
 	}
@@ -1890,9 +1894,17 @@ func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrP
 	}
 	local = netip.AddrPortFrom(address, port)
 	key := tcpListenKey{address: address, port: port}
+	acceptCapacity := state.tcpDefaults.AcceptQueue
+	if options.acceptQueue.set {
+		acceptCapacity = options.acceptQueue.value
+	}
+	backlog := state.tcpDefaults.SYNBacklog
+	if options.synBacklog.set {
+		backlog = options.synBacklog.value
+	}
 	listener := &TCPListener{
-		stack: s, key: key, local: local, dual: dual, net: network, accept: make(chan *TCPConn, state.tcpDefaults.AcceptQueue), backlog: state.tcpDefaults.SYNBacklog,
-		acceptCapacity: state.tcpDefaults.AcceptQueue,
+		stack: s, key: key, local: local, dual: dual, net: network, options: options, accept: make(chan *TCPConn, acceptCapacity), backlog: backlog,
+		acceptCapacity: acceptCapacity,
 		closed:         make(chan struct{}), pending: make(map[*TCPConn]struct{}), handshaking: make(map[*TCPConn]struct{}),
 	}
 	if err = binding.register(passive, listener); err != nil {
@@ -2281,6 +2293,11 @@ var _ net.Listener = (*TCPListener)(nil)
 // tcp, tcp4, or tcp6. A zero source selects both address and port
 // automatically; an unspecified source address selects only the address.
 func (s *Stack) DialTCP(ctx context.Context, network string, source, remote netip.AddrPort) (net.Conn, error) {
+	return s.dialTCP(ctx, network, source, remote, tcpSocketOptionSet{})
+}
+
+// dialTCP contains active connection construction shared by Stack and Dialer.
+func (s *Stack) dialTCP(ctx context.Context, network string, source, remote netip.AddrPort, options tcpSocketOptionSet) (net.Conn, error) {
 	remote = netip.AddrPortFrom(remote.Addr().Unmap(), remote.Port())
 	target := net.TCPAddrFromAddrPort(remote)
 	wrap := func(source net.Addr, err error) (net.Conn, error) {
@@ -2291,6 +2308,9 @@ func (s *Stack) DialTCP(ctx context.Context, network string, source, remote neti
 	}
 	if !remote.IsValid() || remote.Addr().IsUnspecified() || remote.Addr().IsMulticast() || remote.Addr().Zone() != "" {
 		return wrap(nil, errors.New("mipstack: invalid TCP destination"))
+	}
+	if err := (socketOptionSet{tcp: options}).validateFamily(socketOptionTCPDial, remote.Addr().Is6(), false); err != nil {
+		return wrap(nil, err)
 	}
 	if s.network.Load().broadcastDestination(remote.Addr()) {
 		return wrap(nil, syscall.EACCES)
@@ -2338,7 +2358,7 @@ func (s *Stack) DialTCP(ctx context.Context, network string, source, remote neti
 	}
 	key := tcpKey{local: netip.AddrPortFrom(localAddress.Unmap(), port), remote: remote}
 	initialSequence := s.tcpInitialSequence(key, time.Now())
-	connection := newTCPConn(s, network, key, connectionMTU)
+	connection := newTCPConn(s, network, key, connectionMTU, options)
 	connection.connected = make(chan error, 1)
 	connection.publishICMPSequenceRange(initialSequence, initialSequence+1)
 	s.tcp[key] = connection
@@ -2357,13 +2377,15 @@ func (s *Stack) DialTCP(ctx context.Context, network string, source, remote neti
 	}
 }
 
-// newTCPConn allocates the shared active and passive connection state.
-func newTCPConn(stack *Stack, network string, key tcpKey, mtu int) *TCPConn {
+// newTCPConn allocates connection state after applying explicit creation
+// policies to the latest Stack defaults.
+func newTCPConn(stack *Stack, network string, key tcpKey, mtu int, options tcpSocketOptionSet) *TCPConn {
 	defaults, _ := normalizeTCPSocketDefaults(TCPSocketDefaults{})
 	if stack != nil {
 		state := stack.network.Load()
 		defaults = state.tcpDefaults
 	}
+	defaults = applyTCPSocketOptions(defaults, options)
 	connection := &TCPConn{
 		stack: stack, net: network, key: key, mtu: mtu,
 		inbound: newTCPSegmentQueue(), networkError: make(chan error, 8), actorWake: make(chan struct{}, 1),
@@ -2378,6 +2400,7 @@ func newTCPConn(stack *Stack, network string, key tcpKey, mtu int) *TCPConn {
 		keepAlive:       defaults.KeepAlive, keepAliveConfig: defaults.KeepAliveConfig,
 		idleTimeout: defaults.IdleTimeout, userTimeout: defaults.UserTimeout,
 		congestionFactory:  defaults.CongestionControlFactory,
+		congestionUser:     options.congestionControl.set,
 		maximumPacingRate:  defaults.MaximumPacingRate,
 		receiveWindowScale: tcpReceiveWindowScaleFor(defaults.MaximumReceiveBuffer),
 	}
@@ -2385,14 +2408,60 @@ func newTCPConn(stack *Stack, network string, key tcpKey, mtu int) *TCPConn {
 		connection.outputFlowID = stack.nextOutputFlow.Add(1)
 	}
 	if key.local.Addr().Is6() {
-		connection.flowLabel = defaults.FlowLabel
-		if connection.flowLabel == 0 && stack != nil {
+		if options.flowLabel.set {
+			connection.flowLabel = options.flowLabel.value
+		} else {
+			connection.flowLabel = defaults.FlowLabel
+		}
+		if connection.flowLabel == 0 && !options.flowLabel.set && stack != nil {
 			connection.flowLabel = stack.automaticTransportFlowLabel(key.local.Addr(), key.remote.Addr(), protocolTCP, key.local.Port(), key.remote.Port())
 		}
 	}
 	connection.trafficClass.Store(uint32(defaults.TrafficClass))
 	connection.sendCapacityHint.Store(int64(defaults.SendBuffer))
 	return connection
+}
+
+// applyTCPSocketOptions overlays explicit creation policies on normalized
+// Stack defaults. Buffer overrides also fix the auto-tuning maximum so the
+// connection starts with the same semantics as SetReadBuffer or SetWriteBuffer.
+func applyTCPSocketOptions(defaults TCPSocketDefaults, options tcpSocketOptionSet) TCPSocketDefaults {
+	if options.readBuffer.set {
+		defaults.ReceiveBuffer = options.readBuffer.value
+		defaults.MaximumReceiveBuffer = options.readBuffer.value
+	}
+	if options.writeBuffer.set {
+		defaults.SendBuffer = options.writeBuffer.value
+		defaults.MaximumSendBuffer = options.writeBuffer.value
+	}
+	if options.keepAlive != socketOptionBoolOverrideUnset {
+		defaults.KeepAlive = options.keepAlive == socketOptionBoolOverrideEnabled
+	}
+	if options.keepAliveConfig.set {
+		defaults.KeepAliveConfig = options.keepAliveConfig.value
+	}
+	if options.noDelay != socketOptionBoolOverrideUnset {
+		defaults.DisableNoDelay = options.noDelay == socketOptionBoolOverrideDisabled
+	}
+	if options.idleTimeout.set {
+		defaults.IdleTimeout = options.idleTimeout.value
+	}
+	if options.userTimeout.set {
+		defaults.UserTimeout = options.userTimeout.value
+	}
+	if options.congestionControl.set {
+		defaults.CongestionControlFactory = options.congestionControl.value
+	}
+	if options.maximumPacingRate.set {
+		defaults.MaximumPacingRate = options.maximumPacingRate.value
+	}
+	if options.trafficClass.set {
+		defaults.TrafficClass = uint8(options.trafficClass.value) & 0xfc
+	}
+	if options.flowLabel.set {
+		defaults.FlowLabel = options.flowLabel.value
+	}
+	return defaults
 }
 
 // tcpTimestamp returns a wrapping millisecond clock suitable for TSval.
@@ -2530,12 +2599,12 @@ func (s *Stack) rejectTCPSegment(key tcpKey, segment tcpSegment) error {
 		}
 		flags |= tcpFlagACK
 	}
-	return s.tryWriteTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, acknowledgement, flags, 0, nil, nil, s.mtuFor(key.remote.Addr()), 0, 0)
+	return s.tryWriteTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, acknowledgement, flags, 0, nil, nil, s.mtuFor(key.remote.Addr()), 0, 0, 0, false)
 }
 
 // acceptTCP creates and starts one forwarded passive connection after the
 // handler has claimed its request.
-func (f *TCPForwarder) acceptTCP(request *TCPForwarderRequest) (*TCPConn, <-chan error, error) {
+func (f *TCPForwarder) acceptTCP(request *TCPForwarderRequest, options tcpSocketOptionSet) (*TCPConn, <-chan error, error) {
 	stack := f.stack
 	stack.mu.Lock()
 	if stack.closed {
@@ -2567,7 +2636,7 @@ func (f *TCPForwarder) acceptTCP(request *TCPForwarderRequest) (*TCPConn, <-chan
 	if request.key.local.Addr().Is6() {
 		network = "tcp6"
 	}
-	connection := newTCPConn(stack, network, request.key, stack.mtuFor(request.key.remote.Addr()))
+	connection := newTCPConn(stack, network, request.key, stack.mtuFor(request.key.remote.Addr()), options)
 	connection.passive = true
 	connection.forwarded = true
 	initialSequence := stack.tcpInitialSequence(request.key, tcpSegmentEventTime(request.segment, time.Now(), time.Time{}, stack.timestampEpoch))
@@ -2628,7 +2697,7 @@ func (state *tcpPassiveState) handleSYN(stack *Stack, packet ipPacket, segment t
 	listener = state.listener(key.local, key.remote)
 	if listener != nil && stack.tcpConnectionAvailableLocked() {
 		initialSequence := stack.tcpInitialSequence(key, tcpSegmentEventTime(segment, time.Now(), time.Time{}, stack.timestampEpoch))
-		connection := newTCPConn(stack, listener.net, key, stack.mtuFor(packet.source))
+		connection := newTCPConn(stack, listener.net, key, stack.mtuFor(packet.source), listener.options)
 		connection.passive = true
 		connection.reuseAddress, connection.reusePort = listener.reuseAddress, listener.reusePort
 		connection.publishICMPSequenceRange(initialSequence, initialSequence+1)
@@ -2645,7 +2714,7 @@ func (state *tcpPassiveState) handleSYN(stack *Stack, packet ipPacket, segment t
 	if listener == nil {
 		return false, nil
 	}
-	err := state.sendSYNCookie(stack, key, segment, tcpSegmentEventTime(segment, time.Now(), time.Time{}, stack.timestampEpoch))
+	err := state.sendSYNCookie(stack, listener, key, segment, tcpSegmentEventTime(segment, time.Now(), time.Time{}, stack.timestampEpoch))
 	if err == nil {
 		listener.synCookiesSent.Add(1)
 		stack.stats.tcpSYNCookiesSent.Add(1)
@@ -2693,7 +2762,7 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 		stack.mu.Unlock()
 		return true, nil
 	}
-	connection := newTCPConn(stack, listener.net, key, stack.mtuFor(key.remote.Addr()))
+	connection := newTCPConn(stack, listener.net, key, stack.mtuFor(key.remote.Addr()), listener.options)
 	connection.passive = true
 	connection.reuseAddress, connection.reusePort = listener.reuseAddress, listener.reusePort
 	connection.publishICMPSequenceRange(initialSequence+1, initialSequence+1)
@@ -2796,9 +2865,8 @@ func buildTCPPacketViewInto(packet []byte, source, target netip.Addr, sourcePort
 
 // tryWriteTCP emits one best-effort stack-owned control segment without
 // waiting for device capacity.
-func (s *Stack) tryWriteTCP(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte) error {
-	flowLabel := uint32(0)
-	if source.Is6() {
+func (s *Stack) tryWriteTCP(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte, flowLabel uint32, flowLabelSet bool) error {
+	if source.Is6() && !flowLabelSet {
 		flowLabel = s.network.Load().tcpDefaults.FlowLabel
 		if flowLabel == 0 {
 			flowLabel = s.automaticTransportFlowLabel(source, target, protocolTCP, sourcePort, targetPort)
