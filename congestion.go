@@ -889,7 +889,7 @@ func (c *tcpCongestionController) duplicateACKWindow(now time.Time, current, fli
 	return c.state.CongestionWindow
 }
 
-// diagnostics returns the controller-owned portion of TCPInfo after publishing
+// diagnostics returns the controller-owned portion of TCPConnInfo after publishing
 // the transport state from the same actor snapshot.
 func (c *tcpCongestionController) diagnostics(now time.Time, window, threshold, flight uint32, mss int, smoothedRTT, minimumRTT time.Duration) CongestionDiagnostics {
 	c.syncTransportState(window, threshold, flight, mss, smoothedRTT)

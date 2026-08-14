@@ -180,7 +180,7 @@ func TestTCPCreationOptionsApplyToDialedAndAcceptedConnections(t *testing.T) {
 	}
 	defer accepted.Close()
 
-	check := func(name string, info TCPInfo, receive, send int, keepAliveConfig KeepAliveConfig, pacing uint64, trafficClass uint8, flowLabel uint32) {
+	check := func(name string, info TCPConnInfo, receive, send int, keepAliveConfig KeepAliveConfig, pacing uint64, trafficClass uint8, flowLabel uint32) {
 		t.Helper()
 		if info.ReceiveBufferCapacity != receive || info.MaximumReceiveBuffer != receive ||
 			info.SendBufferCapacity != send || info.MaximumSendBuffer != send ||
@@ -803,8 +803,8 @@ func TestIPHeaderIncludedOnWriteSelectsErrorQueueRepresentationAtDelivery(t *tes
 	connection.deliverError(remote, networkError)
 	for index, want := range [][]byte{packet, parsed.payload} {
 		buffer := make([]byte, len(packet))
-		messages := []Message{{Buffers: [][]byte{buffer}, OOB: make([]byte, 128)}}
-		if count, readErr := connection.ReadBatch(messages, MessageErrorQueue); readErr != nil || count != 1 || !bytes.Equal(buffer[:messages[0].N], want) {
+		messages := []SocketMessage{{Buffers: [][]byte{buffer}, OOB: make([]byte, 128)}}
+		if count, readErr := connection.ReadBatch(messages, MessageFlagErrorQueue); readErr != nil || count != 1 || !bytes.Equal(buffer[:messages[0].N], want) {
 			t.Fatalf("error queue representation %d = count %d payload %x, %v; want %x", index, count, buffer[:messages[0].N], readErr, want)
 		}
 	}

@@ -58,7 +58,7 @@ const (
 )
 
 // SocketErrorControlMessage is the structured form of one Linux
-// sock_extended_err ancillary record returned by MessageErrorQueue reads.
+// sock_extended_err ancillary record returned by MessageFlagErrorQueue reads.
 type SocketErrorControlMessage struct {
 	// Errno is the Linux errno number associated with the failed operation.
 	Errno uint32

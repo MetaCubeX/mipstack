@@ -523,11 +523,11 @@ func TestUDPClosedPortInterop(t *testing.T) {
 			if err = mipstackUDP.SetReceiveErrors(true); err != nil {
 				t.Fatalf("reserve gVisor ICMP error for MSG_ERRQUEUE: %v", err)
 			}
-			message := []mipstack.Message{{Buffers: [][]byte{buffer}, OOB: make([]byte, 128)}}
+			message := []mipstack.SocketMessage{{Buffers: [][]byte{buffer}, OOB: make([]byte, 128)}}
 			deadlineTimer := time.NewTimer(time.Until(deadline))
 			defer deadlineTimer.Stop()
 			for {
-				count, readErr := mipstackUDP.ReadBatch(message, mipstack.MessageErrorQueue)
+				count, readErr := mipstackUDP.ReadBatch(message, mipstack.MessageFlagErrorQueue)
 				if readErr == nil && count == 1 {
 					break
 				}
@@ -540,7 +540,7 @@ func TestUDPClosedPortInterop(t *testing.T) {
 				case <-time.After(time.Millisecond):
 				}
 			}
-			if message[0].N != 1 || buffer[0] != 2 || message[0].Flags != mipstack.MessageErrorQueue || message[0].Addr.(*net.UDPAddr).AddrPort() != netipAddrPort(family.gvisorAddress, 44994) {
+			if message[0].N != 1 || buffer[0] != 2 || message[0].Flags != mipstack.MessageFlagErrorQueue || message[0].Addr.(*net.UDPAddr).AddrPort() != netipAddrPort(family.gvisorAddress, 44994) {
 				t.Fatalf("gVisor ICMP error-queue message = %+v payload=%x", message[0], buffer[:message[0].N])
 			}
 			var socketError mipstack.SocketErrorControlMessage

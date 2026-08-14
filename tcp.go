@@ -248,11 +248,11 @@ func (s TCPState) String() string {
 	}
 }
 
-// TCPInfo is a consistent point-in-time diagnostic snapshot of one TCP
+// TCPConnInfo is a consistent point-in-time diagnostic snapshot of one TCP
 // connection. Window, congestion, buffer, and path sizes are measured in
 // bytes; PathMTU and MaximumSegmentSize include and exclude IP/TCP headers,
 // respectively.
-type TCPInfo struct {
+type TCPConnInfo struct {
 	// LocalAddress is the local TCP endpoint.
 	LocalAddress netip.AddrPort
 	// RemoteAddress is the peer TCP endpoint.
@@ -1608,7 +1608,7 @@ type TCPConn struct {
 	done              chan struct{}
 	connected         chan error
 	lingerDone        chan struct{}
-	infoRequest       chan chan TCPInfo
+	infoRequest       chan chan TCPConnInfo
 	abortOnce         sync.Once
 	closeOnce         sync.Once
 	lingerOnce        sync.Once
@@ -1619,7 +1619,7 @@ type TCPConn struct {
 	outOfOrderUnread  atomic.Int64
 	retransmissions   atomic.Uint64
 	inboundQueueDrops atomic.Uint64
-	lastInfo          atomic.Pointer[TCPInfo]
+	lastInfo          atomic.Pointer[TCPConnInfo]
 	sendCapacityHint  atomic.Int64
 
 	abortMu  sync.Mutex
@@ -2390,7 +2390,7 @@ func newTCPConn(stack *Stack, network string, key tcpKey, mtu int, options tcpSo
 		stack: stack, net: network, key: key, mtu: mtu,
 		inbound: newTCPSegmentQueue(), networkError: make(chan error, 8), actorWake: make(chan struct{}, 1),
 		abortCh: make(chan struct{}), done: make(chan struct{}), lingerDone: make(chan struct{}),
-		infoRequest: make(chan chan TCPInfo),
+		infoRequest: make(chan chan TCPConnInfo),
 		readNotify:  make(chan struct{}, 1), sendChanged: make(chan struct{}, 1),
 		noDelay: !defaults.DisableNoDelay, linger: -1,
 		receiveCapacity: defaults.ReceiveBuffer, sendCapacity: defaults.SendBuffer,
@@ -3290,8 +3290,8 @@ func (c *TCPConn) RemoteAddr() net.Addr { return net.TCPAddrFromAddrPort(c.key.r
 // Info returns a consistent diagnostic snapshot. The connection actor
 // supplies live protocol state; after termination, the final snapshot remains
 // available for post-mortem inspection.
-func (c *TCPConn) Info() TCPInfo {
-	response := make(chan TCPInfo, 1)
+func (c *TCPConn) Info() TCPConnInfo {
+	response := make(chan TCPConnInfo, 1)
 	select {
 	case c.infoRequest <- response:
 		select {
@@ -3304,20 +3304,20 @@ func (c *TCPConn) Info() TCPInfo {
 	if info := c.lastInfo.Load(); info != nil {
 		return *info
 	}
-	return c.tcpInfoBase(TCPStateClosed)
+	return c.tcpConnInfoBase(TCPStateClosed)
 }
 
-// tcpInfoBase snapshots application-facing state protected by c.mu.
-func (c *TCPConn) tcpInfoBase(state TCPState) TCPInfo {
+// tcpConnInfoBase snapshots application-facing state protected by c.mu.
+func (c *TCPConn) tcpConnInfoBase(state TCPState) TCPConnInfo {
 	c.mu.Lock()
-	info := c.tcpInfoBaseLocked(state)
+	info := c.tcpConnInfoBaseLocked(state)
 	c.mu.Unlock()
 	return info
 }
 
-// tcpInfoBaseLocked snapshots application-facing state while c.mu is held.
-func (c *TCPConn) tcpInfoBaseLocked(state TCPState) TCPInfo {
-	info := TCPInfo{
+// tcpConnInfoBaseLocked snapshots application-facing state while c.mu is held.
+func (c *TCPConn) tcpConnInfoBaseLocked(state TCPState) TCPConnInfo {
+	info := TCPConnInfo{
 		LocalAddress: c.key.local, RemoteAddress: c.key.remote, State: state,
 		CongestionControl: c.congestionFactory.Name(),
 		SendBufferSize:    c.sendBuffer.size, SendBufferCapacity: c.sendCapacity, MaximumSendBuffer: c.sendMaximum,
@@ -3334,8 +3334,8 @@ func (c *TCPConn) tcpInfoBaseLocked(state TCPState) TCPInfo {
 	return info
 }
 
-// respondTCPInfo retains the newest snapshot before returning it to a caller.
-func (c *TCPConn) respondTCPInfo(response chan TCPInfo, info TCPInfo) {
+// respondTCPConnInfo retains the newest snapshot before returning it to a caller.
+func (c *TCPConn) respondTCPConnInfo(response chan TCPConnInfo, info TCPConnInfo) {
 	c.lastInfo.Store(&info)
 	response <- info
 }
@@ -3346,10 +3346,10 @@ func (c *TCPConn) noteRetransmission() {
 	c.retransmissions.Add(1)
 }
 
-// handshakeTCPInfo builds the subset available before congestion and data
+// handshakeTCPConnInfo builds the subset available before congestion and data
 // transfer state has been initialized.
-func (c *TCPConn) handshakeTCPInfo(state TCPState, mss int, rto time.Duration) TCPInfo {
-	info := c.tcpInfoBase(state)
+func (c *TCPConn) handshakeTCPConnInfo(state TCPState, mss int, rto time.Duration) TCPConnInfo {
+	info := c.tcpConnInfoBase(state)
 	info.MaximumSegmentSize = mss
 	info.PathMTU = c.mtu
 	info.RetransmissionTimeout = rto
@@ -3937,7 +3937,7 @@ releaseNetworkErrors:
 	// a concurrent packet lookup can otherwise enqueue work after the sole
 	// consumer has exited.
 	c.inbound.close()
-	base := c.tcpInfoBase(TCPStateClosed)
+	base := c.tcpConnInfoBase(TCPStateClosed)
 	if previous := c.lastInfo.Load(); previous != nil {
 		info := *previous
 		info.State = TCPStateClosed
@@ -4235,7 +4235,7 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 				return err
 			}
 		case response := <-c.infoRequest:
-			c.respondTCPInfo(response, c.handshakeTCPInfo(TCPStateSYNReceived, localMSS, rto))
+			c.respondTCPConnInfo(response, c.handshakeTCPConnInfo(TCPStateSYNReceived, localMSS, rto))
 		case <-c.abortCh:
 			return c.abortedError()
 		case <-c.stack.closeCh:
@@ -4394,7 +4394,7 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 				return err
 			}
 		case response := <-c.infoRequest:
-			c.respondTCPInfo(response, c.handshakeTCPInfo(TCPStateSYNSent, localMSS, rto))
+			c.respondTCPConnInfo(response, c.handshakeTCPConnInfo(TCPStateSYNSent, localMSS, rto))
 		case <-c.abortCh:
 			return c.abortedError()
 		case <-c.stack.closeCh:
@@ -4632,9 +4632,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			return TCPStateClosed
 		}
 	}
-	tcpInfo := func() TCPInfo {
+	tcpInfo := func() TCPConnInfo {
 		c.mu.Lock()
-		info := c.tcpInfoBaseLocked(connectionState())
+		info := c.tcpConnInfoBaseLocked(connectionState())
 		info.CongestionControl = controller.algorithmName()
 		info.RTT, info.MinimumRTT, info.RTTVariation, info.RetransmissionTimeout = rtt.srtt, rtt.minimum, rtt.variation, rtt.rto
 		info.CongestionWindow, info.SlowStartThreshold = congestionWindow, slowStartThreshold
@@ -6554,7 +6554,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				return err
 			}
 		case response := <-c.infoRequest:
-			c.respondTCPInfo(response, tcpInfo())
+			c.respondTCPConnInfo(response, tcpInfo())
 		case <-activeLiveness:
 			consumeActorTimer()
 			liveness = false

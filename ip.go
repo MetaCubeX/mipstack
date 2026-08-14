@@ -105,12 +105,12 @@ type ipDatagram struct {
 	options ipPacketOptions
 }
 
-// IPInfo is a point-in-time diagnostic snapshot of one IP protocol socket.
+// IPConnInfo is a point-in-time diagnostic snapshot of one IP protocol socket.
 // Traffic byte counters measure the representation exposed by the socket:
 // protocol payloads by default or complete packets when the corresponding
 // header option is enabled. Receive-queue byte values also include the stack's
 // per-datagram accounting overhead.
-type IPInfo struct {
+type IPConnInfo struct {
 	// LocalAddress is the bound local address; an unspecified address denotes
 	// a wildcard binding.
 	LocalAddress netip.Addr
@@ -747,7 +747,7 @@ func (c *IPConn) ReadMsgIP(buffer, oob []byte) (n, oobn, flags int, address *net
 	n, datagram, truncated, err = c.readDatagram(buffer)
 	address = ipNetAddr(datagram.source)
 	if truncated {
-		flags |= MessageTruncated
+		flags |= MessageFlagTruncated
 	}
 	if err != nil {
 		err = c.operationError("read", err)
@@ -760,25 +760,25 @@ func (c *IPConn) ReadMsgIP(buffer, oob []byte) (n, oobn, flags int, address *net
 	}
 	oobn = copy(oob, control)
 	if oobn < len(control) {
-		flags |= MessageControlTruncated
+		flags |= MessageFlagControlTruncated
 	}
 	return
 }
 
-// ReadBatch reads one or more IP protocol messages using the Message layout
+// ReadBatch reads one or more IP protocol messages using the SocketMessage layout
 // shared by x/net/ipv4 and x/net/ipv6. The first message follows the socket's
 // blocking and deadline semantics; after it succeeds, the method drains only
-// messages already queued. MessageDontWait also makes the first read
+// messages already queued. MessageFlagDontWait also makes the first read
 // nonblocking.
-func (c *IPConn) ReadBatch(messages []Message, flags int) (int, error) {
-	if flags&^(MessagePeek|MessageDontWait|MessageTruncated|MessageErrorQueue) != 0 {
+func (c *IPConn) ReadBatch(messages []SocketMessage, flags int) (int, error) {
+	if flags&^(MessageFlagPeek|MessageFlagDontWait|MessageFlagTruncated|MessageFlagErrorQueue) != 0 {
 		return 0, c.operationError("read", syscall.EOPNOTSUPP)
 	}
-	if flags&MessageErrorQueue != 0 {
+	if flags&MessageFlagErrorQueue != 0 {
 		return c.readErrorBatch(messages, flags)
 	}
 	for index := range messages {
-		wait := index == 0 && flags&MessageDontWait == 0
+		wait := index == 0 && flags&MessageFlagDontWait == 0
 		err := c.readBatchMessage(&messages[index], flags, wait, index == 0)
 		if err != nil {
 			// recvmmsg reports a completed prefix without the error that stopped
@@ -795,11 +795,11 @@ func (c *IPConn) ReadBatch(messages []Message, flags int) (int, error) {
 // readBatchMessage receives one scatter/gather message without waiting when
 // wait is false. consumeErrors is false after a successful prefix so an
 // asynchronous error remains available to the next socket operation.
-func (c *IPConn) readBatchMessage(message *Message, flags int, wait, consumeErrors bool) error {
+func (c *IPConn) readBatchMessage(message *SocketMessage, flags int, wait, consumeErrors bool) error {
 	if _, err := messageBufferLength(message.Buffers); err != nil {
 		return c.operationError("read", err)
 	}
-	n, datagram, truncated, err := c.readDatagramBuffers(message.Buffers, wait, consumeErrors, flags&MessagePeek != 0, flags&MessageTruncated != 0)
+	n, datagram, truncated, err := c.readDatagramBuffers(message.Buffers, wait, consumeErrors, flags&MessageFlagPeek != 0, flags&MessageFlagTruncated != 0)
 	if err != nil {
 		return c.operationError("read", err)
 	}
@@ -809,11 +809,11 @@ func (c *IPConn) readBatchMessage(message *Message, flags int, wait, consumeErro
 	}
 	resultFlags := 0
 	if truncated {
-		resultFlags |= MessageTruncated
+		resultFlags |= MessageFlagTruncated
 	}
 	oobn := copy(message.OOB, control)
 	if oobn < len(control) {
-		resultFlags |= MessageControlTruncated
+		resultFlags |= MessageFlagControlTruncated
 	}
 	message.N, message.NN, message.Flags, message.Addr = n, oobn, resultFlags, ipNetAddr(datagram.source)
 	return nil
@@ -967,7 +967,7 @@ func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, peek
 
 // readErrorBatch consumes a prefix of the asynchronous error queue. Linux
 // MSG_ERRQUEUE is nonblocking regardless of socket deadlines or MSG_DONTWAIT.
-func (c *IPConn) readErrorBatch(messages []Message, flags int) (int, error) {
+func (c *IPConn) readErrorBatch(messages []SocketMessage, flags int) (int, error) {
 	for index := range messages {
 		c.mu.Lock()
 		select {
@@ -1144,13 +1144,13 @@ func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn i
 }
 
 // WriteBatch writes a prefix of IP protocol messages using scatter/gather
-// payloads. MessageDontWait bypasses packet-queue waiting; other flags are
+// payloads. MessageFlagDontWait bypasses packet-queue waiting; other flags are
 // unsupported.
-func (c *IPConn) WriteBatch(messages []Message, flags int) (int, error) {
-	if flags&^MessageDontWait != 0 {
+func (c *IPConn) WriteBatch(messages []SocketMessage, flags int) (int, error) {
+	if flags&^MessageFlagDontWait != 0 {
 		return 0, c.operationError("write", syscall.EOPNOTSUPP)
 	}
-	dontWait := flags&MessageDontWait != 0
+	dontWait := flags&MessageFlagDontWait != 0
 	if c.ipHeaderIncludedOnWrite.Load() {
 		return c.writeHeaderIncludedBatch(messages, dontWait)
 	}
@@ -1172,7 +1172,7 @@ func (c *IPConn) WriteBatch(messages []Message, flags int) (int, error) {
 
 // writeBatchMessage validates one destination and sends a scatter/gather
 // payload through the ordinary ancillary-data and output policy.
-func (c *IPConn) writeBatchMessage(message *Message, dontWait bool) (int, int, error) {
+func (c *IPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int, int, error) {
 	var target netip.Addr
 	var address net.Addr
 	if c.remote.IsValid() {
@@ -1237,7 +1237,7 @@ func (c *IPConn) writeBatchMessage(message *Message, dontWait bool) (int, int, e
 
 // writeHeaderIncludedBatch writes complete IP packets after WriteBatch has
 // selected the header-included representation once for the whole operation.
-func (c *IPConn) writeHeaderIncludedBatch(messages []Message, dontWait bool) (int, error) {
+func (c *IPConn) writeHeaderIncludedBatch(messages []SocketMessage, dontWait bool) (int, error) {
 	for index := range messages {
 		message := &messages[index]
 		n, oobn, err := c.writeHeaderIncludedBatchMessage(message, dontWait)
@@ -1253,7 +1253,7 @@ func (c *IPConn) writeHeaderIncludedBatch(messages []Message, dontWait bool) (in
 }
 
 // writeHeaderIncludedBatchMessage validates and writes one complete IP packet.
-func (c *IPConn) writeHeaderIncludedBatchMessage(message *Message, dontWait bool) (int, int, error) {
+func (c *IPConn) writeHeaderIncludedBatchMessage(message *SocketMessage, dontWait bool) (int, int, error) {
 	var target netip.Addr
 	var address net.Addr
 	if c.remote.IsValid() {
@@ -1626,13 +1626,13 @@ func (c *IPConn) RemoteAddr() net.Addr { return c.remoteAddr() }
 
 // Info returns a diagnostic snapshot of the protocol socket and its receive
 // queue.
-func (c *IPConn) Info() IPInfo {
+func (c *IPConn) Info() IPConnInfo {
 	c.mu.Lock()
 	flowLabel := c.defaultOptions.flowLabel
 	if !c.v6 && !c.dual {
 		flowLabel = 0
 	}
-	info := IPInfo{
+	info := IPConnInfo{
 		LocalAddress: c.local, RemoteAddress: c.remote, Protocol: c.protocol,
 		IPHeaderIncludedOnWrite: c.ipHeaderIncludedOnWrite.Load(), IPHeaderIncludedOnRead: c.ipHeaderIncludedOnRead,
 		ReceiveQueuePackets: c.receive.len(), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,

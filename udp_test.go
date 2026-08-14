@@ -215,7 +215,7 @@ func TestUDPBatchRead(t *testing.T) {
 	}
 	firstA, firstB := make([]byte, 2), make([]byte, 4)
 	second := make([]byte, 3)
-	messages := []Message{
+	messages := []SocketMessage{
 		{Buffers: [][]byte{firstA, firstB}, OOB: make([]byte, 128)},
 		{Buffers: [][]byte{second}, OOB: make([]byte, 8)},
 		{Buffers: [][]byte{make([]byte, 1)}, N: 91, NN: 92, Flags: 93, Addr: net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5399))},
@@ -235,14 +235,14 @@ func TestUDPBatchRead(t *testing.T) {
 		t.Fatalf("first batch control = %+v, %v", control, err)
 	}
 	if string(second) != "sec" || messages[1].N != 3 || messages[1].NN != len(messages[1].OOB) ||
-		messages[1].Flags != MessageTruncated|MessageControlTruncated {
+		messages[1].Flags != MessageFlagTruncated|MessageFlagControlTruncated {
 		t.Fatalf("second batch message = %+v payload %q", messages[1], second)
 	}
 	if messages[2].N != 91 || messages[2].NN != 92 || messages[2].Flags != 93 || messages[2].Addr == nil {
 		t.Fatalf("unprocessed batch message changed = %+v", messages[2])
 	}
 
-	n, err = connection.ReadBatch([]Message{{Buffers: [][]byte{make([]byte, 1)}}}, MessageDontWait)
+	n, err = connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait)
 	if n != 0 || !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("nonblocking empty ReadBatch = %d, %v", n, err)
 	}
@@ -252,11 +252,11 @@ func TestUDPBatchRead(t *testing.T) {
 	if err = writeTestPacket(stack, buildTestUDP(remote, local, 5330, 5310, []byte("kept"))); err != nil {
 		t.Fatal(err)
 	}
-	if n, err = connection.ReadBatch([]Message{{Buffers: nil}}, MessageDontWait); n != 0 || !errors.Is(err, syscall.EINVAL) {
+	if n, err = connection.ReadBatch([]SocketMessage{{Buffers: nil}}, MessageFlagDontWait); n != 0 || !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("empty-buffer ReadBatch = %d, %v", n, err)
 	}
 	kept := make([]byte, 4)
-	if n, err = connection.ReadBatch([]Message{{Buffers: [][]byte{kept}}}, MessageDontWait); n != 1 || err != nil || string(kept) != "kept" {
+	if n, err = connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{kept}}}, MessageFlagDontWait); n != 1 || err != nil || string(kept) != "kept" {
 		t.Fatalf("message after invalid buffer = %d, %v, %q", n, err, kept)
 	}
 
@@ -264,14 +264,14 @@ func TestUDPBatchRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection.deliverError(netip.AddrPortFrom(remote, 5331), ICMPError{Code: 7})
-	batch := []Message{{Buffers: [][]byte{make([]byte, 4)}}, {Buffers: [][]byte{make([]byte, 1)}}}
+	batch := []SocketMessage{{Buffers: [][]byte{make([]byte, 4)}}, {Buffers: [][]byte{make([]byte, 1)}}}
 	if n, err = connection.ReadBatch(batch, 0); n != 1 || err != nil {
 		t.Fatalf("data before queued error = %d, %v", n, err)
 	}
 	if info := connection.Info(); info.ErrorQueueEntries != 1 {
 		t.Fatalf("batch consumed trailing error: %+v", info)
 	}
-	if n, err = connection.ReadBatch(batch[1:], MessageDontWait); n != 0 || err == nil {
+	if n, err = connection.ReadBatch(batch[1:], MessageFlagDontWait); n != 0 || err == nil {
 		t.Fatalf("leading queued error = %d, %v", n, err)
 	}
 }
@@ -297,7 +297,7 @@ func TestUDPBatchWrite(t *testing.T) {
 	connection := packetConnection.(*UDPConn)
 	defer connection.Close()
 	control := appendLinuxPacketInfoControl(nil, secondLocal)
-	messages := []Message{
+	messages := []SocketMessage{
 		{Buffers: [][]byte{[]byte("ab"), []byte("cd")}, Addr: net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5350))},
 		{Buffers: [][]byte{[]byte("ef"), []byte("gh")}, OOB: control, Addr: net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5351))},
 	}
@@ -318,11 +318,11 @@ func TestUDPBatchWrite(t *testing.T) {
 			t.Fatalf("batch result %d = %+v", index, messages[index])
 		}
 	}
-	if n, err = connection.WriteBatch(messages[:1], MessageDontWait); n != 1 || err != nil {
+	if n, err = connection.WriteBatch(messages[:1], MessageFlagDontWait); n != 1 || err != nil {
 		t.Fatalf("nonblocking WriteBatch = %d, %v", n, err)
 	}
 	_ = readOutboundPacket(t, stack)
-	prefix := []Message{messages[0], {Buffers: nil, Addr: messages[1].Addr, N: 91, NN: 92, Flags: 93}}
+	prefix := []SocketMessage{messages[0], {Buffers: nil, Addr: messages[1].Addr, N: 91, NN: 92, Flags: 93}}
 	if n, err = connection.WriteBatch(prefix, 0); n != 1 || err != nil {
 		t.Fatalf("partial WriteBatch = %d, %v", n, err)
 	}
@@ -340,7 +340,7 @@ func TestUDPBatchWrite(t *testing.T) {
 	}
 	connected := connectedNet.(*UDPConn)
 	defer connected.Close()
-	connectedMessage := []Message{{Buffers: [][]byte{[]byte("connected")}}}
+	connectedMessage := []SocketMessage{{Buffers: [][]byte{[]byte("connected")}}}
 	if n, err = connected.WriteBatch(connectedMessage, 0); n != 1 || err != nil {
 		t.Fatalf("connected WriteBatch = %d, %v", n, err)
 	}
@@ -376,8 +376,8 @@ func TestUDPNonblockingFragmentedWriteIsAtomic(t *testing.T) {
 		}
 	}
 	before := stack.outbound.len()
-	message := []Message{{Buffers: [][]byte{bytes.Repeat([]byte{0x71}, 1200)}, Addr: net.UDPAddrFromAddrPort(remote)}}
-	if count, writeErr := connection.WriteBatch(message, MessageDontWait); count != 0 || !errors.Is(writeErr, syscall.EAGAIN) {
+	message := []SocketMessage{{Buffers: [][]byte{bytes.Repeat([]byte{0x71}, 1200)}, Addr: net.UDPAddrFromAddrPort(remote)}}
+	if count, writeErr := connection.WriteBatch(message, MessageFlagDontWait); count != 0 || !errors.Is(writeErr, syscall.EAGAIN) {
 		t.Fatalf("nonblocking fragmented write = %d, %v", count, writeErr)
 	}
 	if after := stack.outbound.len(); after != before {
@@ -403,7 +403,7 @@ func TestUDPBatchWriteFragmentedBuffers(t *testing.T) {
 	connection := netConnection.(*UDPConn)
 	defer connection.Close()
 	payload := bytes.Repeat([]byte{0x5a}, 2000)
-	messages := []Message{{Buffers: [][]byte{payload[:333], payload[333:1500], payload[1500:]}}}
+	messages := []SocketMessage{{Buffers: [][]byte{payload[:333], payload[333:1500], payload[1500:]}}}
 	if count, writeErr := connection.WriteBatch(messages, 0); writeErr != nil || count != 1 || messages[0].N != len(payload) {
 		t.Fatalf("fragmented UDP WriteBatch = %d, %v, message %+v", count, writeErr, messages[0])
 	}
@@ -1115,8 +1115,8 @@ func TestUDPMessagePacketInfoRoundTrip(t *testing.T) {
 			if err != nil || n != 3 || string(buffer) != "req" || source != netip.AddrPortFrom(test.remote, 50014) {
 				t.Fatalf("ReadMsgUDPAddrPort = %q, %d oob, flags %#x, source %v, %v", buffer[:n], oobn, flags, source, err)
 			}
-			if oobn != test.controlSize || flags != MessageTruncated {
-				t.Fatalf("packet info size/flags = %d/%#x, want %d/%#x", oobn, flags, test.controlSize, MessageTruncated)
+			if oobn != test.controlSize || flags != MessageFlagTruncated {
+				t.Fatalf("packet info size/flags = %d/%#x, want %d/%#x", oobn, flags, test.controlSize, MessageFlagTruncated)
 			}
 			if test.first.Is4() {
 				var message IPv4ControlMessage
@@ -1177,7 +1177,7 @@ func TestUDPMessageControlValidationAndWriteBuffer(t *testing.T) {
 	buffer := make([]byte, 16)
 	oob := make([]byte, 8)
 	_, oobn, flags, _, err := connection.ReadMsgUDPAddrPort(buffer, oob)
-	if err != nil || oobn != len(oob) || flags != MessageControlTruncated {
+	if err != nil || oobn != len(oob) || flags != MessageFlagControlTruncated {
 		t.Fatalf("control truncation = oob %d flags %#x, %v", oobn, flags, err)
 	}
 	if err = connection.Close(); err != nil {
@@ -1672,7 +1672,7 @@ func BenchmarkUDPBatchWrite(b *testing.B) {
 				_ = stack.Close()
 			})
 			payload := make([]byte, payloadSize)
-			messages := make([]Message, batchSize)
+			messages := make([]SocketMessage, batchSize)
 			for index := range messages {
 				messages[index].Buffers = [][]byte{payload}
 				if buffersPerMessage == 2 {

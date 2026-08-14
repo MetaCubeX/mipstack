@@ -9,9 +9,9 @@ import (
 	"syscall"
 )
 
-// TransportFlow identifies one inbound TCP or UDP four-tuple. Source is the
+// ForwarderFlow identifies one inbound TCP or UDP four-tuple. Source is the
 // remote endpoint and Destination is the original packet destination.
-type TransportFlow struct {
+type ForwarderFlow struct {
 	// Source is the remote endpoint that sent the packet.
 	Source netip.AddrPort
 	// Destination is the original local endpoint from the packet.
@@ -382,7 +382,7 @@ type UDPForwarder struct {
 // capacity-bounded receive queue.
 type UDPForwarderRequest struct {
 	forwarder *UDPForwarder
-	flow      TransportFlow
+	flow      ForwarderFlow
 	packet    ipPacket
 	options   ipPacketOptions
 	state     atomic.Uint32
@@ -399,13 +399,13 @@ type UDPForwarderRequest struct {
 type UDPForwarderResponder struct {
 	forwarderResponder
 
-	flow    TransportFlow
+	flow    ForwarderFlow
 	payload []byte
 }
 
-// IPMessage describes one valid, reassembled upper-layer IP payload. Its
-// ownership and lifetime are specified by the method that returned it.
-type IPMessage struct {
+// IPForwarderMessage describes one valid, reassembled upper-layer IP payload.
+// Its ownership and lifetime are specified by the method that returned it.
+type IPForwarderMessage struct {
 	// Source is the sender of the IP payload.
 	Source netip.Addr
 	// Destination is the original packet destination.
@@ -454,13 +454,14 @@ type IPForwarderRequest struct {
 type IPForwarderResponder struct {
 	forwarderResponder
 
-	message IPMessage
+	message IPForwarderMessage
 }
 
-// ICMPMessage describes one checksum-validated, reassembled ICMP protocol
-// message. Payload contains the complete ICMP header and body. Its ownership
-// and lifetime are specified by the method that returned the message.
-type ICMPMessage struct {
+// ICMPForwarderMessage describes one checksum-validated, reassembled ICMP
+// protocol message. Payload contains the complete ICMP header and body. Its
+// ownership and lifetime are specified by the method that returned the
+// message.
+type ICMPForwarderMessage struct {
 	// Source is the sender of the ICMP message.
 	Source netip.Addr
 	// Destination is the original packet destination.
@@ -477,7 +478,7 @@ type ICMPMessage struct {
 // IsEchoRequest reports whether the message is a complete IPv4 or IPv6 Echo
 // Request whose Type and Code fields agree with Payload. Source and Destination
 // must identify the same address family.
-func (m ICMPMessage) IsEchoRequest() bool {
+func (m ICMPForwarderMessage) IsEchoRequest() bool {
 	if len(m.Payload) < 2 || m.Type != m.Payload[0] || m.Code != m.Payload[1] {
 		return false
 	}
@@ -524,7 +525,7 @@ type ICMPForwarderRequest struct {
 type ICMPForwarderResponder struct {
 	forwarderResponder
 
-	message      ICMPMessage
+	message      ICMPForwarderMessage
 	rejectPacket ipPacket
 	rejectable   bool
 }
@@ -542,7 +543,7 @@ type tcpForwarderEndpoints interface {
 // udpForwarderEndpoints is the small dispatch surface retained by Stack.
 type udpForwarderEndpoints interface {
 	// handlePacket offers one otherwise unhandled datagram to the forwarder.
-	handlePacket(packet ipPacket, flow TransportFlow, options ipPacketOptions) bool
+	handlePacket(packet ipPacket, flow ForwarderFlow, options ipPacketOptions) bool
 	// updateConfig invalidates requests no longer admitted by network policy.
 	updateConfig(network *networkState)
 	// closeFromStack cancels pending requests during stack closure.
@@ -685,8 +686,8 @@ func NewICMPForwarder(stack *Stack, options ICMPForwarderOptions, handler ICMPFo
 // Flow returns the original inbound TCP four-tuple. The method may be called
 // only during the handler, but the returned value is an independent copy that
 // may be retained.
-func (r *TCPForwarderRequest) Flow() TransportFlow {
-	return TransportFlow{Source: r.key.remote, Destination: r.key.local}
+func (r *TCPForwarderRequest) Flow() ForwarderFlow {
+	return ForwarderFlow{Source: r.key.remote, Destination: r.key.local}
 }
 
 // Done is closed when the handler returns or the request is invalidated by a
@@ -775,7 +776,7 @@ func (r *TCPForwarderRequest) Reject() error {
 // Flow returns the original inbound UDP four-tuple. The method may be called
 // only during the handler, but the returned value is an independent copy that
 // may be retained.
-func (r *UDPForwarderRequest) Flow() TransportFlow { return r.flow }
+func (r *UDPForwarderRequest) Flow() ForwarderFlow { return r.flow }
 
 // Payload returns the triggering UDP payload. The returned slice aliases
 // packet-delivery storage, must not be modified, and is valid only until the
@@ -923,7 +924,7 @@ func (r *UDPForwarderRequest) Reject() error {
 // Message returns the validated upper-layer IP payload presented to the
 // handler. Payload aliases packet-delivery storage, must not be modified, and
 // is valid only until the handler returns. Message does not select an action.
-func (r *IPForwarderRequest) Message() IPMessage {
+func (r *IPForwarderRequest) Message() IPForwarderMessage {
 	return ipForwarderMessage(r.packet, r.packet.payload)
 }
 
@@ -972,8 +973,8 @@ func (r *IPForwarderRequest) Reject() error {
 // Message returns the checksum-validated ICMP message presented to the handler.
 // Payload aliases packet-delivery storage, must not be modified, and is valid
 // only until the handler returns. Message does not select an action.
-func (r *ICMPForwarderRequest) Message() ICMPMessage {
-	return ICMPMessage{
+func (r *ICMPForwarderRequest) Message() ICMPForwarderMessage {
+	return ICMPForwarderMessage{
 		Source: r.packet.source, Destination: r.packet.target,
 		Type: r.packet.payload[0], Code: r.packet.payload[1], Payload: r.packet.payload,
 	}
@@ -1228,7 +1229,7 @@ func (f *TCPForwarder) handleSegment(segment tcpSegment, key tcpKey) bool {
 
 // handlePacket serializes the first undecided datagram for a four-tuple and
 // invokes the synchronous handler.
-func (f *UDPForwarder) handlePacket(packet ipPacket, flow TransportFlow, options ipPacketOptions) bool {
+func (f *UDPForwarder) handlePacket(packet ipPacket, flow ForwarderFlow, options ipPacketOptions) bool {
 	key := udpFlowKey{local: flow.Destination, remote: flow.Source}
 	f.mu.Lock()
 	if f.closed.Load() {
@@ -1817,7 +1818,7 @@ func (f *UDPForwarder) detach(request *UDPForwarderRequest, mode forwarderDetach
 }
 
 // Flow returns the detached datagram's original four-tuple.
-func (r *UDPForwarderResponder) Flow() TransportFlow { return r.flow }
+func (r *UDPForwarderResponder) Flow() ForwarderFlow { return r.flow }
 
 // Payload returns an independently owned copy of the triggering UDP payload.
 // It returns nil after DetachForReplies or RestrictToReplies. The caller may
@@ -1969,8 +1970,8 @@ func (f *IPForwarder) detach(request *IPForwarderRequest, mode forwarderDetachMo
 
 // ipForwarderMessage constructs public metadata around supplied payload
 // ownership.
-func ipForwarderMessage(packet ipPacket, payload []byte) IPMessage {
-	return IPMessage{
+func ipForwarderMessage(packet ipPacket, payload []byte) IPForwarderMessage {
+	return IPForwarderMessage{
 		Source: packet.source, Destination: packet.target, Protocol: packet.protocol,
 		HopLimit: packet.hopLimit, TrafficClass: packet.trafficClass,
 		FlowLabel: packet.flowLabel, Payload: payload,
@@ -2003,7 +2004,7 @@ func (f *forwarderRuntime) replyIPPayload(packet ipPacket, payload []byte) error
 // Message returns the detached IP metadata and independently owned payload.
 // Payload is nil after DetachForReplies or RestrictToReplies. The caller may
 // retain or modify a returned payload and must synchronize concurrent access.
-func (r *IPForwarderResponder) Message() IPMessage { return r.message }
+func (r *IPForwarderResponder) Message() IPForwarderMessage { return r.message }
 
 // RestrictToReplies irreversibly discards the upper-layer payload and rejection
 // quote while retaining Message metadata, Reply, and Done. On success, Reject
@@ -2118,7 +2119,7 @@ func (f *ICMPForwarder) detach(request *ICMPForwarderRequest, mode forwarderDeta
 			runtime: f.forwarderRuntime,
 			packet:  packet,
 		},
-		message: ICMPMessage{
+		message: ICMPForwarderMessage{
 			Source: packet.source, Destination: packet.target,
 			Type: request.packet.payload[0], Code: request.packet.payload[1], Payload: packet.payload,
 		},
@@ -2140,7 +2141,7 @@ func (f *ICMPForwarder) detach(request *ICMPForwarderRequest, mode forwarderDeta
 // Type and Code remain the original classification; changing the first two
 // Payload bytes makes the snapshot inconsistent and causes ReplyEcho to report
 // syscall.EINVAL.
-func (r *ICMPForwarderResponder) Message() ICMPMessage { return r.message }
+func (r *ICMPForwarderResponder) Message() ICMPForwarderMessage { return r.message }
 
 // IPPacket returns the complete, reassembled packet snapshot retained by
 // Detach, or nil after DetachForReplies or RestrictToReplies. The caller owns a

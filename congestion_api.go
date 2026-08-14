@@ -127,7 +127,7 @@ func NewCongestionControlFactory(definition CongestionControlDefinition) (*Conge
 	return &CongestionControlFactory{definition: definition}, nil
 }
 
-// Name returns the diagnostic name reported by TCPInfo. A nil factory has an
+// Name returns the diagnostic name reported by TCPConnInfo. A nil factory has an
 // empty name and is not a valid connection policy.
 func (f *CongestionControlFactory) Name() CongestionControl {
 	if f == nil {
@@ -452,7 +452,7 @@ type CongestionPacing struct {
 	MarkSchedulerLimited bool
 }
 
-// CongestionDiagnostics is the controller-owned portion of TCPInfo.
+// CongestionDiagnostics is the controller-owned portion of TCPConnInfo.
 type CongestionDiagnostics struct {
 	// DeliveryRate is the current delivery model in bytes per second.
 	DeliveryRate uint64

@@ -521,16 +521,17 @@ mode. UDP and IP writes are synchronous with packet delivery to the embedding
 device, so `SetWriteBuffer` is a validated no-op.
 
 UDP and IP `ReadBatch`/`WriteBatch` also accept Linux-compatible message flags.
-`MessagePeek` preserves an ordinary queued payload, while pending socket errors
-and successful `MessageErrorQueue` reads are consumed like Linux. A
-`MessageErrorQueue` read never blocks and returns the quoted failed payload,
+`MessageFlagPeek` preserves an ordinary queued payload, while pending socket
+errors and successful `MessageFlagErrorQueue` reads are consumed like Linux. A
+`MessageFlagErrorQueue` read never blocks and returns the quoted failed payload,
 the original destination in `Addr`, and a Linux `sock_extended_err` record in
 `OOB`; `SocketErrorControlMessage.Parse` provides its structured form.
-`MessageDontWait` makes packet-queue reads and writes return `EAGAIN` instead
-of waiting. `MessageTruncated` requests the complete payload length and, along
-with `MessageControlTruncated`, also reports output truncation. Nonblocking
-fragmented output reserves the complete fragment set before publishing it, so
-a failed send cannot leave a partial datagram on the link or loopback path.
+`MessageFlagDontWait` makes packet-queue reads and writes return `EAGAIN`
+instead of waiting. `MessageFlagTruncated` requests the complete payload length
+and, along with `MessageFlagControlTruncated`, also reports output truncation.
+Nonblocking fragmented output reserves the complete fragment set before
+publishing it, so a failed send cannot leave a partial datagram on the link or
+loopback path.
 
 An ordinary `IPConn` exchanges upper-layer protocol payloads. With
 `IPHeaderIncludedOnWrite`, IPv4 writes follow Linux `IP_HDRINCL`: the stack
@@ -586,16 +587,17 @@ TOS/Traffic Class for a message write. `IPv6ControlMessage` also exposes the
 because MIPS has one embedding link.
 
 `UDPConn.ReadBatch`/`WriteBatch` and `IPConn.ReadBatch`/`WriteBatch` use the
-same `Message` layout as `x/net/ipv4` and `x/net/ipv6`: `Buffers` contains the
-scatter/gather payload, `OOB` contains ancillary data, `Addr` carries the peer,
-and `N`, `NN`, and `Flags` receive operation results. A read blocks for its
-first message and then drains only the currently ready prefix;
-`MessageDontWait` makes the first read nonblocking. `MessageTruncated` and
-`MessageControlTruncated` name the fixed Linux result bits returned on every
-host. Batch operations follow Linux `recvmmsg`/`sendmmsg` successful-prefix
-semantics: an error after one or more completed messages is deferred until the
-caller retries the unprocessed suffix, whose result fields remain unchanged.
-Batch writes accept `MessageDontWait`; other nonzero write flags return
+same `SocketMessage` layout as `x/net/ipv4` and `x/net/ipv6`: `Buffers` contains
+the scatter/gather payload, `OOB` contains ancillary data, `Addr` carries the
+peer, and `N`, `NN`, and `Flags` receive operation results. A read blocks for
+its first message and then drains only the currently ready prefix;
+`MessageFlagDontWait` makes the first read nonblocking.
+`MessageFlagTruncated` and `MessageFlagControlTruncated` name the fixed Linux
+result bits returned on every host. Batch operations follow Linux
+`recvmmsg`/`sendmmsg` successful-prefix semantics: an error after one or more
+completed messages is deferred until the caller retries the unprocessed
+suffix, whose result fields remain unchanged.
+Batch writes accept `MessageFlagDontWait`; other nonzero write flags return
 `EOPNOTSUPP`.
 
 ## Protocol behavior
@@ -794,9 +796,9 @@ Both correlate asynchronous ICMP errors with recently used remote endpoints.
 
 `IPConn` applies the same recent-destination correlation to protocol payload
 writes. Validated errors are returned by a subsequent read and retained in
-`IPInfo`; Packet Too Big also updates the shared destination PMTU. Its explicit
-probe and confirmation methods follow the same application-acknowledgement
-contract as UDP.
+`IPConnInfo`; Packet Too Big also updates the shared destination PMTU. Its
+explicit probe and confirmation methods follow the same
+application-acknowledgement contract as UDP.
 
 ICMP echo, unreachable, packet-too-big, IPv4 fragmentation, IPv6 source
 fragmentation, and bounded IPv4 and IPv6 reassembly are handled internally.

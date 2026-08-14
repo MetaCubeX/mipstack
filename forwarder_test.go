@@ -1908,7 +1908,7 @@ func TestUDPForwarderDetachedReply(t *testing.T) {
 	for index := range packet {
 		packet[index] = 0
 	}
-	if got := responder.Flow(); got != (TransportFlow{Source: netip.AddrPortFrom(remote, 55007), Destination: netip.AddrPortFrom(target, 53)}) {
+	if got := responder.Flow(); got != (ForwarderFlow{Source: netip.AddrPortFrom(remote, 55007), Destination: netip.AddrPortFrom(target, 53)}) {
 		t.Fatalf("detached UDP flow = %+v", got)
 	}
 	if got := string(responder.Payload()); got != "async query" {
@@ -3842,7 +3842,7 @@ func TestIPForwarderReplyAndMetadata(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = stack.Close() })
-			var observed IPMessage
+			var observed IPForwarderMessage
 			forwarder, err := NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
 				observed = request.Message()
 				if replyErr := request.Reply([]byte("first")); replyErr != nil {
@@ -4309,7 +4309,7 @@ func TestICMPForwarderReplyEchoRejectsNonEcho(t *testing.T) {
 	}
 }
 
-func TestICMPMessageIsEchoRequest(t *testing.T) {
+func TestICMPForwarderMessageIsEchoRequest(t *testing.T) {
 	v4Source := netip.MustParseAddr("192.0.2.90")
 	v4Target := netip.MustParseAddr("198.51.100.90")
 	v6Source := netip.MustParseAddr("2001:db8::90")
@@ -4318,16 +4318,16 @@ func TestICMPMessageIsEchoRequest(t *testing.T) {
 	v6Echo := []byte{128, 0, 0, 0, 0, 1, 0, 2}
 	tests := []struct {
 		name    string
-		message ICMPMessage
+		message ICMPForwarderMessage
 		want    bool
 	}{
-		{name: "IPv4", message: ICMPMessage{Source: v4Source, Destination: v4Target, Type: 8, Payload: v4Echo}, want: true},
-		{name: "IPv6", message: ICMPMessage{Source: v6Source, Destination: v6Target, Type: 128, Payload: v6Echo}, want: true},
-		{name: "reply", message: ICMPMessage{Source: v4Source, Destination: v4Target, Payload: []byte{0, 0, 0, 0, 0, 1, 0, 2}}},
-		{name: "nonzero code", message: ICMPMessage{Source: v4Source, Destination: v4Target, Type: 8, Code: 1, Payload: []byte{8, 1, 0, 0, 0, 1, 0, 2}}},
-		{name: "truncated", message: ICMPMessage{Source: v4Source, Destination: v4Target, Type: 8, Payload: []byte{8, 0}}},
-		{name: "cross family", message: ICMPMessage{Source: v4Source, Destination: v6Target, Type: 8, Payload: v4Echo}},
-		{name: "metadata mismatch", message: ICMPMessage{Source: v4Source, Destination: v4Target, Type: 128, Payload: v4Echo}},
+		{name: "IPv4", message: ICMPForwarderMessage{Source: v4Source, Destination: v4Target, Type: 8, Payload: v4Echo}, want: true},
+		{name: "IPv6", message: ICMPForwarderMessage{Source: v6Source, Destination: v6Target, Type: 128, Payload: v6Echo}, want: true},
+		{name: "reply", message: ICMPForwarderMessage{Source: v4Source, Destination: v4Target, Payload: []byte{0, 0, 0, 0, 0, 1, 0, 2}}},
+		{name: "nonzero code", message: ICMPForwarderMessage{Source: v4Source, Destination: v4Target, Type: 8, Code: 1, Payload: []byte{8, 1, 0, 0, 0, 1, 0, 2}}},
+		{name: "truncated", message: ICMPForwarderMessage{Source: v4Source, Destination: v4Target, Type: 8, Payload: []byte{8, 0}}},
+		{name: "cross family", message: ICMPForwarderMessage{Source: v4Source, Destination: v6Target, Type: 8, Payload: v4Echo}},
+		{name: "metadata mismatch", message: ICMPForwarderMessage{Source: v4Source, Destination: v4Target, Type: 128, Payload: v4Echo}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -4347,7 +4347,7 @@ func TestICMPReplyEchoLifecycleAndSnapshotValidation(t *testing.T) {
 	}
 	responder := &ICMPForwarderResponder{
 		forwarderResponder: forwarderResponder{packet: ipPacket{protocol: protocolICMPv4}},
-		message: ICMPMessage{
+		message: ICMPForwarderMessage{
 			Source: netip.MustParseAddr("192.0.2.91"), Destination: netip.MustParseAddr("198.51.100.91"),
 			Payload: nonEcho,
 		},
@@ -4479,7 +4479,7 @@ func TestUDPForwarderRepliesOnlyResponder(t *testing.T) {
 			if responder.packet.payload != nil || responder.packet.original != nil {
 				t.Fatal("replies-only UDP responder retained packet storage")
 			}
-			if got := responder.Flow(); got != (TransportFlow{Source: netip.AddrPortFrom(remote, 56000), Destination: netip.AddrPortFrom(target, 53)}) {
+			if got := responder.Flow(); got != (ForwarderFlow{Source: netip.AddrPortFrom(remote, 56000), Destination: netip.AddrPortFrom(target, 53)}) {
 				t.Fatalf("replies-only UDP flow = %+v", got)
 			}
 			if _, err = responder.Reply([]byte("default source")); err != nil {

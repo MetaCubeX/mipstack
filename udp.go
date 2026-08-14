@@ -32,10 +32,10 @@ type udpDatagram struct {
 	options ipPacketOptions
 }
 
-// UDPInfo is a point-in-time diagnostic snapshot of one UDP socket. Traffic
+// UDPConnInfo is a point-in-time diagnostic snapshot of one UDP socket. Traffic
 // byte counters measure UDP payload; receive-queue byte values also include
 // the stack's per-datagram accounting overhead.
-type UDPInfo struct {
+type UDPConnInfo struct {
 	// LocalAddress is the bound local endpoint; an unspecified address denotes
 	// a wildcard binding.
 	LocalAddress netip.AddrPort
@@ -295,7 +295,7 @@ func (s *Stack) handleUDP(packet ipPacket, destination inboundDestinationClass) 
 	s.mu.RUnlock()
 	if connection == nil {
 		options := ipPacketOptions{hopLimit: packet.hopLimit, trafficClass: packet.trafficClass, flowLabel: packet.flowLabel}
-		if forwarder != nil && forwarder.handlePacket(packet, TransportFlow{Source: source, Destination: target}, options) {
+		if forwarder != nil && forwarder.handlePacket(packet, ForwarderFlow{Source: source, Destination: target}, options) {
 			return nil
 		}
 		if !localDestination {
@@ -484,7 +484,7 @@ func (f *UDPForwarder) listenUDP(request *UDPForwarderRequest, options datagramS
 
 // validateUDPForwarderReply normalizes one caller-selected source and checks
 // only properties required to serialize a reverse-flow UDP datagram.
-func validateUDPForwarderReply(flow TransportFlow, payload []byte, source netip.AddrPort) (netip.AddrPort, error) {
+func validateUDPForwarderReply(flow ForwarderFlow, payload []byte, source netip.AddrPort) (netip.AddrPort, error) {
 	address := source.Addr()
 	if !source.IsValid() {
 		return netip.AddrPort{}, syscall.EINVAL
@@ -513,7 +513,7 @@ func validateUDPForwarderReplyPayload(ipv6 bool, payload []byte) error {
 
 // replyUDPFlow sends one reverse-flow response from a validated caller-selected
 // source without retaining a registered endpoint after the write completes.
-func (f *forwarderRuntime) replyUDPFlow(flow TransportFlow, payload []byte, source netip.AddrPort) (int, error) {
+func (f *forwarderRuntime) replyUDPFlow(flow ForwarderFlow, payload []byte, source netip.AddrPort) (int, error) {
 	local, remote := flow.Destination, flow.Source
 	state := f.stack.network.Load()
 	if !state.acceptsInboundDestination(local.Addr()) {
@@ -657,7 +657,7 @@ func (c *UDPConn) readMsgUDPAddrPort(buffer, oob []byte) (n, oobn, flags int, so
 	var truncated bool
 	n, source, target, options, truncated, err = c.readDatagram(buffer)
 	if truncated {
-		flags |= MessageTruncated
+		flags |= MessageFlagTruncated
 	}
 	if err != nil {
 		err = c.operationError("read", c.remoteAddr(), err)
@@ -670,24 +670,24 @@ func (c *UDPConn) readMsgUDPAddrPort(buffer, oob []byte) (n, oobn, flags int, so
 	}
 	oobn = copy(oob, control)
 	if oobn < len(control) {
-		flags |= MessageControlTruncated
+		flags |= MessageFlagControlTruncated
 	}
 	return
 }
 
-// ReadBatch reads one or more UDP messages using the Message layout shared by
+// ReadBatch reads one or more UDP messages using the SocketMessage layout shared by
 // x/net/ipv4 and x/net/ipv6. The first message follows the socket's blocking
 // and deadline semantics; after it succeeds, the method drains only messages
-// already queued. MessageDontWait also makes the first read nonblocking.
-func (c *UDPConn) ReadBatch(messages []Message, flags int) (int, error) {
-	if flags&^(MessagePeek|MessageDontWait|MessageTruncated|MessageErrorQueue) != 0 {
+// already queued. MessageFlagDontWait also makes the first read nonblocking.
+func (c *UDPConn) ReadBatch(messages []SocketMessage, flags int) (int, error) {
+	if flags&^(MessageFlagPeek|MessageFlagDontWait|MessageFlagTruncated|MessageFlagErrorQueue) != 0 {
 		return 0, c.operationError("read", c.remoteAddr(), syscall.EOPNOTSUPP)
 	}
-	if flags&MessageErrorQueue != 0 {
+	if flags&MessageFlagErrorQueue != 0 {
 		return c.readErrorBatch(messages, flags)
 	}
 	for index := range messages {
-		wait := index == 0 && flags&MessageDontWait == 0
+		wait := index == 0 && flags&MessageFlagDontWait == 0
 		err := c.readBatchMessage(&messages[index], flags, wait, index == 0)
 		if err != nil {
 			// recvmmsg reports a completed prefix without the error that stopped
@@ -704,11 +704,11 @@ func (c *UDPConn) ReadBatch(messages []Message, flags int) (int, error) {
 // readBatchMessage receives one scatter/gather message without waiting when
 // wait is false. consumeErrors is false after a successful prefix so an
 // asynchronous error remains available to the next socket operation.
-func (c *UDPConn) readBatchMessage(message *Message, flags int, wait, consumeErrors bool) error {
+func (c *UDPConn) readBatchMessage(message *SocketMessage, flags int, wait, consumeErrors bool) error {
 	if _, err := messageBufferLength(message.Buffers); err != nil {
 		return c.operationError("read", c.remoteAddr(), err)
 	}
-	n, source, target, options, truncated, err := c.readDatagramBuffers(message.Buffers, wait, consumeErrors, flags&MessagePeek != 0, flags&MessageTruncated != 0)
+	n, source, target, options, truncated, err := c.readDatagramBuffers(message.Buffers, wait, consumeErrors, flags&MessageFlagPeek != 0, flags&MessageFlagTruncated != 0)
 	if err != nil {
 		return c.operationError("read", c.remoteAddr(), err)
 	}
@@ -718,11 +718,11 @@ func (c *UDPConn) readBatchMessage(message *Message, flags int, wait, consumeErr
 	}
 	resultFlags := 0
 	if truncated {
-		resultFlags |= MessageTruncated
+		resultFlags |= MessageFlagTruncated
 	}
 	oobn := copy(message.OOB, control)
 	if oobn < len(control) {
-		resultFlags |= MessageControlTruncated
+		resultFlags |= MessageFlagControlTruncated
 	}
 	message.N, message.NN, message.Flags = n, oobn, resultFlags
 	if source.IsValid() {
@@ -880,7 +880,7 @@ func (c *UDPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, pee
 
 // readErrorBatch consumes a prefix of the asynchronous error queue. Linux
 // MSG_ERRQUEUE is nonblocking regardless of socket deadlines or MSG_DONTWAIT.
-func (c *UDPConn) readErrorBatch(messages []Message, flags int) (int, error) {
+func (c *UDPConn) readErrorBatch(messages []SocketMessage, flags int) (int, error) {
 	for index := range messages {
 		c.mu.Lock()
 		select {
@@ -1091,12 +1091,12 @@ func (c *UDPConn) WriteMsgUDPAddrPort(payload, oob []byte, address netip.AddrPor
 }
 
 // WriteBatch writes a prefix of UDP messages using scatter/gather payloads.
-// MessageDontWait bypasses packet-queue waiting; other flags are unsupported.
-func (c *UDPConn) WriteBatch(messages []Message, flags int) (int, error) {
-	if flags&^MessageDontWait != 0 {
+// MessageFlagDontWait bypasses packet-queue waiting; other flags are unsupported.
+func (c *UDPConn) WriteBatch(messages []SocketMessage, flags int) (int, error) {
+	if flags&^MessageFlagDontWait != 0 {
 		return 0, c.operationError("write", c.remoteAddr(), syscall.EOPNOTSUPP)
 	}
-	dontWait := flags&MessageDontWait != 0
+	dontWait := flags&MessageFlagDontWait != 0
 	for index := range messages {
 		message := &messages[index]
 		n, oobn, err := c.writeBatchMessage(message, dontWait)
@@ -1115,7 +1115,7 @@ func (c *UDPConn) WriteBatch(messages []Message, flags int) (int, error) {
 
 // writeBatchMessage validates one destination and sends a scatter/gather
 // payload through the ordinary ancillary-data and output policy.
-func (c *UDPConn) writeBatchMessage(message *Message, dontWait bool) (int, int, error) {
+func (c *UDPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int, int, error) {
 	var target netip.AddrPort
 	var address net.Addr
 	if c.remote.IsValid() {
@@ -1650,14 +1650,14 @@ func (c *UDPConn) LocalAddr() net.Addr {
 func (c *UDPConn) RemoteAddr() net.Addr { return c.remoteAddr() }
 
 // Info returns a diagnostic snapshot of the socket and its receive queue.
-func (c *UDPConn) Info() UDPInfo {
+func (c *UDPConn) Info() UDPConnInfo {
 	c.mu.Lock()
 	automaticFlowLabel := !c.defaultOptions.flowLabelSet
 	flowLabel := c.defaultOptions.flowLabel
 	if !c.v6 && !c.dual {
 		flowLabel = 0
 	}
-	info := UDPInfo{
+	info := UDPConnInfo{
 		LocalAddress: netip.AddrPortFrom(c.local, c.port), RemoteAddress: c.remote,
 		ReceiveQueuePackets: c.receive.len(), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
 		ReceiveErrors: c.receiveErrors, ErrorQueueEntries: c.errorQueue.len(), ErrorQueueBytes: c.errorQueuedBytes,

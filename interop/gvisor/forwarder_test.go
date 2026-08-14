@@ -44,7 +44,7 @@ func TestTCPForwarderInterop(t *testing.T) {
 
 				type acceptResult struct {
 					connection *mipstack.TCPConn
-					flow       mipstack.TransportFlow
+					flow       mipstack.ForwarderFlow
 					err        error
 				}
 				accepted := make(chan acceptResult, 1)
@@ -103,7 +103,7 @@ func TestTCPForwarderRejectInterop(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			type rejectResult struct {
-				flow mipstack.TransportFlow
+				flow mipstack.ForwarderFlow
 				err  error
 			}
 			results := make(chan rejectResult, 1)
@@ -148,7 +148,7 @@ func TestUDPForwarderRejectInterop(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			type rejectResult struct {
-				flow mipstack.TransportFlow
+				flow mipstack.ForwarderFlow
 				err  error
 			}
 			replied := make(chan rejectResult, 1)
@@ -475,7 +475,7 @@ func TestUDPForwarderEndpointInterop(t *testing.T) {
 
 					type endpointResult struct {
 						connection *mipstack.UDPConn
-						flow       mipstack.TransportFlow
+						flow       mipstack.ForwarderFlow
 						err        error
 					}
 					endpoints := make(chan endpointResult, 1)
@@ -607,7 +607,7 @@ func TestUDPForwarderReplyInterop(t *testing.T) {
 					defer cancel()
 
 					type replyResult struct {
-						flow      mipstack.TransportFlow
+						flow      mipstack.ForwarderFlow
 						request   []byte
 						responses [][]byte
 						responder *mipstack.UDPForwarderResponder
@@ -1029,7 +1029,7 @@ func TestICMPForwarderInterop(t *testing.T) {
 					defer cancel()
 
 					type echoResult struct {
-						message   mipstack.ICMPMessage
+						message   mipstack.ICMPForwarderMessage
 						responder *mipstack.ICMPForwarderResponder
 						err       error
 					}
@@ -1147,7 +1147,7 @@ func TestIPForwarderInterop(t *testing.T) {
 					defer cancel()
 
 					type replyResult struct {
-						message   mipstack.IPMessage
+						message   mipstack.IPForwarderMessage
 						response  []byte
 						responder *mipstack.IPForwarderResponder
 						err       error

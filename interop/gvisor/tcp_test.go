@@ -542,7 +542,7 @@ func TestTCPReceiveWindowReopenInterop(t *testing.T) {
 
 // validateTCPMTUInfo verifies that mipstack retained the configured path MTU
 // and negotiated an MSS that can fit one fixed-header packet on that path.
-func validateTCPMTUInfo(t *testing.T, info mipstack.TCPInfo, family interopFamily, mtu uint32) {
+func validateTCPMTUInfo(t *testing.T, info mipstack.TCPConnInfo, family interopFamily, mtu uint32) {
 	t.Helper()
 	maximumSegmentSize := int(mtu) - header.IPv4MinimumSize - header.TCPMinimumSize
 	if family.mipstackAddress.Is6() {

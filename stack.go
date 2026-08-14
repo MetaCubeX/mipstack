@@ -172,10 +172,10 @@ func (mode PathMTUDiscovery) valid() bool {
 	return mode >= PathMTUDiscoveryDont && mode <= PathMTUDiscoveryOmit
 }
 
-// Message represents one scatter/gather datagram or IP protocol message. Its
-// layout and field meanings match golang.org/x/net/ipv4.Message and
-// golang.org/x/net/ipv6.Message without requiring either package.
-type Message struct {
+// SocketMessage represents one scatter/gather datagram or IP protocol
+// message. Its layout and field meanings match golang.org/x/net/ipv4.Message
+// and golang.org/x/net/ipv6.Message without requiring either package.
+type SocketMessage struct {
 	// Buffers contains the contiguous payload regions read or written in order.
 	// A batch operation requires their combined length to be nonzero.
 	Buffers [][]byte
@@ -196,22 +196,22 @@ type Message struct {
 }
 
 const (
-	// MessagePeek is Linux MSG_PEEK. Ordinary ReadBatch calls copy the oldest
+	// MessageFlagPeek is Linux MSG_PEEK. Ordinary ReadBatch calls copy the oldest
 	// queued payload without consuming it. A pending socket error and a
-	// MessageErrorQueue result are still consumed, matching Linux recvmsg.
-	MessagePeek = 0x02
-	// MessageControlTruncated is Linux MSG_CTRUNC. ReadMsg and ReadBatch include
+	// MessageFlagErrorQueue result are still consumed, matching Linux recvmsg.
+	MessageFlagPeek = 0x02
+	// MessageFlagControlTruncated is Linux MSG_CTRUNC. ReadMsg and ReadBatch include
 	// it in the result flags when the supplied OOB buffer was too small.
-	MessageControlTruncated = 0x08
-	// MessageTruncated is Linux MSG_TRUNC. ReadMsg and ReadBatch include it in
+	MessageFlagControlTruncated = 0x08
+	// MessageFlagTruncated is Linux MSG_TRUNC. ReadMsg and ReadBatch include it in
 	// the result flags when the supplied payload buffers were too small.
-	MessageTruncated = 0x20
-	// MessageDontWait is Linux MSG_DONTWAIT. Reads and writes return EAGAIN
+	MessageFlagTruncated = 0x20
+	// MessageFlagDontWait is Linux MSG_DONTWAIT. Reads and writes return EAGAIN
 	// instead of waiting for queue state to change.
-	MessageDontWait = 0x40
-	// MessageErrorQueue is Linux MSG_ERRQUEUE. ReadBatch reads asynchronous
+	MessageFlagDontWait = 0x40
+	// MessageFlagErrorQueue is Linux MSG_ERRQUEUE. ReadBatch reads asynchronous
 	// network errors instead of ordinary payloads and never blocks.
-	MessageErrorQueue = 0x2000
+	MessageFlagErrorQueue = 0x2000
 )
 
 // DatagramSocketDefaults configures policies inherited by newly created UDP
@@ -662,7 +662,7 @@ func gatherMessagePayload(buffers [][]byte, maximum int) ([]byte, error) {
 
 // fillSocketErrorMessage copies one immutable error-queue entry into the
 // public scatter/gather representation.
-func fillSocketErrorMessage(message *Message, queued queuedSocketError, returnLength bool) error {
+func fillSocketErrorMessage(message *SocketMessage, queued queuedSocketError, returnLength bool) error {
 	if _, err := messageBufferLength(message.Buffers); err != nil {
 		return err
 	}
@@ -672,16 +672,16 @@ func fillSocketErrorMessage(message *Message, queued queuedSocketError, returnLe
 	}
 	copied := copyMessagePayload(message.Buffers, queued.payload)
 	n := copied
-	flags := MessageErrorQueue
+	flags := MessageFlagErrorQueue
 	if copied < len(queued.payload) {
-		flags |= MessageTruncated
+		flags |= MessageFlagTruncated
 		if returnLength {
 			n = len(queued.payload)
 		}
 	}
 	oobn := copy(message.OOB, control)
 	if oobn < len(control) {
-		flags |= MessageControlTruncated
+		flags |= MessageFlagControlTruncated
 	}
 	message.N, message.NN, message.Flags, message.Addr = n, oobn, flags, queued.err.Addr
 	return nil
@@ -691,12 +691,12 @@ func fillSocketErrorMessage(message *Message, queued queuedSocketError, returnLe
 // only after every validation and ancillary-data conversion succeeds. Linux
 // MSG_ERRQUEUE ignores MSG_PEEK, so a successful read always removes the
 // error. The caller must hold the owning socket mutex for the complete call.
-func readSocketErrorMessage(queue *datagramQueue[queuedSocketError], message *Message, flags int) (size int, ok bool, err error) {
+func readSocketErrorMessage(queue *datagramQueue[queuedSocketError], message *SocketMessage, flags int) (size int, ok bool, err error) {
 	queued, ok := queue.peek()
 	if !ok {
 		return 0, false, nil
 	}
-	if err := fillSocketErrorMessage(message, queued, flags&MessageTruncated != 0); err != nil {
+	if err := fillSocketErrorMessage(message, queued, flags&MessageFlagTruncated != 0); err != nil {
 		return 0, true, err
 	}
 	consumed, popped := queue.pop()

@@ -224,7 +224,7 @@ func TestIPConnFanoutAndLinuxControl(t *testing.T) {
 			short := make([]byte, 3)
 			oob := make([]byte, 128)
 			n, oobn, flags, source, err := all.ReadMsgIP(short, oob)
-			if err != nil || n != len(short) || string(short) != "raw" || flags != MessageTruncated || oobn != test.controlSize {
+			if err != nil || n != len(short) || string(short) != "raw" || flags != MessageFlagTruncated || oobn != test.controlSize {
 				t.Fatalf("ReadMsgIP = %q/%d flags %#x from %v, %v", short[:n], oobn, flags, source, err)
 			}
 			if test.local.Is4() {
@@ -554,8 +554,8 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 	if err = writeTestPacket(stack, invalid); err != nil {
 		t.Fatal(err)
 	}
-	readMessages := []Message{{Buffers: [][]byte{make([]byte, 16)}}}
-	if count, readErr := ipConnection.ReadBatch(readMessages, MessageDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+	readMessages := []SocketMessage{{Buffers: [][]byte{make([]byte, 16)}}}
+	if count, readErr := ipConnection.ReadBatch(readMessages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
 		t.Fatalf("invalid ICMPv6 checksum read = %d, %v, want EAGAIN", count, readErr)
 	}
 	reply := buildIPPacket(remote, local, protocolICMPv6, []byte{129, 0, 0, 0, 0, 1, 0, 1}, 0, true)
@@ -631,8 +631,8 @@ func TestIPConnICMPReceiveFilters(t *testing.T) {
 				}
 			}
 			assertEmpty := func() {
-				messages := []Message{{Buffers: [][]byte{make([]byte, 32)}}}
-				if count, readErr := connection.ReadBatch(messages, MessageDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+				messages := []SocketMessage{{Buffers: [][]byte{make([]byte, 32)}}}
+				if count, readErr := connection.ReadBatch(messages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
 					t.Fatalf("filtered read = %d, %v, want EAGAIN", count, readErr)
 				}
 			}
@@ -754,8 +754,8 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	messages := []Message{{Buffers: [][]byte{buffer}}}
-	if count, readErr := connection.ReadBatch(messages, MessageDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+	messages := []SocketMessage{{Buffers: [][]byte{buffer}}}
+	if count, readErr := connection.ReadBatch(messages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
 		t.Fatalf("invalid-checksum receive = %d, %v, want EAGAIN", count, readErr)
 	}
 	if err = connection.SetIPv6Checksum(false, -99); err != nil {
@@ -789,7 +789,7 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 
 	batchPayload := []byte{0x51, 0x52, 0xaa, 0xbb, 0x55, 0x56, 0x57, 0x58}
 	batchOriginal := append([]byte(nil), batchPayload...)
-	batch := []Message{{Buffers: [][]byte{batchPayload[:3], batchPayload[3:]}, Addr: ipNetAddr(remote)}}
+	batch := []SocketMessage{{Buffers: [][]byte{batchPayload[:3], batchPayload[3:]}, Addr: ipNetAddr(remote)}}
 	if count, writeErr := connection.WriteBatch(batch, 0); writeErr != nil || count != 1 || batch[0].N != len(batchPayload) {
 		t.Fatalf("checksummed WriteBatch = %d, %v, message=%+v", count, writeErr, batch[0])
 	}
@@ -803,7 +803,7 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 
 	fragmented := bytes.Repeat([]byte{0x6b}, 3000)
 	fragmentedOriginal := append([]byte(nil), fragmented...)
-	fragmentedBatch := []Message{{Buffers: [][]byte{fragmented[:317], fragmented[317:1301], fragmented[1301:]}, Addr: ipNetAddr(remote)}}
+	fragmentedBatch := []SocketMessage{{Buffers: [][]byte{fragmented[:317], fragmented[317:1301], fragmented[1301:]}, Addr: ipNetAddr(remote)}}
 	if count, writeErr := connection.WriteBatch(fragmentedBatch, 0); writeErr != nil || count != 1 {
 		t.Fatalf("checksummed fragmented WriteBatch = %d, %v", count, writeErr)
 	}
@@ -933,8 +933,8 @@ func TestIPConnIPv6ChecksumHeaderIncludedOwnership(t *testing.T) {
 	if err = writeTestPacket(stack, invalid); err != nil {
 		t.Fatal(err)
 	}
-	messages := []Message{{Buffers: [][]byte{buffer}}}
-	if count, readErr := connection.ReadBatch(messages, MessageDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+	messages := []SocketMessage{{Buffers: [][]byte{buffer}}}
+	if count, readErr := connection.ReadBatch(messages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
 		t.Fatalf("header-included invalid checksum read = %d, %v, want EAGAIN", count, readErr)
 	}
 }
@@ -1411,7 +1411,7 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 	}
 	firstA, firstB := make([]byte, 1), make([]byte, 5)
 	second := make([]byte, 2)
-	messages := []Message{
+	messages := []SocketMessage{
 		{Buffers: [][]byte{firstA, firstB}, OOB: make([]byte, 128)},
 		{Buffers: [][]byte{second}, OOB: make([]byte, 8)},
 		{Buffers: [][]byte{make([]byte, 1)}, N: 91, NN: 92, Flags: 93, Addr: ipNetAddr(remote)},
@@ -1430,18 +1430,18 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 	if err = control.Parse(messages[0].OOB[:messages[0].NN]); err != nil || control.Dst != secondLocal {
 		t.Fatalf("first IP batch control = %+v, %v", control, err)
 	}
-	if string(second) != "se" || messages[1].Flags != MessageTruncated|MessageControlTruncated {
+	if string(second) != "se" || messages[1].Flags != MessageFlagTruncated|MessageFlagControlTruncated {
 		t.Fatalf("second IP batch message = %+v payload %q", messages[1], second)
 	}
 	if messages[2].N != 91 || messages[2].NN != 92 || messages[2].Flags != 93 || messages[2].Addr == nil {
 		t.Fatalf("unprocessed IP batch message changed = %+v", messages[2])
 	}
-	if n, err = connection.ReadBatch(messages[:1], MessageDontWait); n != 0 || !errors.Is(err, syscall.EAGAIN) {
+	if n, err = connection.ReadBatch(messages[:1], MessageFlagDontWait); n != 0 || !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("nonblocking empty IP ReadBatch = %d, %v", n, err)
 	}
 
 	controlBytes := appendLinuxPacketInfoControl(nil, secondLocal)
-	writes := []Message{
+	writes := []SocketMessage{
 		{Buffers: [][]byte{[]byte("ab"), []byte("cd")}, Addr: ipNetAddr(remote)},
 		{Buffers: [][]byte{[]byte("ef"), []byte("gh")}, OOB: controlBytes, Addr: ipNetAddr(remote)},
 	}
@@ -1457,7 +1457,7 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 			t.Fatalf("IP batch result %d = %+v", index, writes[index])
 		}
 	}
-	prefix := []Message{writes[0], {Buffers: nil, Addr: ipNetAddr(remote), N: 91, NN: 92, Flags: 93}}
+	prefix := []SocketMessage{writes[0], {Buffers: nil, Addr: ipNetAddr(remote), N: 91, NN: 92, Flags: 93}}
 	if n, err = connection.WriteBatch(prefix, 0); n != 1 || err != nil {
 		t.Fatalf("partial IP WriteBatch = %d, %v", n, err)
 	}
@@ -1475,7 +1475,7 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 	}
 	connected := connectedNet.(*IPConn)
 	defer connected.Close()
-	connectedMessage := []Message{{Buffers: [][]byte{[]byte("connected")}}}
+	connectedMessage := []SocketMessage{{Buffers: [][]byte{[]byte("connected")}}}
 	if n, err = connected.WriteBatch(connectedMessage, 0); n != 1 || err != nil {
 		t.Fatalf("connected IP WriteBatch = %d, %v", n, err)
 	}
@@ -1505,7 +1505,7 @@ func TestIPBatchWriteIPv6ChecksumAndFlowLabel(t *testing.T) {
 	defer connection.Close()
 	payload := []byte{128, 0, 0xaa, 0xbb, 0x12, 0x34, 0x56, 0x78, 1, 2, 3, 4}
 	original := append([]byte(nil), payload...)
-	messages := []Message{{Buffers: [][]byte{payload[:3], payload[3:7], payload[7:]}}}
+	messages := []SocketMessage{{Buffers: [][]byte{payload[:3], payload[3:7], payload[7:]}}}
 	if count, writeErr := connection.WriteBatch(messages, 0); writeErr != nil || count != 1 {
 		t.Fatalf("IPv6 ICMP WriteBatch = %d, %v", count, writeErr)
 	}
@@ -1541,7 +1541,7 @@ func TestIPBatchWriteFragmentedBuffers(t *testing.T) {
 	connection := netConnection.(*IPConn)
 	defer connection.Close()
 	payload := bytes.Repeat([]byte{0x6b}, 2000)
-	messages := []Message{{Buffers: [][]byte{payload[:511], payload[511:1700], payload[1700:]}}}
+	messages := []SocketMessage{{Buffers: [][]byte{payload[:511], payload[511:1700], payload[1700:]}}}
 	if count, writeErr := connection.WriteBatch(messages, 0); writeErr != nil || count != 1 || messages[0].N != len(payload) {
 		t.Fatalf("fragmented IP WriteBatch = %d, %v, message %+v", count, writeErr, messages[0])
 	}
@@ -1936,7 +1936,7 @@ func BenchmarkIPBatchWrite(b *testing.B) {
 				_ = stack.Close()
 			})
 			payload := make([]byte, payloadSize)
-			messages := make([]Message, batchSize)
+			messages := make([]SocketMessage, batchSize)
 			for index := range messages {
 				messages[index].Buffers = [][]byte{payload}
 				if buffersPerMessage == 2 {
