@@ -38,6 +38,69 @@ func TestICMPEchoInterop(t *testing.T) {
 	}
 }
 
+// TestPublicICMPMessageCodecInterop verifies that gVisor accepts an echo
+// request constructed by the public codec and that its native reply is decoded
+// by the same semantic API.
+func TestPublicICMPMessageCodecInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			captured := make(chan []byte, 4)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					select {
+					case captured <- append([]byte(nil), packet...):
+					default:
+					}
+					return false
+				},
+			})
+			messageType, protocol := uint8(8), mipstack.ProtocolICMPv4
+			if family.mipstackAddress.Is6() {
+				messageType, protocol = 128, mipstack.ProtocolICMPv6
+			}
+			body := append([]byte{0x12, 0x34, 0, 7}, []byte("public-icmp-codec")...)
+			message := mipstack.ICMPMessage{
+				Source: family.mipstackAddress, Destination: family.gvisorAddress,
+				Type: messageType, Body: body,
+			}
+			icmpWire, err := message.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public ICMP message: %v", err)
+			}
+			packet := mipstack.IPPacket{
+				Source: family.mipstackAddress, Destination: family.gvisorAddress,
+				Protocol: protocol, HopLimit: 64, Payload: icmpWire,
+			}
+			wire, err := packet.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public ICMP packet: %v", err)
+			}
+			if err = network.deliverToGVisor(wire); err != nil {
+				t.Fatalf("deliver public ICMP packet: %v", err)
+			}
+			select {
+			case responseWire := <-captured:
+				parsedPacket, parseErr := mipstack.ParseIPPacket(responseWire)
+				if parseErr != nil {
+					t.Fatalf("parse gVisor ICMP packet: %v", parseErr)
+				}
+				parsed, parseErr := parsedPacket.ICMPMessage()
+				wantType := uint8(0)
+				if family.mipstackAddress.Is6() {
+					wantType = 129
+				}
+				if parseErr != nil || parsed.Source != family.gvisorAddress || parsed.Destination != family.mipstackAddress || parsed.Type != wantType || parsed.Code != 0 || !bytes.Equal(parsed.Body, body) {
+					t.Fatalf("parsed gVisor ICMP = %+v, %v", parsed, parseErr)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("timed out waiting for gVisor ICMP reply")
+			}
+		})
+	}
+}
+
 // TestMipstackICMPFilterInterop verifies that native gVisor raw ICMP traffic
 // observes mipstack's Linux-compatible IPv4 and RFC 3542 IPv6 type filters.
 func TestMipstackICMPFilterInterop(t *testing.T) {

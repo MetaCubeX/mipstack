@@ -485,9 +485,9 @@ func (m ICMPForwarderMessage) IsEchoRequest() bool {
 	protocol := byte(0)
 	switch {
 	case m.Source.Is4() && m.Destination.Is4():
-		protocol = protocolICMPv4
+		protocol = ProtocolICMPv4
 	case m.Source.Is6() && m.Destination.Is6():
-		protocol = protocolICMPv6
+		protocol = ProtocolICMPv6
 	default:
 		return false
 	}
@@ -1193,7 +1193,7 @@ func (f *ICMPForwarder) Info() ForwarderInfo {
 
 // handleSegment coalesces one valid initial SYN into the bounded request set.
 func (f *TCPForwarder) handleSegment(segment tcpSegment, key tcpKey) bool {
-	if key.remote.Port() == 0 || segment.flags&tcpFlagSYN == 0 || segment.flags&(tcpFlagACK|tcpFlagRST|tcpFlagFIN) != 0 {
+	if key.remote.Port() == 0 || segment.flags&TCPFlagSYN == 0 || segment.flags&(TCPFlagACK|TCPFlagRST|TCPFlagFIN) != 0 {
 		return false
 	}
 	f.mu.Lock()

@@ -3,20 +3,331 @@ package mipstack
 import (
 	"encoding/binary"
 	"net/netip"
+	"syscall"
 )
 
 const (
+	// ProtocolICMPv4 is the IPv4 Internet Control Message Protocol number.
+	ProtocolICMPv4 = 1
+	// ProtocolTCP is the Transmission Control Protocol number.
+	ProtocolTCP = 6
+	// ProtocolUDP is the User Datagram Protocol number.
+	ProtocolUDP = 17
+	// ProtocolICMPv6 is the IPv6 Internet Control Message Protocol number.
+	ProtocolICMPv6 = 58
+
 	// ipv6MaximumFlowLabel is the 20-bit RFC 8200 Flow Label ceiling.
 	ipv6MaximumFlowLabel = 1<<20 - 1
-	// protocolICMPv4 is the IPv4 ICMP protocol number.
-	protocolICMPv4 = byte(1)
-	// protocolTCP is the TCP protocol number.
-	protocolTCP = byte(6)
-	// protocolUDP is the UDP protocol number.
-	protocolUDP = byte(17)
-	// protocolICMPv6 is the ICMPv6 next-header number.
-	protocolICMPv6 = byte(58)
 )
+
+// IPPacket is the semantic representation of one complete, unfragmented IPv4
+// or IPv6 packet. For IPv6, Protocol is the base header's immediate Next
+// Header value and Payload includes any extension headers. ParseIPPacket
+// borrows IPv4Options and Payload from its input; callers must replace or copy
+// those slices before modifying data they do not own. Construction normalizes
+// IPv4-mapped IPv6 addresses to IPv4.
+type IPPacket struct {
+	// Source is the packet's source address.
+	Source netip.Addr
+	// Destination is the packet's destination address.
+	Destination netip.Addr
+	// Protocol is the IPv4 Protocol or IPv6 base-header Next Header value.
+	Protocol int
+	// HopLimit is the IPv4 TTL or IPv6 Hop Limit, including an explicit zero.
+	HopLimit int
+	// TrafficClass is the complete IPv4 TOS or IPv6 Traffic Class byte.
+	TrafficClass int
+	// FlowLabel is the IPv6 Flow Label and must be zero for IPv4.
+	FlowLabel uint32
+	// Identification is the IPv4 Identification field and must be zero for IPv6.
+	Identification uint16
+	// DontFragment is the IPv4 Don't Fragment flag and must be false for IPv6.
+	DontFragment bool
+	// IPv4Options contains the exact IPv4 option area, including parsed padding.
+	// Construction also accepts an unpadded option sequence and adds zero padding.
+	IPv4Options []byte
+	// Payload is the complete IP payload. It includes IPv6 extension headers.
+	Payload []byte
+}
+
+// ParseIPPacket validates packet and returns a zero-copy semantic value. It
+// validates declared lengths, the IPv4 header checksum, option framing, IPv6
+// extension framing, and extension placement. Stateful fragment reassembly is
+// outside this codec, so non-atomic fragments are rejected. Bytes beyond the
+// declared IP length are ignored as link-layer padding.
+func ParseIPPacket(packet []byte) (IPPacket, error) {
+	if len(packet) == 0 {
+		return IPPacket{}, syscall.EINVAL
+	}
+	switch packet[0] >> 4 {
+	case 4:
+		if len(packet) < 20 {
+			return IPPacket{}, syscall.EINVAL
+		}
+		headerSize := int(packet[0]&0x0f) * 4
+		totalSize := int(binary.BigEndian.Uint16(packet[2:4]))
+		fragment := binary.BigEndian.Uint16(packet[6:8])
+		if headerSize < 20 || totalSize < headerSize || totalSize > len(packet) || fragment&0x8000 != 0 || fragment&0x3fff != 0 || checksum(packet[:headerSize]) != 0 {
+			return IPPacket{}, syscall.EINVAL
+		}
+		options := packet[20:headerSize]
+		if !validIPv4OptionsForCodec(options) {
+			return IPPacket{}, syscall.EINVAL
+		}
+		return IPPacket{
+			Source: netip.AddrFrom4([4]byte(packet[12:16])), Destination: netip.AddrFrom4([4]byte(packet[16:20])),
+			Protocol: int(packet[9]), HopLimit: int(packet[8]), TrafficClass: int(packet[1]),
+			Identification: binary.BigEndian.Uint16(packet[4:6]), DontFragment: fragment&0x4000 != 0,
+			IPv4Options: options, Payload: packet[headerSize:totalSize],
+		}, nil
+	case 6:
+		if len(packet) < 40 {
+			return IPPacket{}, syscall.EINVAL
+		}
+		payloadSize := int(binary.BigEndian.Uint16(packet[4:6]))
+		end := 40 + payloadSize
+		if end > len(packet) {
+			return IPPacket{}, syscall.EINVAL
+		}
+		source, destination := netip.AddrFrom16([16]byte(packet[8:24])), netip.AddrFrom16([16]byte(packet[24:40]))
+		if source.Is4In6() || destination.Is4In6() {
+			return IPPacket{}, syscall.EINVAL
+		}
+		result := IPPacket{
+			Source: source, Destination: destination,
+			Protocol: int(packet[6]), HopLimit: int(packet[7]),
+			TrafficClass: int(packet[0]&0x0f)<<4 | int(packet[1]>>4),
+			FlowLabel:    uint32(packet[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(packet[2:4])),
+			Payload:      packet[40:end],
+		}
+		if _, _, _, err := result.upperLayer(); err != nil {
+			return IPPacket{}, err
+		}
+		return result, nil
+	default:
+		return IPPacket{}, syscall.EINVAL
+	}
+}
+
+// UpperLayer returns the final IPv4 protocol or IPv6 Next Header value and
+// the corresponding upper-layer bytes. The returned slice aliases Payload.
+// For IPv6 it walks supported extension headers without applying Stack routing
+// or option-admission policy.
+func (p IPPacket) UpperLayer() (protocol int, payload []byte, err error) {
+	protocol, payload, _, err = p.upperLayer()
+	return
+}
+
+// upperLayer locates the final protocol and reports whether the base source
+// and destination are safe to use as a transport pseudo-header. Active IPv4
+// source routes and IPv6 routing headers remain inspectable through
+// UpperLayer, but protocol decoders reject them rather than validate a
+// checksum against an address that an IPv4 source route, IPv6 routing header,
+// or Mobile IPv6 Home Address option replaces for upper-layer processing.
+func (p IPPacket) upperLayer() (protocol int, payload []byte, pseudoHeaderSafe bool, err error) {
+	source, destination := p.Source.Unmap(), p.Destination.Unmap()
+	if !source.IsValid() || !destination.IsValid() || p.Source.Zone() != "" || p.Destination.Zone() != "" ||
+		source.Is4() != destination.Is4() || p.Protocol < 0 || p.Protocol > 255 {
+		return 0, nil, false, syscall.EINVAL
+	}
+	if source.Is4() {
+		if len(p.IPv4Options) > 40 || !validIPv4OptionsForCodec(p.IPv4Options) {
+			return 0, nil, false, syscall.EINVAL
+		}
+		return p.Protocol, p.Payload, !hasActiveIPv4SourceRoute(p.IPv4Options), nil
+	}
+	if len(p.IPv4Options) != 0 {
+		return 0, nil, false, syscall.EINVAL
+	}
+	next, upper, pseudoHeaderUnsafe, ok := walkIPv6UpperLayer(byte(p.Protocol), p.Payload)
+	if !ok {
+		return 0, nil, false, syscall.EINVAL
+	}
+	return int(next), upper, !pseudoHeaderUnsafe, nil
+}
+
+// upperLayerForProtocol returns one expected upper-layer payload and reports
+// whether the base IP addresses are safe to use in a checksum pseudo-header.
+func (p IPPacket) upperLayerForProtocol(protocol byte) ([]byte, bool, error) {
+	actual, payload, pseudoHeaderSafe, err := p.upperLayer()
+	if err != nil {
+		return nil, false, err
+	}
+	if actual != int(protocol) {
+		return nil, false, syscall.EPROTONOSUPPORT
+	}
+	return payload, pseudoHeaderSafe, nil
+}
+
+// MarshalBinary returns the complete packet wire encoding. It is semantically
+// identical to AppendBinary(nil).
+func (p IPPacket) MarshalBinary() ([]byte, error) { return p.AppendBinary(nil) }
+
+// AppendBinary appends the complete packet wire encoding to dst. It validates
+// every field and the extension chain before changing dst and does not retain
+// any input slice. The destination may share backing storage with IPv4Options
+// or Payload. It calculates the IPv4 header checksum but never calculates an
+// upper-layer checksum; callers must encode any TCP, UDP, or ICMP value before
+// assigning it to Payload. On validation failure it returns the original dst
+// unchanged.
+func (p IPPacket) AppendBinary(dst []byte) ([]byte, error) {
+	normalized, headerSize, totalSize, err := p.wireLayout()
+	if err != nil {
+		return dst, err
+	}
+	start := len(dst)
+	dst = extendForAppend(dst, totalSize)
+	marshalPublicIPPacket(dst[start:], normalized, headerSize)
+	return dst, nil
+}
+
+// extendForAppend exposes reusable capacity without clearing bytes that a
+// zero-copy parsed value may still borrow from the same backing array.
+func extendForAppend(dst []byte, size int) []byte {
+	if size <= cap(dst)-len(dst) {
+		return dst[:len(dst)+size]
+	}
+	return append(dst, make([]byte, size)...)
+}
+
+// wireLayout validates p, normalizes IPv4-mapped addresses, and returns its
+// exact base-header and packet lengths.
+func (p IPPacket) wireLayout() (IPPacket, int, int, error) {
+	if p.Source.Zone() != "" || p.Destination.Zone() != "" {
+		return IPPacket{}, 0, 0, syscall.EINVAL
+	}
+	p.Source, p.Destination = p.Source.Unmap(), p.Destination.Unmap()
+	if !p.Source.IsValid() || !p.Destination.IsValid() || p.Source.Is4() != p.Destination.Is4() ||
+		p.Protocol < 0 || p.Protocol > 255 || p.HopLimit < 0 || p.HopLimit > 255 ||
+		p.TrafficClass < 0 || p.TrafficClass > 255 {
+		return IPPacket{}, 0, 0, syscall.EINVAL
+	}
+	if p.Source.Is4() {
+		if p.FlowLabel != 0 || len(p.IPv4Options) > 40 || !validIPv4OptionsForCodec(p.IPv4Options) {
+			return IPPacket{}, 0, 0, syscall.EINVAL
+		}
+		headerSize := 20 + (len(p.IPv4Options)+3)&^3
+		if len(p.Payload) > 65535-headerSize {
+			return IPPacket{}, 0, 0, syscall.EMSGSIZE
+		}
+		return p, headerSize, headerSize + len(p.Payload), nil
+	}
+	if p.FlowLabel > ipv6MaximumFlowLabel || p.Identification != 0 || p.DontFragment || len(p.IPv4Options) != 0 {
+		return IPPacket{}, 0, 0, syscall.EINVAL
+	}
+	if len(p.Payload) > 65535 {
+		return IPPacket{}, 0, 0, syscall.EMSGSIZE
+	}
+	if _, _, _, err := p.upperLayer(); err != nil {
+		return IPPacket{}, 0, 0, err
+	}
+	return p, 40, 40 + len(p.Payload), nil
+}
+
+// marshalPublicIPPacket writes one already validated public packet. Payload is
+// copied before its header so an in-place AppendBinary can reuse a payload
+// suffix.
+func marshalPublicIPPacket(dst []byte, p IPPacket, headerSize int) {
+	if p.Source.Is4() {
+		var options [40]byte
+		copy(options[:], p.IPv4Options)
+		copy(dst[headerSize:], p.Payload)
+		copy(dst[20:headerSize], options[:len(p.IPv4Options)])
+		for index := 20 + len(p.IPv4Options); index < headerSize; index++ {
+			dst[index] = 0
+		}
+		dst[0], dst[1], dst[8], dst[9] = 0x40|byte(headerSize/4), byte(p.TrafficClass), byte(p.HopLimit), byte(p.Protocol)
+		binary.BigEndian.PutUint16(dst[2:4], uint16(len(dst)))
+		binary.BigEndian.PutUint16(dst[4:6], p.Identification)
+		fragment := uint16(0)
+		if p.DontFragment {
+			fragment = 0x4000
+		}
+		binary.BigEndian.PutUint16(dst[6:8], fragment)
+		source, destination := p.Source.As4(), p.Destination.As4()
+		copy(dst[12:16], source[:])
+		copy(dst[16:20], destination[:])
+		binary.BigEndian.PutUint16(dst[10:12], 0)
+		binary.BigEndian.PutUint16(dst[10:12], checksum(dst[:headerSize]))
+		return
+	}
+	copy(dst[headerSize:], p.Payload)
+	normalizeIPv6ExtensionFields(byte(p.Protocol), dst[headerSize:])
+	dst[0] = 0x60 | byte(p.TrafficClass)>>4
+	dst[1] = byte(p.TrafficClass)<<4 | byte(p.FlowLabel>>16)
+	binary.BigEndian.PutUint16(dst[2:4], uint16(p.FlowLabel))
+	binary.BigEndian.PutUint16(dst[4:6], uint16(len(dst)-40))
+	dst[6], dst[7] = byte(p.Protocol), byte(p.HopLimit)
+	source, destination := p.Source.As16(), p.Destination.As16()
+	copy(dst[8:24], source[:])
+	copy(dst[24:40], destination[:])
+}
+
+// normalizeIPv6ExtensionFields applies RFC 8200's sender requirements to a
+// validated extension chain. Receivers ignore these fields, so parsing keeps
+// the original bytes available while every newly encoded packet writes zeros.
+func normalizeIPv6ExtensionFields(first byte, payload []byte) {
+	next, offset := first, 0
+	for offset <= len(payload) {
+		switch next {
+		case 0, 60:
+			length := (int(payload[offset+1]) + 1) * 8
+			for optionOffset := offset + 2; optionOffset < offset+length; {
+				kind := payload[optionOffset]
+				if kind == 0 {
+					optionOffset++
+					continue
+				}
+				optionLength := int(payload[optionOffset+1])
+				if kind == 1 {
+					for index := optionOffset + 2; index < optionOffset+2+optionLength; index++ {
+						payload[index] = 0
+					}
+				}
+				optionOffset += optionLength + 2
+			}
+			next, offset = payload[offset], offset+length
+		case 43:
+			length := (int(payload[offset+1]) + 1) * 8
+			next, offset = payload[offset], offset+length
+		case 44:
+			next = payload[offset]
+			payload[offset+1] = 0
+			field := binary.BigEndian.Uint16(payload[offset+2 : offset+4])
+			binary.BigEndian.PutUint16(payload[offset+2:offset+4], field&^0x0006)
+			offset += 8
+		default:
+			return
+		}
+	}
+}
+
+// InternetChecksum computes the RFC 1071 one's-complement checksum of data.
+// A caller generating a checksummed header must clear its checksum field
+// first; computing over a complete valid checksummed region returns zero.
+func InternetChecksum(data []byte) uint16 { return checksum(data) }
+
+// IPTransportChecksum computes an IPv4 or IPv6 pseudo-header checksum over
+// payload. Protocol must be between 0 and 255, payload must not exceed 65535
+// bytes, and both addresses must be valid, unzoned members of the same family.
+// IPv4-mapped IPv6 addresses are normalized to IPv4. A caller generating a
+// transport header must clear its checksum field first and apply any
+// protocol-specific wire rule; in particular, RFC 768 represents a computed
+// UDP checksum of zero as 0xffff. Computing over a complete valid checksummed
+// payload returns zero.
+func IPTransportChecksum(source, destination netip.Addr, protocol int, payload []byte) (uint16, error) {
+	if source.Zone() != "" || destination.Zone() != "" {
+		return 0, syscall.EINVAL
+	}
+	source, destination = source.Unmap(), destination.Unmap()
+	if !source.IsValid() || !destination.IsValid() || source.Is4() != destination.Is4() || protocol < 0 || protocol > 255 {
+		return 0, syscall.EINVAL
+	}
+	if len(payload) > 65535 {
+		return 0, syscall.EMSGSIZE
+	}
+	return transportChecksum(source, destination, byte(protocol), payload), nil
+}
 
 // ipPacket is a validated, complete IP packet and its upper-layer payload.
 type ipPacket struct {
@@ -211,16 +522,15 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 			return ipPacket{}, false
 		}
 		payloadSize := int(binary.BigEndian.Uint16(packet[4:6]))
-		if payloadSize == 0 && len(packet) > 40 {
-			// Jumbo Payload options are intentionally unsupported.
-			return ipPacket{}, false
-		}
 		end := 40 + payloadSize
 		if end > len(packet) {
 			return ipPacket{}, false
 		}
 		source := netip.AddrFrom16([16]byte(packet[8:24]))
 		target := netip.AddrFrom16([16]byte(packet[24:40]))
+		if source.Is4In6() || target.Is4In6() {
+			return ipPacket{}, false
+		}
 		flowLabel := uint32(packet[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(packet[2:4]))
 		next, nextOffset, offset := packet[6], 6, 40
 		seenHop := false
@@ -311,6 +621,149 @@ func (p ipPacket) hasRouterAlert() bool {
 	}
 	length := (int(p.original[41]) + 1) * 8
 	return length <= len(p.original)-40 && ipv6RouterAlert(p.original[40:40+length])
+}
+
+// walkIPv6UpperLayer validates supported extension-header framing and returns
+// the final upper-layer view. Unknown option action bits are codec data, not
+// host admission policy, and therefore do not make the public packet invalid.
+func walkIPv6UpperLayer(first byte, payload []byte) (protocol byte, upper []byte, pseudoHeaderUnsafe, ok bool) {
+	next, offset := first, 0
+	seenHop := false
+	for offset <= len(payload) {
+		switch next {
+		case 0, 60:
+			if next == 0 && (offset != 0 || seenHop) || len(payload)-offset < 8 {
+				return 0, nil, false, false
+			}
+			length := (int(payload[offset+1]) + 1) * 8
+			if length > len(payload)-offset {
+				return 0, nil, false, false
+			}
+			valid, homeAddress, jumboPayload := inspectIPv6OptionsForCodec(payload[offset : offset+length])
+			if !valid || jumboPayload {
+				return 0, nil, false, false
+			}
+			pseudoHeaderUnsafe = pseudoHeaderUnsafe || homeAddress
+			if next == 0 {
+				seenHop = true
+			}
+			next, offset = payload[offset], offset+length
+		case 43:
+			if len(payload)-offset < 8 {
+				return 0, nil, false, false
+			}
+			length := (int(payload[offset+1]) + 1) * 8
+			if length > len(payload)-offset {
+				return 0, nil, false, false
+			}
+			pseudoHeaderUnsafe = pseudoHeaderUnsafe || payload[offset+3] != 0
+			next, offset = payload[offset], offset+length
+		case 44:
+			// Only atomic fragments contain a complete upper-layer unit. The
+			// two reserved bits are ignored as RFC 8200 requires.
+			if len(payload)-offset < 8 || binary.BigEndian.Uint16(payload[offset+2:offset+4])&0xfff9 != 0 {
+				return 0, nil, false, false
+			}
+			next, offset = payload[offset], offset+8
+		case 59:
+			// RFC 8200 requires receivers to ignore bytes following No Next
+			// Header. IPPacket.Payload still preserves them for round trips.
+			return next, nil, pseudoHeaderUnsafe, true
+		default:
+			return next, payload[offset:], pseudoHeaderUnsafe, true
+		}
+	}
+	return 0, nil, false, false
+}
+
+// validIPv4OptionsForCodec validates only the wire framing of IPv4 options.
+// Host policy such as source-route rejection remains in validateIPv4Options.
+func validIPv4OptionsForCodec(options []byte) bool {
+	for offset := 0; offset < len(options); {
+		switch options[offset] {
+		case 0:
+			for _, padding := range options[offset+1:] {
+				if padding != 0 {
+					return false
+				}
+			}
+			return true
+		case 1:
+			offset++
+			continue
+		}
+		if len(options)-offset < 2 {
+			return false
+		}
+		length := int(options[offset+1])
+		if length < 2 || length > len(options)-offset {
+			return false
+		}
+		offset += length
+	}
+	return true
+}
+
+// hasActiveIPv4SourceRoute reports a loose or strict source route whose next
+// address has not yet been consumed. Malformed source-route metadata is also
+// unsafe because the base destination cannot be trusted for a pseudo-header.
+func hasActiveIPv4SourceRoute(options []byte) bool {
+	for offset := 0; offset < len(options); {
+		kind := options[offset]
+		if kind == 0 {
+			return false
+		}
+		if kind == 1 {
+			offset++
+			continue
+		}
+		if len(options)-offset < 2 {
+			return false
+		}
+		length := int(options[offset+1])
+		if length < 2 || length > len(options)-offset {
+			return false
+		}
+		if kind == 131 || kind == 137 {
+			if length < 3 {
+				return true
+			}
+			pointer := int(options[offset+2])
+			if pointer < 4 || pointer <= length {
+				return true
+			}
+		}
+		offset += length
+	}
+	return false
+}
+
+// inspectIPv6OptionsForCodec validates one complete Hop-by-Hop or Destination
+// Options header and reports options that require state outside the standalone
+// codec. RFC 6275 substitutes a Home Address into upper-layer pseudo-headers.
+// RFC 2675's Jumbo Payload option changes IPv6 length and transport-checksum
+// semantics, and mipstack intentionally does not support jumbograms.
+func inspectIPv6OptionsForCodec(header []byte) (valid, homeAddress, jumboPayload bool) {
+	if len(header) < 8 || len(header)%8 != 0 {
+		return false, false, false
+	}
+	for offset := 2; offset < len(header); {
+		if header[offset] == 0 {
+			offset++
+			continue
+		}
+		if len(header)-offset < 2 {
+			return false, false, false
+		}
+		length := int(header[offset+1]) + 2
+		if length > len(header)-offset {
+			return false, false, false
+		}
+		homeAddress = homeAddress || header[offset] == 201
+		jumboPayload = jumboPayload || header[offset] == 194
+		offset += length
+	}
+	return true, homeAddress, jumboPayload
 }
 
 // ipv4RouterAlert reports a well-formed, zero-valued RFC 2113 option.

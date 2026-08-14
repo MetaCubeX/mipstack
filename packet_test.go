@@ -2,10 +2,28 @@ package mipstack
 
 import (
 	"bytes"
+	"encoding"
 	"encoding/binary"
+	"errors"
 	"net/netip"
+	"syscall"
 	"testing"
 	"time"
+)
+
+type binaryAppender interface {
+	AppendBinary([]byte) ([]byte, error)
+}
+
+var (
+	_ encoding.BinaryMarshaler = IPPacket{}
+	_ encoding.BinaryMarshaler = TCPSegment{}
+	_ encoding.BinaryMarshaler = UDPDatagram{}
+	_ encoding.BinaryMarshaler = ICMPMessage{}
+	_ binaryAppender           = IPPacket{}
+	_ binaryAppender           = TCPSegment{}
+	_ binaryAppender           = UDPDatagram{}
+	_ binaryAppender           = ICMPMessage{}
 )
 
 func referenceChecksum(data []byte) uint16 {
@@ -52,12 +70,12 @@ func TestTransportChecksumMatchesReference(t *testing.T) {
 			pseudoHeader = append(pseudoHeader, test.source.AsSlice()...)
 			pseudoHeader = append(pseudoHeader, test.target.AsSlice()...)
 			if test.source.Is4() {
-				pseudoHeader = append(pseudoHeader, 0, protocolTCP, byte(size>>8), byte(size))
+				pseudoHeader = append(pseudoHeader, 0, ProtocolTCP, byte(size>>8), byte(size))
 			} else {
-				pseudoHeader = append(pseudoHeader, byte(size>>24), byte(size>>16), byte(size>>8), byte(size), 0, 0, 0, protocolTCP)
+				pseudoHeader = append(pseudoHeader, byte(size>>24), byte(size>>16), byte(size>>8), byte(size), 0, 0, 0, ProtocolTCP)
 			}
 			pseudoHeader = append(pseudoHeader, payload[:size]...)
-			if got, want := transportChecksum(test.source, test.target, protocolTCP, payload[:size]), referenceChecksum(pseudoHeader); got != want {
+			if got, want := transportChecksum(test.source, test.target, ProtocolTCP, payload[:size]), referenceChecksum(pseudoHeader); got != want {
 				t.Fatalf("%s transport checksum at length %d = %#x, want %#x", test.name, size, got, want)
 			}
 		}
@@ -73,21 +91,547 @@ func TestTransportChecksumPartsMatchesContiguousPayload(t *testing.T) {
 		{netip.MustParseAddr("192.0.2.17"), netip.MustParseAddr("198.51.100.17")},
 		{netip.MustParseAddr("2001:db8::17"), netip.MustParseAddr("2001:db8:1::17")},
 	} {
-		want := transportChecksum(addresses[0], addresses[1], protocolUDP, payload)
+		want := transportChecksum(addresses[0], addresses[1], ProtocolUDP, payload)
 		for split := 0; split <= len(payload); split++ {
-			if got := transportChecksumParts(addresses[0], addresses[1], protocolUDP, len(payload), payload[:split], payload[split:]); got != want {
+			if got := transportChecksumParts(addresses[0], addresses[1], ProtocolUDP, len(payload), payload[:split], payload[split:]); got != want {
 				t.Fatalf("%s split %d checksum = %#x, want %#x", addresses[0], split, got, want)
 			}
 		}
 	}
 }
 
+func TestPublicIPPacketCodec(t *testing.T) {
+	tests := []IPPacket{
+		{
+			Source: netip.MustParseAddr("192.0.2.10"), Destination: netip.MustParseAddr("198.51.100.20"),
+			Protocol: 99, HopLimit: 0, TrafficClass: 0xab, Identification: 0x1234, DontFragment: true,
+			IPv4Options: []byte{1, 148, 4, 0, 0}, Payload: []byte("ipv4-codec-payload"),
+		},
+		{
+			Source: netip.MustParseAddr("2001:db8::10"), Destination: netip.MustParseAddr("2001:db8::20"),
+			Protocol: 60, HopLimit: 0, TrafficClass: 0xab, FlowLabel: 0xabcde,
+			Payload: append([]byte{99, 0, 0x80, 0, 0, 0, 0, 0}, []byte("ipv6-upper-layer")...),
+		},
+	}
+	for _, test := range tests {
+		name := "IPv4"
+		if test.Source.Is6() {
+			name = "IPv6"
+		}
+		t.Run(name, func(t *testing.T) {
+			prefix := []byte{0xaa, 0xbb, 0xcc}
+			wire, err := test.AppendBinary(append([]byte(nil), prefix...))
+			if err != nil {
+				t.Fatalf("append packet: %v", err)
+			}
+			if !bytes.Equal(wire[:len(prefix)], prefix) {
+				t.Fatal("AppendBinary changed the destination prefix")
+			}
+			wire = wire[len(prefix):]
+			parsed, err := ParseIPPacket(wire)
+			if err != nil {
+				t.Fatalf("parse packet: %v", err)
+			}
+			if parsed.Source != test.Source || parsed.Destination != test.Destination || parsed.Protocol != test.Protocol || parsed.HopLimit != 0 || parsed.TrafficClass != test.TrafficClass || parsed.FlowLabel != test.FlowLabel || parsed.Identification != test.Identification || parsed.DontFragment != test.DontFragment {
+				t.Fatalf("parsed packet metadata = %+v, want %+v", parsed, test)
+			}
+			protocol, upper, err := parsed.UpperLayer()
+			if err != nil {
+				t.Fatalf("locate upper layer: %v", err)
+			}
+			wantProtocol, wantUpper := test.Protocol, test.Payload
+			if test.Source.Is6() {
+				wantProtocol, wantUpper = 99, test.Payload[8:]
+			}
+			if protocol != wantProtocol || !bytes.Equal(upper, wantUpper) {
+				t.Fatalf("upper layer = protocol %d payload %x, want %d %x", protocol, upper, wantProtocol, wantUpper)
+			}
+			roundTrip, err := parsed.MarshalBinary()
+			if err != nil || !bytes.Equal(roundTrip, wire) {
+				t.Fatalf("packet round trip: error=%v\n got %x\nwant %x", err, roundTrip, wire)
+			}
+			inPlace := append([]byte(nil), wire...)
+			inPlacePacket, err := ParseIPPacket(inPlace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			inPlaceResult, appendErr := inPlacePacket.AppendBinary(inPlace[:0])
+			if appendErr != nil || len(inPlaceResult) == 0 || &inPlaceResult[0] != &inPlace[0] || !bytes.Equal(inPlaceResult, wire) {
+				t.Fatalf("in-place packet round trip: error=%v\n got %x\nwant %x", appendErr, inPlaceResult, wire)
+			}
+		})
+	}
+}
+
+// TestPublicCodecAppendBinaryOverlappingOptions covers a caller reusing a parsed
+// wire buffer after selecting an option subslice that the shifted payload will
+// overwrite. AppendBinary must read all semantic fields before changing dst.
+func TestPublicCodecAppendBinaryOverlappingOptions(t *testing.T) {
+	ip := IPPacket{
+		Source: netip.MustParseAddr("192.0.2.10"), Destination: netip.MustParseAddr("198.51.100.20"),
+		Protocol: 99, HopLimit: 64, IPv4Options: []byte{1, 1, 1, 1, 148, 4, 0, 0}, Payload: []byte("overlapping-ip-options"),
+	}
+	ipWire, err := ip.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedIP, err := ParseIPPacket(ipWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedIP.IPv4Options = parsedIP.IPv4Options[4:8]
+	wantIP := parsedIP
+	wantIP.IPv4Options = append([]byte(nil), parsedIP.IPv4Options...)
+	wantIP.Payload = append([]byte(nil), parsedIP.Payload...)
+	wantIPWire, err := wantIP.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedIP, err := parsedIP.AppendBinary(ipWire[:0])
+	if err != nil || len(encodedIP) == 0 || &encodedIP[0] != &ipWire[0] || !bytes.Equal(encodedIP, wantIPWire) {
+		t.Fatalf("overlapping IPv4 options: error=%v\n got %x\nwant %x", err, encodedIP, wantIPWire)
+	}
+
+	segment := TCPSegment{
+		Source: netip.MustParseAddrPort("192.0.2.10:1234"), Destination: netip.MustParseAddrPort("198.51.100.20:443"),
+		Flags: TCPFlagACK, Options: []byte{1, 1, 1, 1, 2, 4, 5, 180}, Payload: []byte("overlapping-tcp-options"),
+	}
+	tcpWire, err := segment.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedSegment, err := (IPPacket{
+		Source: segment.Source.Addr(), Destination: segment.Destination.Addr(), Protocol: ProtocolTCP, Payload: tcpWire,
+	}).TCPSegment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedSegment.Options = parsedSegment.Options[4:8]
+	wantSegment := parsedSegment
+	wantSegment.Options = append([]byte(nil), parsedSegment.Options...)
+	wantSegment.Payload = append([]byte(nil), parsedSegment.Payload...)
+	wantTCPWire, err := wantSegment.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedTCP, err := parsedSegment.AppendBinary(tcpWire[:0])
+	if err != nil || len(encodedTCP) == 0 || &encodedTCP[0] != &tcpWire[0] || !bytes.Equal(encodedTCP, wantTCPWire) {
+		t.Fatalf("overlapping TCP options: error=%v\n got %x\nwant %x", err, encodedTCP, wantTCPWire)
+	}
+}
+
+// TestPublicCodecAppendBinaryOverlappingInput verifies the natural zero-copy
+// round-trip pattern where a parsed value still borrows the destination's
+// backing array and AppendBinary reuses that array from length zero.
+func TestPublicCodecAppendBinaryOverlappingInput(t *testing.T) {
+	type appendTest struct {
+		name   string
+		wire   []byte
+		append func([]byte) ([]byte, error)
+	}
+	tests := []appendTest{}
+
+	ipWire, err := (IPPacket{
+		Source: netip.MustParseAddr("192.0.2.10"), Destination: netip.MustParseAddr("198.51.100.20"),
+		Protocol: 99, HopLimit: 64, IPv4Options: []byte{1, 148, 4, 0, 0}, Payload: []byte("overlapping-ip-payload"),
+	}).AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedIP, err := ParseIPPacket(ipWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests = append(tests, appendTest{"IP", ipWire, parsedIP.AppendBinary})
+
+	tcpWire, err := (TCPSegment{
+		Source: netip.MustParseAddrPort("192.0.2.10:1234"), Destination: netip.MustParseAddrPort("198.51.100.20:443"),
+		Flags: TCPFlagACK, Options: []byte{2, 4, 5, 180, 1}, Payload: []byte("overlapping-tcp-payload"),
+	}).AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedTCP, err := (IPPacket{
+		Source: netip.MustParseAddr("192.0.2.10"), Destination: netip.MustParseAddr("198.51.100.20"),
+		Protocol: ProtocolTCP, Payload: tcpWire,
+	}).TCPSegment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests = append(tests, appendTest{"TCP", tcpWire, parsedTCP.AppendBinary})
+
+	udpWire, err := (UDPDatagram{
+		Source: netip.MustParseAddrPort("192.0.2.10:1234"), Destination: netip.MustParseAddrPort("198.51.100.20:53"),
+		Payload: []byte("overlapping-udp-payload"),
+	}).AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedUDP, err := (IPPacket{
+		Source: netip.MustParseAddr("192.0.2.10"), Destination: netip.MustParseAddr("198.51.100.20"),
+		Protocol: ProtocolUDP, Payload: udpWire,
+	}).UDPDatagram()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests = append(tests, appendTest{"UDP", udpWire, parsedUDP.AppendBinary})
+
+	icmpWire, err := (ICMPMessage{
+		Source: netip.MustParseAddr("192.0.2.10"), Destination: netip.MustParseAddr("198.51.100.20"),
+		Type: 8, Body: []byte{0x12, 0x34, 0, 1, 'e', 'c', 'h', 'o'},
+	}).AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedICMP, err := (IPPacket{
+		Source: netip.MustParseAddr("192.0.2.10"), Destination: netip.MustParseAddr("198.51.100.20"),
+		Protocol: ProtocolICMPv4, Payload: icmpWire,
+	}).ICMPMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests = append(tests, appendTest{"ICMP", icmpWire, parsedICMP.AppendBinary})
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			want := append([]byte(nil), test.wire...)
+			got, appendErr := test.append(test.wire[:0])
+			if appendErr != nil || !bytes.Equal(got, want) {
+				t.Fatalf("overlapping AppendBinary: error=%v\n got %x\nwant %x", appendErr, got, want)
+			}
+		})
+	}
+}
+
+func TestPublicIPPacketCodecPolicyBoundary(t *testing.T) {
+	// A codec may preserve source routing while transport decoding refuses to
+	// use the base destination in a pseudo-header checksum.
+	ipv4 := IPPacket{
+		Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"), Protocol: ProtocolTCP,
+		HopLimit: 64, IPv4Options: []byte{131, 7, 4, 203, 0, 113, 1}, Payload: make([]byte, tcpHeaderSize),
+	}
+	wire, err := ipv4.AppendBinary(nil)
+	if err != nil {
+		t.Fatalf("marshal source-routed IPv4: %v", err)
+	}
+	parsed, err := ParseIPPacket(wire)
+	if err != nil {
+		t.Fatalf("parse source-routed IPv4: %v", err)
+	}
+	if _, err = parsed.TCPSegment(); !errors.Is(err, syscall.EPROTONOSUPPORT) {
+		t.Fatalf("source-routed TCP error = %v, want EPROTONOSUPPORT", err)
+	}
+	icmpPayload, err := (ICMPMessage{
+		Source: ipv4.Source, Destination: ipv4.Destination, Type: 8, Body: []byte{0, 1, 0, 2},
+	}).AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceRoutedICMP := ipv4
+	sourceRoutedICMP.Protocol, sourceRoutedICMP.Payload = ProtocolICMPv4, icmpPayload
+	if _, err = sourceRoutedICMP.ICMPMessage(); err != nil {
+		t.Fatalf("decode source-routed ICMPv4 without a pseudo-header: %v", err)
+	}
+	uncheckedUDPPayload, err := (UDPDatagram{
+		Source: netip.AddrPortFrom(ipv4.Source, 1234), Destination: netip.AddrPortFrom(ipv4.Destination, 53),
+		ChecksumDisabled: true,
+	}).AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceRoutedUDP := ipv4
+	sourceRoutedUDP.Protocol, sourceRoutedUDP.Payload = ProtocolUDP, uncheckedUDPPayload
+	if _, err = sourceRoutedUDP.UDPDatagram(); err != nil {
+		t.Fatalf("decode source-routed IPv4 UDP without a pseudo-header checksum: %v", err)
+	}
+	checkedUDPPayload, err := (UDPDatagram{
+		Source: netip.AddrPortFrom(ipv4.Source, 1234), Destination: netip.AddrPortFrom(ipv4.Destination, 53),
+	}).AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceRoutedUDP.Payload = checkedUDPPayload
+	if _, err = sourceRoutedUDP.UDPDatagram(); !errors.Is(err, syscall.EPROTONOSUPPORT) {
+		t.Fatalf("source-routed checksummed UDP error = %v, want EPROTONOSUPPORT", err)
+	}
+	exhaustedSegment := TCPSegment{
+		Source: netip.MustParseAddrPort("192.0.2.1:1234"), Destination: netip.MustParseAddrPort("192.0.2.2:443"),
+		Flags: TCPFlagACK,
+	}
+	exhaustedPayload, err := exhaustedSegment.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exhausted := ipv4
+	exhausted.IPv4Options = []byte{131, 7, 8, 203, 0, 113, 1}
+	exhausted.Payload = exhaustedPayload
+	wire, err = exhausted.AppendBinary(nil)
+	if err != nil {
+		t.Fatalf("marshal exhausted source route: %v", err)
+	}
+	parsed, err = ParseIPPacket(wire)
+	if err != nil {
+		t.Fatalf("parse exhausted source route: %v", err)
+	}
+	if _, err = parsed.TCPSegment(); err != nil {
+		t.Fatalf("decode TCP after exhausted source route: %v", err)
+	}
+
+	ipv6 := IPPacket{
+		Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"), Protocol: 43, HopLimit: 64,
+		Payload: append([]byte{ProtocolTCP, 0, 0, 1, 0, 0, 0, 0}, make([]byte, tcpHeaderSize)...),
+	}
+	wire, err = ipv6.AppendBinary(nil)
+	if err != nil {
+		t.Fatalf("marshal actively routed IPv6: %v", err)
+	}
+	parsed, err = ParseIPPacket(wire)
+	if err != nil {
+		t.Fatalf("parse actively routed IPv6: %v", err)
+	}
+	if protocol, _, upperErr := parsed.UpperLayer(); upperErr != nil || protocol != ProtocolTCP {
+		t.Fatalf("routed upper layer = %d, %v", protocol, upperErr)
+	}
+	if _, err = parsed.TCPSegment(); !errors.Is(err, syscall.EPROTONOSUPPORT) {
+		t.Fatalf("routed TCP error = %v, want EPROTONOSUPPORT", err)
+	}
+
+	homeAddressOptions := make([]byte, 24)
+	homeAddressOptions[0], homeAddressOptions[1] = ProtocolTCP, 2
+	homeAddressOptions[2], homeAddressOptions[3] = 201, 16
+	copy(homeAddressOptions[4:20], netip.MustParseAddr("2001:db8::10").AsSlice())
+	homeAddressOptions[20], homeAddressOptions[21] = 1, 1
+	homeAddressPacket := IPPacket{
+		Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"),
+		Protocol: 60, HopLimit: 64, Payload: append(homeAddressOptions, make([]byte, tcpHeaderSize)...),
+	}
+	wire, err = homeAddressPacket.AppendBinary(nil)
+	if err != nil {
+		t.Fatalf("marshal Home Address packet: %v", err)
+	}
+	parsed, err = ParseIPPacket(wire)
+	if err != nil {
+		t.Fatalf("parse Home Address packet: %v", err)
+	}
+	if _, err = parsed.TCPSegment(); !errors.Is(err, syscall.EPROTONOSUPPORT) {
+		t.Fatalf("Home Address TCP error = %v, want EPROTONOSUPPORT", err)
+	}
+}
+
+func TestPublicIPv6NoNextHeaderAndLinkPadding(t *testing.T) {
+	packet := IPPacket{
+		Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"),
+		Protocol: 59, HopLimit: 64, Payload: []byte{1, 2, 3, 4},
+	}
+	wire, err := packet.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseIPPacket(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol, upper, err := parsed.UpperLayer()
+	if err != nil || protocol != 59 || len(upper) != 0 || !bytes.Equal(parsed.Payload, packet.Payload) {
+		t.Fatalf("No Next Header upper layer = %d, %x, %v; packet payload=%x", protocol, upper, err, parsed.Payload)
+	}
+
+	empty := packet
+	empty.Payload = nil
+	wire, err = empty.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	padded := append(append([]byte(nil), wire...), 1, 2, 3, 4, 5, 6)
+	parsed, err = ParseIPPacket(padded)
+	if err != nil || len(parsed.Payload) != 0 {
+		t.Fatalf("parse padded zero-payload IPv6: packet=%+v error=%v", parsed, err)
+	}
+	internal, ok := parseIPPacket(padded)
+	if !ok || len(internal.payload) != 0 || len(internal.original) != len(wire) {
+		t.Fatalf("internal padded zero-payload IPv6 = %+v, %v", internal, ok)
+	}
+}
+
+func TestPublicIPv6JumboPayloadOptionRejected(t *testing.T) {
+	packet := IPPacket{
+		Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"),
+		Protocol: 0, HopLimit: 64,
+		Payload: []byte{59, 0, 194, 4, 0, 1, 0, 0},
+	}
+	if _, err := packet.AppendBinary(nil); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("constructing a Jumbo Payload option returned %v, want EINVAL", err)
+	}
+
+	// Build the illegal nonzero Payload Length combination directly so parsing
+	// cannot reuse the public constructor under test.
+	wire := make([]byte, 48)
+	wire[0], wire[6], wire[7] = 0x60, 0, 64
+	binary.BigEndian.PutUint16(wire[4:6], 8)
+	source, destination := packet.Source.As16(), packet.Destination.As16()
+	copy(wire[8:24], source[:])
+	copy(wire[24:40], destination[:])
+	copy(wire[40:], packet.Payload)
+	if _, err := ParseIPPacket(wire); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("parsing a Jumbo Payload option returned %v, want EINVAL", err)
+	}
+	binary.BigEndian.PutUint16(wire[4:6], 0)
+	if _, err := ParseIPPacket(wire); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("parsing a Payload Length zero jumbogram returned %v, want EINVAL", err)
+	}
+}
+
+func TestPublicIPv6ExtensionReservedFieldsAreNormalized(t *testing.T) {
+	packet := IPPacket{
+		Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"),
+		Protocol: 0, HopLimit: 64,
+		Payload: []byte{
+			44, 0, 1, 4, 0xaa, 0xbb, 0, 0, // Hop-by-Hop with nonzero PadN data.
+			99, 0xff, 0, 6, 0x12, 0x34, 0x56, 0x78, // Atomic Fragment with nonzero reserved fields.
+			1, 2, 3, 4,
+		},
+	}
+	wire, err := packet.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(wire[44:48], []byte{0, 0, 0, 0}) || wire[49] != 0 || binary.BigEndian.Uint16(wire[50:52]) != 0 {
+		t.Fatalf("generated extension reserved fields were not cleared: %x", wire[40:56])
+	}
+
+	// Parsing remains receiver-tolerant and exposes the original wire bytes.
+	raw := append([]byte(nil), wire...)
+	copy(raw[44:46], []byte{0xaa, 0xbb})
+	raw[49] = 0xff
+	binary.BigEndian.PutUint16(raw[50:52], 6)
+	parsed, err := ParseIPPacket(raw)
+	if err != nil {
+		t.Fatalf("parse nonzero reserved fields: %v", err)
+	}
+	if !bytes.Equal(parsed.Payload, raw[40:]) {
+		t.Fatal("ParseIPPacket did not preserve received extension bytes")
+	}
+	reencoded, err := parsed.AppendBinary(nil)
+	if err != nil || !bytes.Equal(reencoded, wire) {
+		t.Fatalf("normalized IPv6 packet: error=%v\n got %x\nwant %x", err, reencoded, wire)
+	}
+}
+
+// TestIPv6MappedAddressesAreRejected verifies the RFC 6890 on-wire boundary
+// and prevents a parsed IPv6 packet from being re-encoded as IPv4.
+func TestIPv6MappedAddressesAreRejected(t *testing.T) {
+	packet := make([]byte, 40)
+	packet[0], packet[6], packet[7] = 0x60, 59, 64
+	source := netip.MustParseAddr("::ffff:192.0.2.1").As16()
+	destination := netip.MustParseAddr("2001:db8::1").As16()
+	copy(packet[8:24], source[:])
+	copy(packet[24:40], destination[:])
+	if _, err := ParseIPPacket(packet); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("mapped IPv6 ParseIPPacket error = %v", err)
+	}
+	if _, ok := parseIPPacket(packet); ok {
+		t.Fatal("internal parser accepted a mapped IPv6 source")
+	}
+}
+
+func TestPublicIPPacketCodecErrorsDoNotModifyDestination(t *testing.T) {
+	valid := IPPacket{Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"), Protocol: 99, HopLimit: 64, Payload: []byte{1}}
+	invalid := valid
+	invalid.HopLimit = 256
+	destination := []byte{1, 2, 3}
+	want := append([]byte(nil), destination...)
+	if got, err := invalid.AppendBinary(destination); !errors.Is(err, syscall.EINVAL) || !bytes.Equal(got, want) || !bytes.Equal(destination, want) {
+		t.Fatalf("invalid AppendBinary: got=%x error=%v", got, err)
+	}
+	if _, err := ParseIPPacket([]byte{0x40}); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("truncated ParseIPPacket error = %v", err)
+	}
+	invalid = valid
+	invalid.Source = netip.MustParseAddr("2001:db8::1").WithZone("test")
+	invalid.Destination = netip.MustParseAddr("2001:db8::2")
+	if _, err := invalid.AppendBinary(nil); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("zoned IP packet error = %v", err)
+	}
+}
+
+func TestPublicChecksumAPI(t *testing.T) {
+	payload := []byte("public-checksum")
+	if got, want := InternetChecksum(payload), checksum(payload); got != want {
+		t.Fatalf("InternetChecksum = %#x, want %#x", got, want)
+	}
+	source, destination := netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2")
+	got, err := IPTransportChecksum(source, destination, ProtocolUDP, payload)
+	if err != nil || got != transportChecksum(source, destination, ProtocolUDP, payload) {
+		t.Fatalf("IPTransportChecksum = %#x, %v", got, err)
+	}
+	if _, err = IPTransportChecksum(source, netip.MustParseAddr("192.0.2.1"), ProtocolUDP, payload); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("cross-family checksum error = %v", err)
+	}
+	mappedSource := netip.MustParseAddr("::ffff:192.0.2.1")
+	mappedDestination := netip.MustParseAddr("::ffff:198.51.100.1")
+	mapped, err := IPTransportChecksum(mappedSource, mappedDestination, ProtocolUDP, payload)
+	if want := transportChecksum(mappedSource.Unmap(), mappedDestination.Unmap(), ProtocolUDP, payload); err != nil || mapped != want {
+		t.Fatalf("mapped IPv4 checksum = %#x, %v; want %#x", mapped, err, want)
+	}
+	for _, protocol := range []int{-1, 256} {
+		if _, err = IPTransportChecksum(source, destination, protocol, payload); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("protocol %d checksum error = %v", protocol, err)
+		}
+	}
+	if _, err = IPTransportChecksum(source.WithZone("test"), destination, ProtocolUDP, payload); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("zoned checksum error = %v", err)
+	}
+	if _, err = IPTransportChecksum(source, destination, ProtocolUDP, make([]byte, 65536)); !errors.Is(err, syscall.EMSGSIZE) {
+		t.Fatalf("oversized checksum error = %v", err)
+	}
+}
+
+func FuzzPublicIPPacketCodec(f *testing.F) {
+	seeds := []IPPacket{
+		{Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"), Protocol: 99, HopLimit: 64, Payload: []byte("v4")},
+		{Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"), Protocol: 99, HopLimit: 64, Payload: []byte("v6")},
+	}
+	for _, seed := range seeds {
+		wire, err := seed.AppendBinary(nil)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(wire)
+	}
+	f.Fuzz(func(t *testing.T, wire []byte) {
+		original := append([]byte(nil), wire...)
+		packet, err := ParseIPPacket(wire)
+		if !bytes.Equal(wire, original) {
+			t.Fatal("ParseIPPacket modified its input")
+		}
+		if err != nil {
+			return
+		}
+		encoded, err := packet.AppendBinary(nil)
+		if err != nil {
+			t.Fatalf("parsed packet could not be encoded: %v", err)
+		}
+		if _, err = ParseIPPacket(encoded); err != nil {
+			t.Fatalf("encoded packet could not be parsed: %v", err)
+		}
+		canonical := append([]byte(nil), encoded...)
+		reparsed, err := ParseIPPacket(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inPlace, err := reparsed.AppendBinary(encoded[:0])
+		if err != nil || !bytes.Equal(inPlace, canonical) {
+			t.Fatalf("in-place packet append: error=%v\n got %x\nwant %x", err, inPlace, canonical)
+		}
+	})
+}
+
 // FuzzChecksumParts verifies the Internet checksum and both pseudo-header
 // variants across every odd or even split between adjacent payload regions.
 func FuzzChecksumParts(f *testing.F) {
-	f.Add([]byte(nil), uint16(0), false, byte(protocolUDP))
-	f.Add([]byte{1}, uint16(1), false, byte(protocolTCP))
-	f.Add([]byte{1, 2, 3, 4, 5}, uint16(3), true, byte(protocolICMPv6))
+	f.Add([]byte(nil), uint16(0), false, byte(ProtocolUDP))
+	f.Add([]byte{1}, uint16(1), false, byte(ProtocolTCP))
+	f.Add([]byte{1, 2, 3, 4, 5}, uint16(3), true, byte(ProtocolICMPv6))
 	f.Fuzz(func(t *testing.T, payload []byte, splitAt uint16, ipv6 bool, protocol byte) {
 		if len(payload) > 65535 {
 			payload = payload[:65535]
@@ -120,15 +664,15 @@ func FuzzChecksumParts(f *testing.F) {
 }
 
 func TestIPv6RouterAlertValidation(t *testing.T) {
-	valid := []byte{protocolICMPv6, 0, 5, 2, 0, 0, 1, 0}
+	valid := []byte{ProtocolICMPv6, 0, 5, 2, 0, 0, 1, 0}
 	if !ipv6RouterAlert(valid) {
 		t.Fatal("valid IPv6 Router Alert was rejected")
 	}
-	malformed := []byte{protocolICMPv6, 0, 5, 1, 0, 1, 1, 0}
+	malformed := []byte{ProtocolICMPv6, 0, 5, 1, 0, 1, 1, 0}
 	if ipv6RouterAlert(malformed) {
 		t.Fatal("malformed IPv6 Router Alert was accepted")
 	}
-	duplicate := []byte{protocolICMPv6, 1, 5, 2, 0, 0, 5, 2, 0, 0, 1, 4, 0, 0, 0, 0}
+	duplicate := []byte{ProtocolICMPv6, 1, 5, 2, 0, 0, 5, 2, 0, 0, 1, 4, 0, 0, 0, 0}
 	if ipv6RouterAlert(duplicate) {
 		t.Fatal("duplicate IPv6 Router Alert was accepted")
 	}
@@ -176,7 +720,7 @@ func BenchmarkChecksum(b *testing.B) {
 func FuzzInboundPacket(f *testing.F) {
 	f.Add([]byte(nil))
 	f.Add([]byte{0x45, 0, 0, 20})
-	f.Add(buildIPPacket(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.1"), protocolUDP, make([]byte, 8), 1, false))
+	f.Add(buildIPPacket(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.1"), ProtocolUDP, make([]byte, 8), 1, false))
 	f.Add(buildMulticastTestIGMPQuery(
 		netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("224.0.0.1"), netip.IPv4Unspecified(), 3, nil, true,
 	))
@@ -194,7 +738,7 @@ func FuzzInboundPacket(f *testing.F) {
 // checksum gate for UDP, TCP, and ICMP packets with valid pseudo-headers.
 func FuzzInboundChecksummedTransportPackets(f *testing.F) {
 	f.Add([]byte("udp"), false, byte(0), uint16(49152), uint16(53), byte(0))
-	f.Add([]byte("tcp"), false, byte(1), uint16(49153), uint16(80), byte(tcpFlagSYN))
+	f.Add([]byte("tcp"), false, byte(1), uint16(49153), uint16(80), byte(TCPFlagSYN))
 	f.Add([]byte("icmp"), true, byte(2), uint16(1), uint16(2), byte(0))
 	f.Fuzz(func(t *testing.T, payload []byte, ipv6 bool, protocolSelector byte, sourcePort, targetPort uint16, flags byte) {
 		if len(payload) > 256 {
@@ -215,10 +759,10 @@ func FuzzInboundChecksummedTransportPackets(f *testing.F) {
 			packet = buildTestUDP(remote, local, sourcePort, targetPort, payload)
 		case 1:
 			if flags == 0 {
-				flags = tcpFlagACK
+				flags = TCPFlagACK
 			}
 			options := []byte(nil)
-			if flags&tcpFlagSYN != 0 {
+			if flags&TCPFlagSYN != 0 {
 				options = []byte{2, 4, 0x05, 0xb4, 4, 2}
 			}
 			packet = buildTestTCP(remote, local, sourcePort, targetPort, 1000, 2000, flags, 65535, options, payload)
@@ -233,11 +777,11 @@ func FuzzInboundChecksummedTransportPackets(f *testing.F) {
 			binary.BigEndian.PutUint16(message[6:8], targetPort)
 			copy(message[8:], payload)
 			if ipv6 {
-				binary.BigEndian.PutUint16(message[2:4], transportChecksum(remote, local, protocolICMPv6, message))
-				packet = buildIPPacket(remote, local, protocolICMPv6, message, 1, true)
+				binary.BigEndian.PutUint16(message[2:4], transportChecksum(remote, local, ProtocolICMPv6, message))
+				packet = buildIPPacket(remote, local, ProtocolICMPv6, message, 1, true)
 			} else {
 				binary.BigEndian.PutUint16(message[2:4], checksum(message))
-				packet = buildIPPacket(remote, local, protocolICMPv4, message, 1, true)
+				packet = buildIPPacket(remote, local, ProtocolICMPv4, message, 1, true)
 			}
 		}
 		if err := writeTestPacket(stack, packet); err != nil {
@@ -254,10 +798,10 @@ func FuzzIPPacketParsing(f *testing.F) {
 	local6 := netip.MustParseAddr("2001:db8::1")
 	remote6 := netip.MustParseAddr("2001:db8:1::1")
 	f.Add([]byte(nil))
-	f.Add(buildIPPacket(remote4, local4, protocolUDP, make([]byte, udpHeaderSize), 1, false))
+	f.Add(buildIPPacket(remote4, local4, ProtocolUDP, make([]byte, udpHeaderSize), 1, false))
 	f.Add(buildTestIPv4Options(remote4, local4, []byte{1, 1, 0, 0}))
-	f.Add(buildIPPacket(remote6, local6, protocolTCP, make([]byte, tcpHeaderSize), 0, true))
-	f.Add(buildTestIPv6Extension(remote6, local6, 60, []byte{protocolUDP, 0, 1, 0, 0, 0, 0, 0}))
+	f.Add(buildIPPacket(remote6, local6, ProtocolTCP, make([]byte, tcpHeaderSize), 0, true))
+	f.Add(buildTestIPv6Extension(remote6, local6, 60, []byte{ProtocolUDP, 0, 1, 0, 0, 0, 0, 0}))
 	f.Fuzz(func(t *testing.T, packet []byte) {
 		if len(packet) > 65575 {
 			packet = packet[:65575]
@@ -345,7 +889,7 @@ func FuzzIPv4OptionParsing(f *testing.F) {
 			}
 			return
 		}
-		if !ok || parsed.parameterError || parsed.protocol != protocolUDP || len(parsed.payload) != udpHeaderSize || parsed.hasRouterAlert() != ipv4RouterAlert(options) {
+		if !ok || parsed.parameterError || parsed.protocol != ProtocolUDP || len(parsed.payload) != udpHeaderSize || parsed.hasRouterAlert() != ipv4RouterAlert(options) {
 			t.Fatalf("valid IPv4 options %x parsed as %+v, ok=%t", options, parsed, ok)
 		}
 	})
@@ -377,7 +921,7 @@ func FuzzIPv6OptionParsing(f *testing.F) {
 	f.Fuzz(func(t *testing.T, input []byte, hopByHop bool, multicastTarget bool) {
 		options := paddedIPv6FuzzOptions(input)
 		header := make([]byte, 8+len(options))
-		header[0] = protocolUDP
+		header[0] = ProtocolUDP
 		header[1] = byte(len(header)/8 - 1)
 		copy(header[2:], options)
 		extensionType := byte(60)
@@ -414,7 +958,7 @@ func FuzzIPv6OptionParsing(f *testing.F) {
 			}
 			return
 		}
-		if !ok || parsed.parameterError || parsed.protocol != protocolUDP || len(parsed.payload) != 0 {
+		if !ok || parsed.parameterError || parsed.protocol != ProtocolUDP || len(parsed.payload) != 0 {
 			t.Fatalf("valid IPv6 options %x parsed as %+v, ok=%t", header, parsed, ok)
 		}
 		if hopByHop && parsed.hasRouterAlert() != ipv6RouterAlert(header) {
@@ -439,7 +983,7 @@ func TestIPv6FlowLabelEncodingAndFragmentation(t *testing.T) {
 	source := netip.MustParseAddr("2001:db8::10")
 	target := netip.MustParseAddr("2001:db8::20")
 	const label = uint32(0xabcde)
-	packet := buildIPPacketWithOptions(source, target, protocolUDP, make([]byte, udpHeaderSize), 0, true, ipPacketOptions{
+	packet := buildIPPacketWithOptions(source, target, ProtocolUDP, make([]byte, udpHeaderSize), 0, true, ipPacketOptions{
 		trafficClass: 0x2e, flowLabel: label, flowLabelSet: true,
 	})
 	parsed, ok := parseIPPacket(packet)
@@ -456,7 +1000,7 @@ func TestIPv6FlowLabelEncodingAndFragmentation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fragments, err := stack.ipPayloadPackets(source, target, protocolUDP, make([]byte, 2000), true)
+	fragments, err := stack.ipPayloadPackets(source, target, ProtocolUDP, make([]byte, 2000), true)
 	if err != nil || len(fragments) < 2 {
 		t.Fatalf("IPv6 flow fragmentation = %d packets, %v", len(fragments), err)
 	}
@@ -517,23 +1061,31 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 
 	local6 := netip.MustParseAddr("2001:db8::50")
 	remote6 := netip.MustParseAddr("2001:db8::51")
-	if _, ok := parseIPPacket(buildTestIPv6Extension(remote6, local6, 60, []byte{protocolUDP, 0, 0x40, 0, 0, 0, 0, 0})); ok {
+	if _, ok := parseIPPacket(buildTestIPv6Extension(remote6, local6, 60, []byte{ProtocolUDP, 0, 0x40, 0, 0, 0, 0, 0})); ok {
 		t.Fatal("IPv6 discard-action option was accepted")
 	}
-	routingError, ok := parseIPPacket(buildTestIPv6Extension(remote6, local6, 43, []byte{protocolUDP, 0, 99, 1, 0, 0, 0, 0}))
+	routingError, ok := parseIPPacket(buildTestIPv6Extension(remote6, local6, 43, []byte{ProtocolUDP, 0, 99, 1, 0, 0, 0, 0}))
 	if !ok || !routingError.parameterError || routingError.parameterCode != 0 || routingError.parameterAt != 42 {
 		t.Fatalf("active IPv6 routing header = %+v, parsed = %v", routingError, ok)
 	}
-	misplacedHopPayload := append([]byte{0, 0, 0, 0, 0, 0, 0, 0}, protocolUDP, 0, 0, 0, 0, 0, 0, 0)
+	misplacedHopPayload := append([]byte{0, 0, 0, 0, 0, 0, 0, 0}, ProtocolUDP, 0, 0, 0, 0, 0, 0, 0)
 	misplacedHop := buildIPPacket(remote6, local6, 60, misplacedHopPayload, 0, false)
 	misplacedHopError, ok := parseIPPacket(misplacedHop)
 	if !ok || !misplacedHopError.parameterError || misplacedHopError.parameterCode != 1 || misplacedHopError.parameterAt != 40 {
 		t.Fatalf("misplaced IPv6 Hop-by-Hop header = %+v, parsed = %v", misplacedHopError, ok)
 	}
-	jumbogram := buildIPPacket(remote6, local6, protocolUDP, []byte{1}, 0, true)
+	paddedEmptyPacket := buildIPPacket(remote6, local6, ProtocolUDP, []byte{1}, 0, true)
+	paddedEmptyPacket[4], paddedEmptyPacket[5] = 0, 0
+	parsedEmptyPacket, ok := parseIPPacket(paddedEmptyPacket)
+	if !ok || len(parsedEmptyPacket.payload) != 0 || len(parsedEmptyPacket.original) != 40 {
+		t.Fatalf("zero-length IPv6 payload with link padding = %+v, parsed=%t", parsedEmptyPacket, ok)
+	}
+	// A real jumbogram starts with a Hop-by-Hop Jumbo Payload option. The
+	// declared zero length cannot expose that unsupported header to this stack.
+	jumbogram := buildIPPacket(remote6, local6, 0, []byte{ProtocolUDP, 0, 0xc2, 4, 0, 1, 0, 0}, 0, true)
 	jumbogram[4], jumbogram[5] = 0, 0
-	if _, ok := parseIPPacket(jumbogram); ok {
-		t.Fatal("unsupported IPv6 jumbogram was accepted as an empty packet")
+	if _, ok = parseIPPacket(jumbogram); ok {
+		t.Fatal("unsupported IPv6 jumbogram was accepted")
 	}
 
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{
@@ -547,13 +1099,13 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = stack.Close() })
-	unsupportedOption := buildTestIPv6Extension(remote6, local6, 60, []byte{protocolUDP, 0, 0x80, 0, 0, 0, 0, 0})
+	unsupportedOption := buildTestIPv6Extension(remote6, local6, 60, []byte{ProtocolUDP, 0, 0x80, 0, 0, 0, 0, 0})
 	if err = writeTestPacket(stack, unsupportedOption); err != nil {
 		t.Fatal(err)
 	}
 	response := readOutboundPacket(t, stack)
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 2 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 42 {
+	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 2 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 42 {
 		t.Fatalf("IPv6 unsupported-option response = %x", response)
 	}
 	malformedIPv4 := buildTestIPv4Options(remote4, local4, []byte{7, 1, 0, 0})
@@ -562,7 +1114,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	}
 	response = readOutboundPacket(t, stack)
 	parsed, ok = parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv4 || len(parsed.payload) < 8 || parsed.payload[0] != 12 || parsed.payload[1] != 0 || parsed.payload[4] != 20 {
+	if !ok || parsed.protocol != ProtocolICMPv4 || len(parsed.payload) < 8 || parsed.payload[0] != 12 || parsed.payload[1] != 0 || parsed.payload[4] != 20 {
 		t.Fatalf("IPv4 malformed-option response = %x", response)
 	}
 	nonInitial := append([]byte(nil), malformedIPv4...)
@@ -577,13 +1129,13 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		response = consumeTestPacket(&stack.outbound, entry)
 		t.Fatalf("non-initial malformed fragment produced Parameter Problem: %x", response)
 	}
-	activeRouting := buildTestIPv6Extension(remote6, local6, 43, []byte{protocolUDP, 0, 99, 1, 0, 0, 0, 0})
+	activeRouting := buildTestIPv6Extension(remote6, local6, 43, []byte{ProtocolUDP, 0, 99, 1, 0, 0, 0, 0})
 	if err = writeTestPacket(stack, activeRouting); err != nil {
 		t.Fatal(err)
 	}
 	response = readOutboundPacket(t, stack)
 	parsed, ok = parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 0 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 42 {
+	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 0 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 42 {
 		t.Fatalf("IPv6 routing-header response = %x", response)
 	}
 	if err = writeTestPacket(stack, misplacedHop); err != nil {
@@ -591,10 +1143,10 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	}
 	response = readOutboundPacket(t, stack)
 	parsed, ok = parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 1 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 40 {
+	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 1 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 40 {
 		t.Fatalf("misplaced IPv6 Hop-by-Hop response = %x", response)
 	}
-	icmpErrorWithUnknownOption := buildTestIPv6Extension(remote6, local6, 60, []byte{protocolICMPv6, 0, 0x80, 0, 0, 0, 0, 0})
+	icmpErrorWithUnknownOption := buildTestIPv6Extension(remote6, local6, 60, []byte{ProtocolICMPv6, 0, 0x80, 0, 0, 0, 0, 0})
 	icmpErrorWithUnknownOption = append(icmpErrorWithUnknownOption, 1, 0, 0, 0, 0, 0, 0, 0)
 	binary.BigEndian.PutUint16(icmpErrorWithUnknownOption[4:6], uint16(len(icmpErrorWithUnknownOption)-40))
 	if err = writeTestPacket(stack, icmpErrorWithUnknownOption); err != nil {
@@ -609,7 +1161,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	}
 	response = readOutboundPacket(t, stack)
 	parsed, ok = parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv4 || len(parsed.payload) < 8 || parsed.payload[0] != 3 || parsed.payload[1] != 2 {
+	if !ok || parsed.protocol != ProtocolICMPv4 || len(parsed.payload) < 8 || parsed.payload[0] != 3 || parsed.payload[1] != 2 {
 		t.Fatalf("IPv4 unsupported-protocol response = %x", response)
 	}
 	if err = writeTestPacket(stack, buildIPPacket(remote6, local6, 100, []byte{1, 2, 3, 4}, 0, true)); err != nil {
@@ -617,7 +1169,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	}
 	response = readOutboundPacket(t, stack)
 	parsed, ok = parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 1 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 6 {
+	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 1 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 6 {
 		t.Fatalf("IPv6 unsupported-protocol response = %x", response)
 	}
 	if err = writeTestPacket(stack, buildIPPacket(remote6, local6, 59, nil, 0, true)); err != nil {
@@ -643,10 +1195,10 @@ func TestIPv6ExtensionHeadersFollowReceiverRules(t *testing.T) {
 	payload = append(payload, 60, 0, 99, 0, 0, 0, 0, 0) // Routing -> Destination.
 	payload = append(payload, 44, 0, 0, 0, 0, 0, 0, 0)  // Destination -> Fragment.
 	payload = append(payload, 44, 0, 0, 0, 0, 0, 0, 1)  // Atomic Fragment -> Fragment.
-	payload = append(payload, protocolUDP, 0, 0, 0, 0, 0, 0, 2)
+	payload = append(payload, ProtocolUDP, 0, 0, 0, 0, 0, 0, 2)
 	payload = append(payload, 1, 2, 3, 4, 5, 6, 7, 8)
 	parsed, ok := parseIPPacket(buildIPPacket(remote, local, 60, payload, 0, false))
-	if !ok || parsed.protocol != protocolUDP || len(parsed.payload) != 8 {
+	if !ok || parsed.protocol != ProtocolUDP || len(parsed.payload) != 8 {
 		t.Fatalf("repeated IPv6 extension headers = %+v, parsed = %t", parsed, ok)
 	}
 }
@@ -748,7 +1300,7 @@ func TestICMPProtocolMustMatchIPFamily(t *testing.T) {
 	echo := make([]byte, 8)
 	echo[0] = 8
 	binary.BigEndian.PutUint16(echo[2:4], checksum(echo))
-	if err := writeTestPacket(stack, buildIPPacket(remote, local, protocolICMPv4, echo, 0, true)); err != nil {
+	if err := writeTestPacket(stack, buildIPPacket(remote, local, ProtocolICMPv4, echo, 0, true)); err != nil {
 		t.Fatal(err)
 	}
 	var response []byte
@@ -758,12 +1310,32 @@ func TestICMPProtocolMustMatchIPFamily(t *testing.T) {
 		t.Fatal("timed out waiting for cross-family protocol error")
 	}
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 1 {
+	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 1 {
 		t.Fatalf("cross-family ICMP response = %x", response)
 	}
 }
 
 func BenchmarkParseIPPacket(b *testing.B) {
+	for _, test := range []struct {
+		name   string
+		packet []byte
+	}{
+		{name: "IPv4", packet: buildTestUDP(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("192.0.2.1"), 50000, 443, make([]byte, 1200))},
+		{name: "IPv6", packet: buildTestUDP(netip.MustParseAddr("2001:db8:1::1"), netip.MustParseAddr("2001:db8::1"), 50000, 443, make([]byte, 1200))},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(test.packet)))
+			for index := 0; index < b.N; index++ {
+				if _, err := ParseIPPacket(test.packet); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkStackPacketParsing(b *testing.B) {
 	for _, test := range []struct {
 		name   string
 		packet []byte

@@ -19,13 +19,13 @@ func TestIPv6AtomicFragmentReservedBits(t *testing.T) {
 	source := netip.MustParseAddr("2001:db8::2")
 	target := netip.MustParseAddr("2001:db8::1")
 	fragment := make([]byte, 8+udpHeaderSize)
-	fragment[0] = protocolUDP
+	fragment[0] = ProtocolUDP
 	fragment[1] = 0xff
 	binary.BigEndian.PutUint16(fragment[2:4], 0x0002)
 	binary.BigEndian.PutUint32(fragment[4:8], 1)
 	packet := buildIPPacket(source, target, 44, fragment, 0, false)
 	parsed, ok := parseIPPacket(packet)
-	if !ok || parsed.protocol != protocolUDP || len(parsed.payload) != udpHeaderSize {
+	if !ok || parsed.protocol != ProtocolUDP || len(parsed.payload) != udpHeaderSize {
 		t.Fatalf("IPv6 atomic fragment with reserved bits = %+v, parsed = %v", parsed, ok)
 	}
 }
@@ -35,7 +35,7 @@ func TestIPv6FragmentReservedBitsAreIgnored(t *testing.T) {
 	remote := netip.MustParseAddr("2001:db8::2")
 	_, stack := newTestStack(t, local, remote)
 	defer stack.Close()
-	fragments := buildIPv6FragmentsWithOptions(remote, local, protocolUDP, make([]byte, 24), 56, 7, ipPacketOptions{})
+	fragments := buildIPv6FragmentsWithOptions(remote, local, ProtocolUDP, make([]byte, 24), 56, 7, ipPacketOptions{})
 	for index, fragment := range fragments {
 		fragment[41] = 0xff
 		field := binary.BigEndian.Uint16(fragment[42:44]) | 0x0006
@@ -46,7 +46,7 @@ func TestIPv6FragmentReservedBitsAreIgnored(t *testing.T) {
 		}
 		if index == len(fragments)-1 {
 			parsed, ok := parseIPPacket(packet)
-			if !ok || parsed.protocol != protocolUDP || len(parsed.payload) != 24 {
+			if !ok || parsed.protocol != ProtocolUDP || len(parsed.payload) != 24 {
 				t.Fatalf("reserved-bit IPv6 reassembly = %+v, parsed = %v", parsed, ok)
 			}
 		}
@@ -215,7 +215,7 @@ func TestIPv6UnfragmentableHeaderErrors(t *testing.T) {
 				t.Fatal("timed out waiting for unfragmentable-header Parameter Problem")
 			}
 			parsed, ok := parseIPPacket(response)
-			if !ok || parsed.protocol != protocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != test.wantCode || binary.BigEndian.Uint32(parsed.payload[4:8]) != test.wantAt {
+			if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != test.wantCode || binary.BigEndian.Uint32(parsed.payload[4:8]) != test.wantAt {
 				t.Fatalf("unfragmentable-header response = %x", response)
 			}
 		})
@@ -228,7 +228,7 @@ func TestIPv6FirstFragmentRequiresCompleteHeaderChain(t *testing.T) {
 	link, stack := newTestStack(t, local, remote)
 	defer stack.Close()
 	fragment := make([]byte, 16)
-	fragment[0] = protocolTCP
+	fragment[0] = ProtocolTCP
 	binary.BigEndian.PutUint16(fragment[2:4], 1)
 	binary.BigEndian.PutUint32(fragment[4:8], 7)
 	packet := buildIPPacket(remote, local, 44, fragment, 0, false)
@@ -242,7 +242,7 @@ func TestIPv6FirstFragmentRequiresCompleteHeaderChain(t *testing.T) {
 		t.Fatal("timed out waiting for RFC 7112 Parameter Problem")
 	}
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 3 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 0 {
+	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 3 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 0 {
 		t.Fatalf("incomplete first-fragment response = %x", response)
 	}
 	stack.fragmentMu.Lock()
@@ -269,19 +269,19 @@ func TestIPv6FirstFragmentHeaderCompleteness(t *testing.T) {
 		payload []byte
 		want    bool
 	}{
-		{name: "hop by hop to UDP", next: 0, payload: extension(protocolUDP, 0, udp), want: true},
-		{name: "routing to UDP", next: 43, payload: extension(protocolUDP, 0, udp), want: true},
-		{name: "destination to UDP", next: 60, payload: extension(protocolUDP, 0, udp), want: true},
-		{name: "mobility to UDP", next: 135, payload: extension(protocolUDP, 0, udp), want: true},
-		{name: "truncated extension", next: 60, payload: extension(protocolUDP, 1, nil)},
-		{name: "AH to UDP", next: 51, payload: extension(protocolUDP, 0, udp), want: true},
-		{name: "truncated AH", next: 51, payload: []byte{protocolUDP}},
+		{name: "hop by hop to UDP", next: 0, payload: extension(ProtocolUDP, 0, udp), want: true},
+		{name: "routing to UDP", next: 43, payload: extension(ProtocolUDP, 0, udp), want: true},
+		{name: "destination to UDP", next: 60, payload: extension(ProtocolUDP, 0, udp), want: true},
+		{name: "mobility to UDP", next: 135, payload: extension(ProtocolUDP, 0, udp), want: true},
+		{name: "truncated extension", next: 60, payload: extension(ProtocolUDP, 1, nil)},
+		{name: "AH to UDP", next: 51, payload: extension(ProtocolUDP, 0, udp), want: true},
+		{name: "truncated AH", next: 51, payload: []byte{ProtocolUDP}},
 		{name: "nested fragment", next: 44, payload: make([]byte, 8)},
-		{name: "TCP", next: protocolTCP, payload: tcp, want: true},
-		{name: "TCP short", next: protocolTCP, payload: tcp[:tcpHeaderSize-1]},
-		{name: "TCP invalid data offset is complete", next: protocolTCP, payload: invalidTCPSize, want: true},
-		{name: "UDP", next: protocolUDP, payload: udp, want: true},
-		{name: "UDP short", next: protocolUDP, payload: udp[:udpHeaderSize-1]},
+		{name: "TCP", next: ProtocolTCP, payload: tcp, want: true},
+		{name: "TCP short", next: ProtocolTCP, payload: tcp[:tcpHeaderSize-1]},
+		{name: "TCP invalid data offset is complete", next: ProtocolTCP, payload: invalidTCPSize, want: true},
+		{name: "UDP", next: ProtocolUDP, payload: udp, want: true},
+		{name: "UDP short", next: ProtocolUDP, payload: udp[:udpHeaderSize-1]},
 		{name: "ESP", next: 50, payload: make([]byte, 8), want: true},
 		{name: "ESP short", next: 50, payload: make([]byte, 7)},
 		{name: "DCCP", next: 33, payload: make([]byte, 12), want: true},
@@ -313,7 +313,7 @@ func TestIPv6NonFinalFragmentRequiresEightBytePayload(t *testing.T) {
 	select {
 	case response := <-link.outbound:
 		parsed, ok := parseIPPacket(response)
-		if !ok || parsed.protocol != protocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 0 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 4 {
+		if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 0 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 4 {
 			t.Fatalf("misaligned IPv6 fragment response = %x", response)
 		}
 	case <-time.After(time.Second):
@@ -332,11 +332,11 @@ func TestIPv4NonFinalFragmentTrimsPartialOffsetUnit(t *testing.T) {
 	remote := netip.MustParseAddr("198.51.100.87")
 	_, stack := newTestStack(t, local, remote)
 	firstPayload := append(bytes.Repeat([]byte{0x41}, 8), 0xff)
-	first := buildIPPacket(remote, local, protocolUDP, firstPayload, 89, false)
+	first := buildIPPacket(remote, local, ProtocolUDP, firstPayload, 89, false)
 	binary.BigEndian.PutUint16(first[6:8], 0x2000)
 	first[10], first[11] = 0, 0
 	binary.BigEndian.PutUint16(first[10:12], checksum(first[:20]))
-	second := buildIPPacket(remote, local, protocolUDP, bytes.Repeat([]byte{0x42}, 8), 89, false)
+	second := buildIPPacket(remote, local, ProtocolUDP, bytes.Repeat([]byte{0x42}, 8), 89, false)
 	binary.BigEndian.PutUint16(second[6:8], 1)
 	second[10], second[11] = 0, 0
 	binary.BigEndian.PutUint16(second[10:12], checksum(second[:20]))
@@ -354,7 +354,7 @@ func TestIPv6FragmentReassemblyLengthOverflow(t *testing.T) {
 	local := netip.MustParseAddr("2001:db8::85")
 	remote := netip.MustParseAddr("2001:db8::86")
 	link, stack := newTestStack(t, local, remote)
-	fragments := buildIPv6FragmentsWithOptions(remote, local, protocolUDP, make([]byte, 16), 56, 88, ipPacketOptions{})
+	fragments := buildIPv6FragmentsWithOptions(remote, local, ProtocolUDP, make([]byte, 16), 56, 88, ipPacketOptions{})
 	overflow := append([]byte(nil), fragments[0]...)
 	binary.BigEndian.PutUint16(overflow[42:44], 0xfff9)
 	fragment, valid := parseFragment(overflow)
@@ -371,7 +371,7 @@ func TestIPv6FragmentReassemblyLengthOverflow(t *testing.T) {
 		t.Fatal("timed out waiting for oversized-fragment Parameter Problem")
 	}
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 0 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 42 {
+	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 0 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 42 {
 		t.Fatalf("IPv6 oversized-reassembly response = %x", response)
 	}
 }
@@ -380,7 +380,7 @@ func TestIPv6IncompleteFirstFragmentDiscardsPriorTail(t *testing.T) {
 	local := netip.MustParseAddr("2001:db8::11")
 	remote := netip.MustParseAddr("2001:db8::12")
 	link, stack := newTestStack(t, local, remote)
-	fragments := buildIPv6FragmentsWithOptions(remote, local, protocolTCP, make([]byte, 24), 56, 17, ipPacketOptions{})
+	fragments := buildIPv6FragmentsWithOptions(remote, local, ProtocolTCP, make([]byte, 24), 56, 17, ipPacketOptions{})
 	if len(fragments) != 3 {
 		t.Fatalf("fragment count = %d, want 3", len(fragments))
 	}
@@ -399,7 +399,7 @@ func TestIPv6IncompleteFirstFragmentDiscardsPriorTail(t *testing.T) {
 	select {
 	case response := <-link.outbound:
 		parsed, ok := parseIPPacket(response)
-		if !ok || parsed.protocol != protocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 3 {
+		if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 3 {
 			t.Fatalf("incomplete first-fragment response = %x", response)
 		}
 	case <-time.After(time.Second):
@@ -490,11 +490,11 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 		t.Fatal(err)
 	}
 	stack4.ipv4ID.Store(100)
-	first, err := stack4.ipPayloadPackets(local4, remote4, protocolUDP, make([]byte, 96), true)
+	first, err := stack4.ipPayloadPackets(local4, remote4, ProtocolUDP, make([]byte, 96), true)
 	if err != nil || len(first) < 2 {
 		t.Fatalf("first IPv4 fragments = %d, %v", len(first), err)
 	}
-	second, err := stack4.ipPayloadPackets(local4, remote4, protocolUDP, make([]byte, 96), true)
+	second, err := stack4.ipPayloadPackets(local4, remote4, ProtocolUDP, make([]byte, 96), true)
 	if err != nil || len(second) < 2 {
 		t.Fatalf("second IPv4 fragments = %d, %v", len(second), err)
 	}
@@ -508,7 +508,7 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 			t.Fatalf("second IPv4 fragment %d ID = %d, want 102", index, id)
 		}
 	}
-	atomic4, err := stack4.ipPayloadPackets(local4, remote4, protocolICMPv4, make([]byte, 8), false)
+	atomic4, err := stack4.ipPayloadPackets(local4, remote4, ProtocolICMPv4, make([]byte, 8), false)
 	if err != nil || len(atomic4) != 1 {
 		t.Fatalf("atomic IPv4 packets = %d, %v", len(atomic4), err)
 	}
@@ -526,13 +526,13 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 		t.Fatal(err)
 	}
 	stack6.ipv6FragmentID.Store(1000)
-	if _, err = stack6.ipPayloadPackets(local6, remote6, protocolUDP, make([]byte, 8), true); err != nil {
+	if _, err = stack6.ipPayloadPackets(local6, remote6, ProtocolUDP, make([]byte, 8), true); err != nil {
 		t.Fatal(err)
 	}
 	if got := stack6.ipv6FragmentID.Load(); got != 1000 {
 		t.Fatalf("unfragmented IPv6 consumed Fragment ID: %d", got)
 	}
-	fragments6, err := stack6.ipPayloadPackets(local6, remote6, protocolUDP, make([]byte, 1300), true)
+	fragments6, err := stack6.ipPayloadPackets(local6, remote6, ProtocolUDP, make([]byte, 1300), true)
 	if err != nil || len(fragments6) < 2 {
 		t.Fatalf("IPv6 fragments = %d, %v", len(fragments6), err)
 	}
@@ -556,14 +556,14 @@ func TestDirectIPv6FragmentOutputOverwritesReusableHeader(t *testing.T) {
 	defer stack.Close()
 	dirty := bytes.Repeat([]byte{0xff}, 1280)
 	stack.outbound.buffers <- dirty[:0]
-	if err = stack.writeIPPayload(local, remote, protocolUDP, make([]byte, 1300), true); err != nil {
+	if err = stack.writeIPPayload(local, remote, ProtocolUDP, make([]byte, 1300), true); err != nil {
 		t.Fatal(err)
 	}
 	entry, ok := stack.outbound.tryDequeue()
 	if !ok {
 		t.Fatal("missing first IPv6 fragment")
 	}
-	if len(entry.packet) != 1280 || entry.packet[40] != protocolUDP || entry.packet[41] != 0 {
+	if len(entry.packet) != 1280 || entry.packet[40] != ProtocolUDP || entry.packet[41] != 0 {
 		t.Fatalf("reused IPv6 fragment header = %x", entry.packet[40:48])
 	}
 	stack.outbound.release(entry)
@@ -595,7 +595,7 @@ func TestDirectFragmentOutputPreservesPartialDeadlineEmission(t *testing.T) {
 	var deadline socketDeadline
 	deadline.set(time.Now().Add(20 * time.Millisecond))
 	state := socketWriteState{deadline: &deadline, closed: make(chan struct{})}
-	err = stack.writeIPPayloadUntilOptionsForMTU(local, remote, protocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, 68, state)
+	err = stack.writeIPPayloadUntilOptionsForMTU(local, remote, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, 68, state)
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("fragmented write error = %v, want deadline exceeded", err)
 	}
@@ -605,7 +605,7 @@ func TestDirectFragmentOutputPreservesPartialDeadlineEmission(t *testing.T) {
 		if !ok {
 			break
 		}
-		if len(entry.packet) >= 20 && entry.packet[9] == protocolUDP && binary.BigEndian.Uint16(entry.packet[6:8])&0x2000 != 0 {
+		if len(entry.packet) >= 20 && entry.packet[9] == ProtocolUDP && binary.BigEndian.Uint16(entry.packet[6:8])&0x2000 != 0 {
 			fragments++
 			if identification := binary.BigEndian.Uint16(entry.packet[4:6]); identification != 101 {
 				t.Fatalf("partial fragment ID = %d, want 101", identification)
@@ -633,9 +633,9 @@ func TestMinimumSizeFragmentsReassembleRequiredPacket(t *testing.T) {
 			payload := make([]byte, test.payloadSize)
 			var fragments [][]byte
 			if test.local.Is4() {
-				fragments = buildIPv4Fragments(test.remote, test.local, protocolUDP, payload, test.fragmentPacket, 45)
+				fragments = buildIPv4Fragments(test.remote, test.local, ProtocolUDP, payload, test.fragmentPacket, 45)
 			} else {
-				fragments = buildIPv6FragmentsWithOptions(test.remote, test.local, protocolUDP, payload, test.fragmentPacket, 45, ipPacketOptions{})
+				fragments = buildIPv6FragmentsWithOptions(test.remote, test.local, ProtocolUDP, payload, test.fragmentPacket, 45, ipPacketOptions{})
 			}
 			if len(fragments) <= 128 || len(fragments) > fragmentMaximumPieces {
 				t.Fatalf("fragment count = %d, want 129..%d", len(fragments), fragmentMaximumPieces)
@@ -657,7 +657,7 @@ func TestFragmentOverlapDropsDatagram(t *testing.T) {
 	_, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
 	defer stack.Close()
 	payload := bytes.Repeat([]byte{0x44}, 3000)
-	fragments := buildIPv4Fragments(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.1"), protocolUDP, payload, 1280, 7)
+	fragments := buildIPv4Fragments(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.1"), ProtocolUDP, payload, 1280, 7)
 	if len(fragments) < 2 {
 		t.Fatal("test datagram was not fragmented")
 	}
@@ -692,9 +692,9 @@ func TestDuplicateFragmentPreservesReassembly(t *testing.T) {
 			payload := bytes.Repeat([]byte{0x71}, 3000)
 			var fragments [][]byte
 			if test.local.Is4() {
-				fragments = buildIPv4Fragments(test.remote, test.local, protocolUDP, payload, 1280, 71)
+				fragments = buildIPv4Fragments(test.remote, test.local, ProtocolUDP, payload, 1280, 71)
 			} else {
-				fragments = buildIPv6FragmentsWithOptions(test.remote, test.local, protocolUDP, payload, 1280, 71, ipPacketOptions{})
+				fragments = buildIPv6FragmentsWithOptions(test.remote, test.local, ProtocolUDP, payload, 1280, 71, ipPacketOptions{})
 			}
 			if packet := stack.reassemblePacket(fragments[0], time.Now()); packet != nil {
 				t.Fatal("first fragment completed a datagram")
@@ -722,7 +722,7 @@ func TestFragmentReassemblySeparatesLoopbackAndDeviceInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	first := buildIPv4Fragments(remote, local, protocolUDP, make([]byte, 32), 36, 0x7071)[0]
+	first := buildIPv4Fragments(remote, local, ProtocolUDP, make([]byte, 32), 36, 0x7071)[0]
 	if packet, pending := stack.reassemblePacketStatus(first, time.Now(), false); packet != nil || !pending {
 		t.Fatalf("device fragment = packet %v pending %v", packet != nil, pending)
 	}
@@ -731,8 +731,8 @@ func TestFragmentReassemblySeparatesLoopbackAndDeviceInput(t *testing.T) {
 	}
 	stack.fragmentMu.Lock()
 	sets := len(stack.fragments)
-	_, device := stack.fragments[fragmentKey{source: remote, target: local, identification: 0x7071, protocol: protocolUDP}]
-	_, loopback := stack.fragments[fragmentKey{source: remote, target: local, identification: 0x7071, protocol: protocolUDP, loopback: true}]
+	_, device := stack.fragments[fragmentKey{source: remote, target: local, identification: 0x7071, protocol: ProtocolUDP}]
+	_, loopback := stack.fragments[fragmentKey{source: remote, target: local, identification: 0x7071, protocol: ProtocolUDP, loopback: true}]
 	stack.fragmentMu.Unlock()
 	if sets != 2 || !device || !loopback {
 		t.Fatalf("fragment ingress domains = sets %d device %t loopback %t", sets, device, loopback)
@@ -743,7 +743,7 @@ func TestDuplicateFragmentAtPieceLimitPreservesQueue(t *testing.T) {
 	_, stack := newTestStack(t, netip.MustParseAddr("192.0.2.73"), netip.MustParseAddr("192.0.2.74"))
 	key := fragmentKey{
 		source: netip.MustParseAddr("192.0.2.74"), target: netip.MustParseAddr("192.0.2.73"),
-		identification: 73, protocol: protocolUDP,
+		identification: 73, protocol: ProtocolUDP,
 	}
 	pieces := make([]fragmentPiece, fragmentMaximumPieces)
 	for index := range pieces {
@@ -752,7 +752,7 @@ func TestDuplicateFragmentAtPieceLimitPreservesQueue(t *testing.T) {
 	stack.fragmentMu.Lock()
 	stack.fragments[key] = &fragmentSet{
 		pieces: pieces, total: -1, bytes: fragmentMaximumPieces * 8,
-		created: time.Now(), updated: time.Now(), protocol: protocolUDP,
+		created: time.Now(), updated: time.Now(), protocol: ProtocolUDP,
 		source: key.source, target: key.target, identifier: key.identification,
 		ecnMask: 1, maximum: fragmentMaximumDatagram - 20,
 	}
@@ -779,11 +779,11 @@ func TestIPv6FragmentUsesFirstNextHeader(t *testing.T) {
 	_, stack := newTestStack(t, local, remote)
 	defer stack.Close()
 	payload := make([]byte, 24)
-	fragments := buildIPv6FragmentsWithOptions(remote, local, protocolUDP, payload, 56, 7, ipPacketOptions{})
+	fragments := buildIPv6FragmentsWithOptions(remote, local, ProtocolUDP, payload, 56, 7, ipPacketOptions{})
 	if len(fragments) != 3 {
 		t.Fatalf("fragment count = %d, want 3", len(fragments))
 	}
-	fragments[2][40] = protocolTCP
+	fragments[2][40] = ProtocolTCP
 	if packet := stack.reassemblePacket(fragments[2], time.Now()); packet != nil {
 		t.Fatal("final fragment completed a datagram")
 	}
@@ -792,7 +792,7 @@ func TestIPv6FragmentUsesFirstNextHeader(t *testing.T) {
 	}
 	packet := stack.reassemblePacket(fragments[1], time.Now())
 	parsed, ok := parseIPPacket(packet)
-	if !ok || parsed.protocol != protocolUDP || !bytes.Equal(parsed.payload, payload) {
+	if !ok || parsed.protocol != ProtocolUDP || !bytes.Equal(parsed.payload, payload) {
 		t.Fatalf("reassembled packet uses wrong first-fragment metadata: protocol=%d payload=%x", parsed.protocol, parsed.payload)
 	}
 }
@@ -855,7 +855,7 @@ func TestFragmentFinalLengthRejectsPriorTail(t *testing.T) {
 	remote := netip.MustParseAddr("2001:db8::12")
 	_, stack := newTestStack(t, local, remote)
 	defer stack.Close()
-	fragments := buildIPv6FragmentsWithOptions(remote, local, protocolUDP, make([]byte, 24), 56, 8, ipPacketOptions{})
+	fragments := buildIPv6FragmentsWithOptions(remote, local, ProtocolUDP, make([]byte, 24), 56, 8, ipPacketOptions{})
 	if len(fragments) != 3 {
 		t.Fatalf("fragment count = %d, want 3", len(fragments))
 	}
@@ -887,7 +887,7 @@ func TestFragmentSetCapacityEvictsOldest(t *testing.T) {
 	_, stack := newTestStack(t, local, remote)
 	now := time.Now()
 	for identifier := 1; identifier <= fragmentMaximumSets+1; identifier++ {
-		fragments := buildIPv4Fragments(remote, local, protocolUDP, make([]byte, 2000), 1280, uint16(identifier))
+		fragments := buildIPv4Fragments(remote, local, ProtocolUDP, make([]byte, 2000), 1280, uint16(identifier))
 		if len(fragments) < 2 {
 			t.Fatal("test payload was not fragmented")
 		}
@@ -897,7 +897,7 @@ func TestFragmentSetCapacityEvictsOldest(t *testing.T) {
 	}
 	stack.fragmentMu.Lock()
 	sets := len(stack.fragments)
-	_, oldestPresent := stack.fragments[fragmentKey{source: remote, target: local, identification: 1, protocol: protocolUDP}]
+	_, oldestPresent := stack.fragments[fragmentKey{source: remote, target: local, identification: 1, protocol: ProtocolUDP}]
 	stack.fragmentMu.Unlock()
 	if sets != fragmentMaximumSets || oldestPresent {
 		t.Fatalf("fragment sets = %d, oldest present = %v", sets, oldestPresent)
@@ -912,7 +912,7 @@ func TestFragmentByteCapacityEvictsOldest(t *testing.T) {
 	remote := netip.MustParseAddr("198.51.100.84")
 	_, stack := newTestStack(t, local, remote)
 	now := time.Now()
-	oldKey := fragmentKey{source: remote, target: local, identification: 1, protocol: protocolUDP}
+	oldKey := fragmentKey{source: remote, target: local, identification: 1, protocol: ProtocolUDP}
 	old := &fragmentSet{
 		total: -1, bytes: fragmentMaximumBytes - 1, created: now, updated: now.Add(-time.Second),
 		source: remote, target: local, identifier: 1, maximum: fragmentMaximumDatagram - 20,
@@ -921,11 +921,11 @@ func TestFragmentByteCapacityEvictsOldest(t *testing.T) {
 	stack.fragments[oldKey] = old
 	stack.fragmentBytes = old.bytes
 	stack.fragmentMu.Unlock()
-	fragments := buildIPv4Fragments(remote, local, protocolUDP, make([]byte, 16), 28, 2)
+	fragments := buildIPv4Fragments(remote, local, ProtocolUDP, make([]byte, 16), 28, 2)
 	if packet := stack.reassemblePacket(fragments[0], now); packet != nil {
 		t.Fatal("incomplete replacement fragment unexpectedly reassembled")
 	}
-	newKey := fragmentKey{source: remote, target: local, identification: 2, protocol: protocolUDP}
+	newKey := fragmentKey{source: remote, target: local, identification: 2, protocol: ProtocolUDP}
 	stack.fragmentMu.Lock()
 	_, oldPresent := stack.fragments[oldKey]
 	newSet := stack.fragments[newKey]
@@ -946,7 +946,7 @@ func TestFragmentArrivalDoesNotExtendLifetime(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.41")
 	remote := netip.MustParseAddr("198.51.100.41")
 	_, stack := newTestStack(t, local, remote)
-	fragments := buildIPv4Fragments(remote, local, protocolUDP, make([]byte, 3000), 1280, 81)
+	fragments := buildIPv4Fragments(remote, local, ProtocolUDP, make([]byte, 3000), 1280, 81)
 	if len(fragments) < 3 {
 		t.Fatal("test payload did not produce three fragments")
 	}
@@ -973,7 +973,7 @@ func TestFragmentTimesDoNotFollowLockAcquisitionOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fragments := buildIPv4Fragments(remote, local, protocolUDP, make([]byte, 24), 28, 97)
+	fragments := buildIPv4Fragments(remote, local, ProtocolUDP, make([]byte, 24), 28, 97)
 	if len(fragments) < 3 {
 		t.Fatalf("fragment count = %d, want at least 3", len(fragments))
 	}
@@ -1025,17 +1025,17 @@ func TestFragmentReassemblyTimeoutResponse(t *testing.T) {
 		messageType   byte
 		lifetime      time.Duration
 	}{
-		{name: "IPv4", local: netip.MustParseAddr("192.0.2.43"), remote: netip.MustParseAddr("198.51.100.43"), protocol: protocolICMPv4, messageType: 11, lifetime: fragmentIPv4Lifetime},
-		{name: "IPv6", local: netip.MustParseAddr("2001:db8::43"), remote: netip.MustParseAddr("2001:db8:1::43"), protocol: protocolICMPv6, messageType: 3, lifetime: fragmentIPv6Lifetime},
+		{name: "IPv4", local: netip.MustParseAddr("192.0.2.43"), remote: netip.MustParseAddr("198.51.100.43"), protocol: ProtocolICMPv4, messageType: 11, lifetime: fragmentIPv4Lifetime},
+		{name: "IPv6", local: netip.MustParseAddr("2001:db8::43"), remote: netip.MustParseAddr("2001:db8:1::43"), protocol: ProtocolICMPv6, messageType: 3, lifetime: fragmentIPv6Lifetime},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			link, stack := newTestStack(t, test.local, test.remote)
 			payload := make([]byte, 2000)
 			var fragments [][]byte
 			if test.local.Is4() {
-				fragments = buildIPv4Fragments(test.remote, test.local, protocolUDP, payload, 1280, 42)
+				fragments = buildIPv4Fragments(test.remote, test.local, ProtocolUDP, payload, 1280, 42)
 			} else {
-				fragments = buildIPv6FragmentsWithOptions(test.remote, test.local, protocolUDP, payload, 1280, 42, ipPacketOptions{})
+				fragments = buildIPv6FragmentsWithOptions(test.remote, test.local, ProtocolUDP, payload, 1280, 42, ipPacketOptions{})
 			}
 			start := time.Now()
 			if packet := stack.reassemblePacket(fragments[0], start); packet != nil {
@@ -1069,8 +1069,8 @@ func TestFragmentReassemblyTimeoutSuppressesICMPError(t *testing.T) {
 		messageType   byte
 		lifetime      time.Duration
 	}{
-		{name: "IPv4", local: netip.MustParseAddr("192.0.2.44"), remote: netip.MustParseAddr("198.51.100.44"), protocol: protocolICMPv4, messageType: 3, lifetime: fragmentIPv4Lifetime},
-		{name: "IPv6", local: netip.MustParseAddr("2001:db8::44"), remote: netip.MustParseAddr("2001:db8:1::44"), protocol: protocolICMPv6, messageType: 1, lifetime: fragmentIPv6Lifetime},
+		{name: "IPv4", local: netip.MustParseAddr("192.0.2.44"), remote: netip.MustParseAddr("198.51.100.44"), protocol: ProtocolICMPv4, messageType: 3, lifetime: fragmentIPv4Lifetime},
+		{name: "IPv6", local: netip.MustParseAddr("2001:db8::44"), remote: netip.MustParseAddr("2001:db8:1::44"), protocol: ProtocolICMPv6, messageType: 1, lifetime: fragmentIPv6Lifetime},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			link, stack := newTestStack(t, test.local, test.remote)
@@ -1099,10 +1099,10 @@ func TestFragmentReassemblyTimeoutSuppressesICMPError(t *testing.T) {
 func FuzzFragmentParsing(f *testing.F) {
 	local := netip.MustParseAddr("192.0.2.32")
 	remote := netip.MustParseAddr("198.51.100.32")
-	fragments := buildIPv4Fragments(remote, local, protocolUDP, make([]byte, 2000), 1280, 1)
+	fragments := buildIPv4Fragments(remote, local, ProtocolUDP, make([]byte, 2000), 1280, 1)
 	local6 := netip.MustParseAddr("2001:db8::32")
 	remote6 := netip.MustParseAddr("2001:db8:1::32")
-	fragments6 := buildIPv6FragmentsWithOptions(remote6, local6, protocolUDP, make([]byte, 2000), 1280, 1, ipPacketOptions{})
+	fragments6 := buildIPv6FragmentsWithOptions(remote6, local6, ProtocolUDP, make([]byte, 2000), 1280, 1, ipPacketOptions{})
 	f.Add([]byte(nil))
 	f.Add(fragments[0])
 	f.Add(fragments6[0])
@@ -1207,9 +1207,9 @@ func FuzzFragmentReassemblyOrder(f *testing.F) {
 		}
 		var fragments [][]byte
 		if ipv6 {
-			fragments = buildIPv6FragmentsWithOptions(remote, local, protocolUDP, payload, 1280, 77, ipPacketOptions{})
+			fragments = buildIPv6FragmentsWithOptions(remote, local, ProtocolUDP, payload, 1280, 77, ipPacketOptions{})
 		} else {
-			fragments = buildIPv4Fragments(remote, local, protocolUDP, payload, 1280, 77)
+			fragments = buildIPv4Fragments(remote, local, ProtocolUDP, payload, 1280, 77)
 		}
 		now := time.Unix(100, 0)
 		for _, selected := range order {
@@ -1219,7 +1219,7 @@ func FuzzFragmentReassemblyOrder(f *testing.F) {
 				continue
 			}
 			parsed, ok := parseIPPacket(packet)
-			if !ok || parsed.protocol != protocolUDP || !bytes.Equal(parsed.payload, payload) {
+			if !ok || parsed.protocol != ProtocolUDP || !bytes.Equal(parsed.payload, payload) {
 				t.Fatalf("reassembled fuzz datagram = protocol %d payload %d parsed %t", parsed.protocol, len(parsed.payload), ok)
 			}
 		}
@@ -1256,9 +1256,9 @@ func FuzzFragmentReassemblyOverlap(f *testing.F) {
 			local = netip.MustParseAddr("2001:db8::34")
 			remote = netip.MustParseAddr("2001:db8:1::34")
 			bits = 128
-			fragments = buildIPv6FragmentsWithOptions(remote, local, protocolUDP, payload, 56, 78, ipPacketOptions{})
+			fragments = buildIPv6FragmentsWithOptions(remote, local, ProtocolUDP, payload, 56, 78, ipPacketOptions{})
 		} else {
-			fragments = buildIPv4Fragments(remote, local, protocolUDP, payload, 28, 78)
+			fragments = buildIPv4Fragments(remote, local, ProtocolUDP, payload, 28, 78)
 		}
 		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, bits)}, MTU: 1280})
 		if err != nil {
@@ -1304,7 +1304,7 @@ func FuzzFragmentReassemblyOverlap(f *testing.F) {
 				continue
 			}
 			parsed, valid := parseIPPacket(reassembled)
-			if !valid || parsed.protocol != protocolUDP || len(parsed.payload) > maximumEnd {
+			if !valid || parsed.protocol != ProtocolUDP || len(parsed.payload) > maximumEnd {
 				t.Fatalf("overlap reassembly produced invalid packet: parsed=%t protocol=%d payload=%d", valid, parsed.protocol, len(parsed.payload))
 			}
 		}
@@ -1314,8 +1314,8 @@ func FuzzFragmentReassemblyOverlap(f *testing.F) {
 // FuzzIPPayloadFragmentationRoundTrip verifies that source fragmentation and
 // inbound reassembly are inverse operations across packet-size boundaries.
 func FuzzIPPayloadFragmentationRoundTrip(f *testing.F) {
-	f.Add([]byte("short"), false, uint16(1500), byte(protocolUDP), byte(64), byte(0), uint32(0), false)
-	f.Add(make([]byte, 1500), false, uint16(68), byte(protocolTCP), byte(1), byte(0xff), uint32(0), true)
+	f.Add([]byte("short"), false, uint16(1500), byte(ProtocolUDP), byte(64), byte(0), uint32(0), false)
+	f.Add(make([]byte, 1500), false, uint16(68), byte(ProtocolTCP), byte(1), byte(0xff), uint32(0), true)
 	f.Add(make([]byte, 3000), true, uint16(1280), byte(99), byte(255), byte(0x2e), uint32(0xabcde), true)
 	f.Fuzz(func(t *testing.T, payload []byte, ipv6 bool, mtuSeed uint16, protocol, hopLimit, trafficClass byte, flowLabel uint32, reverse bool) {
 		if len(payload) > 4096 {
@@ -1329,10 +1329,10 @@ func FuzzIPPayloadFragmentationRoundTrip(f *testing.F) {
 			source = netip.MustParseAddr("2001:db8:1::35")
 			target = netip.MustParseAddr("2001:db8::35")
 			mtu = ipv6MinimumMTU + int(mtuSeed)%(1501-ipv6MinimumMTU)
-			protocols := [...]byte{protocolTCP, protocolUDP, protocolICMPv6, 253, 254}
+			protocols := [...]byte{ProtocolTCP, ProtocolUDP, ProtocolICMPv6, 253, 254}
 			protocol = protocols[int(protocol)%len(protocols)]
 		} else {
-			protocols := [...]byte{protocolTCP, protocolUDP, protocolICMPv4, 253, 254}
+			protocols := [...]byte{ProtocolTCP, ProtocolUDP, ProtocolICMPv4, 253, 254}
 			protocol = protocols[int(protocol)%len(protocols)]
 		}
 		stack, err := New(Config{
@@ -1414,7 +1414,7 @@ func FuzzIPPayloadFragmentationRoundTrip(f *testing.F) {
 func TestFragmentECNReassembly(t *testing.T) {
 	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
 	defer stack.Close()
-	fragments := buildIPv4Fragments(link.remote, link.local, protocolUDP, make([]byte, 2000), 1280, 91)
+	fragments := buildIPv4Fragments(link.remote, link.local, ProtocolUDP, make([]byte, 2000), 1280, 91)
 	if len(fragments) != 2 {
 		t.Fatalf("fragment count = %d, want 2", len(fragments))
 	}
@@ -1429,7 +1429,7 @@ func TestFragmentECNReassembly(t *testing.T) {
 		t.Fatalf("reassembled ECN = %d, valid = %v, want CE", parsed.ecn, ok)
 	}
 
-	fragments = buildIPv4Fragments(link.remote, link.local, protocolUDP, make([]byte, 2000), 1280, 92)
+	fragments = buildIPv4Fragments(link.remote, link.local, ProtocolUDP, make([]byte, 2000), 1280, 92)
 	setPacketECN(fragments[0], 0)
 	setPacketECN(fragments[1], 2)
 	_ = stack.reassemblePacket(fragments[0], time.Now())
@@ -1437,7 +1437,7 @@ func TestFragmentECNReassembly(t *testing.T) {
 		t.Fatal("mixed Not-ECT/ECT fragment set was accepted")
 	}
 
-	fragments = buildIPv4Fragments(link.remote, link.local, protocolUDP, make([]byte, 3000), 1280, 93)
+	fragments = buildIPv4Fragments(link.remote, link.local, ProtocolUDP, make([]byte, 3000), 1280, 93)
 	setPacketECN(fragments[0], 1)
 	setPacketECN(fragments[1], 2)
 	setPacketECN(fragments[2], 3)
@@ -1469,8 +1469,8 @@ func TestIncompleteFragmentIsNotCountedAsDropped(t *testing.T) {
 	binary.BigEndian.PutUint16(udp[0:2], 50000)
 	binary.BigEndian.PutUint16(udp[2:4], 50001)
 	binary.BigEndian.PutUint16(udp[4:6], uint16(len(udp)))
-	binary.BigEndian.PutUint16(udp[6:8], transportChecksum(remote, local, protocolUDP, udp))
-	fragments := buildIPv4Fragments(remote, local, protocolUDP, udp, 28, 1)
+	binary.BigEndian.PutUint16(udp[6:8], transportChecksum(remote, local, ProtocolUDP, udp))
+	fragments := buildIPv4Fragments(remote, local, ProtocolUDP, udp, 28, 1)
 	if len(fragments) < 2 {
 		t.Fatalf("fragment count = %d", len(fragments))
 	}
@@ -1486,7 +1486,7 @@ func TestIPv4FragmentsWithDontFragmentAreAccepted(t *testing.T) {
 	source := netip.MustParseAddr("198.51.100.94")
 	target := netip.MustParseAddr("192.0.2.94")
 	payload := make([]byte, 24)
-	fragments := buildIPv4Fragments(source, target, protocolUDP, payload, 28, 1)
+	fragments := buildIPv4Fragments(source, target, ProtocolUDP, payload, 28, 1)
 	if len(fragments) < 2 {
 		t.Fatalf("fragment count = %d", len(fragments))
 	}
@@ -1504,7 +1504,7 @@ func TestIPv4FragmentsWithDontFragmentAreAccepted(t *testing.T) {
 		}
 	}
 	parsed, ok := parseIPPacket(packet)
-	if !ok || parsed.protocol != protocolUDP || !bytes.Equal(parsed.payload, payload) {
+	if !ok || parsed.protocol != ProtocolUDP || !bytes.Equal(parsed.payload, payload) {
 		t.Fatalf("DF fragment reassembly = %+v, parsed = %v", parsed, ok)
 	}
 	if field := binary.BigEndian.Uint16(packet[6:8]); field&0x4000 == 0 {
@@ -1517,7 +1517,7 @@ func TestIPv4FragmentsWithDontFragmentAreAccepted(t *testing.T) {
 func TestIPv4FragmentWithReservedFlagIsRejected(t *testing.T) {
 	source := netip.MustParseAddr("198.51.100.95")
 	target := netip.MustParseAddr("192.0.2.95")
-	fragments := buildIPv4Fragments(source, target, protocolUDP, make([]byte, 24), 28, 2)
+	fragments := buildIPv4Fragments(source, target, ProtocolUDP, make([]byte, 24), 28, 2)
 	field := binary.BigEndian.Uint16(fragments[0][6:8]) | 0x8000
 	binary.BigEndian.PutUint16(fragments[0][6:8], field)
 	fragments[0][10], fragments[0][11] = 0, 0
@@ -1538,7 +1538,7 @@ func TestIPv4FragmentOptionsLimit(t *testing.T) {
 	binary.BigEndian.PutUint16(first[6:8], 0x2000)
 	first[10], first[11] = 0, 0
 	binary.BigEndian.PutUint16(first[10:12], checksum(first[:24]))
-	last := buildIPPacket(source, target, protocolUDP, make([]byte, 8), 3, false)
+	last := buildIPPacket(source, target, ProtocolUDP, make([]byte, 8), 3, false)
 	binary.BigEndian.PutUint16(last[6:8], 8188)
 	last[10], last[11] = 0, 0
 	binary.BigEndian.PutUint16(last[10:12], checksum(last[:20]))
@@ -1581,9 +1581,9 @@ func BenchmarkFragmentReassembly(b *testing.B) {
 			payload := bytes.Repeat([]byte{0x5a}, 60*1024)
 			var fragments [][]byte
 			if test.local.Is4() {
-				fragments = buildIPv4Fragments(test.remote, test.local, protocolUDP, payload, 1280, 240)
+				fragments = buildIPv4Fragments(test.remote, test.local, ProtocolUDP, payload, 1280, 240)
 			} else {
-				fragments = buildIPv6FragmentsWithOptions(test.remote, test.local, protocolUDP, payload, 1280, 240, ipPacketOptions{})
+				fragments = buildIPv6FragmentsWithOptions(test.remote, test.local, ProtocolUDP, payload, 1280, 240, ipPacketOptions{})
 			}
 			b.SetBytes(int64(len(payload)))
 			b.ReportAllocs()
@@ -1608,7 +1608,7 @@ func BenchmarkIPv6FragmentBuild(b *testing.B) {
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	for iteration := 0; iteration < b.N; iteration++ {
-		fragments := buildIPv6FragmentsWithOptions(source, target, protocolUDP, payload, 1280, uint32(iteration), ipPacketOptions{})
+		fragments := buildIPv6FragmentsWithOptions(source, target, ProtocolUDP, payload, 1280, uint32(iteration), ipPacketOptions{})
 		if len(fragments) == 0 {
 			b.Fatal("payload was not fragmented")
 		}

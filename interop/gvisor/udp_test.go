@@ -48,6 +48,88 @@ func TestUDPInterop(t *testing.T) {
 	}
 }
 
+// TestPublicUDPDatagramCodecInterop verifies native gVisor UDP receive from a
+// public-codec datagram and public decoding of gVisor's native UDP output.
+func TestPublicUDPDatagramCodecInterop(t *testing.T) {
+	const (
+		mipstackPort = 43011
+		gvisorPort   = 43012
+	)
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			captured := make(chan []byte, 4)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					select {
+					case captured <- append([]byte(nil), packet...):
+					default:
+					}
+					return false
+				},
+			})
+			peer := newGVisorUDPSocket(t, network, family.networkProtocol, gvisorFullAddress(family.gvisorAddress, gvisorPort), func(tcpip.Endpoint) {})
+			defer peer.Close()
+			if err := peer.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+
+			request := []byte("public-udp-codec-request")
+			datagram := mipstack.UDPDatagram{
+				Source:           netipAddrPort(family.mipstackAddress, mipstackPort),
+				Destination:      netipAddrPort(family.gvisorAddress, gvisorPort),
+				ChecksumDisabled: family.mipstackAddress.Is4(),
+				Payload:          request,
+			}
+			udpWire, err := datagram.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public UDP datagram: %v", err)
+			}
+			packet := mipstack.IPPacket{
+				Source: family.mipstackAddress, Destination: family.gvisorAddress,
+				Protocol: mipstack.ProtocolUDP, HopLimit: 64, Payload: udpWire,
+			}
+			if family.mipstackAddress.Is6() {
+				// Exercise a legal Destination Options chain in addition to the
+				// direct transport path used by the IPv4 zero-checksum case.
+				packet.Protocol = 60
+				packet.Payload = append([]byte{mipstack.ProtocolUDP, 0, 1, 4, 0, 0, 0, 0}, udpWire...)
+			}
+			wire, err := packet.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public UDP packet: %v", err)
+			}
+			if err = network.deliverToGVisor(wire); err != nil {
+				t.Fatalf("deliver public UDP packet: %v", err)
+			}
+			storage := make([]byte, 128)
+			read, source, err := peer.ReadFrom(storage)
+			if err != nil || !bytes.Equal(storage[:read], request) || source.String() != net.UDPAddrFromAddrPort(datagram.Source).String() {
+				t.Fatalf("gVisor UDP receive: n=%d source=%v payload=%x error=%v", read, source, storage[:read], err)
+			}
+
+			response := []byte("gvisor-udp-response")
+			if written, writeErr := peer.WriteTo(response, net.UDPAddrFromAddrPort(netipAddrPort(family.mipstackAddress, mipstackPort))); writeErr != nil || written != len(response) {
+				t.Fatalf("write gVisor UDP response: n=%d, error=%v", written, writeErr)
+			}
+			select {
+			case responseWire := <-captured:
+				parsedPacket, parseErr := mipstack.ParseIPPacket(responseWire)
+				if parseErr != nil {
+					t.Fatalf("parse gVisor UDP packet: %v", parseErr)
+				}
+				parsed, parseErr := parsedPacket.UDPDatagram()
+				if parseErr != nil || parsed.Source != netipAddrPort(family.gvisorAddress, gvisorPort) || parsed.Destination != datagram.Source || !bytes.Equal(parsed.Payload, response) {
+					t.Fatalf("parsed gVisor UDP = %+v, %v", parsed, parseErr)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("timed out waiting for gVisor UDP packet")
+			}
+		})
+	}
+}
+
 // TestUDPMaximumDatagramInterop verifies each address family's largest legal
 // UDP payload in both socket arrangements over a jumbo link that still
 // requires source fragmentation.

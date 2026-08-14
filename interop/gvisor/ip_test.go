@@ -34,6 +34,82 @@ func TestRawIPInterop(t *testing.T) {
 	}
 }
 
+// TestPublicIPPacketCodecInterop sends a public-codec packet through gVisor's
+// native raw endpoint and decodes gVisor's native response with the same API.
+func TestPublicIPPacketCodecInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			captured := make(chan []byte, 4)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					select {
+					case captured <- append([]byte(nil), packet...):
+					default:
+					}
+					return false
+				},
+			})
+			var queue waiter.Queue
+			endpoint, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, interopRawIPProtocol, &queue)
+			if tcpipErr != nil {
+				t.Fatalf("create gVisor raw endpoint: %s", tcpipErr.String())
+			}
+			defer endpoint.Close()
+			if tcpipErr = endpoint.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+				t.Fatalf("bind gVisor raw endpoint: %s", tcpipErr.String())
+			}
+			if tcpipErr = endpoint.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+				t.Fatalf("connect gVisor raw endpoint: %s", tcpipErr.String())
+			}
+			entry, notifications := registerReadable(&queue)
+			defer queue.EventUnregister(&entry)
+
+			request := []byte("public-ip-codec-request")
+			packet := mipstack.IPPacket{
+				Source: family.mipstackAddress, Destination: family.gvisorAddress,
+				Protocol: int(interopRawIPProtocol), HopLimit: 37, TrafficClass: 0x2e, Payload: request,
+			}
+			wire, err := packet.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public IP packet: %v", err)
+			}
+			if err = network.deliverToGVisor(wire); err != nil {
+				t.Fatalf("deliver public IP packet: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			received, _, err := readGVisorEndpoint(ctx, endpoint, notifications, 65535)
+			if err != nil {
+				t.Fatalf("read public packet in gVisor: %v", err)
+			}
+			received, err = stripGVisorRawHeader(family, received)
+			if err != nil || !bytes.Equal(received, request) {
+				t.Fatalf("gVisor raw payload = %x, %v", received, err)
+			}
+
+			response := []byte("gvisor-native-response")
+			if written, writeErr := endpoint.Write(bytes.NewReader(response), tcpip.WriteOptions{}); writeErr != nil || written != int64(len(response)) {
+				t.Fatalf("write gVisor raw response: n=%d, error=%s", written, tcpipErrorString(writeErr))
+			}
+			select {
+			case responseWire := <-captured:
+				parsed, parseErr := mipstack.ParseIPPacket(responseWire)
+				if parseErr != nil {
+					t.Fatalf("parse gVisor response: %v", parseErr)
+				}
+				protocol, payload, upperErr := parsed.UpperLayer()
+				if upperErr != nil || protocol != int(interopRawIPProtocol) || parsed.Source != family.gvisorAddress || parsed.Destination != family.mipstackAddress || !bytes.Equal(payload, response) {
+					t.Fatalf("parsed gVisor response = protocol %d source %s target %s payload %x, %v", protocol, parsed.Source, parsed.Destination, payload, upperErr)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+		})
+	}
+}
+
 // TestIPv6RawChecksumInterop verifies RFC 3542 IPV6_CHECKSUM insertion and
 // receive verification in both directions. Fragmented output is delivered to
 // gVisor's UDP transport because the pinned gVisor raw demultiplexer observes

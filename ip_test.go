@@ -72,17 +72,17 @@ func TestIPv6UDPChecksumNegativeZero(t *testing.T) {
 	payload := make([]byte, 8)
 	// Adding the checksum of an all-zero payload as ordinary data makes the
 	// checksum to be inserted at offset 6 evaluate to positive zero.
-	binary.BigEndian.PutUint16(payload[0:2], transportChecksum(source, target, protocolUDP, payload))
-	if value := transportChecksum(source, target, protocolUDP, payload); value != 0 {
+	binary.BigEndian.PutUint16(payload[0:2], transportChecksum(source, target, ProtocolUDP, payload))
+	if value := transportChecksum(source, target, ProtocolUDP, payload); value != 0 {
 		t.Fatalf("constructed UDP checksum = %#x, want zero", value)
 	}
-	if err := setIPv6PayloadChecksum(payload, source, target, protocolUDP, 6); err != nil {
+	if err := setIPv6PayloadChecksum(payload, source, target, ProtocolUDP, 6); err != nil {
 		t.Fatal(err)
 	}
 	if value := binary.BigEndian.Uint16(payload[6:8]); value != 0xffff {
 		t.Fatalf("inserted zero UDP checksum = %#x, want 0xffff", value)
 	}
-	if value := transportChecksum(source, target, protocolUDP, payload); value != 0 {
+	if value := transportChecksum(source, target, ProtocolUDP, payload); value != 0 {
 		t.Fatalf("negative-zero UDP checksum verifies as %#x", value)
 	}
 }
@@ -99,7 +99,7 @@ func TestIPConnReceivePolicyConcurrentUpdates(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	ipv4 := newIPConn(stack, "ip4:icmp", protocolICMPv4, local4, netip.Addr{}, socketOptionSet{})
+	ipv4 := newIPConn(stack, "ip4:icmp", ProtocolICMPv4, local4, netip.Addr{}, socketOptionSet{})
 	ipv6 := newIPConn(stack, "ip6:99", 99, local6, netip.Addr{}, socketOptionSet{})
 	defer ipv4.closeFromStack()
 	defer ipv6.closeFromStack()
@@ -524,7 +524,7 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 		t.Fatalf("connected IP Write = %d, %v", n, writeErr)
 	}
 	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
-	if !ok || transportChecksum(local, remote, protocolICMPv6, packet.payload) != 0 {
+	if !ok || transportChecksum(local, remote, ProtocolICMPv6, packet.payload) != 0 {
 		t.Fatalf("ICMPv6 raw checksum is invalid: %x", packet.payload)
 	}
 	if _, _, err = ipConnection.WriteMsgIP(payload, nil, nil); !errors.Is(err, net.ErrWriteToConnected) {
@@ -537,10 +537,10 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 	} else if operationError := checkNetOpError(t, err, "write", "ip6:ipv6-icmp"); operationError.Addr != nil {
 		t.Fatalf("connected IP WriteToIP(nil) error address = %v, want nil", operationError.Addr)
 	}
-	wrong := buildIPPacket(other, local, protocolICMPv6, []byte{129, 0, 0, 0, 0, 1, 0, 1}, 0, true)
+	wrong := buildIPPacket(other, local, ProtocolICMPv6, []byte{129, 0, 0, 0, 0, 1, 0, 1}, 0, true)
 	binaryPayload := wrong[40:]
 	binaryPayload[2], binaryPayload[3] = 0, 0
-	checksumValue := transportChecksum(other, local, protocolICMPv6, binaryPayload)
+	checksumValue := transportChecksum(other, local, ProtocolICMPv6, binaryPayload)
 	binaryPayload[2], binaryPayload[3] = byte(checksumValue>>8), byte(checksumValue)
 	if err = writeTestPacket(stack, wrong); err != nil {
 		t.Fatal(err)
@@ -550,7 +550,7 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 		t.Fatalf("connected remote filter error = %v, want deadline", err)
 	}
 	_ = connection.SetReadDeadline(time.Time{})
-	invalid := buildIPPacket(remote, local, protocolICMPv6, []byte{129, 0, 0, 0, 0, 1, 0, 1}, 0, true)
+	invalid := buildIPPacket(remote, local, ProtocolICMPv6, []byte{129, 0, 0, 0, 0, 1, 0, 1}, 0, true)
 	if err = writeTestPacket(stack, invalid); err != nil {
 		t.Fatal(err)
 	}
@@ -558,10 +558,10 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 	if count, readErr := ipConnection.ReadBatch(readMessages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
 		t.Fatalf("invalid ICMPv6 checksum read = %d, %v, want EAGAIN", count, readErr)
 	}
-	reply := buildIPPacket(remote, local, protocolICMPv6, []byte{129, 0, 0, 0, 0, 1, 0, 1}, 0, true)
+	reply := buildIPPacket(remote, local, ProtocolICMPv6, []byte{129, 0, 0, 0, 0, 1, 0, 1}, 0, true)
 	replyPayload := reply[40:]
 	replyPayload[2], replyPayload[3] = 0, 0
-	checksumValue = transportChecksum(remote, local, protocolICMPv6, replyPayload)
+	checksumValue = transportChecksum(remote, local, ProtocolICMPv6, replyPayload)
 	replyPayload[2], replyPayload[3] = byte(checksumValue>>8), byte(checksumValue)
 	if err = writeTestPacket(stack, reply); err != nil {
 		t.Fatal(err)
@@ -585,7 +585,7 @@ func TestIPConnICMPReceiveFilters(t *testing.T) {
 	}{
 		{
 			name: "IPv4", local: netip.MustParseAddr("192.0.2.150"), remote: netip.MustParseAddr("198.51.100.150"),
-			network: "ip4:icmp", protocol: protocolICMPv4, messageType: 0,
+			network: "ip4:icmp", protocol: ProtocolICMPv4, messageType: 0,
 			option: func() (SocketOption, any) {
 				var filter ICMPv4Filter
 				filter.Block(0)
@@ -594,7 +594,7 @@ func TestIPConnICMPReceiveFilters(t *testing.T) {
 		},
 		{
 			name: "IPv6", local: netip.MustParseAddr("2001:db8::150"), remote: netip.MustParseAddr("2001:db8:1::150"),
-			network: "ip6:ipv6-icmp", protocol: protocolICMPv6, messageType: 129,
+			network: "ip6:ipv6-icmp", protocol: ProtocolICMPv6, messageType: 129,
 			option: func() (SocketOption, any) {
 				var filter ICMPv6Filter
 				filter.Block(129)
@@ -620,7 +620,7 @@ func TestIPConnICMPReceiveFilters(t *testing.T) {
 			defer connection.Close()
 
 			message := []byte{test.messageType, 0, 0, 0, 0x12, 0x34, 0x56, 0x78}
-			if test.protocol == protocolICMPv4 {
+			if test.protocol == ProtocolICMPv4 {
 				binary.BigEndian.PutUint16(message[2:4], checksum(message))
 			} else {
 				binary.BigEndian.PutUint16(message[2:4], transportChecksum(test.remote, test.local, test.protocol, message))
@@ -692,7 +692,7 @@ func TestIPConnICMPReceiveFilters(t *testing.T) {
 			}
 			write()
 			assertEmpty()
-			if test.protocol == protocolICMPv4 {
+			if test.protocol == ProtocolICMPv4 {
 				// x/net's filter methods expose the 32-bit mask through low-bit
 				// indexing, while Linux passes received types above that mask.
 				message[0], message[2], message[3] = 32, 0, 0
@@ -880,7 +880,7 @@ func TestIPConnDualStackIPv6ChecksumIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
-	if !ok || packet.source != local4 || packet.protocol != protocolICMPv6 || !bytes.Equal(packet.payload, want) || !bytes.Equal(icmpNumberOverIPv4, want) {
+	if !ok || packet.source != local4 || packet.protocol != ProtocolICMPv6 || !bytes.Equal(packet.payload, want) || !bytes.Equal(icmpNumberOverIPv4, want) {
 		t.Fatalf("IPv4 protocol 58 was treated as ICMPv6: %+v payload=%x", packet, icmpNumberOverIPv4)
 	}
 }
@@ -1513,11 +1513,11 @@ func TestIPBatchWriteIPv6ChecksumAndFlowLabel(t *testing.T) {
 		t.Fatalf("WriteBatch mutated caller payload: %x", payload)
 	}
 	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
-	if !ok || packet.source != local || packet.target != remote || packet.protocol != protocolICMPv6 ||
-		transportChecksum(local, remote, protocolICMPv6, packet.payload) != 0 {
+	if !ok || packet.source != local || packet.target != remote || packet.protocol != ProtocolICMPv6 ||
+		transportChecksum(local, remote, ProtocolICMPv6, packet.payload) != 0 {
 		t.Fatalf("IPv6 ICMP batch packet = %+v, parsed = %v", packet, ok)
 	}
-	wantLabel := stack.automaticFlowLabel(local, remote, protocolICMPv6, original)
+	wantLabel := stack.automaticFlowLabel(local, remote, ProtocolICMPv6, original)
 	if packet.flowLabel != wantLabel {
 		t.Fatalf("IPv6 ICMP batch flow label = %#x, want %#x", packet.flowLabel, wantLabel)
 	}

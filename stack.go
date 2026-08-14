@@ -1142,7 +1142,7 @@ func outputHashWord(hash, value uint64) uint64 {
 // locally generated TCP, UDP, and ICMP traffic. ICMP checksums and echo
 // sequence numbers vary per message; type, code, and identifier do not.
 func outputTransportSelector(protocol byte, payload []byte) uint32 {
-	if protocol == protocolICMPv4 || protocol == protocolICMPv6 {
+	if protocol == ProtocolICMPv4 || protocol == ProtocolICMPv6 {
 		var selector [4]byte
 		if len(payload) >= 2 {
 			selector[0], selector[1] = payload[0], payload[1]
@@ -2274,11 +2274,11 @@ func validInboundPacketSource(state *networkState, packet ipPacket) bool {
 func (s *Stack) automaticFlowLabel(source, target netip.Addr, protocol byte, payload []byte) uint32 {
 	var selector [4]byte
 	switch protocol {
-	case protocolTCP, protocolUDP:
+	case ProtocolTCP, ProtocolUDP:
 		if len(payload) >= 4 {
 			copy(selector[:], payload[:4])
 		}
-	case protocolICMPv6:
+	case ProtocolICMPv6:
 		if len(payload) >= 6 {
 			selector[0], selector[1] = payload[0], payload[1]
 			copy(selector[2:4], payload[4:6])
@@ -3219,8 +3219,8 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 	// before exposing the message to a raw socket. Raw fan-out precedes the
 	// built-in ICMP handler below, so this validation belongs at the common
 	// dispatch boundary rather than in the handler alone.
-	if parsed.source.Is6() && parsed.protocol == protocolICMPv6 &&
-		(len(parsed.payload) < 4 || transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0) {
+	if parsed.source.Is6() && parsed.protocol == ProtocolICMPv6 &&
+		(len(parsed.payload) < 4 || transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0) {
 		s.stats.inboundDroppedPackets.Add(1)
 		return nil
 	}
@@ -3230,7 +3230,7 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 	}
 	// UDP and raw sockets apply equivalent per-socket filters during fanout.
 	// Built-in ICMP processing needs the aggregate interface filter here.
-	if destination == inboundDestinationMulticast && (parsed.protocol == protocolICMPv4 || parsed.protocol == protocolICMPv6) &&
+	if destination == inboundDestinationMulticast && (parsed.protocol == ProtocolICMPv4 || parsed.protocol == ProtocolICMPv6) &&
 		!isAllHostsGroup(parsed.target) && !isMulticastControlPacket(parsed) &&
 		(multicast == nil || !multicast.acceptsSource(parsed.target, parsed.source)) {
 		s.stats.inboundDroppedPackets.Add(1)
@@ -3258,18 +3258,18 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 		return nil
 	}
 	switch parsed.protocol {
-	case protocolTCP:
+	case ProtocolTCP:
 		if destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast {
 			return s.handleTCPForDestination(parsed, receivedAt, destination == inboundDestinationLocalUnicast)
 		}
 		return nil
-	case protocolUDP:
+	case ProtocolUDP:
 		return s.handleUDP(parsed, destination)
-	case protocolICMPv4:
+	case ProtocolICMPv4:
 		if parsed.source.Is4() && (destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast) {
 			return s.handleICMP(parsed, destination == inboundDestinationLocalUnicast)
 		}
-	case protocolICMPv6:
+	case ProtocolICMPv6:
 		if parsed.source.Is6() && destination == inboundDestinationMulticast {
 			return s.handleMulticastICMPv6(parsed)
 		}

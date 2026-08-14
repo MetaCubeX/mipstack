@@ -369,7 +369,7 @@ func TestUDPNonblockingFragmentedWriteIsAtomic(t *testing.T) {
 	connection := packetConnection.(*UDPConn)
 	defer connection.Close()
 
-	dummy := buildIPPacket(local, remote.Addr(), protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	dummy := buildIPPacket(local, remote.Addr(), ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
 	for stack.outbound.len() < outboundPacketQueue-1 {
 		if !stack.outbound.tryEnqueue(dummy) {
 			t.Fatal("outbound queue filled before the expected boundary")
@@ -417,8 +417,8 @@ func TestUDPBatchWriteFragmentedBuffers(t *testing.T) {
 		reassembled = receiver.reassemblePacket(readOutboundPacket(t, stack), time.Now())
 	}
 	packet, ok := parseIPPacket(reassembled)
-	if !ok || packet.protocol != protocolUDP || len(packet.payload) != udpHeaderSize+len(payload) ||
-		!bytes.Equal(packet.payload[udpHeaderSize:], payload) || transportChecksum(local, remote, protocolUDP, packet.payload) != 0 {
+	if !ok || packet.protocol != ProtocolUDP || len(packet.payload) != udpHeaderSize+len(payload) ||
+		!bytes.Equal(packet.payload[udpHeaderSize:], payload) || transportChecksum(local, remote, ProtocolUDP, packet.payload) != 0 {
 		t.Fatalf("reassembled UDP batch packet = %+v, parsed = %v", packet, ok)
 	}
 }
@@ -542,6 +542,89 @@ func TestUDPPathMTUConfirmationCanRaiseExpiredBaseline(t *testing.T) {
 	if mtu, pathErr := stack.PathMTU(remote); pathErr != nil || mtu != 1200 {
 		t.Fatalf("confirmed path MTU = %d, %v, want 1200", mtu, pathErr)
 	}
+}
+
+func TestPublicUDPDatagramCodec(t *testing.T) {
+	tests := []UDPDatagram{
+		{Source: netip.MustParseAddrPort("192.0.2.1:5353"), Destination: netip.MustParseAddrPort("198.51.100.2:53"), ChecksumDisabled: true, Payload: []byte("unchecked-v4")},
+		{Source: netip.MustParseAddrPort("[2001:db8::1]:5353"), Destination: netip.MustParseAddrPort("[2001:db8::2]:53"), Payload: []byte("checked-v6")},
+	}
+	for _, test := range tests {
+		name := "IPv4ZeroChecksum"
+		if test.Source.Addr().Is6() {
+			name = "IPv6"
+		}
+		t.Run(name, func(t *testing.T) {
+			wire, err := test.AppendBinary([]byte{1, 2})
+			if err != nil {
+				t.Fatalf("append UDP: %v", err)
+			}
+			if !bytes.Equal(wire[:2], []byte{1, 2}) {
+				t.Fatal("UDP AppendBinary changed prefix")
+			}
+			wire = wire[2:]
+			checksumValue := binary.BigEndian.Uint16(wire[6:8])
+			if test.ChecksumDisabled && checksumValue != 0 || !test.ChecksumDisabled && (checksumValue == 0 || transportChecksum(test.Source.Addr(), test.Destination.Addr(), ProtocolUDP, wire) != 0) {
+				t.Fatalf("encoded UDP checksum = %#x", checksumValue)
+			}
+			packet := IPPacket{Source: test.Source.Addr(), Destination: test.Destination.Addr(), Protocol: ProtocolUDP, HopLimit: 64, Payload: append(wire, 0xaa, 0xbb)}
+			parsed, err := packet.UDPDatagram()
+			if err != nil {
+				t.Fatalf("parse UDP: %v", err)
+			}
+			if parsed.Source != test.Source || parsed.Destination != test.Destination || parsed.ChecksumDisabled != test.ChecksumDisabled || !bytes.Equal(parsed.Payload, test.Payload) {
+				t.Fatalf("parsed UDP = %+v, want %+v", parsed, test)
+			}
+			roundTrip, err := parsed.MarshalBinary()
+			if err != nil || !bytes.Equal(roundTrip, wire) {
+				t.Fatalf("UDP round trip: error=%v\n got %x\nwant %x", err, roundTrip, wire)
+			}
+		})
+	}
+}
+
+func TestPublicUDPDatagramCodecErrorsDoNotModifyDestination(t *testing.T) {
+	datagram := UDPDatagram{Source: netip.MustParseAddrPort("[2001:db8::1]:1"), Destination: netip.MustParseAddrPort("[2001:db8::2]:2"), ChecksumDisabled: true}
+	prefix := []byte{3, 4, 5}
+	want := append([]byte(nil), prefix...)
+	if got, err := datagram.AppendBinary(prefix); !errors.Is(err, syscall.EINVAL) || !bytes.Equal(got, want) || !bytes.Equal(prefix, want) {
+		t.Fatalf("invalid UDP AppendBinary: got=%x error=%v", got, err)
+	}
+	datagram.ChecksumDisabled = false
+	datagram.Source = netip.AddrPortFrom(netip.MustParseAddr("2001:db8::1").WithZone("test"), 1)
+	if _, err := datagram.AppendBinary(nil); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("zoned UDP datagram error = %v", err)
+	}
+}
+
+func FuzzPublicUDPDatagramCodec(f *testing.F) {
+	seed := UDPDatagram{Source: netip.MustParseAddrPort("[2001:db8::1]:1234"), Destination: netip.MustParseAddrPort("[2001:db8::2]:53"), Payload: []byte("seed")}
+	wire, err := seed.AppendBinary(nil)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(wire)
+	f.Fuzz(func(t *testing.T, wire []byte) {
+		packet := IPPacket{Source: seed.Source.Addr(), Destination: seed.Destination.Addr(), Protocol: ProtocolUDP, HopLimit: 64, Payload: wire}
+		datagram, err := packet.UDPDatagram()
+		if err != nil {
+			return
+		}
+		encoded, err := datagram.AppendBinary(nil)
+		if err != nil {
+			t.Fatalf("parsed UDP could not be encoded: %v", err)
+		}
+		packet.Payload = encoded
+		reparsed, err := packet.UDPDatagram()
+		if err != nil {
+			t.Fatalf("encoded UDP could not be parsed: %v", err)
+		}
+		canonical := append([]byte(nil), encoded...)
+		inPlace, err := reparsed.AppendBinary(encoded[:0])
+		if err != nil || !bytes.Equal(inPlace, canonical) {
+			t.Fatalf("in-place UDP append: error=%v\n got %x\nwant %x", err, inPlace, canonical)
+		}
+	})
 }
 
 func TestMarshalUDPDatagramOverwritesReusedBuffer(t *testing.T) {

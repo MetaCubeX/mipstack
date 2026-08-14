@@ -341,7 +341,7 @@ func TestTCPSocketDefaultConfiguration(t *testing.T) {
 		close(dialDone)
 	}()
 	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
-	if !ok || packet.protocol != protocolTCP || packet.trafficClass != 0xa8 {
+	if !ok || packet.protocol != ProtocolTCP || packet.trafficClass != 0xa8 {
 		t.Fatalf("default TCP SYN traffic class = %#x, want %#x", packet.trafficClass, 0xa8)
 	}
 	cancel()

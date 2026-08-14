@@ -421,15 +421,15 @@ func parseIPNetwork(network string, address netip.Addr) (byte, error) {
 	var protocol byte
 	switch strings.ToLower(protocolName) {
 	case "icmp":
-		protocol = protocolICMPv4
+		protocol = ProtocolICMPv4
 	case "igmp":
 		protocol = 2
 	case "tcp":
-		protocol = protocolTCP
+		protocol = ProtocolTCP
 	case "udp":
-		protocol = protocolUDP
+		protocol = ProtocolUDP
 	case "ipv6-icmp":
-		protocol = protocolICMPv6
+		protocol = ProtocolICMPv6
 	default:
 		for _, character := range protocolName {
 			if character < '0' || character > '9' {
@@ -465,7 +465,7 @@ func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.
 	}
 	defaults = applyDatagramSocketOptions(defaults, options.datagram, ipDatagramMetadataSize)
 	checksumOffset := -1
-	if local.Is6() && protocol == protocolICMPv6 {
+	if local.Is6() && protocol == ProtocolICMPv6 {
 		checksumOffset = 2
 	}
 	if checksum := options.ip.ipv6Checksum; checksum.set {
@@ -661,9 +661,9 @@ func (c *IPConn) enqueuePacket(packet ipPacket, options ipPacketOptions) {
 	}
 	size := ipDatagramMetadataSize + len(payload)
 	c.mu.Lock()
-	blocked := len(packet.payload) != 0 && (packet.source.Is4() && c.protocol == protocolICMPv4 && packet.payload[0] < 32 && c.icmpV4Filter.WillBlock(packet.payload[0]) ||
-		packet.source.Is6() && c.protocol == protocolICMPv6 && c.icmpV6Filter.WillBlock(packet.payload[0]))
-	if blocked || packet.source.Is6() && c.protocol != protocolICMPv6 && c.ipv6ChecksumOffset >= 0 &&
+	blocked := len(packet.payload) != 0 && (packet.source.Is4() && c.protocol == ProtocolICMPv4 && packet.payload[0] < 32 && c.icmpV4Filter.WillBlock(packet.payload[0]) ||
+		packet.source.Is6() && c.protocol == ProtocolICMPv6 && c.icmpV6Filter.WillBlock(packet.payload[0]))
+	if blocked || packet.source.Is6() && c.protocol != ProtocolICMPv6 && c.ipv6ChecksumOffset >= 0 &&
 		(c.ipv6ChecksumOffset > len(packet.payload)-2 || transportChecksum(packet.source, packet.target, c.protocol, packet.payload) != 0) {
 		c.mu.Unlock()
 		return
@@ -1432,7 +1432,7 @@ func setIPv6PayloadChecksum(payload []byte, source, target netip.Addr, protocol 
 	}
 	payload[offset], payload[offset+1] = 0, 0
 	value := transportChecksum(source, target, protocol, payload)
-	if protocol == protocolUDP && value == 0 {
+	if protocol == ProtocolUDP && value == 0 {
 		// RFC 768 assigns an all-zero UDP checksum field to the disabled
 		// state. IPv6 forbids that state, so Linux rawv6 uses negative zero.
 		value = 0xffff
@@ -1679,7 +1679,7 @@ func (c *IPConn) SetICMPv4Filter(filter ICMPv4Filter) error {
 	if c.v6 && !c.dual {
 		return c.setOperationError(syscall.EAFNOSUPPORT)
 	}
-	if c.protocol != protocolICMPv4 {
+	if c.protocol != ProtocolICMPv4 {
 		return c.setOperationError(syscall.ENOPROTOOPT)
 	}
 	c.mu.Lock()
@@ -1699,7 +1699,7 @@ func (c *IPConn) ICMPv4Filter() (ICMPv4Filter, error) {
 	if c.v6 && !c.dual {
 		return ICMPv4Filter{}, c.setOperationError(syscall.EAFNOSUPPORT)
 	}
-	if c.protocol != protocolICMPv4 {
+	if c.protocol != ProtocolICMPv4 {
 		return ICMPv4Filter{}, c.setOperationError(syscall.ENOPROTOOPT)
 	}
 	c.mu.Lock()
@@ -1718,7 +1718,7 @@ func (c *IPConn) SetICMPv6Filter(filter ICMPv6Filter) error {
 	if !c.v6 {
 		return c.setOperationError(syscall.EAFNOSUPPORT)
 	}
-	if c.protocol != protocolICMPv6 {
+	if c.protocol != ProtocolICMPv6 {
 		return c.setOperationError(syscall.ENOPROTOOPT)
 	}
 	c.mu.Lock()
@@ -1738,7 +1738,7 @@ func (c *IPConn) ICMPv6Filter() (ICMPv6Filter, error) {
 	if !c.v6 {
 		return ICMPv6Filter{}, c.setOperationError(syscall.EAFNOSUPPORT)
 	}
-	if c.protocol != protocolICMPv6 {
+	if c.protocol != ProtocolICMPv6 {
 		return ICMPv6Filter{}, c.setOperationError(syscall.ENOPROTOOPT)
 	}
 	c.mu.Lock()
@@ -1759,7 +1759,7 @@ func (c *IPConn) SetIPv6Checksum(enabled bool, offset int) error {
 	if !c.v6 {
 		return c.setOperationError(syscall.EAFNOSUPPORT)
 	}
-	if c.protocol == protocolICMPv6 || enabled && (offset < 0 || offset&1 != 0) {
+	if c.protocol == ProtocolICMPv6 || enabled && (offset < 0 || offset&1 != 0) {
 		return c.setOperationError(syscall.EINVAL)
 	}
 	if !enabled {

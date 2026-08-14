@@ -63,6 +63,71 @@ func TestTCPInterop(t *testing.T) {
 	}
 }
 
+// TestPublicTCPSegmentCodecInterop verifies that gVisor accepts a SYN built by
+// the public codec and that its native SYN-ACK is decoded by the same API.
+func TestPublicTCPSegmentCodecInterop(t *testing.T) {
+	const (
+		mipstackPort = 44011
+		gvisorPort   = 44012
+	)
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			captured := make(chan []byte, 4)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					select {
+					case captured <- append([]byte(nil), packet...):
+					default:
+					}
+					return false
+				},
+			})
+			listener, err := gonet.ListenTCP(network.gvisor, gvisorFullAddress(family.gvisorAddress, gvisorPort), family.networkProtocol)
+			if err != nil {
+				t.Fatalf("listen with gVisor TCP: %v", err)
+			}
+			defer listener.Close()
+
+			segment := mipstack.TCPSegment{
+				Source:         netipAddrPort(family.mipstackAddress, mipstackPort),
+				Destination:    netipAddrPort(family.gvisorAddress, gvisorPort),
+				SequenceNumber: 1000, Flags: mipstack.TCPFlagSYN, WindowSize: 65535,
+				Options: []byte{2, 4, 0x05, 0xb4},
+			}
+			tcpWire, err := segment.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public TCP SYN: %v", err)
+			}
+			packet := mipstack.IPPacket{
+				Source: family.mipstackAddress, Destination: family.gvisorAddress,
+				Protocol: mipstack.ProtocolTCP, HopLimit: 64, Payload: tcpWire,
+			}
+			wire, err := packet.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public TCP packet: %v", err)
+			}
+			if err = network.deliverToGVisor(wire); err != nil {
+				t.Fatalf("deliver public TCP SYN: %v", err)
+			}
+			select {
+			case responseWire := <-captured:
+				parsedPacket, parseErr := mipstack.ParseIPPacket(responseWire)
+				if parseErr != nil {
+					t.Fatalf("parse gVisor SYN-ACK packet: %v", parseErr)
+				}
+				parsed, parseErr := parsedPacket.TCPSegment()
+				if parseErr != nil || parsed.Source != segment.Destination || parsed.Destination != segment.Source || parsed.Flags&(mipstack.TCPFlagSYN|mipstack.TCPFlagACK) != mipstack.TCPFlagSYN|mipstack.TCPFlagACK || parsed.Flags&mipstack.TCPFlagRST != 0 || parsed.AcknowledgmentNumber != segment.SequenceNumber+1 {
+					t.Fatalf("parsed gVisor SYN-ACK = %+v, %v", parsed, parseErr)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("timed out waiting for gVisor SYN-ACK")
+			}
+		})
+	}
+}
+
 // TestTCPCongestionControlInterop verifies that every built-in mipstack
 // controller completes active and passive transfers after an actual data loss
 // against gVisor's TCP implementation.

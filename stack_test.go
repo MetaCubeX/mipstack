@@ -110,7 +110,7 @@ func TestSocketMessagePeekTruncationAndErrorQueue(t *testing.T) {
 	}
 	networkError := ICMPError{
 		Reporter: reporter, Type: 3, Code: 3,
-		QuotedSource: local, QuotedTarget: remote.Addr(), QuotedProtocol: protocolUDP,
+		QuotedSource: local, QuotedTarget: remote.Addr(), QuotedProtocol: ProtocolUDP,
 		QuotedPacket: quotedPacket, QuotedPayload: quoted.payload,
 	}
 	if err = connection.SetReceiveErrors(true); err != nil {
@@ -203,7 +203,7 @@ func TestStackClosePreventsCacheRepopulation(t *testing.T) {
 		t.Fatal(err)
 	}
 	stack.pathMTU[remote] = pathMTUEntry{mtu: 1200, updated: time.Now()}
-	fragments := buildIPv4Fragments(remote, local, protocolUDP, make([]byte, 1600), 600, 1)
+	fragments := buildIPv4Fragments(remote, local, ProtocolUDP, make([]byte, 1600), 600, 1)
 	if len(fragments) < 2 {
 		t.Fatal("test datagram was not fragmented")
 	}
@@ -512,7 +512,7 @@ func TestFullLoopbackQueueDoesNotBlock(t *testing.T) {
 	}
 	defer stack.Close()
 	fillTestPacketQueue(t, &stack.loopback, []byte{0})
-	packet := buildIPPacket(local, local, protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	packet := buildIPPacket(local, local, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
 	if err = stack.writePacket(packet); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("writePacket to full loopback queue = %v, want ErrResourceLimit", err)
 	}
@@ -532,7 +532,7 @@ func TestPacketQueueTicketTracksDeviceDequeue(t *testing.T) {
 	if err = stack.Start(); err != nil {
 		t.Fatal(err)
 	}
-	packet := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	packet := buildIPPacket(local, remote, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
 	queue, loopback := stack.outputQueue(packet)
 	if loopback {
 		t.Fatal("remote packet selected the loopback queue")
@@ -629,7 +629,7 @@ func TestPacketQueueConcurrentWritersMakeBoundedProgress(t *testing.T) {
 	if err = stack.Start(); err != nil {
 		t.Fatal(err)
 	}
-	packet := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	packet := buildIPPacket(local, remote, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
 	const writers = 1024
 	errorsCh := make(chan error, writers)
 	start := make(chan struct{})
@@ -1414,7 +1414,7 @@ func testOutputUDPPacket(source, target netip.Addr, sourcePort, targetPort uint1
 	payload := make([]byte, size)
 	binary.BigEndian.PutUint16(payload[0:2], sourcePort)
 	binary.BigEndian.PutUint16(payload[2:4], targetPort)
-	return buildIPPacket(source, target, protocolUDP, payload, 0, true)
+	return buildIPPacket(source, target, ProtocolUDP, payload, 0, true)
 }
 
 func enqueueTestOutputPacket(t *testing.T, queue *packetQueue, packet []byte) {
@@ -1514,7 +1514,7 @@ func TestOutputPacketFlowHashKeepsIPv6FragmentsTogether(t *testing.T) {
 	source := netip.MustParseAddr("2001:db8::4")
 	target := netip.MustParseAddr("2001:db8:1::4")
 	secret := [16]byte{4}
-	fragments := buildIPv6FragmentsWithOptions(source, target, protocolUDP, make([]byte, 3000), 1280, 0x12345678, ipPacketOptions{})
+	fragments := buildIPv6FragmentsWithOptions(source, target, ProtocolUDP, make([]byte, 3000), 1280, 0x12345678, ipPacketOptions{})
 	if len(fragments) < 2 {
 		t.Fatal("test datagram was not fragmented")
 	}
@@ -1524,7 +1524,7 @@ func TestOutputPacketFlowHashKeepsIPv6FragmentsTogether(t *testing.T) {
 			t.Fatalf("fragment %d hash = %x, want %x", index+1, got, want)
 		}
 	}
-	other := buildIPv6FragmentsWithOptions(source, target, protocolUDP, make([]byte, 3000), 1280, 0x12345679, ipPacketOptions{})
+	other := buildIPv6FragmentsWithOptions(source, target, ProtocolUDP, make([]byte, 3000), 1280, 0x12345679, ipPacketOptions{})
 	if got := outputPacketFlowHash(secret, other[0]); got == want {
 		t.Fatalf("different fragment identifications share hash %x", got)
 	}
@@ -1536,16 +1536,16 @@ func TestOutputPacketFlowHashKeepsICMPEchoSequenceTogether(t *testing.T) {
 		{netip.MustParseAddr("192.0.2.5"), netip.MustParseAddr("198.51.100.5")},
 		{netip.MustParseAddr("2001:db8::5"), netip.MustParseAddr("2001:db8:1::5")},
 	} {
-		protocol, echoType := protocolICMPv4, byte(8)
+		protocol, echoType := byte(ProtocolICMPv4), byte(8)
 		if addresses[0].Is6() {
-			protocol, echoType = protocolICMPv6, 128
+			protocol, echoType = ProtocolICMPv6, 128
 		}
 		makeEcho := func(identifier, sequence uint16) []byte {
 			message := make([]byte, 12)
 			message[0] = echoType
 			binary.BigEndian.PutUint16(message[4:6], identifier)
 			binary.BigEndian.PutUint16(message[6:8], sequence)
-			if protocol == protocolICMPv4 {
+			if protocol == ProtocolICMPv4 {
 				binary.BigEndian.PutUint16(message[2:4], checksum(message))
 			} else {
 				binary.BigEndian.PutUint16(message[2:4], transportChecksum(addresses[0], addresses[1], protocol, message))

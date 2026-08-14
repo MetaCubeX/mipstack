@@ -253,7 +253,7 @@ func TestTCPForwarderCoalescesPendingSYNs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer forwarder.Close()
-	syn := buildTestTCP(remote, target, 42000, 443, 100, 0, tcpFlagSYN, 65535, nil, nil)
+	syn := buildTestTCP(remote, target, 42000, 443, 100, 0, TCPFlagSYN, 65535, nil, nil)
 	var writers sync.WaitGroup
 	for index := 0; index < 32; index++ {
 		writers.Add(1)
@@ -269,7 +269,7 @@ func TestTCPForwarderCoalescesPendingSYNs(t *testing.T) {
 	if err = writeTestPacket(stack, syn); err != nil {
 		t.Fatal(err)
 	}
-	if err = writeTestPacket(stack, buildTestTCP(remote, target, 42001, 443, 200, 0, tcpFlagSYN, 65535, nil, nil)); err != nil {
+	if err = writeTestPacket(stack, buildTestTCP(remote, target, 42001, 443, 200, 0, TCPFlagSYN, 65535, nil, nil)); err != nil {
 		t.Fatal(err)
 	}
 	info := forwarder.Info()
@@ -306,7 +306,7 @@ func TestTCPForwarderCloseSignalsCompletedRequestHandler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = writeTestPacket(stack, buildTestTCP(remote, target, 50003, 443, 100, 0, tcpFlagSYN, 65535, nil, nil)); err != nil {
+	if err = writeTestPacket(stack, buildTestTCP(remote, target, 50003, 443, 100, 0, TCPFlagSYN, 65535, nil, nil)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -354,7 +354,7 @@ func TestForwarderAcceptFailureAllowsRetry(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer forwarder.Close()
-		packet := buildTestTCP(remote, target, 50004, 443, 100, 0, tcpFlagSYN, 65535, nil, nil)
+		packet := buildTestTCP(remote, target, 50004, 443, 100, 0, TCPFlagSYN, 65535, nil, nil)
 		if err = writeTestPacket(stack, packet); err != nil {
 			t.Fatal(err)
 		}
@@ -436,13 +436,13 @@ func TestPromiscuousAdmissionDoesNotImplySourceSpoofing(t *testing.T) {
 	target := netip.MustParseAddr("198.51.100.35")
 	stack := newForwarderTestStack(t, owned, true)
 	packets := [][]byte{
-		buildTestTCP(remote, target, 42500, 80, 1, 0, tcpFlagSYN, 65535, nil, nil),
+		buildTestTCP(remote, target, 42500, 80, 1, 0, TCPFlagSYN, 65535, nil, nil),
 		buildTestUDP(remote, target, 42501, 53, []byte("query")),
 	}
 	icmp := make([]byte, 8)
 	icmp[0] = 8
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	packets = append(packets, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true))
+	packets = append(packets, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true))
 	for _, packet := range packets {
 		if err := writeTestPacket(stack, packet); err != nil {
 			t.Fatal(err)
@@ -483,7 +483,7 @@ func TestForwardersHandleLocalTrafficWithoutPromiscuous(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = writeTestPacket(stack, buildTestTCP(remote, local, 42600, 80, 1, 0, tcpFlagSYN, 65535, nil, nil)); err != nil {
+	if err = writeTestPacket(stack, buildTestTCP(remote, local, 42600, 80, 1, 0, TCPFlagSYN, 65535, nil, nil)); err != nil {
 		t.Fatal(err)
 	}
 	if err = writeTestPacket(stack, buildTestUDP(remote, local, 42601, 53, []byte("local"))); err != nil {
@@ -492,7 +492,7 @@ func TestForwardersHandleLocalTrafficWithoutPromiscuous(t *testing.T) {
 	icmp := make([]byte, 20)
 	icmp[0] = 13
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	if err = writeTestPacket(stack, buildIPPacket(remote, local, protocolICMPv4, icmp, 1, true)); err != nil {
+	if err = writeTestPacket(stack, buildIPPacket(remote, local, ProtocolICMPv4, icmp, 1, true)); err != nil {
 		t.Fatal(err)
 	}
 	for name, handled := range map[string]<-chan struct{}{"TCP": tcpHandled, "UDP": udpHandled, "ICMP": icmpHandled} {
@@ -593,7 +593,7 @@ func TestUDPForwarderUsesCompleteFlowTuple(t *testing.T) {
 	}
 	response := readForwarderTestPacket(t, stack)
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.source != target || parsed.target != firstRemote || parsed.protocol != protocolUDP {
+	if !ok || parsed.source != target || parsed.target != firstRemote || parsed.protocol != ProtocolUDP {
 		t.Fatalf("forwarded UDP response = %x", response)
 	}
 	if gotSource, gotTarget := binary.BigEndian.Uint16(parsed.payload[0:2]), binary.BigEndian.Uint16(parsed.payload[2:4]); gotSource != 5353 || gotTarget != 51001 {
@@ -666,7 +666,7 @@ func TestUDPForwarderListenUnconnected(t *testing.T) {
 	}
 	response := readForwarderTestPacket(t, stack)
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.source != target || parsed.target != secondRemote || parsed.protocol != protocolUDP {
+	if !ok || parsed.source != target || parsed.target != secondRemote || parsed.protocol != ProtocolUDP {
 		t.Fatalf("listened UDP response = %x", response)
 	}
 	if gotSource, gotTarget := binary.BigEndian.Uint16(parsed.payload[0:2]), binary.BigEndian.Uint16(parsed.payload[2:4]); gotSource != 5353 || gotTarget != 51102 {
@@ -952,7 +952,7 @@ func TestUDPForwarderReceivesReassembledNonlocalDatagram(t *testing.T) {
 	if !ok {
 		t.Fatal("failed to parse complete UDP test packet")
 	}
-	fragments := buildIPv4Fragments(remote, target, protocolUDP, complete.payload, 600, 77)
+	fragments := buildIPv4Fragments(remote, target, ProtocolUDP, complete.payload, 600, 77)
 	for _, fragment := range fragments {
 		if err = writeTestPacket(stack, fragment); err != nil {
 			t.Fatal(err)
@@ -997,12 +997,12 @@ func TestICMPForwarderRepliesFromOriginalDestination(t *testing.T) {
 	binary.BigEndian.PutUint16(icmp[6:8], 0x5678)
 	copy(icmp[8:], "ping")
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != protocolICMPv4 || parsed.payload[0] != 0 || !bytes.Equal(parsed.payload[4:], icmp[4:]) || checksum(parsed.payload) != 0 {
+	if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != ProtocolICMPv4 || parsed.payload[0] != 0 || !bytes.Equal(parsed.payload[4:], icmp[4:]) || checksum(parsed.payload) != 0 {
 		t.Fatalf("forwarded ICMP response = %x", response)
 	}
 	response = readForwarderTestPacket(t, stack)
@@ -1035,7 +1035,7 @@ func TestICMPForwarderCloseInvalidatesRunningRequest(t *testing.T) {
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
 	writeResult := make(chan error, 1)
 	go func() {
-		writeResult <- writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true))
+		writeResult <- writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true))
 	}()
 	<-entered
 	if err = forwarder.Close(); err != nil {
@@ -1074,7 +1074,7 @@ func TestICMPForwarderConfigInvalidatesRunningRequest(t *testing.T) {
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
 	writeResult := make(chan error, 1)
 	go func() {
-		writeResult <- writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true))
+		writeResult <- writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true))
 	}()
 	<-entered
 	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(owned, 32)}, MTU: 1400}); err != nil {
@@ -1137,12 +1137,12 @@ func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer forwarder.Close()
-		if err = writeTestPacket(stack, buildTestTCP(remote, target, 53001, 443, 99, 0, tcpFlagSYN, 65535, nil, nil)); err != nil {
+		if err = writeTestPacket(stack, buildTestTCP(remote, target, 53001, 443, 99, 0, TCPFlagSYN, 65535, nil, nil)); err != nil {
 			t.Fatal(err)
 		}
 		response := readForwarderTestPacket(t, stack)
 		parsed, ok := parseIPPacket(response)
-		if !ok || parsed.source != target || parsed.target != remote || parsed.payload[13] != tcpFlagRST|tcpFlagACK || binary.BigEndian.Uint32(parsed.payload[8:12]) != 100 {
+		if !ok || parsed.source != target || parsed.target != remote || parsed.payload[13] != TCPFlagRST|TCPFlagACK || binary.BigEndian.Uint32(parsed.payload[8:12]) != 100 {
 			t.Fatalf("forwarded TCP rejection = %x", response)
 		}
 		if err = <-repeated; !errors.Is(err, ErrForwarderRequestCompleted) {
@@ -1205,12 +1205,12 @@ func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 		{
 			name: "ICMPv4 reject", owned: netip.MustParseAddr("192.0.2.74"),
 			remote: netip.MustParseAddr("192.0.2.75"), target: netip.MustParseAddr("198.51.100.74"),
-			protocol: protocolICMPv4, requestType: 8, responseType: 3, responseCode: 13,
+			protocol: ProtocolICMPv4, requestType: 8, responseType: 3, responseCode: 13,
 		},
 		{
 			name: "ICMPv6 reject", owned: netip.MustParseAddr("2001:db8::74"),
 			remote: netip.MustParseAddr("2001:db8::75"), target: netip.MustParseAddr("2001:db8:1::74"),
-			protocol: protocolICMPv6, requestType: 128, responseType: 1, responseCode: 1,
+			protocol: ProtocolICMPv6, requestType: 128, responseType: 1, responseCode: 1,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1222,10 +1222,10 @@ func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 			defer forwarder.Close()
 			icmp := make([]byte, 8)
 			icmp[0] = test.requestType
-			if test.protocol == protocolICMPv4 {
+			if test.protocol == ProtocolICMPv4 {
 				binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
 			} else {
-				binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(test.remote, test.target, protocolICMPv6, icmp))
+				binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(test.remote, test.target, ProtocolICMPv6, icmp))
 			}
 			if err = writeTestPacket(stack, buildIPPacket(test.remote, test.target, test.protocol, icmp, 1, true)); err != nil {
 				t.Fatal(err)
@@ -1235,8 +1235,8 @@ func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 			validChecksum := false
 			if ok {
 				validChecksum = checksum(parsed.payload) == 0
-				if test.protocol == protocolICMPv6 {
-					validChecksum = transportChecksum(test.target, test.remote, protocolICMPv6, parsed.payload) == 0
+				if test.protocol == ProtocolICMPv6 {
+					validChecksum = transportChecksum(test.target, test.remote, ProtocolICMPv6, parsed.payload) == 0
 				}
 			}
 			if !ok || parsed.source != test.target || parsed.target != test.remote || parsed.payload[0] != test.responseType || parsed.payload[1] != test.responseCode || !validChecksum {
@@ -1307,7 +1307,7 @@ func TestUDPForwarderReplyAllowsTerminalActions(t *testing.T) {
 
 			packet := readForwarderTestPacket(t, stack)
 			parsed, ok := parseIPPacket(packet)
-			if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != protocolUDP || string(parsed.payload[udpHeaderSize:]) != "request reply" {
+			if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != ProtocolUDP || string(parsed.payload[udpHeaderSize:]) != "request reply" {
 				t.Fatalf("request Reply output = %x", packet)
 			}
 			if connection != nil {
@@ -1347,7 +1347,7 @@ func TestUDPForwarderReplyAllowsTerminalActions(t *testing.T) {
 			if action.request == "Reject" || action.responder == "Reject" {
 				packet = readForwarderTestPacket(t, stack)
 				parsed, ok = parseIPPacket(packet)
-				if !ok || parsed.protocol != protocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 3 {
+				if !ok || parsed.protocol != ProtocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 3 {
 					t.Fatalf("UDP rejection after Reply = %x", packet)
 				}
 			}
@@ -1473,7 +1473,7 @@ func TestIPAndICMPForwarderReplyAllowsTerminalActions(t *testing.T) {
 				} else {
 					message := []byte{8, 0, 0, 0, 1, 2, 3, 4}
 					binary.BigEndian.PutUint16(message[2:4], checksum(message))
-					input = buildIPPacket(remote, target, protocolICMPv4, message, 1, true)
+					input = buildIPPacket(remote, target, ProtocolICMPv4, message, 1, true)
 				}
 				if err = writeTestPacket(stack, input); err != nil {
 					t.Fatal(err)
@@ -1491,7 +1491,7 @@ func TestIPAndICMPForwarderReplyAllowsTerminalActions(t *testing.T) {
 					if parsed.protocol != 99 || string(parsed.payload) != "request reply" {
 						t.Fatalf("IP request Reply output = %+v", parsed)
 					}
-				} else if parsed.protocol != protocolICMPv4 || parsed.payload[0] != 0 {
+				} else if parsed.protocol != ProtocolICMPv4 || parsed.payload[0] != 0 {
 					t.Fatalf("ICMP request Reply output = %+v", parsed)
 				}
 
@@ -1514,7 +1514,7 @@ func TestIPAndICMPForwarderReplyAllowsTerminalActions(t *testing.T) {
 				if action == "Reject" || action == "Detach/Reject" {
 					packet = readForwarderTestPacket(t, stack)
 					parsed, ok = parseIPPacket(packet)
-					if !ok || parsed.protocol != protocolICMPv4 {
+					if !ok || parsed.protocol != ProtocolICMPv4 {
 						t.Fatalf("%s rejection after Reply = %x", protocol, packet)
 					}
 				}
@@ -1604,7 +1604,7 @@ func TestUDPForwarderRequestConcurrentReplyAndTerminalAction(t *testing.T) {
 		}
 		packet := consumeTestPacket(&stack.outbound, entry)
 		parsed, valid := parseIPPacket(packet)
-		if !valid || parsed.source != target || parsed.target != remote || parsed.protocol != protocolUDP || len(parsed.payload) != udpHeaderSize+1 {
+		if !valid || parsed.source != target || parsed.target != remote || parsed.protocol != ProtocolUDP || len(parsed.payload) != udpHeaderSize+1 {
 			t.Fatalf("concurrent Reply output = %x", packet)
 		}
 		queued++
@@ -1645,7 +1645,7 @@ func TestForwarderOutputActionsDoNotBlockOnFullQueue(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer forwarder.Close()
-		packet := buildTestTCP(remote, target, 55001, 443, 100, 0, tcpFlagSYN, 65535, nil, nil)
+		packet := buildTestTCP(remote, target, 55001, 443, 100, 0, TCPFlagSYN, 65535, nil, nil)
 		if err = writeTestPacket(stack, packet); err != nil {
 			t.Fatal(err)
 		}
@@ -1715,7 +1715,7 @@ func TestForwarderOutputActionsDoNotBlockOnFullQueue(t *testing.T) {
 		icmp := make([]byte, 8)
 		icmp[0] = 8
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+		if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 			t.Fatal(err)
 		}
 		awaitResourceLimit(t, result)
@@ -1738,7 +1738,7 @@ func TestForwarderOutputActionsDoNotBlockOnFullQueue(t *testing.T) {
 		icmp := make([]byte, 8)
 		icmp[0] = 8
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+		if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 			t.Fatal(err)
 		}
 		awaitResourceLimit(t, result)
@@ -1845,7 +1845,7 @@ func TestUDPForwarderReplyUsesSocketDefaults(t *testing.T) {
 	}
 	response := readForwarderTestPacket(t, stack)
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != protocolUDP {
+	if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != ProtocolUDP {
 		t.Fatalf("configured UDP forwarder response = %x", response)
 	}
 	if parsed.hopLimit != 37 || parsed.trafficClass != 0x2e || parsed.flowLabel != 0x54321 {
@@ -1876,7 +1876,7 @@ func TestUDPForwarderReplyUsesAutomaticFlowLabel(t *testing.T) {
 	if !ok {
 		t.Fatalf("automatic-label UDP forwarder response = %x", response)
 	}
-	want := stack.automaticTransportFlowLabel(target, remote, protocolUDP, targetPort, sourcePort)
+	want := stack.automaticTransportFlowLabel(target, remote, ProtocolUDP, targetPort, sourcePort)
 	if parsed.flowLabel != want {
 		t.Fatalf("automatic UDP flow label = %#x, want %#x", parsed.flowLabel, want)
 	}
@@ -2001,9 +2001,9 @@ func TestUDPForwarderReplyFrom(t *testing.T) {
 			}
 			response := readForwarderTestPacket(t, stack)
 			parsed, ok := parseIPPacket(response)
-			if !ok || parsed.source != test.source || parsed.target != test.remote || parsed.protocol != protocolUDP ||
+			if !ok || parsed.source != test.source || parsed.target != test.remote || parsed.protocol != ProtocolUDP ||
 				binary.BigEndian.Uint16(parsed.payload[:2]) != sourcePort || binary.BigEndian.Uint16(parsed.payload[2:4]) != remotePort ||
-				string(parsed.payload[udpHeaderSize:]) != "selected" || transportChecksum(parsed.source, parsed.target, protocolUDP, parsed.payload) != 0 {
+				string(parsed.payload[udpHeaderSize:]) != "selected" || transportChecksum(parsed.source, parsed.target, ProtocolUDP, parsed.payload) != 0 {
 				t.Fatalf("ReplyFrom output = %x", response)
 			}
 			if info := forwarder.Info(); info.Replies != 1 || info.ReplyErrors != 2 || info.Dropped != 0 {
@@ -2091,7 +2091,7 @@ func TestICMPForwarderReplyIPPacketPreservesConfiguredBroadcastSource(t *testing
 	icmp[0] = 8
 	copy(icmp[8:], "query")
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 		t.Fatal(err)
 	}
 	resultErrors := <-result
@@ -2300,7 +2300,7 @@ func TestUDPForwarderDetachedReplyFromConcurrent(t *testing.T) {
 	seen := make(map[netip.AddrPort]byte, len(sources))
 	for range sources {
 		parsed, ok := parseIPPacket(readForwarderTestPacket(t, stack))
-		if !ok || parsed.protocol != protocolUDP || parsed.target != remote || len(parsed.payload) != udpHeaderSize+1 {
+		if !ok || parsed.protocol != ProtocolUDP || parsed.target != remote || len(parsed.payload) != udpHeaderSize+1 {
 			t.Fatalf("detached ReplyFrom output = %+v", parsed)
 		}
 		seen[netip.AddrPortFrom(parsed.source, binary.BigEndian.Uint16(parsed.payload[:2]))] = parsed.payload[udpHeaderSize]
@@ -2359,7 +2359,7 @@ func TestUDPForwarderDetachedTerminalActions(t *testing.T) {
 				}
 				response := readForwarderTestPacket(t, stack)
 				parsed, ok := parseIPPacket(response)
-				if !ok || parsed.protocol != protocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 3 {
+				if !ok || parsed.protocol != ProtocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 3 {
 					t.Fatalf("detached UDP rejection = %x", response)
 				}
 			}
@@ -2389,7 +2389,7 @@ func TestICMPForwarderDetachedReply(t *testing.T) {
 	icmp[0] = 8
 	copy(icmp[8:], "ping")
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	packet := buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)
+	packet := buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)
 	if err = writeTestPacket(stack, packet); err != nil {
 		t.Fatal(err)
 	}
@@ -2451,7 +2451,7 @@ func TestICMPForwarderIPPacketRequestLifetime(t *testing.T) {
 	defer forwarder.Close()
 	icmp := []byte{13, 0, 0, 0, 1, 2, 3, 4}
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 		t.Fatal(err)
 	}
 	if err = <-result; err != nil {
@@ -2462,9 +2462,9 @@ func TestICMPForwarderIPPacketRequestLifetime(t *testing.T) {
 func makeForwarderICMPErrorPacket(source, target netip.Addr, quoted []byte) []byte {
 	icmp := make([]byte, 8+len(quoted))
 	copy(icmp[8:], quoted)
-	protocol := protocolICMPv6
+	protocol := byte(ProtocolICMPv6)
 	if source.Is4() {
-		protocol = protocolICMPv4
+		protocol = ProtocolICMPv4
 		icmp[0], icmp[1] = 3, 1
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
 	} else {
@@ -2478,10 +2478,10 @@ func makeForwarderICMPErrorPacket(source, target netip.Addr, quoted []byte) []by
 func makeForwarderICMPEchoReplyPacket(source, target netip.Addr, payload []byte) []byte {
 	icmp := make([]byte, 8+len(payload))
 	copy(icmp[8:], payload)
-	protocol := byte(protocolICMPv6)
+	protocol := byte(ProtocolICMPv6)
 	icmp[0] = 129
 	if source.Is4() {
-		protocol = protocolICMPv4
+		protocol = ProtocolICMPv4
 		icmp[0] = 0
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
 	} else {
@@ -2518,7 +2518,7 @@ func makeNoncanonicalIPv6AtomicFragmentPacket(packet []byte, identification uint
 	result[49] = 0xa5
 	binary.BigEndian.PutUint16(result[50:52], 6)
 	binary.BigEndian.PutUint32(result[52:56], identification)
-	result[56] = protocolICMPv6
+	result[56] = ProtocolICMPv6
 	copy(result[64:], packet[40:])
 	binary.BigEndian.PutUint16(result[4:6], uint16(len(result)-40))
 	return result
@@ -2562,9 +2562,9 @@ func TestICMPForwarderReplyIPPacketNormalization(t *testing.T) {
 			}
 			defer forwarder.Close()
 			requestICMP := []byte{13, 0, 0, 0, 1, 2, 3, 4}
-			protocol := protocolICMPv6
+			protocol := byte(ProtocolICMPv6)
 			if test.remote.Is4() {
-				protocol = protocolICMPv4
+				protocol = ProtocolICMPv4
 				binary.BigEndian.PutUint16(requestICMP[2:4], checksum(requestICMP))
 			} else {
 				binary.BigEndian.PutUint16(requestICMP[2:4], transportChecksum(test.remote, test.target, protocol, requestICMP))
@@ -2585,7 +2585,7 @@ func TestICMPForwarderReplyIPPacketNormalization(t *testing.T) {
 				if parsed.hopLimit != 37 || parsed.trafficClass != 0x2e || checksum(parsed.payload) != 0 || binary.BigEndian.Uint16(output[4:6]) == 0 {
 					t.Fatalf("normalized IPv4 ReplyIPPacket = %x", output)
 				}
-			} else if parsed.hopLimit != 37 || parsed.trafficClass != 0x2e || transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0 {
+			} else if parsed.hopLimit != 37 || parsed.trafficClass != 0x2e || transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0 {
 				t.Fatalf("normalized IPv6 ReplyIPPacket = %x", output)
 			}
 			if bytes.Contains(output, bytes.Repeat([]byte{0xa5}, 16)) {
@@ -2605,8 +2605,8 @@ func TestICMPForwarderReplyIPPacketValidationAllowsLaterAction(t *testing.T) {
 		invalid := [][]byte{
 			nil,
 			make([]byte, 19),
-			buildIPPacket(target, netip.MustParseAddr("192.0.2.156"), protocolICMPv4, make([]byte, 8), 0, false),
-			buildIPPacket(target, remote, protocolUDP, make([]byte, 8), 0, false),
+			buildIPPacket(target, netip.MustParseAddr("192.0.2.156"), ProtocolICMPv4, make([]byte, 8), 0, false),
+			buildIPPacket(target, remote, ProtocolUDP, make([]byte, 8), 0, false),
 		}
 		for _, packet := range invalid {
 			if replyErr := request.ReplyIPPacket(packet); !errors.Is(replyErr, syscall.EINVAL) {
@@ -2626,7 +2626,7 @@ func TestICMPForwarderReplyIPPacketValidationAllowsLaterAction(t *testing.T) {
 	defer forwarder.Close()
 	icmp := []byte{13, 0, 0, 0, 1, 2, 3, 4}
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 		t.Fatal(err)
 	}
 	if err = <-result; err != nil {
@@ -2670,7 +2670,7 @@ func TestICMPForwarderReplyIPPacketFragmentation(t *testing.T) {
 					// informational Echo Reply to exercise legal IPv6 source
 					// fragmentation while IPv4 continues to cover error output.
 					reply[40] = 129
-					extension := []byte{protocolICMPv6, 0, 0, 0, 0, 0, 0, 0}
+					extension := []byte{ProtocolICMPv6, 0, 0, 0, 0, 0, 0, 0}
 					reply[6] = 60
 					reply = append(append(reply[:40:40], extension...), reply[40:]...)
 				}
@@ -2681,9 +2681,9 @@ func TestICMPForwarderReplyIPPacketFragmentation(t *testing.T) {
 			}
 			defer forwarder.Close()
 			request := []byte{13, 0, 0, 0, 1, 2, 3, 4}
-			protocol := protocolICMPv6
+			protocol := byte(ProtocolICMPv6)
 			if test.remote.Is4() {
-				protocol = protocolICMPv4
+				protocol = ProtocolICMPv4
 				binary.BigEndian.PutUint16(request[2:4], checksum(request))
 			} else {
 				binary.BigEndian.PutUint16(request[2:4], transportChecksum(test.remote, test.target, protocol, request))
@@ -2760,8 +2760,8 @@ func TestICMPForwarderReplyIPPacketIPv6AtomicFragment(t *testing.T) {
 			}
 			defer forwarder.Close()
 			request := []byte{128, 0, 0, 0, 1, 2, 3, 4}
-			binary.BigEndian.PutUint16(request[2:4], transportChecksum(remote, target, protocolICMPv6, request))
-			if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv6, request, 1, true)); err != nil {
+			binary.BigEndian.PutUint16(request[2:4], transportChecksum(remote, target, ProtocolICMPv6, request))
+			if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv6, request, 1, true)); err != nil {
 				t.Fatal(err)
 			}
 			if err = <-result; err != nil {
@@ -2769,11 +2769,11 @@ func TestICMPForwarderReplyIPPacketIPv6AtomicFragment(t *testing.T) {
 			}
 			if !test.noncanonical {
 				output := readForwarderTestPacket(t, stack)
-				if output[6] != 44 || output[40] != protocolICMPv6 || output[41] != 0 || binary.BigEndian.Uint16(output[42:44]) != 0 || binary.BigEndian.Uint32(output[44:48]) != test.identification {
+				if output[6] != 44 || output[40] != ProtocolICMPv6 || output[41] != 0 || binary.BigEndian.Uint16(output[42:44]) != 0 || binary.BigEndian.Uint32(output[44:48]) != test.identification {
 					t.Fatalf("fitting atomic Fragment header = %x", output[40:48])
 				}
 				parsed, ok := parseIPPacket(output)
-				if !ok || !bytes.Equal(parsed.payload[8:], payload) || transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0 {
+				if !ok || !bytes.Equal(parsed.payload[8:], payload) || transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0 {
 					t.Fatalf("fitting atomic ReplyIPPacket = %x", output)
 				}
 				return
@@ -2789,7 +2789,7 @@ func TestICMPForwarderReplyIPPacketIPv6AtomicFragment(t *testing.T) {
 				fragments++
 				// Destination Options, Routing, Fragment, ICMP is the canonical
 				// result after replacing the noncanonical atomic header.
-				if fragment[6] != 60 || fragment[40] != 43 || fragment[48] != 44 || fragment[56] != protocolICMPv6 || binary.BigEndian.Uint32(fragment[60:64]) != test.identification {
+				if fragment[6] != 60 || fragment[40] != 43 || fragment[48] != 44 || fragment[56] != ProtocolICMPv6 || binary.BigEndian.Uint32(fragment[60:64]) != test.identification {
 					t.Fatalf("refragmented IPv6 chain = %x", fragment[:64])
 				}
 				if completed := stack.reassemblePacket(fragment, time.Now()); completed != nil {
@@ -2800,7 +2800,7 @@ func TestICMPForwarderReplyIPPacketIPv6AtomicFragment(t *testing.T) {
 				t.Fatalf("atomic refragmentation produced %d fragments and %d reassembled bytes", fragments, len(reassembled))
 			}
 			parsed, ok := parseIPPacket(reassembled)
-			if !ok || !bytes.Equal(parsed.payload[8:], payload) || transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0 {
+			if !ok || !bytes.Equal(parsed.payload[8:], payload) || transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0 {
 				t.Fatalf("reassembled atomic ReplyIPPacket = %x", reassembled)
 			}
 		})
@@ -2837,8 +2837,8 @@ func TestICMPForwarderReplyIPPacketIPv6StaticValidation(t *testing.T) {
 	}
 	defer forwarder.Close()
 	request := []byte{128, 0, 0, 0, 1, 2, 3, 4}
-	binary.BigEndian.PutUint16(request[2:4], transportChecksum(remote, target, protocolICMPv6, request))
-	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv6, request, 1, true)); err != nil {
+	binary.BigEndian.PutUint16(request[2:4], transportChecksum(remote, target, ProtocolICMPv6, request))
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv6, request, 1, true)); err != nil {
 		t.Fatal(err)
 	}
 	if err = <-result; err != nil {
@@ -2893,8 +2893,8 @@ func TestICMPForwarderReplyRejectsOversizedIPv6Error(t *testing.T) {
 			}
 			defer forwarder.Close()
 			request := []byte{128, 0, 0, 0, 1, 2, 3, 4}
-			binary.BigEndian.PutUint16(request[2:4], transportChecksum(remote, target, protocolICMPv6, request))
-			if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv6, request, 1, true)); err != nil {
+			binary.BigEndian.PutUint16(request[2:4], transportChecksum(remote, target, ProtocolICMPv6, request))
+			if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv6, request, 1, true)); err != nil {
 				t.Fatal(err)
 			}
 			if err = <-result; err != nil {
@@ -2944,7 +2944,7 @@ func TestICMPForwarderReplyIPPacketDFAndAtomicQueue(t *testing.T) {
 			defer forwarder.Close()
 			request := []byte{13, 0, 0, 0, 1, 2, 3, 4}
 			binary.BigEndian.PutUint16(request[2:4], checksum(request))
-			if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, request, 1, true)); err != nil {
+			if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, request, 1, true)); err != nil {
 				t.Fatal(err)
 			}
 			if err = <-result; !errors.Is(err, test.want) {
@@ -2974,10 +2974,10 @@ func FuzzICMPForwarderReplyIPPacket(f *testing.F) {
 		}
 		original := append([]byte(nil), input...)
 		destination := v4Target
-		protocol := byte(protocolICMPv4)
+		protocol := byte(ProtocolICMPv4)
 		if ipv6 {
 			destination = v6Target
-			protocol = protocolICMPv6
+			protocol = ProtocolICMPv6
 		}
 		reply, err := prepareICMPForwarderIPPacket(input, destination)
 		if !bytes.Equal(input, original) {
@@ -2994,7 +2994,7 @@ func FuzzICMPForwarderReplyIPPacket(f *testing.F) {
 			if checksum(parsed.payload) != 0 || checksum(reply.packet[:int(reply.packet[0]&0x0f)*4]) != 0 {
 				t.Fatal("accepted IPv4 ReplyIPPacket has an invalid checksum")
 			}
-		} else if transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0 {
+		} else if transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0 {
 			t.Fatal("accepted IPv6 ReplyIPPacket has an invalid checksum")
 		}
 	})
@@ -3019,7 +3019,7 @@ func FuzzICMPForwarderReplyIPPacketFragmentation(f *testing.F) {
 	v4OptionPacket[10], v4OptionPacket[11] = 0, 0
 	binary.BigEndian.PutUint16(v4OptionPacket[10:12], checksum(v4OptionPacket[:headerSize]))
 	v6WithExtension := makeForwarderICMPEchoReplyPacket(v6Source, v6Target, bytes.Repeat([]byte{0x42}, 1800))
-	extension := []byte{protocolICMPv6, 0, 0, 0, 0, 0, 0, 0}
+	extension := []byte{ProtocolICMPv6, 0, 0, 0, 0, 0, 0, 0}
 	v6WithExtension[6] = 60
 	v6WithExtension = append(append(v6WithExtension[:40:40], extension...), v6WithExtension[40:]...)
 	binary.BigEndian.PutUint16(v6WithExtension[4:6], uint16(len(v6WithExtension)-40))
@@ -3098,7 +3098,7 @@ func FuzzICMPForwarderReplyIPPacketFragmentation(f *testing.F) {
 			if checksum(parsed.payload) != 0 {
 				t.Fatal("reassembled IPv4 ReplyIPPacket has an invalid ICMP checksum")
 			}
-		} else if transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0 {
+		} else if transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0 {
 			t.Fatal("reassembled IPv6 ReplyIPPacket has an invalid ICMP checksum")
 		}
 	})
@@ -3153,7 +3153,7 @@ func TestForwarderFailedRequestReplyAllowsTerminalAction(t *testing.T) {
 			packet: func() []byte {
 				icmp := []byte{13, 0, 0, 0, 1, 2, 3, 4}
 				binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-				return buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)
+				return buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)
 			}(),
 		},
 	} {
@@ -3257,7 +3257,7 @@ func TestForwarderFailedResponderReplyAllowsTerminalAction(t *testing.T) {
 			packet: func() []byte {
 				icmp := []byte{13, 0, 0, 0, 1, 2, 3, 4}
 				binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-				return buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)
+				return buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)
 			}(),
 		},
 	} {
@@ -3308,7 +3308,7 @@ func TestICMPForwarderDetachedTerminalActions(t *testing.T) {
 			icmp := make([]byte, 8)
 			icmp[0] = 13
 			binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-			if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+			if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 				t.Fatal(err)
 			}
 			responder := <-detached
@@ -3367,7 +3367,7 @@ func TestICMPForwarderDetachedRejectUsesIndependentQuote(t *testing.T) {
 	defer forwarder.Close()
 	icmp := []byte{8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8}
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	requestPacket := buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)
+	requestPacket := buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)
 	wantQuote := append([]byte(nil), requestPacket[:28]...)
 	if err = writeTestPacket(stack, requestPacket); err != nil {
 		t.Fatal(err)
@@ -3381,7 +3381,7 @@ func TestICMPForwarderDetachedRejectUsesIndependentQuote(t *testing.T) {
 	}
 	response := readForwarderTestPacket(t, stack)
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 13 || checksum(parsed.payload) != 0 || !bytes.Equal(parsed.payload[8:], wantQuote) {
+	if !ok || parsed.protocol != ProtocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 13 || checksum(parsed.payload) != 0 || !bytes.Equal(parsed.payload[8:], wantQuote) {
 		t.Fatalf("detached rejection did not preserve its independent quote: %x", response)
 	}
 }
@@ -3599,7 +3599,7 @@ func TestDetachedForwarderResponderRevalidatesLifecycle(t *testing.T) {
 		icmp := make([]byte, 8)
 		icmp[0] = 8
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+		if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 			t.Fatal(err)
 		}
 		responder := <-detached
@@ -3734,7 +3734,7 @@ func TestICMPForwarderResponderConcurrentReplyIPPacketAndDrop(t *testing.T) {
 	defer forwarder.Close()
 	request := []byte{8, 0, 0, 0, 1, 2, 3, 4}
 	binary.BigEndian.PutUint16(request[2:4], checksum(request))
-	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, request, 1, true)); err != nil {
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, request, 1, true)); err != nil {
 		t.Fatal(err)
 	}
 	responder := <-detached
@@ -3800,7 +3800,7 @@ func TestAutomaticControlResponsesDoNotBlockOnFullQueue(t *testing.T) {
 			fillTestPacketQueue(t, &stack.outbound, []byte{0})
 			var packet []byte
 			if protocol == "TCP" {
-				packet = buildTestTCP(remote, local, 55005, 443, 100, 0, tcpFlagSYN, 65535, nil, nil)
+				packet = buildTestTCP(remote, local, 55005, 443, 100, 0, TCPFlagSYN, 65535, nil, nil)
 			} else {
 				packet = buildTestUDP(remote, local, 55006, 5353, []byte("unhandled"))
 			}
@@ -3972,7 +3972,7 @@ func TestForwarderRejectRequiresReturnRoute(t *testing.T) {
 				})
 			},
 			packet: func() []byte {
-				return buildTestTCP(remote, local, 53001, 443, 1, 0, tcpFlagSYN, 65535, nil, nil)
+				return buildTestTCP(remote, local, 53001, 443, 1, 0, TCPFlagSYN, 65535, nil, nil)
 			},
 		},
 		{
@@ -4004,7 +4004,7 @@ func TestForwarderRejectRequiresReturnRoute(t *testing.T) {
 				message := make([]byte, 8)
 				message[0] = 42
 				binary.BigEndian.PutUint16(message[2:4], checksum(message))
-				return buildIPPacket(remote, local, protocolICMPv4, message, 1, true)
+				return buildIPPacket(remote, local, ProtocolICMPv4, message, 1, true)
 			},
 		},
 	} {
@@ -4166,7 +4166,7 @@ func TestIPForwarderDetachAndReject(t *testing.T) {
 	}
 	response = readForwarderTestPacket(t, stack)
 	parsed, ok = parseIPPacket(response)
-	if !ok || parsed.protocol != protocolICMPv4 || len(parsed.payload) < 2 || parsed.payload[0] != 3 || parsed.payload[1] != 2 {
+	if !ok || parsed.protocol != ProtocolICMPv4 || len(parsed.payload) < 2 || parsed.payload[0] != 3 || parsed.payload[1] != 2 {
 		t.Fatalf("IP forwarder rejection = %+v", parsed)
 	}
 }
@@ -4267,13 +4267,13 @@ func TestICMPv6ForwarderReply(t *testing.T) {
 	icmp := make([]byte, 12)
 	icmp[0] = 128
 	copy(icmp[8:], "ping")
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(remote, target, protocolICMPv6, icmp))
-	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv6, icmp, 0, true)); err != nil {
+	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(remote, target, ProtocolICMPv6, icmp))
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv6, icmp, 0, true)); err != nil {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.source != target || parsed.target != remote || parsed.payload[0] != 129 || transportChecksum(target, remote, protocolICMPv6, parsed.payload) != 0 {
+	if !ok || parsed.source != target || parsed.target != remote || parsed.payload[0] != 129 || transportChecksum(target, remote, ProtocolICMPv6, parsed.payload) != 0 {
 		t.Fatalf("forwarded ICMPv6 reply = %x", response)
 	}
 }
@@ -4301,7 +4301,7 @@ func TestICMPForwarderReplyEchoRejectsNonEcho(t *testing.T) {
 	icmp := make([]byte, 8)
 	icmp[0] = 0
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 		t.Fatal(err)
 	}
 	if info := forwarder.Info(); info.Requests != 1 || info.Replies != 0 || info.Dropped != 1 {
@@ -4340,13 +4340,13 @@ func TestICMPForwarderMessageIsEchoRequest(t *testing.T) {
 
 func TestICMPReplyEchoLifecycleAndSnapshotValidation(t *testing.T) {
 	nonEcho := []byte{0, 0, 0, 0, 0, 1, 0, 2}
-	request := &ICMPForwarderRequest{packet: ipPacket{protocol: protocolICMPv4, payload: nonEcho}}
+	request := &ICMPForwarderRequest{packet: ipPacket{protocol: ProtocolICMPv4, payload: nonEcho}}
 	request.state.Store(uint32(forwarderRequestDropped))
 	if err := request.ReplyEcho(); !errors.Is(err, ErrForwarderRequestCompleted) {
 		t.Fatalf("ReplyEcho after request completion = %v", err)
 	}
 	responder := &ICMPForwarderResponder{
-		forwarderResponder: forwarderResponder{packet: ipPacket{protocol: protocolICMPv4}},
+		forwarderResponder: forwarderResponder{packet: ipPacket{protocol: ProtocolICMPv4}},
 		message: ICMPForwarderMessage{
 			Source: netip.MustParseAddr("192.0.2.91"), Destination: netip.MustParseAddr("198.51.100.91"),
 			Payload: nonEcho,
@@ -4376,7 +4376,7 @@ func TestICMPReplyEchoLifecycleAndSnapshotValidation(t *testing.T) {
 	defer forwarder.Close()
 	echo := []byte{8, 0, 0, 0, 0, 1, 0, 2}
 	binary.BigEndian.PutUint16(echo[2:4], checksum(echo))
-	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, echo, 1, true)); err != nil {
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, echo, 1, true)); err != nil {
 		t.Fatal(err)
 	}
 	responder = <-detached
@@ -4411,7 +4411,7 @@ func TestICMPForwarderRejectsShortReply(t *testing.T) {
 	defer forwarder.Close()
 	icmp := []byte{13, 0, 0, 0, 0, 0, 0, 0}
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+	if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 		t.Fatal(err)
 	}
 	for size, replyErr := range <-results {
@@ -4632,7 +4632,7 @@ func TestICMPForwarderRepliesOnlyResponder(t *testing.T) {
 			defer forwarder.Close()
 			icmp := []byte{8, 0, 0, 0, 1, 2, 3, 4}
 			binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-			if err = writeTestPacket(stack, buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)); err != nil {
+			if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
 				t.Fatal(err)
 			}
 			responder := <-detached
@@ -4663,7 +4663,7 @@ func TestICMPForwarderRepliesOnlyResponder(t *testing.T) {
 			}
 			response := readForwarderTestPacket(t, stack)
 			parsed, ok := parseIPPacket(response)
-			if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != protocolICMPv4 || !bytes.Equal(parsed.payload[4:], reply[4:]) || checksum(parsed.payload) != 0 {
+			if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != ProtocolICMPv4 || !bytes.Equal(parsed.payload[4:], reply[4:]) || checksum(parsed.payload) != 0 {
 				t.Fatalf("replies-only ICMP Reply output = %x", response)
 			}
 			rawReply := makeForwarderICMPEchoReplyPacket(target, remote, []byte("raw reply"))
@@ -4811,7 +4811,7 @@ func BenchmarkICMPForwarderReplyEcho(b *testing.B) {
 	icmp[0] = 8
 	binary.BigEndian.PutUint16(icmp[4:6], 1)
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	packet := buildIPPacket(remote, target, protocolICMPv4, icmp, 1, true)
+	packet := buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(packet) + len(icmp)))
 	b.ResetTimer()
@@ -4849,10 +4849,10 @@ func BenchmarkICMPForwarderReplyIPPacket(b *testing.B) {
 			icmp := make([]byte, size-20)
 			icmp[0] = 0
 			binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-			reply := buildIPPacket(selected, remote, protocolICMPv4, icmp, 1, false)
+			reply := buildIPPacket(selected, remote, ProtocolICMPv4, icmp, 1, false)
 			requestICMP := []byte{8, 0, 0, 0, 0, 1, 0, 1}
 			binary.BigEndian.PutUint16(requestICMP[2:4], checksum(requestICMP))
-			packet := buildIPPacket(remote, target, protocolICMPv4, requestICMP, 1, true)
+			packet := buildIPPacket(remote, target, ProtocolICMPv4, requestICMP, 1, true)
 			var replyErr error
 			forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
 				replyErr = request.ReplyIPPacket(reply)

@@ -1135,7 +1135,7 @@ func (set socketOptionSet) validateIPSocket(protocol byte, ipv6, dual bool) erro
 		if !hasIPv4 {
 			return syscall.EAFNOSUPPORT
 		}
-		if protocol != protocolICMPv4 {
+		if protocol != ProtocolICMPv4 {
 			return syscall.ENOPROTOOPT
 		}
 	}
@@ -1143,7 +1143,7 @@ func (set socketOptionSet) validateIPSocket(protocol byte, ipv6, dual bool) erro
 		if !ipv6 {
 			return syscall.EAFNOSUPPORT
 		}
-		if protocol != protocolICMPv6 {
+		if protocol != ProtocolICMPv6 {
 			return syscall.ENOPROTOOPT
 		}
 	}
@@ -1151,7 +1151,7 @@ func (set socketOptionSet) validateIPSocket(protocol byte, ipv6, dual bool) erro
 		if !ipv6 {
 			return syscall.EAFNOSUPPORT
 		}
-		if protocol == protocolICMPv6 {
+		if protocol == ProtocolICMPv6 {
 			return syscall.EINVAL
 		}
 	}

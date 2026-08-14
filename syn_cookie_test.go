@@ -45,18 +45,18 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	clientTimestamp := uint32(1000)
 	options := []byte{2, 4, 0x05, 0xb4, 4, 2, 1, 3, 3, 5}
 	options = append(options, tcpTimestampOptions(clientTimestamp, 0)...)
-	syn := buildTestTCP(remote, local, 43001, 47002, clientSequence, 0, tcpFlagSYN|tcpFlagECE|tcpFlagCWR, 4096, options, nil)
+	syn := buildTestTCP(remote, local, 43001, 47002, clientSequence, 0, TCPFlagSYN|TCPFlagECE|TCPFlagCWR, 4096, options, nil)
 	if err = writeTestPacket(stack, syn); err != nil {
 		t.Fatal(err)
 	}
 	response := readOutboundPacket(t, stack)
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.protocol != protocolTCP || len(parsed.payload) < tcpHeaderSize {
+	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("invalid SYN-cookie response: %x", response)
 	}
 	tcp := parsed.payload
 	headerSize := int(tcp[12]>>4) * 4
-	if tcp[13] != tcpFlagSYN|tcpFlagACK|tcpFlagECE || binary.BigEndian.Uint32(tcp[8:12]) != clientSequence+1 {
+	if tcp[13] != TCPFlagSYN|TCPFlagACK|TCPFlagECE || binary.BigEndian.Uint32(tcp[8:12]) != clientSequence+1 {
 		t.Fatalf("SYN-cookie flags/ack = %#x/%#x", tcp[13], binary.BigEndian.Uint32(tcp[8:12]))
 	}
 	serverSequence := binary.BigEndian.Uint32(tcp[4:8])
@@ -82,15 +82,15 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	ackOptions := tcpTimestampOptions(clientTimestamp+1, serverTimestamp)
-	forgedACK := buildTestTCP(remote, local, 43001, 47002, clientSequence+1, serverSequence+2, tcpFlagACK, 1234, ackOptions, nil)
+	forgedACK := buildTestTCP(remote, local, 43001, 47002, clientSequence+1, serverSequence+2, TCPFlagACK, 1234, ackOptions, nil)
 	if err = writeTestPacket(stack, forgedACK); err != nil {
 		t.Fatal(err)
 	}
 	reset := readOutboundPacket(t, stack)
-	if parsedReset, parsedResetOK := parseIPPacket(reset); !parsedResetOK || len(parsedReset.payload) < tcpHeaderSize || parsedReset.payload[13]&tcpFlagRST == 0 {
+	if parsedReset, parsedResetOK := parseIPPacket(reset); !parsedResetOK || len(parsedReset.payload) < tcpHeaderSize || parsedReset.payload[13]&TCPFlagRST == 0 {
 		t.Fatalf("forged cookie ACK response = %x", reset)
 	}
-	ack := buildTestTCP(remote, local, 43001, 47002, clientSequence+1, serverSequence+1, tcpFlagACK, 1234, ackOptions, nil)
+	ack := buildTestTCP(remote, local, 43001, 47002, clientSequence+1, serverSequence+1, TCPFlagACK, 1234, ackOptions, nil)
 	if err = writeTestPacket(stack, ack); err != nil {
 		t.Fatal(err)
 	}
@@ -159,21 +159,21 @@ func TestSYNCookieFastOpenFallsBackToFinalACK(t *testing.T) {
 
 	const clientSequence = uint32(0x23456789)
 	payload := []byte("fast-open request")
-	syn := buildTestTCP(remote, local, 43003, 47003, clientSequence, 0, tcpFlagSYN, 65535, nil, payload)
+	syn := buildTestTCP(remote, local, 43003, 47003, clientSequence, 0, TCPFlagSYN, 65535, nil, payload)
 	if err = writeTestPacket(stack, syn); err != nil {
 		t.Fatal(err)
 	}
 	response := readOutboundPacket(t, stack)
 	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.protocol != protocolTCP || len(parsed.payload) < tcpHeaderSize {
+	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("invalid SYN-cookie response: %x", response)
 	}
 	tcp := parsed.payload
-	if tcp[13]&byte(tcpFlagSYN|tcpFlagACK) != byte(tcpFlagSYN|tcpFlagACK) || binary.BigEndian.Uint32(tcp[8:12]) != clientSequence+1 {
+	if tcp[13]&byte(TCPFlagSYN|TCPFlagACK) != byte(TCPFlagSYN|TCPFlagACK) || binary.BigEndian.Uint32(tcp[8:12]) != clientSequence+1 {
 		t.Fatalf("SYN-cookie flags/ack = %#x/%#x", tcp[13], binary.BigEndian.Uint32(tcp[8:12]))
 	}
 	serverSequence := binary.BigEndian.Uint32(tcp[4:8])
-	finalACK := buildTestTCP(remote, local, 43003, 47003, clientSequence+1, serverSequence+1, tcpFlagACK|tcpFlagFIN, 65535, nil, payload)
+	finalACK := buildTestTCP(remote, local, 43003, 47003, clientSequence+1, serverSequence+1, TCPFlagACK|TCPFlagFIN, 65535, nil, payload)
 	if err = writeTestPacket(stack, finalACK); err != nil {
 		t.Fatal(err)
 	}
@@ -235,11 +235,11 @@ func TestSYNCookieListenerCloseResetsPendingConnection(t *testing.T) {
 	connection.runPassiveCookie(listener, tcpSegment{}, initialSequence)
 	packet := readOutboundPacket(t, stack)
 	parsed, ok := parseIPPacket(packet)
-	if !ok || parsed.protocol != protocolTCP || len(parsed.payload) < tcpHeaderSize {
+	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("invalid abort reset: %x", packet)
 	}
 	tcp := parsed.payload
-	if tcp[13] != tcpFlagRST|tcpFlagACK || binary.BigEndian.Uint32(tcp[4:8]) != initialSequence+1 ||
+	if tcp[13] != TCPFlagRST|TCPFlagACK || binary.BigEndian.Uint32(tcp[4:8]) != initialSequence+1 ||
 		binary.BigEndian.Uint32(tcp[8:12]) != connection.receiveNext {
 		t.Fatalf("abort reset flags/sequence/ack = %#x/%#x/%#x", tcp[13], binary.BigEndian.Uint32(tcp[4:8]), binary.BigEndian.Uint32(tcp[8:12]))
 	}
@@ -259,7 +259,7 @@ func TestSYNCookieHonorsConfiguredReceiveWindow(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = stack.Close() })
 	key := tcpKey{local: netip.MustParseAddrPort("192.0.2.61:8080"), remote: netip.MustParseAddrPort("198.51.100.61:40000")}
-	syn := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}
+	syn := tcpSegment{sequence: 100, flags: TCPFlagSYN, window: 65535}
 	if err = (&tcpPassiveState{}).sendSYNCookie(stack, nil, key, syn, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +292,7 @@ func TestSYNCookieHonorsListenerCreationOptions(t *testing.T) {
 	}
 	listener := &TCPListener{options: parsed.tcp}
 	key := tcpKey{local: netip.AddrPortFrom(local, 8080), remote: netip.AddrPortFrom(remote, 40000)}
-	syn := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}
+	syn := tcpSegment{sequence: 100, flags: TCPFlagSYN, window: 65535}
 	if err = (&tcpPassiveState{}).sendSYNCookie(stack, listener, key, syn, time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -342,11 +342,11 @@ func TestSYNCookieValidationIPv4AndIPv6(t *testing.T) {
 				state.cookieKey[index] = byte(index + 1)
 			}
 			key := tcpKey{local: netip.AddrPortFrom(test.local, 443), remote: netip.AddrPortFrom(test.remote, 50000)}
-			syn := tcpSegment{sequence: 100, flags: tcpFlagSYN, window: 65535}
+			syn := tcpSegment{sequence: 100, flags: TCPFlagSYN, window: 65535}
 			syn.setOptions([]byte{2, 4, 0x05, 0xb4, 4, 2})
 			_, data := encodeSYNCookieOptions(syn, test.remote)
 			cookie := synCookieSequence(state.cookieKey, key, syn.sequence, synCookiePeriodNumber(now, state.cookieEpoch), data, data)
-			ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: cookie + 1, flags: tcpFlagACK, window: 4096}
+			ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: cookie + 1, flags: TCPFlagACK, window: 4096}
 			if _, _, valid := state.validateSYNCookie(key, ack, now); !valid {
 				t.Fatal("valid SYN cookie was rejected")
 			}
@@ -392,7 +392,7 @@ func TestSYNCookieWindowScaleRotatesByPeriod(t *testing.T) {
 	clientSequence := uint32(100)
 	data := uint32(0)
 	cookie := synCookieSequence(secret, key, clientSequence, period, data, data)
-	ack := tcpSegment{sequence: clientSequence + 1, acknowledgement: cookie + 1, flags: tcpFlagACK}
+	ack := tcpSegment{sequence: clientSequence + 1, acknowledgement: cookie + 1, flags: TCPFlagACK}
 
 	next := now.Add(synCookiePeriod)
 	_, nextPeriod, nextScale, err := state.synCookieKey(next, 7)

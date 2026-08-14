@@ -1469,7 +1469,7 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 		return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, fragmentation, c.stack.network.Load().mtu, dontWait)
 	}
 	if source.Is6() && !options.flowLabelSet {
-		options.flowLabel = c.stack.automaticTransportFlowLabel(source, target, protocolUDP, sourcePort, targetPort)
+		options.flowLabel = c.stack.automaticTransportFlowLabel(source, target, ProtocolUDP, sourcePort, targetPort)
 		options.flowLabelSet = true
 	}
 	mtu := c.stack.network.Load().mtu
@@ -1484,7 +1484,7 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 			identification = uint16(c.stack.ipv4ID.Add(1))
 		}
 		return c.stack.writeNonUnicastPacketUntil(ipSize+udpSize, external, loopback, state, func(packet []byte) bool {
-			if !marshalIPHeader(packet, source, target, protocolUDP, identification, fragmentation.dontFragment, options) {
+			if !marshalIPHeader(packet, source, target, ProtocolUDP, identification, fragmentation.dontFragment, options) {
 				return false
 			}
 			marshalUDPDatagram(packet[ipSize:], source, target, sourcePort, targetPort, payload)
@@ -1496,7 +1496,7 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 	}
 	datagram := make([]byte, udpSize)
 	marshalUDPDatagram(datagram, source, target, sourcePort, targetPort, payload)
-	packets, err := c.stack.ipPayloadPacketsForMTU(source, target, protocolUDP, datagram, fragmentation, options, mtu)
+	packets, err := c.stack.ipPayloadPacketsForMTU(source, target, ProtocolUDP, datagram, fragmentation, options, mtu)
 	if err != nil {
 		return err
 	}
@@ -1681,7 +1681,7 @@ func isMulticastControlPacket(packet ipPacket) bool {
 	if packet.protocol == 2 && packet.source.Is4() {
 		return true
 	}
-	if packet.protocol == protocolICMPv6 && len(packet.payload) != 0 {
+	if packet.protocol == ProtocolICMPv6 && len(packet.payload) != 0 {
 		switch packet.payload[0] {
 		case mldMembershipQuery, mldV1MembershipReport, mldV1ListenerDone, mldV2MembershipReport:
 			return true
@@ -1707,7 +1707,7 @@ func (s *Stack) multicastStateForQuery(packet ipPacket, current multicastEndpoin
 			return nil
 		}
 		query, expected, valid = parseIGMPQuery(packet, network)
-	case protocolICMPv6:
+	case ProtocolICMPv6:
 		if packet.payload[0] != mldMembershipQuery {
 			return nil
 		}
@@ -1782,7 +1782,7 @@ func (s *multicastState) handleMLD(packet ipPacket, receivedAt time.Time) {
 	}
 	if len(payload) < 8 || payload[1] != 0 || packet.hopLimit != 1 || !packet.hasRouterAlert() ||
 		!packet.source.IsLinkLocalUnicast() ||
-		transportChecksum(packet.source, packet.target, protocolICMPv6, payload) != 0 {
+		transportChecksum(packet.source, packet.target, ProtocolICMPv6, payload) != 0 {
 		return
 	}
 	switch payload[0] {
@@ -1853,7 +1853,7 @@ func parseMLDQuery(packet ipPacket, network *networkState) (multicastQuery, neti
 	payload := packet.payload
 	if len(payload) < 24 || payload[0] != mldMembershipQuery || payload[1] != 0 || packet.hopLimit != 1 ||
 		!packet.hasRouterAlert() || !packet.source.IsLinkLocalUnicast() ||
-		transportChecksum(packet.source, packet.target, protocolICMPv6, payload) != 0 {
+		transportChecksum(packet.source, packet.target, ProtocolICMPv6, payload) != 0 {
 		return multicastQuery{}, netip.Addr{}, false
 	}
 	legacyResponse := time.Duration(binary.BigEndian.Uint16(payload[4:6])) * time.Millisecond
@@ -2565,14 +2565,14 @@ func (s *multicastState) sendMLDPacket(target netip.Addr, payload []byte, cancel
 		return
 	}
 	payload[2], payload[3] = 0, 0
-	binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, protocolICMPv6, payload))
+	binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, ProtocolICMPv6, payload))
 	packet := make([]byte, 48+len(payload))
 	packet[0], packet[6], packet[7] = 0x60, 0, 1
 	binary.BigEndian.PutUint16(packet[4:6], uint16(8+len(payload)))
 	sourceBytes, targetBytes := source.As16(), target.As16()
 	copy(packet[8:24], sourceBytes[:])
 	copy(packet[24:40], targetBytes[:])
-	copy(packet[40:48], []byte{protocolICMPv6, 0, 5, 2, 0, 0, 1, 0})
+	copy(packet[40:48], []byte{ProtocolICMPv6, 0, 5, 2, 0, 0, 1, 0})
 	copy(packet[48:], payload)
 	_ = s.stack.writePacketUntil(packet, socketWriteState{closed: cancel})
 }

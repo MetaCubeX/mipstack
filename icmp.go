@@ -7,6 +7,121 @@ import (
 	"syscall"
 )
 
+// ICMPMessage is the semantic representation of one ICMPv4 or ICMPv6
+// message. Source and Destination select the address family and, for ICMPv6,
+// provide the checksum pseudo-header. IPPacket.ICMPMessage borrows Body from
+// the packet; callers must replace or copy it before modifying unowned input.
+// Construction normalizes IPv4-mapped IPv6 addresses to IPv4.
+type ICMPMessage struct {
+	// Source is the source IP address.
+	Source netip.Addr
+	// Destination is the destination IP address.
+	Destination netip.Addr
+	// Type is the ICMP message type.
+	Type uint8
+	// Code is the subtype within Type.
+	Code uint8
+	// Body contains every byte after Type, Code, and Checksum. It must include
+	// the message type's four-byte minimum body.
+	Body []byte
+}
+
+// ICMPMessage validates and decodes the packet's family-appropriate ICMP
+// upper layer.
+func (p IPPacket) ICMPMessage() (ICMPMessage, error) {
+	protocol := byte(ProtocolICMPv4)
+	if p.Source.Unmap().Is6() {
+		protocol = ProtocolICMPv6
+	}
+	icmp, pseudoHeaderSafe, err := p.upperLayerForProtocol(protocol)
+	if err != nil {
+		return ICMPMessage{}, err
+	}
+	if protocol == ProtocolICMPv6 && !pseudoHeaderSafe {
+		return ICMPMessage{}, syscall.EPROTONOSUPPORT
+	}
+	if len(icmp) < 8 {
+		return ICMPMessage{}, syscall.EINVAL
+	}
+	valid := checksum(icmp) == 0
+	if protocol == ProtocolICMPv6 {
+		valid = transportChecksum(p.Source, p.Destination, ProtocolICMPv6, icmp) == 0
+	}
+	if !valid {
+		return ICMPMessage{}, syscall.EINVAL
+	}
+	return ICMPMessage{Source: p.Source.Unmap(), Destination: p.Destination.Unmap(), Type: icmp[0], Code: icmp[1], Body: icmp[4:]}, nil
+}
+
+// IsEchoRequest reports whether m is a complete family-appropriate Echo
+// Request. The four leading Body bytes hold the echo identifier and sequence.
+func (m ICMPMessage) IsEchoRequest() bool {
+	if len(m.Body) < 4 || m.Code != 0 {
+		return false
+	}
+	source, destination := m.Source.Unmap(), m.Destination.Unmap()
+	if !source.IsValid() || !destination.IsValid() || source.Is4() != destination.Is4() {
+		return false
+	}
+	if source.Is4() {
+		return m.Type == 8
+	}
+	return m.Type == 128
+}
+
+// MarshalBinary returns the complete ICMP message wire encoding. Source and
+// Destination select the family and contribute to the ICMPv6 pseudo-header
+// checksum but are not themselves encoded. MarshalBinary is semantically
+// identical to AppendBinary(nil).
+func (m ICMPMessage) MarshalBinary() ([]byte, error) { return m.AppendBinary(nil) }
+
+// AppendBinary appends the complete ICMP message wire encoding to dst. Source
+// and Destination select the family and contribute to the ICMPv6 pseudo-header
+// checksum but are not themselves encoded. It validates every field before
+// changing dst, does not retain any input slice, and permits the destination
+// to share backing storage with Body. On validation failure it returns the
+// original dst unchanged.
+func (m ICMPMessage) AppendBinary(dst []byte) ([]byte, error) {
+	normalized, totalSize, err := m.wireLayout()
+	if err != nil {
+		return dst, err
+	}
+	start := len(dst)
+	dst = extendForAppend(dst, totalSize)
+	marshalPublicICMPMessage(dst[start:], normalized)
+	return dst, nil
+}
+
+// wireLayout validates m, normalizes its addresses, and returns its exact
+// message length.
+func (m ICMPMessage) wireLayout() (ICMPMessage, int, error) {
+	if m.Source.Zone() != "" || m.Destination.Zone() != "" {
+		return ICMPMessage{}, 0, syscall.EINVAL
+	}
+	m.Source, m.Destination = m.Source.Unmap(), m.Destination.Unmap()
+	if !m.Source.IsValid() || !m.Destination.IsValid() || m.Source.Is4() != m.Destination.Is4() {
+		return ICMPMessage{}, 0, syscall.EINVAL
+	}
+	if len(m.Body) < 4 {
+		return ICMPMessage{}, 0, syscall.EINVAL
+	}
+	if len(m.Body) > 65535-4 {
+		return ICMPMessage{}, 0, syscall.EMSGSIZE
+	}
+	return m, 4 + len(m.Body), nil
+}
+
+// marshalPublicICMPMessage writes one already validated semantic message.
+func marshalPublicICMPMessage(dst []byte, m ICMPMessage) {
+	copy(dst[4:], m.Body)
+	dst[0], dst[1], dst[2], dst[3] = m.Type, m.Code, 0, 0
+	value := checksum(dst)
+	if m.Source.Is6() {
+		value = transportChecksum(m.Source, m.Destination, ProtocolICMPv6, dst)
+	}
+	binary.BigEndian.PutUint16(dst[2:4], value)
+}
+
 // ICMPError describes a validated remote network error.
 type ICMPError struct {
 	// Reporter is the router or destination that generated the error.
@@ -96,7 +211,7 @@ func prepareICMPForwarderIPPacket(input []byte, destination netip.Addr) (icmpFor
 		}
 		headerSize := int(packet[0]&0x0f) * 4
 		field := binary.BigEndian.Uint16(packet[6:8])
-		if headerSize < 20 || headerSize > len(packet)-8 || field&0xbfff != 0 || packet[9] != protocolICMPv4 {
+		if headerSize < 20 || headerSize > len(packet)-8 || field&0xbfff != 0 || packet[9] != ProtocolICMPv4 {
 			return icmpForwarderIPPacket{}, syscall.EINVAL
 		}
 		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
@@ -126,13 +241,13 @@ func prepareICMPForwarderIPPacket(input []byte, destination netip.Addr) (icmpFor
 		return icmpForwarderIPPacket{}, syscall.EINVAL
 	}
 	if parsed.source.Is4() {
-		if parsed.protocol != protocolICMPv4 {
+		if parsed.protocol != ProtocolICMPv4 {
 			return icmpForwarderIPPacket{}, syscall.EINVAL
 		}
 		parsed.payload[2], parsed.payload[3] = 0, 0
 		binary.BigEndian.PutUint16(parsed.payload[2:4], checksum(parsed.payload))
 	} else {
-		if parsed.protocol != protocolICMPv6 {
+		if parsed.protocol != ProtocolICMPv6 {
 			return icmpForwarderIPPacket{}, syscall.EINVAL
 		}
 		// RFC 4443 requires every ICMPv6 error to fit the 1280-byte minimum
@@ -141,7 +256,7 @@ func prepareICMPForwarderIPPacket(input []byte, destination netip.Addr) (icmpFor
 			return icmpForwarderIPPacket{}, syscall.EMSGSIZE
 		}
 		parsed.payload[2], parsed.payload[3] = 0, 0
-		binary.BigEndian.PutUint16(parsed.payload[2:4], transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload))
+		binary.BigEndian.PutUint16(parsed.payload[2:4], transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload))
 	}
 	result.parsed = parsed
 	return result, nil
@@ -180,9 +295,9 @@ func isICMPEchoRequest(protocol byte, payload []byte) bool {
 		return false
 	}
 	switch protocol {
-	case protocolICMPv4:
+	case ProtocolICMPv4:
 		return payload[0] == 8
-	case protocolICMPv6:
+	case ProtocolICMPv6:
 		return payload[0] == 128
 	default:
 		return false
@@ -197,7 +312,7 @@ func makeICMPEchoReply(protocol byte, request []byte) ([]byte, bool) {
 		return nil, false
 	}
 	replyType := byte(0)
-	if protocol == protocolICMPv6 {
+	if protocol == ProtocolICMPv6 {
 		replyType = 129
 	}
 	reply := append([]byte(nil), request...)
@@ -213,7 +328,7 @@ func (s *Stack) handleICMP(packet ipPacket, localDestination bool) error {
 	if len(icmp) < 8 {
 		return nil
 	}
-	if packet.protocol == protocolICMPv4 {
+	if packet.protocol == ProtocolICMPv4 {
 		if checksum(icmp) != 0 {
 			return nil
 		}
@@ -223,7 +338,7 @@ func (s *Stack) handleICMP(packet ipPacket, localDestination bool) error {
 					return nil
 				}
 				binary.BigEndian.PutUint16(reply[2:4], checksum(reply))
-				_ = s.writeIPPayload(packet.target, packet.source, protocolICMPv4, reply, true)
+				_ = s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, reply, true)
 				return nil
 			}
 		}
@@ -233,8 +348,8 @@ func (s *Stack) handleICMP(packet ipPacket, localDestination bool) error {
 				if !s.allowControlResponse(controlResponseEchoReply) {
 					return nil
 				}
-				binary.BigEndian.PutUint16(reply[2:4], transportChecksum(packet.target, packet.source, protocolICMPv6, reply))
-				_ = s.writeIPPayload(packet.target, packet.source, protocolICMPv6, reply, true)
+				binary.BigEndian.PutUint16(reply[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, reply))
+				_ = s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, reply, true)
 				return nil
 			}
 		}
@@ -259,7 +374,7 @@ func (s *Stack) handleMulticastICMPv6(packet ipPacket) error {
 	if len(icmp) < 8 {
 		return nil
 	}
-	reply, echoRequest := makeICMPEchoReply(protocolICMPv6, icmp)
+	reply, echoRequest := makeICMPEchoReply(ProtocolICMPv6, icmp)
 	if !echoRequest || !s.allowControlResponse(controlResponseEchoReply) {
 		return nil
 	}
@@ -267,8 +382,8 @@ func (s *Stack) handleMulticastICMPv6(packet ipPacket) error {
 	if err != nil {
 		return nil
 	}
-	binary.BigEndian.PutUint16(reply[2:4], transportChecksum(source, packet.source, protocolICMPv6, reply))
-	_ = s.writeIPPayload(source, packet.source, protocolICMPv6, reply, true)
+	binary.BigEndian.PutUint16(reply[2:4], transportChecksum(source, packet.source, ProtocolICMPv6, reply))
+	_ = s.writeIPPayload(source, packet.source, ProtocolICMPv6, reply, true)
 	return nil
 }
 
@@ -278,7 +393,7 @@ func (s *Stack) handleMulticastICMPv6(packet ipPacket) error {
 func (s *Stack) deliverICMPError(remoteError ICMPError) bool {
 	accepted := false
 	switch remoteError.QuotedProtocol {
-	case protocolUDP:
+	case ProtocolUDP:
 		if len(remoteError.QuotedPayload) >= udpHeaderSize {
 			sourcePort := binary.BigEndian.Uint16(remoteError.QuotedPayload[0:2])
 			targetPort := binary.BigEndian.Uint16(remoteError.QuotedPayload[2:4])
@@ -304,7 +419,7 @@ func (s *Stack) deliverICMPError(remoteError ICMPError) bool {
 				accepted = true
 			}
 		}
-	case protocolTCP:
+	case ProtocolTCP:
 		if len(remoteError.QuotedPayload) >= 8 {
 			sourcePort := binary.BigEndian.Uint16(remoteError.QuotedPayload[0:2])
 			targetPort := binary.BigEndian.Uint16(remoteError.QuotedPayload[2:4])
@@ -364,10 +479,10 @@ func (s *Stack) writeOwnedICMPReply(packet ipPacket, reply []byte) error {
 	reply[2], reply[3] = 0, 0
 	if packet.source.Is4() {
 		binary.BigEndian.PutUint16(reply[2:4], checksum(reply))
-		return s.writeIPPayload(packet.target, packet.source, protocolICMPv4, reply, true)
+		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, reply, true)
 	}
-	binary.BigEndian.PutUint16(reply[2:4], transportChecksum(packet.target, packet.source, protocolICMPv6, reply))
-	return s.writeIPPayload(packet.target, packet.source, protocolICMPv6, reply, true)
+	binary.BigEndian.PutUint16(reply[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, reply))
+	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, reply, true)
 }
 
 // sendAdministrativeUnreachable rejects a handler-supplied ICMP request when
@@ -396,7 +511,7 @@ func (s *Stack) sendAdministrativeUnreachable(packet ipPacket) error {
 		icmp[0], icmp[1] = 3, 13
 		copy(icmp[8:], packet.original[:quoteLength])
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		return s.writeIPPayload(packet.target, packet.source, protocolICMPv4, icmp, false)
+		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
 	}
 	maximumQuote := ipv6MinimumMTU - 48
 	if quoteLength > maximumQuote {
@@ -405,8 +520,8 @@ func (s *Stack) sendAdministrativeUnreachable(packet ipPacket) error {
 	icmp := make([]byte, 8+quoteLength)
 	icmp[0], icmp[1] = 1, 1
 	copy(icmp[8:], packet.original[:quoteLength])
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, protocolICMPv6, icmp))
-	return s.writeIPPayload(packet.target, packet.source, protocolICMPv6, icmp, false)
+	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
+	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, icmp, false)
 }
 
 // sendFragmentReassemblyTimeout reports an expired datagram when its first
@@ -431,7 +546,7 @@ func (s *Stack) sendFragmentReassemblyTimeout(set *fragmentSet) error {
 		icmp[0], icmp[1] = 11, 1
 		copy(icmp[8:], set.firstPacket[:quoteLength])
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		return s.writeIPPayload(set.target, set.source, protocolICMPv4, icmp, false)
+		return s.writeIPPayload(set.target, set.source, ProtocolICMPv4, icmp, false)
 	}
 	maximumQuote := ipv6MinimumMTU - 48
 	if quoteLength > maximumQuote {
@@ -440,8 +555,8 @@ func (s *Stack) sendFragmentReassemblyTimeout(set *fragmentSet) error {
 	icmp := make([]byte, 8+quoteLength)
 	icmp[0], icmp[1] = 3, 1
 	copy(icmp[8:], set.firstPacket[:quoteLength])
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(set.target, set.source, protocolICMPv6, icmp))
-	return s.writeIPPayload(set.target, set.source, protocolICMPv6, icmp, false)
+	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(set.target, set.source, ProtocolICMPv6, icmp))
+	return s.writeIPPayload(set.target, set.source, ProtocolICMPv6, icmp, false)
 }
 
 // packetInvokesICMPError follows a complete or first-fragment header chain
@@ -451,10 +566,10 @@ func packetInvokesICMPError(packet []byte) bool {
 	if !ok || len(payload) == 0 {
 		return false
 	}
-	if protocol == protocolICMPv6 {
+	if protocol == ProtocolICMPv6 {
 		return payload[0] < 128
 	}
-	if protocol == protocolICMPv4 {
+	if protocol == ProtocolICMPv4 {
 		switch payload[0] {
 		case 3, 4, 5, 11, 12:
 			return true
@@ -469,8 +584,8 @@ func parseICMPError(packet ipPacket) (ICMPError, bool) {
 	if len(icmp) < 8 {
 		return ICMPError{}, false
 	}
-	if packet.protocol == protocolICMPv4 {
-		if !validICMPErrorCode(protocolICMPv4, icmp[0], icmp[1]) {
+	if packet.protocol == ProtocolICMPv4 {
+		if !validICMPErrorCode(ProtocolICMPv4, icmp[0], icmp[1]) {
 			return ICMPError{}, false
 		}
 		source, target, protocol, payload, ok := quotedIPPayload(icmp[8:])
@@ -489,7 +604,7 @@ func parseICMPError(packet ipPacket) (ICMPError, bool) {
 		}
 		return result, true
 	}
-	if packet.protocol == protocolICMPv6 && validICMPErrorCode(protocolICMPv6, icmp[0], icmp[1]) {
+	if packet.protocol == ProtocolICMPv6 && validICMPErrorCode(ProtocolICMPv6, icmp[0], icmp[1]) {
 		source, target, protocol, payload, ok := quotedIPPayload(icmp[8:])
 		if !ok || !source.Is6() || !target.Is6() {
 			return ICMPError{}, false
@@ -530,7 +645,7 @@ func cloneICMPError(networkError ICMPError) ICMPError {
 // can affect a socket or the path-MTU cache.
 func validICMPErrorCode(protocol, messageType, code byte) bool {
 	switch protocol {
-	case protocolICMPv4:
+	case ProtocolICMPv4:
 		switch messageType {
 		case 3:
 			return code <= 15
@@ -539,7 +654,7 @@ func validICMPErrorCode(protocol, messageType, code byte) bool {
 		case 12:
 			return code <= 2
 		}
-	case protocolICMPv6:
+	case ProtocolICMPv6:
 		switch messageType {
 		case 1:
 			return code <= 7
@@ -657,7 +772,7 @@ func (s *Stack) sendPortUnreachable(packet ipPacket) error {
 		icmp[0], icmp[1] = 3, 3
 		copy(icmp[8:], quote)
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		return s.writeIPPayload(packet.target, packet.source, protocolICMPv4, icmp, false)
+		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
 	}
 	maximumQuote := ipv6MinimumMTU - 48
 	if quoteLength > maximumQuote {
@@ -667,8 +782,8 @@ func (s *Stack) sendPortUnreachable(packet ipPacket) error {
 	icmp := make([]byte, 8+len(quote))
 	icmp[0], icmp[1] = 1, 4
 	copy(icmp[8:], quote)
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, protocolICMPv6, icmp))
-	return s.writeIPPayload(packet.target, packet.source, protocolICMPv6, icmp, false)
+	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
+	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, icmp, false)
 }
 
 // sendProtocolUnreachable rejects a valid packet whose upper-layer protocol
@@ -694,7 +809,7 @@ func (s *Stack) sendProtocolUnreachable(packet ipPacket) error {
 		icmp[0], icmp[1] = 3, 2
 		copy(icmp[8:], packet.original[:quoteLength])
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		return s.writeIPPayload(packet.target, packet.source, protocolICMPv4, icmp, false)
+		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
 	}
 	maximumQuote := ipv6MinimumMTU - 48
 	quoteLength := len(packet.original)
@@ -705,8 +820,8 @@ func (s *Stack) sendProtocolUnreachable(packet ipPacket) error {
 	icmp[0], icmp[1] = 4, 1
 	binary.BigEndian.PutUint32(icmp[4:8], uint32(packet.protocolOffset))
 	copy(icmp[8:], packet.original[:quoteLength])
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, protocolICMPv6, icmp))
-	return s.writeIPPayload(packet.target, packet.source, protocolICMPv6, icmp, false)
+	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
+	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, icmp, false)
 }
 
 // sendParameterProblem reports a malformed IPv4 option or an IPv6 field whose
@@ -731,7 +846,7 @@ func (s *Stack) sendParameterProblem(packet ipPacket) error {
 		icmp[0], icmp[1], icmp[4] = 12, packet.parameterCode, byte(packet.parameterAt)
 		copy(icmp[8:], packet.original[:quoteLength])
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		return s.writeIPPayload(packet.target, packet.source, protocolICMPv4, icmp, false)
+		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
 	}
 	if packetInvokesICMPError(packet.original) || !s.allowControlResponse(controlResponseParameterProblem) {
 		return nil
@@ -745,6 +860,6 @@ func (s *Stack) sendParameterProblem(packet ipPacket) error {
 	icmp[0], icmp[1] = 4, packet.parameterCode
 	binary.BigEndian.PutUint32(icmp[4:8], packet.parameterAt)
 	copy(icmp[8:], packet.original[:quoteLength])
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, protocolICMPv6, icmp))
-	return s.writeIPPayload(packet.target, packet.source, protocolICMPv6, icmp, false)
+	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
+	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, icmp, false)
 }

@@ -87,6 +87,53 @@ snapshot of every configured address in configuration order. Operating-system
 file descriptors and event channels whose element type belongs to another
 package are left to embedding adapters so MIPS remains standard-library-only.
 
+## Packet codec
+
+`ParseIPPacket` exposes a validated, zero-copy `IPPacket` view of one complete
+IPv4 or IPv6 packet. Its `TCPSegment`, `UDPDatagram`, and `ICMPMessage` methods
+validate the final upper-layer protocol and checksum and return the matching
+semantic value. Parsed option and payload slices borrow the input packet;
+callers must copy or replace a slice before changing input they do not own.
+
+The same four values construct wire data through `MarshalBinary` and
+`AppendBinary`. They implement `encoding.BinaryMarshaler` on every supported Go
+version and `encoding.BinaryAppender` when built with Go 1.24 or newer; the
+`AppendBinary` method remains directly callable with Go 1.20. Both methods
+validate the complete value, calculate the checksum owned by that layer, and
+do not retain caller storage. `IPPacket` calculates the IPv4 header checksum
+but leaves upper-layer checksums to `TCPSegment`, `UDPDatagram`, or
+`ICMPMessage`; callers building another protocol can use the checksum helpers
+below. `AppendBinary` preserves the existing destination prefix and supports
+output that overlaps borrowed option or payload storage, including appending
+to a zero-length view of the parsed wire buffer. It returns the original
+destination unchanged when validation fails. `MarshalBinary` is semantically
+identical to `AppendBinary(nil)`. For TCP, UDP, and ICMP, source and destination
+addresses provide address-family and pseudo-header checksum context but are not
+part of the returned transport wire. IPv4-mapped input addresses are normalized
+to IPv4 during construction, while an IPv4-mapped address encoded in an IPv6
+header is rejected. TCP encoding clears the three unexposed reserved
+bits and normalizes every byte after End of Option List to RFC 9293's required
+zero padding while parsing remains compatible with Linux's tolerant receive
+behavior. The historic NS bit remains explicitly available. IPv6 encoding
+similarly clears Fragment Header reserved fields and PadN data without hiding
+the received bytes from a parsed `IPPacket`.
+
+`IPPacket.UpperLayer` walks IPv6 Hop-by-Hop, Destination Options, Routing, and
+atomic Fragment headers. Stateful fragment reassembly belongs to `Stack`, not
+the standalone codec, while IPv6 jumbograms are not supported. Non-atomic
+fragments and every Jumbo Payload option are therefore rejected. A decoder
+that must validate an address-dependent pseudo-header (TCP, checksummed UDP,
+or ICMPv6) rejects an active IPv4 source route, active IPv6 Routing Header, or
+Mobile IPv6 Home Address option because it lacks the corresponding routing
+state. ICMPv4 and checksum-disabled IPv4 UDP remain decodable.
+
+`ProtocolICMPv4`, `ProtocolTCP`, `ProtocolUDP`, and `ProtocolICMPv6` are
+untyped protocol-number constants. `TCPSegment.Flags` is a `uint16`; combine
+the untyped `TCPFlagFIN` through the historic `TCPFlagNS` constants directly.
+The package also exposes `InternetChecksum` and `IPTransportChecksum` for
+callers building other upper-layer protocols. The codec intentionally stops at
+the 65,535-byte non-jumbogram IP model used by the Stack.
+
 ## Socket API
 
 MIPS provides:

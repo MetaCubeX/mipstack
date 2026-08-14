@@ -190,7 +190,7 @@ func (b *stackBridge) run(source, destination *Stack, countClient bool) {
 // a duplicate transmission in performance diagnostics.
 func (b *stackBridge) trackPeerTCPPacket(packet []byte) {
 	parsed, ok := parseIPPacket(packet)
-	if !ok || parsed.protocol != protocolTCP || len(parsed.payload) < tcpHeaderSize {
+	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		return
 	}
 	tcp := parsed.payload
@@ -243,7 +243,7 @@ func (b *stackBridge) trackPeerTCPPacket(packet []byte) {
 // device boundary. It is used only by performance diagnostics.
 func (b *stackBridge) trackClientTCPPacket(packet []byte) {
 	parsed, ok := parseIPPacket(packet)
-	if !ok || parsed.protocol != protocolTCP || len(parsed.payload) < tcpHeaderSize {
+	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		return
 	}
 	tcp := parsed.payload
@@ -254,10 +254,10 @@ func (b *stackBridge) trackClientTCPPacket(packet []byte) {
 	port := binary.BigEndian.Uint16(tcp[0:2])
 	sequence := binary.BigEndian.Uint32(tcp[4:8])
 	length := uint32(len(tcp) - headerSize)
-	if tcp[13]&tcpFlagSYN != 0 {
+	if tcp[13]&TCPFlagSYN != 0 {
 		length++
 	}
-	if tcp[13]&tcpFlagFIN != 0 {
+	if tcp[13]&TCPFlagFIN != 0 {
 		length++
 	}
 	if length == 0 {
@@ -389,14 +389,14 @@ func (l *testPacketLink) handleOutboundPacket(packet []byte) error {
 	l.mu.Lock()
 	echoUDP, echoTCP := l.echoUDP, l.echoTCP
 	l.mu.Unlock()
-	if parsed.protocol == protocolUDP && echoUDP {
+	if parsed.protocol == ProtocolUDP && echoUDP {
 		udp := parsed.payload
 		if len(udp) >= udpHeaderSize {
 			response := buildTestUDP(parsed.target, parsed.source, binary.BigEndian.Uint16(udp[2:4]), binary.BigEndian.Uint16(udp[0:2]), append([]byte(nil), udp[udpHeaderSize:]...))
 			return writeTestPacket(l.stack, response)
 		}
 	}
-	if parsed.protocol == protocolTCP && echoTCP {
+	if parsed.protocol == ProtocolTCP && echoTCP {
 		return l.handleTCP(parsed)
 	}
 	select {
@@ -428,20 +428,20 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 	if packet.ecn == 2 {
 		l.clientECTPackets++
 	}
-	if flags&tcpFlagECE != 0 {
+	if flags&TCPFlagECE != 0 {
 		l.clientECEs++
 	}
-	if flags&tcpFlagCWR != 0 {
+	if flags&TCPFlagCWR != 0 {
 		l.clientCWRs++
 	}
 	peer := l.tcp[clientPort]
-	if flags&tcpFlagSYN != 0 {
-		if l.dropECNSYN && flags&(tcpFlagECE|tcpFlagCWR) == tcpFlagECE|tcpFlagCWR {
+	if flags&TCPFlagSYN != 0 {
+		if l.dropECNSYN && flags&(TCPFlagECE|TCPFlagCWR) == TCPFlagECE|TCPFlagCWR {
 			l.dropECNSYN = false
 			l.mu.Unlock()
 			return nil
 		}
-		if flags&(tcpFlagECE|tcpFlagCWR) == 0 {
+		if flags&(TCPFlagECE|TCPFlagCWR) == 0 {
 			l.legacySYNSends++
 		}
 		if l.dropTCPSYN > 0 {
@@ -471,9 +471,9 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 				options = append(options, 4, 2)
 			}
 		}
-		responseFlags := byte(tcpFlagSYN | tcpFlagACK)
-		if l.ecnTCP && flags&tcpFlagECE != 0 && flags&tcpFlagCWR != 0 {
-			responseFlags |= tcpFlagECE
+		responseFlags := byte(TCPFlagSYN | TCPFlagACK)
+		if l.ecnTCP && flags&TCPFlagECE != 0 && flags&TCPFlagCWR != 0 {
+			responseFlags |= TCPFlagECE
 		}
 		return l.deliverTCP(serverPort, clientPort, serverSequence, acknowledgement, responseFlags, 65535, options, nil)
 	}
@@ -481,7 +481,7 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 		l.mu.Unlock()
 		return nil
 	}
-	if flags&tcpFlagRST != 0 {
+	if flags&TCPFlagRST != 0 {
 		peer.resetSeen = true
 		l.mu.Unlock()
 		return nil
@@ -496,9 +496,9 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 		peer.clientTimestamp = value
 		l.clientTimestamps++
 	}
-	if flags&tcpFlagACK != 0 && len(payload) == 0 {
+	if flags&TCPFlagACK != 0 && len(payload) == 0 {
 		l.clientACKs++
-		if flags&tcpFlagSYN == 0 {
+		if flags&TCPFlagSYN == 0 {
 			l.lastClientWindow = binary.BigEndian.Uint16(tcp[14:16])
 		}
 	}
@@ -550,7 +550,7 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 			options = testSACKOptions(peer.outOfOrder)
 		}
 		l.mu.Unlock()
-		return l.deliverTCP(serverPort, clientPort, serverSequence, acknowledgement, tcpFlagACK, 65535, options, nil)
+		return l.deliverTCP(serverPort, clientPort, serverSequence, acknowledgement, TCPFlagACK, 65535, options, nil)
 	}
 	if len(payload) != 0 && sequence == peer.clientNext {
 		if droppedAt, retransmitted := peer.dropped[sequence]; retransmitted {
@@ -580,7 +580,7 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 			l.maximumTCPBurst = peer.burst
 		}
 	}
-	if flags&tcpFlagFIN != 0 && sequence+uint32(len(payload)) == peer.clientNext {
+	if flags&TCPFlagFIN != 0 && sequence+uint32(len(payload)) == peer.clientNext {
 		if l.dropTCPFIN > 0 {
 			l.dropTCPFIN--
 			l.mu.Unlock()
@@ -592,13 +592,13 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 		peer.finSent = true
 		peer.serverNext++
 		l.mu.Unlock()
-		if err := l.deliverTCP(serverPort, clientPort, serverSequence, acknowledgement, tcpFlagACK, 65535, nil, nil); err != nil {
+		if err := l.deliverTCP(serverPort, clientPort, serverSequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
 			return err
 		}
-		return l.deliverTCP(serverPort, clientPort, serverSequence, acknowledgement, tcpFlagACK|tcpFlagFIN, 65535, nil, nil)
+		return l.deliverTCP(serverPort, clientPort, serverSequence, acknowledgement, TCPFlagACK|TCPFlagFIN, 65535, nil, nil)
 	}
 	threshold := l.holdTCPACKs
-	flush := len(peer.pending) != 0 && (threshold <= 1 || peer.burst >= threshold || flags&tcpFlagPSH != 0)
+	flush := len(peer.pending) != 0 && (threshold <= 1 || peer.burst >= threshold || flags&TCPFlagPSH != 0)
 	if !flush {
 		l.mu.Unlock()
 		return nil
@@ -645,7 +645,7 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 		}
 	}
 	for _, response := range responses {
-		if err := l.deliverTCP(serverPort, clientPort, response.sequence, acknowledgement, tcpFlagACK|tcpFlagPSH, window, nil, response.payload); err != nil {
+		if err := l.deliverTCP(serverPort, clientPort, response.sequence, acknowledgement, TCPFlagACK|TCPFlagPSH, window, nil, response.payload); err != nil {
 			return err
 		}
 	}
@@ -741,8 +741,8 @@ func (l *testPacketLink) deliverTCP(sourcePort, targetPort uint16, sequence, ack
 	if markCE {
 		l.markTCPCE = false
 	}
-	if l.sendTCPECE && flags&tcpFlagACK != 0 {
-		flags |= tcpFlagECE
+	if l.sendTCPECE && flags&TCPFlagACK != 0 {
+		flags |= TCPFlagECE
 	}
 	l.mu.Unlock()
 	headerSize := tcpHeaderSize + (len(options)+3)&^3
@@ -755,8 +755,8 @@ func (l *testPacketLink) deliverTCP(sourcePort, targetPort uint16, sequence, ack
 	binary.BigEndian.PutUint16(tcp[14:16], window)
 	copy(tcp[tcpHeaderSize:headerSize], options)
 	copy(tcp[headerSize:], payload)
-	binary.BigEndian.PutUint16(tcp[16:18], transportChecksum(l.remote, l.local, protocolTCP, tcp))
-	packet := buildIPPacket(l.remote, l.local, protocolTCP, tcp, 1, true)
+	binary.BigEndian.PutUint16(tcp[16:18], transportChecksum(l.remote, l.local, ProtocolTCP, tcp))
+	packet := buildIPPacket(l.remote, l.local, ProtocolTCP, tcp, 1, true)
 	if markCE {
 		setPacketECN(packet, 3)
 	}
@@ -808,9 +808,9 @@ func fillTestPacketQueue(t *testing.T, queue *packetQueue, packet []byte) {
 func buildTestPacketTooBig(reporter, target netip.Addr, quoted []byte, mtu uint32) []byte {
 	icmp := make([]byte, 8+len(quoted))
 	copy(icmp[8:], quoted)
-	protocol := protocolICMPv6
+	protocol := byte(ProtocolICMPv6)
 	if reporter.Is4() {
-		protocol = protocolICMPv4
+		protocol = ProtocolICMPv4
 		icmp[0], icmp[1] = 3, 4
 		binary.BigEndian.PutUint16(icmp[6:8], uint16(mtu))
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
@@ -829,12 +829,12 @@ func buildTestUDP(source, target netip.Addr, sourcePort, targetPort uint16, payl
 	binary.BigEndian.PutUint16(udp[2:4], targetPort)
 	binary.BigEndian.PutUint16(udp[4:6], uint16(len(udp)))
 	copy(udp[udpHeaderSize:], payload)
-	value := transportChecksum(source, target, protocolUDP, udp)
+	value := transportChecksum(source, target, ProtocolUDP, udp)
 	if value == 0 {
 		value = 0xffff
 	}
 	binary.BigEndian.PutUint16(udp[6:8], value)
-	return buildIPPacket(source, target, protocolUDP, udp, 1, false)
+	return buildIPPacket(source, target, ProtocolUDP, udp, 1, false)
 }
 
 // buildTestTCP constructs one checksummed test segment.
@@ -849,15 +849,15 @@ func buildTestTCP(source, target netip.Addr, sourcePort, targetPort uint16, sequ
 	binary.BigEndian.PutUint16(tcp[14:16], window)
 	copy(tcp[tcpHeaderSize:headerSize], options)
 	copy(tcp[headerSize:], payload)
-	binary.BigEndian.PutUint16(tcp[16:18], transportChecksum(source, target, protocolTCP, tcp))
-	return buildIPPacket(source, target, protocolTCP, tcp, 1, true)
+	binary.BigEndian.PutUint16(tcp[16:18], transportChecksum(source, target, ProtocolTCP, tcp))
+	return buildIPPacket(source, target, ProtocolTCP, tcp, 1, true)
 }
 
 func buildTestIPv4Options(source, target netip.Addr, options []byte) []byte {
 	packet := make([]byte, 20+len(options)+8)
 	packet[0] = 0x40 | byte((20+len(options))/4)
 	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
-	packet[8], packet[9] = 64, protocolUDP
+	packet[8], packet[9] = 64, ProtocolUDP
 	copy(packet[12:16], source.AsSlice())
 	copy(packet[16:20], target.AsSlice())
 	copy(packet[20:], options)

@@ -121,9 +121,9 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, listener *TCPListener,
 	}
 	var optionStorage [40]byte
 	tcpOptions := tcpPassiveSYNOptions(optionStorage[:0], localMSS, options.sack, options.windowScaling, options.timestamp, windowScale, timestamp, options.timestampNow)
-	flags := byte(tcpFlagSYN | tcpFlagACK)
+	flags := byte(TCPFlagSYN | TCPFlagACK)
 	if options.ecn {
-		flags |= tcpFlagECE
+		flags |= TCPFlagECE
 	}
 	receiveWindow := defaults.ReceiveBuffer
 	if receiveWindow > 65535 {
@@ -144,7 +144,7 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 // validateSYNCookieCandidate additionally reports whether a recent cookie
 // made this ACK eligible for authentication diagnostics.
 func (state *tcpPassiveState) validateSYNCookieCandidate(key tcpKey, ack tcpSegment, now time.Time) (uint32, synCookieOptions, bool, bool) {
-	if ack.flags&tcpFlagACK == 0 || ack.flags&(tcpFlagSYN|tcpFlagRST) != 0 {
+	if ack.flags&TCPFlagACK == 0 || ack.flags&(TCPFlagSYN|TCPFlagRST) != 0 {
 		return 0, synCookieOptions{}, false, false
 	}
 	secret, period, scalePeriods, windowScales, scalesSet, active := state.recentSYNCookieState(now)
@@ -216,7 +216,7 @@ func encodeSYNCookieOptions(syn tcpSegment, remoteAddress netip.Addr) (synCookie
 	// The server timestamp echo carries ECN state for the final ACK. Without
 	// timestamps, cookie mode conservatively declines ECN rather than spending
 	// sequence bits that would weaken the authentication tag.
-	ecn := timestamp && syn.flags&(tcpFlagECE|tcpFlagCWR) == tcpFlagECE|tcpFlagCWR
+	ecn := timestamp && syn.flags&(TCPFlagECE|TCPFlagCWR) == TCPFlagECE|TCPFlagCWR
 	return synCookieOptions{
 		mss: int(synCookieMSSValues[mssIndex]), windowScale: scale, windowScaling: scaling,
 		sack: sack, timestamp: timestamp, ecn: ecn, timestampNow: timestampValue,
@@ -296,7 +296,7 @@ func (c *TCPConn) runPassiveCookie(listener *TCPListener, finalACK tcpSegment, i
 	defer close(c.done)
 	protocolTimer := newOwnedTimer()
 	defer protocolTimer.close()
-	if len(finalACK.payload) != 0 || finalACK.flags&tcpFlagFIN != 0 {
+	if len(finalACK.payload) != 0 || finalACK.flags&TCPFlagFIN != 0 {
 		c.inbound.prepend(finalACK)
 	}
 	if !listener.enqueue(c) {

@@ -706,13 +706,13 @@ func ipv6FirstFragmentHeaderComplete(next byte, payload []byte) bool {
 			next, offset = payload[offset], offset+length
 		case 44:
 			return false
-		case protocolTCP:
+		case ProtocolTCP:
 			if len(payload)-offset < tcpHeaderSize {
 				return false
 			}
 			headerSize := int(payload[offset+12]>>4) * 4
 			return headerSize < tcpHeaderSize || headerSize <= len(payload)-offset
-		case protocolUDP, protocolICMPv4, protocolICMPv6, 50:
+		case ProtocolUDP, ProtocolICMPv4, ProtocolICMPv6, 50:
 			return len(payload)-offset >= 8
 		case 33, 132:
 			return len(payload)-offset >= 12

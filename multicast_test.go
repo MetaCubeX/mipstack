@@ -187,14 +187,14 @@ func buildMulticastTestMLDQuery(source, target, group netip.Addr, responseCode u
 			offset += 16
 		}
 	}
-	binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, protocolICMPv6, payload))
+	binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, ProtocolICMPv6, payload))
 	packet := make([]byte, 48+len(payload))
 	packet[0], packet[6], packet[7] = 0x60, 0, 1
 	binary.BigEndian.PutUint16(packet[4:6], uint16(8+len(payload)))
 	sourceBytes, targetBytes := source.As16(), target.As16()
 	copy(packet[8:24], sourceBytes[:])
 	copy(packet[24:40], targetBytes[:])
-	copy(packet[40:48], []byte{protocolICMPv6, 0, 5, 2, 0, 0, 1, 0})
+	copy(packet[40:48], []byte{ProtocolICMPv6, 0, 5, 2, 0, 0, 1, 0})
 	copy(packet[48:], payload)
 	return packet
 }
@@ -378,7 +378,7 @@ func FuzzMulticastQueryParsing(f *testing.F) {
 			packet[50], packet[51] = 0, 0
 			source := netip.AddrFrom16([16]byte(packet[8:24]))
 			target := netip.AddrFrom16([16]byte(packet[24:40]))
-			binary.BigEndian.PutUint16(packet[50:52], transportChecksum(source, target, protocolICMPv6, packet[48:]))
+			binary.BigEndian.PutUint16(packet[50:52], transportChecksum(source, target, ProtocolICMPv6, packet[48:]))
 		}
 		parsed, ok := parseIPPacket(packet)
 		if !ok {
@@ -523,7 +523,7 @@ func TestIPv4BroadcastFanoutAndOutput(t *testing.T) {
 	}
 	readMulticastTestUDP(t, receiver, "broadcast-out")
 	outbound := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == protocolUDP && packet.target == broadcast
+		return packet.protocol == ProtocolUDP && packet.target == broadcast
 	})
 	if outbound.source != local || outbound.hopLimit != 64 || string(outbound.payload[udpHeaderSize:]) != "broadcast-out" {
 		t.Fatalf("broadcast output = source %s ttl %d payload %q", outbound.source, outbound.hopLimit, outbound.payload[udpHeaderSize:])
@@ -584,7 +584,7 @@ func TestASMMulticastIPv4AndIPv6(t *testing.T) {
 				if test.group.Is4() {
 					return candidate.protocol == 2 && len(candidate.payload) >= 16 && candidate.payload[0] == igmpV3MembershipReport
 				}
-				return candidate.protocol == protocolICMPv6 && len(candidate.payload) >= 28 && candidate.payload[0] == mldV2MembershipReport
+				return candidate.protocol == ProtocolICMPv6 && len(candidate.payload) >= 28 && candidate.payload[0] == mldV2MembershipReport
 			})
 			if report.hopLimit != 1 || !report.hasRouterAlert() {
 				t.Fatalf("membership report hop limit/router alert = %d/%v", report.hopLimit, report.hasRouterAlert())
@@ -606,7 +606,7 @@ func TestASMMulticastIPv4AndIPv6(t *testing.T) {
 			}
 			readMulticastTestUDP(t, packet, "multicast-out")
 			outbound := nextMulticastTestPacket(t, stack, func(candidate ipPacket) bool {
-				return candidate.protocol == protocolUDP && candidate.target == test.group
+				return candidate.protocol == ProtocolUDP && candidate.target == test.group
 			})
 			wantSource := local4
 			if test.group.Is6() {
@@ -632,7 +632,7 @@ func TestASMMulticastIPv4AndIPv6(t *testing.T) {
 				}
 				wire := consumeTestPacket(&stack.outbound, entry)
 				candidate, valid := parseIPPacket(wire)
-				if valid && candidate.protocol == protocolUDP && candidate.target == test.group {
+				if valid && candidate.protocol == ProtocolUDP && candidate.target == test.group {
 					t.Fatal("zero-hop multicast escaped to the link")
 				}
 			}
@@ -662,8 +662,8 @@ func TestIPv6InterfaceLocalMulticastStaysInsideHost(t *testing.T) {
 	binary.BigEndian.PutUint16(udp[0:2], 53003)
 	binary.BigEndian.PutUint16(udp[2:4], 43003)
 	binary.BigEndian.PutUint16(udp[4:6], uint16(len(udp)))
-	binary.BigEndian.PutUint16(udp[6:8], transportChecksum(remote, group, protocolUDP, udp))
-	fragments := buildIPv6FragmentsWithOptions(remote, group, protocolUDP, udp, 64, 0x1234, ipPacketOptions{})
+	binary.BigEndian.PutUint16(udp[6:8], transportChecksum(remote, group, ProtocolUDP, udp))
+	fragments := buildIPv6FragmentsWithOptions(remote, group, ProtocolUDP, udp, 64, 0x1234, ipPacketOptions{})
 	if len(fragments) < 2 {
 		t.Fatal("interface-local test datagram did not fragment")
 	}
@@ -813,7 +813,7 @@ func TestBroadcastAndMulticastFragmentReassembly(t *testing.T) {
 			}
 			udp := make([]byte, udpHeaderSize+len(payload))
 			marshalUDPDatagram(udp, remote, test.target, 55000, test.targetPort, payload)
-			fragments := buildIPv4FragmentsWithOptions(remote, test.target, protocolUDP, udp, 180, 0x1234, ipPacketOptions{hopLimit: 1})
+			fragments := buildIPv4FragmentsWithOptions(remote, test.target, ProtocolUDP, udp, 180, 0x1234, ipPacketOptions{hopLimit: 1})
 			if len(fragments) < 2 {
 				t.Fatal("test datagram did not fragment")
 			}
@@ -886,7 +886,7 @@ func TestFragmentedMulticastOutputReachesLinkAndLoopback(t *testing.T) {
 	for {
 		wire := readOutboundPacket(t, sender)
 		fragment, valid := parseFragment(wire)
-		if !valid || fragment.key.source != source || fragment.key.target != group || fragment.protocol != protocolUDP {
+		if !valid || fragment.key.source != source || fragment.key.target != group || fragment.protocol != ProtocolUDP {
 			t.Fatalf("invalid outbound multicast fragment: %x", wire)
 		}
 		if fragment.options.hopLimit != 5 || len(wire) > 300 {
@@ -943,7 +943,7 @@ func TestMulticastRawSocketAndNoBroadcastAmplification(t *testing.T) {
 	binary.BigEndian.PutUint16(echo[4:6], 1)
 	binary.BigEndian.PutUint16(echo[6:8], 2)
 	binary.BigEndian.PutUint16(echo[2:4], checksum(echo))
-	if _, err = stack.Write([][]byte{buildIPPacket(remote, broadcast, protocolICMPv4, echo, 1, false)}, 0); err != nil {
+	if _, err = stack.Write([][]byte{buildIPPacket(remote, broadcast, ProtocolICMPv4, echo, 1, false)}, 0); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond)
@@ -954,7 +954,7 @@ func TestMulticastRawSocketAndNoBroadcastAmplification(t *testing.T) {
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
 		candidate, valid := parseIPPacket(wire)
-		if valid && candidate.protocol == protocolICMPv4 && len(candidate.payload) != 0 && candidate.payload[0] == 0 {
+		if valid && candidate.protocol == ProtocolICMPv4 && len(candidate.payload) != 0 && candidate.payload[0] == 0 {
 			t.Fatal("broadcast Echo Request caused an amplified Echo Reply")
 		}
 	}
@@ -1126,12 +1126,12 @@ func TestIPv6MulticastUnknownOptionParameterProblem(t *testing.T) {
 	binary.BigEndian.PutUint16(packet[4:6], 16)
 	copy(packet[8:24], remote.AsSlice())
 	copy(packet[24:40], group.AsSlice())
-	copy(packet[40:48], []byte{protocolUDP, 0, 0x80, 0, 1, 0, 0, 0})
+	copy(packet[40:48], []byte{ProtocolUDP, 0, 0x80, 0, 1, 0, 0, 0})
 	if _, err = stack.Write([][]byte{packet}, 0); err != nil {
 		t.Fatal(err)
 	}
 	response := nextMulticastTestPacket(t, stack, func(candidate ipPacket) bool {
-		return candidate.protocol == protocolICMPv6 && candidate.target == remote && len(candidate.payload) >= 8 && candidate.payload[0] == 4
+		return candidate.protocol == ProtocolICMPv6 && candidate.target == remote && len(candidate.payload) >= 8 && candidate.payload[0] == 4
 	})
 	if response.source != local || response.payload[1] != 2 || binary.BigEndian.Uint32(response.payload[4:8]) != 42 {
 		t.Fatalf("multicast Parameter Problem = source %s type/code %d/%d pointer %d", response.source, response.payload[0], response.payload[1], binary.BigEndian.Uint32(response.payload[4:8]))
@@ -1159,16 +1159,16 @@ func TestIPv6AllNodesEchoUsesUnicastReplySource(t *testing.T) {
 	echo[0] = 128
 	binary.BigEndian.PutUint16(echo[4:6], 0x1234)
 	binary.BigEndian.PutUint16(echo[6:8], 7)
-	binary.BigEndian.PutUint16(echo[2:4], transportChecksum(remote, allNodes, protocolICMPv6, echo))
-	request := buildIPPacket(remote, allNodes, protocolICMPv6, echo, 1, false)
+	binary.BigEndian.PutUint16(echo[2:4], transportChecksum(remote, allNodes, ProtocolICMPv6, echo))
+	request := buildIPPacket(remote, allNodes, ProtocolICMPv6, echo, 1, false)
 	if _, err := stack.Write([][]byte{request}, 0); err != nil {
 		t.Fatal(err)
 	}
 	reply := nextMulticastTestPacket(t, stack, func(candidate ipPacket) bool {
-		return candidate.protocol == protocolICMPv6 && candidate.target == remote && len(candidate.payload) >= 8 && candidate.payload[0] == 129
+		return candidate.protocol == ProtocolICMPv6 && candidate.target == remote && len(candidate.payload) >= 8 && candidate.payload[0] == 129
 	})
-	if reply.source != local || transportChecksum(reply.source, reply.target, protocolICMPv6, reply.payload) != 0 {
-		t.Fatalf("multicast Echo Reply = source %s checksum %#x", reply.source, transportChecksum(reply.source, reply.target, protocolICMPv6, reply.payload))
+	if reply.source != local || transportChecksum(reply.source, reply.target, ProtocolICMPv6, reply.payload) != 0 {
+		t.Fatalf("multicast Echo Reply = source %s checksum %#x", reply.source, transportChecksum(reply.source, reply.target, ProtocolICMPv6, reply.payload))
 	}
 }
 
@@ -1177,12 +1177,12 @@ func TestIPv6MulticastEchoDoesNotFailInputWhenOutputIsFull(t *testing.T) {
 	remote := netip.MustParseAddr("fe80::6a")
 	allNodes := netip.MustParseAddr("ff02::1")
 	stack := newMulticastTestStack(t, []netip.Prefix{netip.PrefixFrom(local, 64)}, 1400)
-	dummy := buildIPPacket(local, remote, protocolUDP, nil, 1, false)
+	dummy := buildIPPacket(local, remote, ProtocolUDP, nil, 1, false)
 	fillTestPacketQueue(t, &stack.outbound, dummy)
 	echo := make([]byte, 8)
 	echo[0] = 128
-	binary.BigEndian.PutUint16(echo[2:4], transportChecksum(remote, allNodes, protocolICMPv6, echo))
-	request := buildIPPacket(remote, allNodes, protocolICMPv6, echo, 1, false)
+	binary.BigEndian.PutUint16(echo[2:4], transportChecksum(remote, allNodes, ProtocolICMPv6, echo))
+	request := buildIPPacket(remote, allNodes, ProtocolICMPv6, echo, 1, false)
 	if _, err := stack.Write([][]byte{request}, 0); err != nil {
 		t.Fatalf("multicast Echo input inherited control-output congestion: %v", err)
 	}
@@ -1199,7 +1199,7 @@ func TestFragmentMembershipRemovalPrunesState(t *testing.T) {
 	defer packet.Close()
 	udp := make([]byte, 800)
 	marshalUDPDatagram(udp, remote, group, 57000, 47000, udp[udpHeaderSize:])
-	fragments := buildIPv4FragmentsWithOptions(remote, group, protocolUDP, udp, 200, 0x7171, ipPacketOptions{hopLimit: 1})
+	fragments := buildIPv4FragmentsWithOptions(remote, group, ProtocolUDP, udp, 200, 0x7171, ipPacketOptions{hopLimit: 1})
 	if _, err = stack.Write([][]byte{fragments[0]}, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -1548,20 +1548,20 @@ func TestMulticastInterfaceFilterAppliesToICMPv6(t *testing.T) {
 		payload := make([]byte, 8)
 		payload[0] = 128
 		binary.BigEndian.PutUint16(payload[4:6], 0x8900)
-		binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, group, protocolICMPv6, payload))
-		return buildIPPacket(source, group, protocolICMPv6, payload, 1, false)
+		binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, group, ProtocolICMPv6, payload))
+		return buildIPPacket(source, group, ProtocolICMPv6, payload, 1, false)
 	}
 	if _, err = stack.Write([][]byte{echoRequest(blocked)}, 0); err != nil {
 		t.Fatal(err)
 	}
 	expectNoMulticastTestPacket(t, stack, 25*time.Millisecond, func(packet ipPacket) bool {
-		return packet.protocol == protocolICMPv6 && packet.target == blocked && len(packet.payload) >= 8 && packet.payload[0] == 129
+		return packet.protocol == ProtocolICMPv6 && packet.target == blocked && len(packet.payload) >= 8 && packet.payload[0] == 129
 	})
 	if _, err = stack.Write([][]byte{echoRequest(allowed)}, 0); err != nil {
 		t.Fatal(err)
 	}
 	reply := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == protocolICMPv6 && packet.target == allowed && len(packet.payload) >= 8 && packet.payload[0] == 129
+		return packet.protocol == ProtocolICMPv6 && packet.target == allowed && len(packet.payload) >= 8 && packet.payload[0] == 129
 	})
 	if reply.source != local {
 		t.Fatalf("allowed multicast Echo Reply source = %s, want %s", reply.source, local)
@@ -1705,7 +1705,7 @@ func TestMulticastQueryValidationAndDefaultVariables(t *testing.T) {
 	badCodeQuery := buildMulticastTestMLDQuery(remote6, group6, group6, 1, []netip.Addr{})
 	badCodeQuery[49] = 1
 	badCodeQuery[50], badCodeQuery[51] = 0, 0
-	binary.BigEndian.PutUint16(badCodeQuery[50:52], transportChecksum(remote6, group6, protocolICMPv6, badCodeQuery[48:]))
+	binary.BigEndian.PutUint16(badCodeQuery[50:52], transportChecksum(remote6, group6, ProtocolICMPv6, badCodeQuery[48:]))
 	if _, err = stack.Write([][]byte{badCodeQuery}, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -1723,7 +1723,7 @@ func TestMulticastQueryValidationAndDefaultVariables(t *testing.T) {
 	unicastMLDQuery := buildMulticastTestMLDQuery(remote6, local6, netip.IPv6Unspecified(), 1, []netip.Addr{})
 	unicastMLDQuery[72], unicastMLDQuery[73] = 0, 0
 	unicastMLDQuery[50], unicastMLDQuery[51] = 0, 0
-	binary.BigEndian.PutUint16(unicastMLDQuery[50:52], transportChecksum(remote6, local6, protocolICMPv6, unicastMLDQuery[48:]))
+	binary.BigEndian.PutUint16(unicastMLDQuery[50:52], transportChecksum(remote6, local6, ProtocolICMPv6, unicastMLDQuery[48:]))
 	if _, err = stack.Write([][]byte{unicastMLDQuery}, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -1785,7 +1785,7 @@ func TestMulticastQueryAcceptsAdditionalData(t *testing.T) {
 	binary.BigEndian.PutUint16(query6[4:6], uint16(len(query6)-40))
 	payload6 := query6[48:]
 	payload6[2], payload6[3] = 0, 0
-	binary.BigEndian.PutUint16(payload6[2:4], transportChecksum(remote6, group6, protocolICMPv6, payload6))
+	binary.BigEndian.PutUint16(payload6[2:4], transportChecksum(remote6, group6, ProtocolICMPv6, payload6))
 	parsed6, ok := parseIPPacket(query6)
 	if !ok {
 		t.Fatal("MLD test packet did not parse as IP")
@@ -1801,7 +1801,7 @@ func TestMulticastQueryAcceptsAdditionalData(t *testing.T) {
 	payloadMalformed6 := malformed6[48:]
 	binary.BigEndian.PutUint16(payloadMalformed6[26:28], 2)
 	payloadMalformed6[2], payloadMalformed6[3] = 0, 0
-	binary.BigEndian.PutUint16(payloadMalformed6[2:4], transportChecksum(remote6, group6, protocolICMPv6, payloadMalformed6))
+	binary.BigEndian.PutUint16(payloadMalformed6[2:4], transportChecksum(remote6, group6, ProtocolICMPv6, payloadMalformed6))
 	parsedMalformed6, ok := parseIPPacket(malformed6)
 	if !ok {
 		t.Fatal("malformed MLD test packet did not parse as IP")
@@ -1832,7 +1832,7 @@ func TestMLDv2QueryCurrentState(t *testing.T) {
 		t.Fatal(err)
 	}
 	report := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == protocolICMPv6 && len(packet.payload) >= 28 && packet.payload[0] == mldV2MembershipReport && packet.payload[8] == multicastRecordModeIsInclude
+		return packet.protocol == ProtocolICMPv6 && len(packet.payload) >= 28 && packet.payload[0] == mldV2MembershipReport && packet.payload[8] == multicastRecordModeIsInclude
 	})
 	records := multicastTestReportRecords(t, report)
 	if len(records) != 1 || records[0].group != group || len(records[0].sources) != 1 || records[0].sources[0] != source {
@@ -2016,7 +2016,7 @@ func TestOlderQueryBeforeFirstMembershipSelectsCompatibilityMode(t *testing.T) {
 			t.Fatalf("promoted MLD state = seed %+v mode %d", seed, mode)
 		}
 		report := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-			return packet.protocol == protocolICMPv6 && len(packet.payload) >= 24 && packet.payload[0] == mldV1MembershipReport
+			return packet.protocol == ProtocolICMPv6 && len(packet.payload) >= 24 && packet.payload[0] == mldV1MembershipReport
 		})
 		if report.target != group {
 			t.Fatalf("MLDv1 report target = %s, want %s", report.target, group)
@@ -2453,7 +2453,7 @@ func TestCompatibilityChangeCancelsBlockedReportGeneration(t *testing.T) {
 	querier := netip.MustParseAddr("192.0.2.118")
 	group := netip.MustParseAddr("239.117.0.1")
 	stack := newMulticastTestStack(t, []netip.Prefix{netip.PrefixFrom(local, 24)}, 1400)
-	dummy := buildIPPacket(local, querier, protocolUDP, nil, 1, false)
+	dummy := buildIPPacket(local, querier, ProtocolUDP, nil, 1, false)
 	fillTestPacketQueue(t, &stack.outbound, dummy)
 	connection, err := stack.ListenMulticastUDP(context.Background(), "udp4", netip.AddrPortFrom(group, 51700))
 	if err != nil {
@@ -2490,11 +2490,11 @@ func TestNonblockingFragmentedNonUnicastCopiesAreAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = stack.Close() })
-	packets := buildIPv4Fragments(local, remote, protocolUDP, bytes.Repeat([]byte{0x6d}, 1200), 600, 91)
+	packets := buildIPv4Fragments(local, remote, ProtocolUDP, bytes.Repeat([]byte{0x6d}, 1200), 600, 91)
 	if len(packets) < 2 {
 		t.Fatal("test payload did not produce multiple fragments")
 	}
-	dummy := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	dummy := buildIPPacket(local, remote, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
 	for stack.loopback.len() < loopbackPacketQueue-1 {
 		if !stack.loopback.tryEnqueue(dummy) {
 			t.Fatal("loopback queue filled before the expected boundary")
@@ -2542,7 +2542,7 @@ func TestMLDv1CompatibilityReportAndDone(t *testing.T) {
 		t.Fatal(err)
 	}
 	report := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == protocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1MembershipReport
+		return packet.protocol == ProtocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1MembershipReport
 	})
 	if report.target != group || !report.hasRouterAlert() || report.hopLimit != 1 {
 		t.Fatalf("MLDv1 report envelope = target %s alert %v hop %d", report.target, report.hasRouterAlert(), report.hopLimit)
@@ -2551,7 +2551,7 @@ func TestMLDv1CompatibilityReportAndDone(t *testing.T) {
 		t.Fatal(err)
 	}
 	done := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == protocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1ListenerDone
+		return packet.protocol == ProtocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1ListenerDone
 	})
 	if done.target != netip.MustParseAddr("ff02::2") {
 		t.Fatalf("MLDv1 Done target = %s", done.target)
@@ -2561,7 +2561,7 @@ func TestMLDv1CompatibilityReportAndDone(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == protocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1MembershipReport
+		return packet.protocol == ProtocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1MembershipReport
 	})
 	// RFC 3810 section 5.2.14 has the same assigned-address exception as
 	// IGMP. Reuse a valid MLD envelope but direct the peer Report to the
@@ -2570,7 +2570,7 @@ func TestMLDv1CompatibilityReportAndDone(t *testing.T) {
 	heard := heardPacket[48:]
 	heard[0], heard[4], heard[5] = mldV1MembershipReport, 0, 0
 	heard[2], heard[3] = 0, 0
-	binary.BigEndian.PutUint16(heard[2:4], transportChecksum(querier, local, protocolICMPv6, heard))
+	binary.BigEndian.PutUint16(heard[2:4], transportChecksum(querier, local, ProtocolICMPv6, heard))
 	if _, err = stack.Write([][]byte{heardPacket}, 0); err != nil {
 		t.Fatal(err)
 	}

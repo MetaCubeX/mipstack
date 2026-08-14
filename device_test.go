@@ -54,7 +54,7 @@ func TestPacketDeviceIO(t *testing.T) {
 	icmp[0] = 8
 	copy(icmp[8:], []byte("ping"))
 	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	request := buildIPPacket(netip.MustParseAddr("192.168.1.99"), netip.MustParseAddr("192.168.1.2"), protocolICMPv4, icmp, 1, true)
+	request := buildIPPacket(netip.MustParseAddr("192.168.1.99"), netip.MustParseAddr("192.168.1.2"), ProtocolICMPv4, icmp, 1, true)
 	padded := append(make([]byte, 4), request...)
 	if count, writeErr := stack.Write([][]byte{padded}, 4); writeErr != nil || count != 1 {
 		t.Fatalf("Write = %d, %v", count, writeErr)
@@ -121,7 +121,7 @@ func TestPacketDeviceCloseDiscardsOutput(t *testing.T) {
 	if err = stack.Start(); err != nil {
 		t.Fatal(err)
 	}
-	packet := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	packet := buildIPPacket(local, remote, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
 	inFlightSlot, reserved := stack.outbound.tryReserve()
 	if !reserved {
 		t.Fatal("no output slot available for in-flight Read")
@@ -175,7 +175,7 @@ func TestPacketDeviceConcurrentCloseAndPublish(t *testing.T) {
 		if err = stack.Start(); err != nil {
 			t.Fatal(err)
 		}
-		packet := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), uint16(round), false)
+		packet := buildIPPacket(local, remote, ProtocolUDP, make([]byte, udpHeaderSize), uint16(round), false)
 		start := make(chan struct{})
 		publish := make(chan struct{})
 		var ready, writers sync.WaitGroup
