@@ -3,6 +3,7 @@ package gvisorinterop_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -10,8 +11,10 @@ import (
 	"time"
 
 	"github.com/metacubex/gvisor/pkg/tcpip"
+	"github.com/metacubex/gvisor/pkg/tcpip/checksum"
 	"github.com/metacubex/gvisor/pkg/tcpip/header"
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/raw"
+	"github.com/metacubex/gvisor/pkg/tcpip/transport/udp"
 	"github.com/metacubex/gvisor/pkg/waiter"
 	"github.com/metacubex/mipstack"
 )
@@ -234,6 +237,196 @@ func TestIPControlMessageInterop(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestIPHeaderIncludedInterop verifies complete-packet writes and receives
+// through both stacks' native raw-socket APIs. Linux-specific field repair is
+// covered in mipstack's root module; gVisor is used here only as a wire peer.
+// gVisor performs IPv6 raw fan-out before walking extension headers and does
+// not permit a raw endpoint for an extension-header protocol number, so the
+// IPv6 interop packet has no extension header. Mipstack's extension-header
+// complete-packet behavior is covered by its native tests.
+func TestIPHeaderIncludedInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mtu := range interopMTUsForFamily(family) {
+			mtu := mtu
+			t.Run(family.name+"/"+interopMTUName(mtu), func(t *testing.T) {
+				network := newFamilyInteropNetwork(t, family, mtu)
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				defer cancel()
+				config := mipstack.ListenConfig{Options: []mipstack.SocketOption{
+					mipstack.SocketOptions.IPHeaderIncludedOnWrite(true),
+					mipstack.SocketOptions.IPHeaderIncludedOnRead(true),
+				}}
+				mips, err := config.ListenIP(ctx, network.mipstack, family.rawNetwork, family.mipstackAddress)
+				if err != nil {
+					t.Fatalf("listen with complete-packet mipstack raw socket: %v", err)
+				}
+				defer mips.Close()
+				if err = mips.SetDeadline(time.Now().Add(6 * time.Second)); err != nil {
+					t.Fatalf("set mipstack complete-packet deadline: %v", err)
+				}
+
+				var queue waiter.Queue
+				peer, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, interopRawIPProtocol, &queue)
+				if tcpipErr != nil {
+					t.Fatalf("create gVisor complete-packet raw endpoint: %s", tcpipErr.String())
+				}
+				defer peer.Close()
+				peer.SocketOptions().SetHeaderIncluded(true)
+				if tcpipErr = peer.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+					t.Fatalf("bind gVisor complete-packet raw endpoint: %s", tcpipErr.String())
+				}
+				if tcpipErr = peer.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+					t.Fatalf("connect gVisor complete-packet raw endpoint: %s", tcpipErr.String())
+				}
+				entry, notifications := registerReadable(&queue)
+				defer queue.EventUnregister(&entry)
+
+				request := buildHeaderIncludedInteropPacket(family, family.mipstackAddress, family.gvisorAddress, patternedPayload(19, 0xa1))
+				written, writeErr := mips.WriteToIP(request, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
+				if writeErr != nil || written != len(request) {
+					t.Fatalf("write mipstack complete packet: n=%d, error=%v", written, writeErr)
+				}
+				received, remote, readErr := readGVisorEndpoint(ctx, peer, notifications, int(mtu))
+				if readErr != nil || remote.Addr != gvisorAddress(family.mipstackAddress) || !bytes.Equal(received, request) {
+					t.Fatalf("gVisor complete-packet read: bytes=%d, source=%v, error=%v", len(received), remote, readErr)
+				}
+
+				response := buildHeaderIncludedInteropPacket(family, family.gvisorAddress, family.mipstackAddress, patternedPayload(23, 0xb2))
+				written64, tcpipErr := peer.Write(bytes.NewReader(response), tcpip.WriteOptions{})
+				if tcpipErr != nil || written64 != int64(len(response)) {
+					t.Fatalf("write gVisor complete packet: n=%d, error=%s", written64, tcpipErrorString(tcpipErr))
+				}
+				storage := make([]byte, mtu)
+				read, source, readErr := mips.ReadFromIP(storage)
+				if readErr != nil || source.String() != family.gvisorAddress.String() || !bytes.Equal(storage[:read], response) {
+					t.Fatalf("mipstack complete-packet read: bytes=%d, source=%v, error=%v", read, source, readErr)
+				}
+			})
+		}
+	}
+}
+
+// TestIPCompletePacketReassemblyInterop verifies that an
+// IPHeaderIncludedOnRead raw socket observes one complete reconstructed packet
+// after gVisor source fragmentation at every supported link MTU.
+func TestIPCompletePacketReassemblyInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mtu := range interopMTUsForFamily(family) {
+			mtu := mtu
+			t.Run(family.name+"/"+interopMTUName(mtu), func(t *testing.T) {
+				network := newFamilyInteropNetwork(t, family, mtu)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				rawNetwork := "ip4:udp"
+				if family.mipstackAddress.Is6() {
+					rawNetwork = "ip6:udp"
+				}
+				config := mipstack.ListenConfig{Options: []mipstack.SocketOption{mipstack.SocketOptions.IPHeaderIncludedOnRead(true)}}
+				rawConnection, err := config.ListenIP(ctx, network.mipstack, rawNetwork, family.mipstackAddress)
+				if err != nil {
+					t.Fatalf("listen for complete reassembled packets: %v", err)
+				}
+				defer rawConnection.Close()
+				if err = rawConnection.SetReadDeadline(time.Now().Add(8 * time.Second)); err != nil {
+					t.Fatalf("set complete-packet read deadline: %v", err)
+				}
+				const destinationPort = 45117
+				udpListener, err := network.mipstack.ListenUDP(ctx, family.udpNetwork, netipAddrPort(family.mipstackAddress, destinationPort))
+				if err != nil {
+					t.Fatalf("listen for fragmented UDP interop: %v", err)
+				}
+				defer udpListener.Close()
+
+				var queue waiter.Queue
+				peer, tcpipErr := network.gvisor.NewEndpoint(udp.ProtocolNumber, family.networkProtocol, &queue)
+				if tcpipErr != nil {
+					t.Fatalf("create gVisor UDP fragment source: %s", tcpipErr.String())
+				}
+				defer peer.Close()
+				if tcpipErr = peer.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+					t.Fatalf("bind gVisor UDP fragment source: %s", tcpipErr.String())
+				}
+				if tcpipErr = peer.Connect(gvisorFullAddress(family.mipstackAddress, destinationPort)); tcpipErr != nil {
+					t.Fatalf("connect gVisor UDP fragment source: %s", tcpipErr.String())
+				}
+				localAddress, tcpipErr := peer.GetLocalAddress()
+				if tcpipErr != nil {
+					t.Fatalf("get gVisor UDP fragment source: %s", tcpipErr.String())
+				}
+				payload := patternedPayload(fragmentedInteropPayloadSize(mtu, 4096), 0xc3)
+				written, tcpipErr := peer.Write(bytes.NewReader(payload), tcpip.WriteOptions{})
+				if tcpipErr != nil || written != int64(len(payload)) {
+					t.Fatalf("write fragmented gVisor UDP datagram: n=%d, error=%s", written, tcpipErrorString(tcpipErr))
+				}
+				packet := make([]byte, 65535)
+				read, source, readErr := rawConnection.ReadFromIP(packet)
+				if readErr != nil || source.String() != family.gvisorAddress.String() {
+					t.Fatalf("read complete reassembled packet: bytes=%d, source=%v, error=%v", read, source, readErr)
+				}
+				if err = validateCompleteUDPInteropPacket(family, packet[:read], localAddress.Port, destinationPort, payload); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+// buildHeaderIncludedInteropPacket constructs a valid complete packet. IPv4
+// options exercise its variable header length; see TestIPHeaderIncludedInterop
+// for why the IPv6 interop packet intentionally has no extension header.
+func buildHeaderIncludedInteropPacket(family interopFamily, source, target netip.Addr, payload []byte) []byte {
+	if source.Is4() {
+		packet := make([]byte, header.IPv4MinimumSize+4+len(payload))
+		packet[0], packet[1], packet[8], packet[9] = 0x46, 0x2e, 37, byte(interopRawIPProtocol)
+		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+		binary.BigEndian.PutUint16(packet[4:6], 0x4321)
+		copy(packet[12:16], source.AsSlice())
+		copy(packet[16:20], target.AsSlice())
+		copy(packet[20:24], []byte{1, 1, 0, 0})
+		copy(packet[24:], payload)
+		binary.BigEndian.PutUint16(packet[10:12], ^checksum.Checksum(packet[:24], 0))
+		return packet
+	}
+	packet := make([]byte, header.IPv6MinimumSize+len(payload))
+	packet[0], packet[1], packet[2], packet[3] = 0x6a, 0x55, 0x43, 0x21
+	binary.BigEndian.PutUint16(packet[4:6], uint16(len(payload)))
+	packet[6], packet[7] = byte(interopRawIPProtocol), 37
+	copy(packet[8:24], source.AsSlice())
+	copy(packet[24:40], target.AsSlice())
+	copy(packet[40:], payload)
+	return packet
+}
+
+// validateCompleteUDPInteropPacket checks the reconstructed IP and UDP
+// envelopes plus the application payload without accepting fragment headers.
+func validateCompleteUDPInteropPacket(family interopFamily, packet []byte, sourcePort, targetPort uint16, payload []byte) error {
+	offset := 0
+	if family.mipstackAddress.Is4() {
+		if len(packet) < header.IPv4MinimumSize || packet[0]>>4 != 4 {
+			return errors.New("reassembled IPv4 packet has no valid base header")
+		}
+		offset = int(packet[0]&0x0f) * 4
+		if offset < header.IPv4MinimumSize || offset > len(packet) || packet[9] != byte(udp.ProtocolNumber) || binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
+			return errors.New("reassembled IPv4 packet retained invalid fragmentation state")
+		}
+	} else {
+		if len(packet) < header.IPv6MinimumSize || packet[0]>>4 != 6 || packet[6] != byte(udp.ProtocolNumber) {
+			return errors.New("reassembled IPv6 packet retained an extension or fragment header")
+		}
+		offset = header.IPv6MinimumSize
+	}
+	if len(packet)-offset != header.UDPMinimumSize+len(payload) {
+		return errors.New("reassembled UDP packet has an unexpected length")
+	}
+	udpHeader := header.UDP(packet[offset : offset+header.UDPMinimumSize])
+	if udpHeader.SourcePort() != sourcePort || udpHeader.DestinationPort() != targetPort || !bytes.Equal(packet[offset+header.UDPMinimumSize:], payload) {
+		return errors.New("reassembled UDP packet tuple or payload mismatch")
+	}
+	return nil
 }
 
 // testRawIP connects mipstack's IPConn to a native gVisor raw endpoint and

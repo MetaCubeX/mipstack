@@ -16,12 +16,13 @@ func TestTCPReusePortFlowSelectionAndRebind(t *testing.T) {
 	client, server := newStackPair(t, clientAddress, serverAddress, 1400)
 	newStackBridge(t, client, server)
 	local := netip.AddrPortFrom(serverAddress, 47000)
-	first, err := server.ListenTCPReusePort(context.Background(), "tcp4", local)
+	listenConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReusePort(true)}}
+	first, err := listenConfig.ListenTCP(context.Background(), server, "tcp4", local)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
-	second, err := server.ListenTCPReusePort(context.Background(), "tcp4", local)
+	second, err := listenConfig.ListenTCP(context.Background(), server, "tcp4", local)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +89,52 @@ func TestTCPReusePortFlowSelectionAndRebind(t *testing.T) {
 	_ = rebound.Close()
 }
 
+func TestReusablePortZeroAllocatesUniqueEndpoints(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.41")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	tcpConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReusePort(true)}}
+	tcpCursor := stack.nextPort[0]
+	firstTCP, err := tcpConfig.ListenTCP(context.Background(), stack, "tcp4", netip.AddrPort{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstTCP.Close()
+	stack.nextPort[0] = tcpCursor
+	secondTCP, err := tcpConfig.ListenTCP(context.Background(), stack, "tcp4", netip.AddrPort{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondTCP.Close()
+	if firstTCP.Addr().String() == secondTCP.Addr().String() {
+		t.Fatalf("SO_REUSEPORT TCP port-zero binds shared %v", firstTCP.Addr())
+	}
+
+	udpConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReuseAddress(true)}}
+	udpCursor := stack.nextPort[0]
+	firstUDP, err := udpConfig.ListenUDP(context.Background(), stack, "udp4", netip.AddrPort{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstUDP.Close()
+	stack.nextPort[0] = udpCursor
+	secondUDP, err := udpConfig.ListenUDP(context.Background(), stack, "udp4", netip.AddrPort{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondUDP.Close()
+	if firstUDP.LocalAddr().String() == secondUDP.LocalAddr().String() {
+		t.Fatalf("SO_REUSEADDR UDP port-zero binds shared %v", firstUDP.LocalAddr())
+	}
+}
+
 func TestUDPReusePortFlowSelectionAndPrecedence(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.41")
 	remote := netip.MustParseAddr("198.51.100.41")
@@ -100,13 +147,14 @@ func TestUDPReusePortFlowSelectionAndPrecedence(t *testing.T) {
 	}
 	defer stack.Close()
 	binding := netip.AddrPortFrom(netip.IPv4Unspecified(), 47001)
-	firstPacket, err := stack.ListenUDPReusePort(context.Background(), "udp4", binding)
+	listenConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReusePort(true)}}
+	firstPacket, err := listenConfig.ListenUDP(context.Background(), stack, "udp4", binding)
 	if err != nil {
 		t.Fatal(err)
 	}
 	first := firstPacket.(*UDPConn)
 	defer first.Close()
-	secondPacket, err := stack.ListenUDPReusePort(context.Background(), "udp4", binding)
+	secondPacket, err := listenConfig.ListenUDP(context.Background(), stack, "udp4", binding)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +190,7 @@ func TestUDPReusePortFlowSelectionAndPrecedence(t *testing.T) {
 		}
 	}
 
-	exactPacket, err := stack.ListenUDPReusePort(context.Background(), "udp4", netip.AddrPortFrom(local, binding.Port()))
+	exactPacket, err := listenConfig.ListenUDP(context.Background(), stack, "udp4", netip.AddrPortFrom(local, binding.Port()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +209,175 @@ func TestUDPReusePortFlowSelectionAndPrecedence(t *testing.T) {
 	}
 }
 
+func TestUDPReuseOptionCompatibilityAndStablePrecedence(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.42")
+	remote := netip.MustParseAddr("198.51.100.42")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	address := []SocketOption{SocketOptions.ReuseAddress(true)}
+	port := []SocketOption{SocketOptions.ReusePort(true)}
+	both := []SocketOption{SocketOptions.ReuseAddress(true), SocketOptions.ReusePort(true)}
+	tests := []struct {
+		name          string
+		first, second []SocketOption
+		wildcard      bool
+		want          bool
+	}{
+		{name: "address with address", first: address, second: address, want: true},
+		{name: "address with port", first: address, second: port},
+		{name: "address with both", first: address, second: both, want: true},
+		{name: "port with address", first: port, second: address},
+		{name: "port with port", first: port, second: port, want: true},
+		{name: "port with both", first: port, second: both, want: true},
+		{name: "both with address", first: both, second: address, want: true},
+		{name: "both with port", first: both, second: port, want: true},
+		{name: "wildcard address with exact address", first: address, second: address, wildcard: true, want: true},
+		{name: "wildcard address with exact port", first: address, second: port, wildcard: true},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			portNumber := uint16(47100 + index)
+			firstAddress := local
+			if test.wildcard {
+				firstAddress = netip.IPv4Unspecified()
+			}
+			first, listenErr := (&ListenConfig{Options: test.first}).ListenUDP(context.Background(), stack, "udp4", netip.AddrPortFrom(firstAddress, portNumber))
+			if listenErr != nil {
+				t.Fatal(listenErr)
+			}
+			defer first.Close()
+			second, listenErr := (&ListenConfig{Options: test.second}).ListenUDP(context.Background(), stack, "udp4", netip.AddrPortFrom(local, portNumber))
+			if test.want {
+				if listenErr != nil {
+					t.Fatalf("compatible second bind: %v", listenErr)
+				}
+				_ = second.Close()
+			} else if !errors.Is(listenErr, syscall.EADDRINUSE) {
+				t.Fatalf("incompatible second bind = %v, want EADDRINUSE", listenErr)
+			}
+		})
+	}
+
+	listenAddress := ListenConfig{Options: address}
+	binding := netip.AddrPortFrom(local, 47120)
+	firstPacket, err := listenAddress.ListenUDP(context.Background(), stack, "udp4", binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := firstPacket.(*UDPConn)
+	secondPacket, err := listenAddress.ListenUDP(context.Background(), stack, "udp4", binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := secondPacket.(*UDPConn)
+	thirdPacket, err := listenAddress.ListenUDP(context.Background(), stack, "udp4", binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	third := thirdPacket.(*UDPConn)
+	defer second.Close()
+
+	deliver := func(want *UDPConn, value byte) {
+		t.Helper()
+		if err = writeTestPacket(stack, buildTestUDP(remote, local, uint16(48000)+uint16(value), binding.Port(), []byte{value})); err != nil {
+			t.Fatal(err)
+		}
+		for _, connection := range []*UDPConn{first, second, third} {
+			entries := connection.Info().ReceiveQueuePackets
+			if connection == want {
+				if entries != 1 {
+					t.Fatalf("latest SO_REUSEADDR socket queued %d packets, want 1", entries)
+				}
+				buffer := make([]byte, 1)
+				if n, _, readErr := connection.ReadFrom(buffer); readErr != nil || n != 1 || buffer[0] != value {
+					t.Fatalf("latest SO_REUSEADDR read = %x, %v", buffer[:n], readErr)
+				}
+			} else if entries != 0 {
+				t.Fatalf("older SO_REUSEADDR socket queued %d packets", entries)
+			}
+		}
+	}
+	deliver(third, 1)
+	if err = first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deliver(third, 2)
+	if err = third.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deliver(second, 3)
+}
+
+func TestTCPReuseAddressDisabledPreventsLiveConnectionRebind(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.43")
+	serverAddress := netip.MustParseAddr("192.0.2.44")
+	client, server := newStackPair(t, clientAddress, serverAddress, 1400)
+	newStackBridge(t, client, server)
+	local := netip.AddrPortFrom(serverAddress, 47130)
+	config := ListenConfig{Options: []SocketOption{SocketOptions.ReuseAddress(false)}}
+	listener, err := config.ListenTCP(context.Background(), server, "tcp4", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConnection, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConnection.Close()
+	serverConnection, err := listener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverConnection.Close()
+	if err = listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = server.ListenTCP(context.Background(), "tcp4", local); !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("default listener over non-reusable live connection = %v, want EADDRINUSE", err)
+	}
+}
+
+func TestTCPReusePortOnlyAllowsLiveConnectionRebind(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.45")
+	serverAddress := netip.MustParseAddr("192.0.2.46")
+	client, server := newStackPair(t, clientAddress, serverAddress, 1400)
+	newStackBridge(t, client, server)
+	local := netip.AddrPortFrom(serverAddress, 47131)
+	config := ListenConfig{Options: []SocketOption{
+		SocketOptions.ReuseAddress(false),
+		SocketOptions.ReusePort(true),
+	}}
+	listener, err := config.ListenTCP(context.Background(), server, "tcp4", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConnection, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientConnection.Close()
+	serverConnection, err := listener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverConnection.Close()
+	if err = listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := config.ListenTCP(context.Background(), server, "tcp4", local)
+	if err != nil {
+		t.Fatalf("SO_REUSEPORT-only rebind with live accepted connection: %v", err)
+	}
+	_ = rebound.Close()
+}
+
 func TestReusePortRejectsMixedDualStackGroups(t *testing.T) {
 	local4 := netip.MustParseAddr("192.0.2.71")
 	local6 := netip.MustParseAddr("2001:db8::71")
@@ -175,20 +392,21 @@ func TestReusePortRejectsMixedDualStackGroups(t *testing.T) {
 	}
 	defer stack.Close()
 	wildcard := netip.AddrPortFrom(netip.IPv6Unspecified(), 47003)
-	tcp, err := stack.ListenTCPReusePort(context.Background(), "tcp", wildcard)
+	listenConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReusePort(true)}}
+	tcp, err := listenConfig.ListenTCP(context.Background(), stack, "tcp", wildcard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tcp.Close()
-	if _, err = stack.ListenTCPReusePort(context.Background(), "tcp6", wildcard); !errors.Is(err, syscall.EADDRINUSE) {
+	if _, err = listenConfig.ListenTCP(context.Background(), stack, "tcp6", wildcard); !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("mixed dual/IPv6-only TCP group error = %v, want EADDRINUSE", err)
 	}
-	udp, err := stack.ListenUDPReusePort(context.Background(), "udp", netip.AddrPortFrom(netip.IPv6Unspecified(), 47004))
+	udp, err := listenConfig.ListenUDP(context.Background(), stack, "udp", netip.AddrPortFrom(netip.IPv6Unspecified(), 47004))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer udp.Close()
-	if _, err = stack.ListenUDPReusePort(context.Background(), "udp6", netip.AddrPortFrom(netip.IPv6Unspecified(), 47004)); !errors.Is(err, syscall.EADDRINUSE) {
+	if _, err = listenConfig.ListenUDP(context.Background(), stack, "udp6", netip.AddrPortFrom(netip.IPv6Unspecified(), 47004)); !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("mixed dual/IPv6-only UDP group error = %v, want EADDRINUSE", err)
 	}
 }
@@ -209,20 +427,21 @@ func TestReusePortConfigInvalidationClosesGroups(t *testing.T) {
 	}
 	defer stack.Close()
 	tcpLocal := netip.AddrPortFrom(removed, 47005)
-	tcpFirst, err := stack.ListenTCPReusePort(context.Background(), "tcp4", tcpLocal)
+	listenConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReusePort(true)}}
+	tcpFirst, err := listenConfig.ListenTCP(context.Background(), stack, "tcp4", tcpLocal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tcpSecond, err := stack.ListenTCPReusePort(context.Background(), "tcp4", tcpLocal)
+	tcpSecond, err := listenConfig.ListenTCP(context.Background(), stack, "tcp4", tcpLocal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	udpLocal := netip.AddrPortFrom(removed, 47006)
-	udpFirstPacket, err := stack.ListenUDPReusePort(context.Background(), "udp4", udpLocal)
+	udpFirstPacket, err := listenConfig.ListenUDP(context.Background(), stack, "udp4", udpLocal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	udpSecondPacket, err := stack.ListenUDPReusePort(context.Background(), "udp4", udpLocal)
+	udpSecondPacket, err := listenConfig.ListenUDP(context.Background(), stack, "udp4", udpLocal)
 	if err != nil {
 		t.Fatal(err)
 	}

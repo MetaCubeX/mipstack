@@ -256,12 +256,13 @@ func TestIPv4BroadcastFanoutAndOutput(t *testing.T) {
 	broadcast := netip.MustParseAddr("192.0.2.255")
 	stack := newMulticastTestStack(t, []netip.Prefix{netip.MustParsePrefix("192.0.2.10/24")}, 1400)
 
-	firstPacket, err := stack.ListenUDPReusePort(context.Background(), "udp4", netip.MustParseAddrPort("0.0.0.0:42000"))
+	listenConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReusePort(true)}}
+	firstPacket, err := listenConfig.ListenUDP(context.Background(), stack, "udp4", netip.MustParseAddrPort("0.0.0.0:42000"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer firstPacket.Close()
-	secondPacket, err := stack.ListenUDPReusePort(context.Background(), "udp4", netip.MustParseAddrPort("0.0.0.0:42000"))
+	secondPacket, err := listenConfig.ListenUDP(context.Background(), stack, "udp4", netip.MustParseAddrPort("0.0.0.0:42000"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1248,7 +1249,8 @@ func TestMulticastSocketOptionAndMembershipState(t *testing.T) {
 	group := netip.MustParseAddr("239.88.0.1")
 	source := netip.MustParseAddr("192.0.2.88")
 	stack := newMulticastTestStack(t, []netip.Prefix{netip.MustParsePrefix("192.0.2.87/24")}, 1400)
-	packet, err := stack.ListenUDPReusePort(context.Background(), "udp4", netip.MustParseAddrPort("0.0.0.0:48800"))
+	listenConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReusePort(true)}}
+	packet, err := listenConfig.ListenUDP(context.Background(), stack, "udp4", netip.MustParseAddrPort("0.0.0.0:48800"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2275,6 +2277,51 @@ func TestCompatibilityChangeCancelsBlockedReportGeneration(t *testing.T) {
 	}
 }
 
+func TestNonblockingFragmentedNonUnicastCopiesAreAtomic(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.119")
+	remote := netip.MustParseAddr("198.51.100.119")
+	// Keep the stack inactive so its loopback worker cannot consume the dummy
+	// packets while this white-box test observes an atomic queue transition.
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 24)}, MTU: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	packets := buildIPv4Fragments(local, remote, protocolUDP, bytes.Repeat([]byte{0x6d}, 1200), 600, 91)
+	if len(packets) < 2 {
+		t.Fatal("test payload did not produce multiple fragments")
+	}
+	dummy := buildIPPacket(local, remote, protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	for stack.loopback.len() < loopbackPacketQueue-1 {
+		if !stack.loopback.tryEnqueue(dummy) {
+			t.Fatal("loopback queue filled before the expected boundary")
+		}
+	}
+	beforeLocal := stack.loopback.len()
+	if err := stack.writeNonUnicastPacketsUntil(packets, true, true, socketWriteState{dontWait: true}); err != nil {
+		t.Fatalf("external non-unicast write with full local copy queue: %v", err)
+	}
+	if after := stack.loopback.len(); after != beforeLocal {
+		t.Fatalf("best-effort local fragment copy changed queue depth from %d to %d", beforeLocal, after)
+	}
+	if stack.outbound.len() != len(packets) {
+		t.Fatalf("external fragment count = %d, want %d", stack.outbound.len(), len(packets))
+	}
+	for {
+		entry, ok := stack.outbound.tryDequeue()
+		if !ok {
+			break
+		}
+		stack.outbound.release(entry)
+	}
+	if err := stack.writeNonUnicastPacketsUntil(packets, false, true, socketWriteState{dontWait: true}); err != nil {
+		t.Fatalf("local-only non-unicast write with full queue: %v", err)
+	}
+	if after := stack.loopback.len(); after != beforeLocal {
+		t.Fatalf("local-only fragment failure changed queue depth from %d to %d", beforeLocal, after)
+	}
+}
+
 func TestMLDv1CompatibilityReportAndDone(t *testing.T) {
 	local := netip.MustParseAddr("fe80::b0")
 	querier := netip.MustParseAddr("fe80::b1")
@@ -2514,7 +2561,8 @@ func TestMulticastConcurrentMembershipCloseAndInput(t *testing.T) {
 	group := netip.MustParseAddr("239.150.0.1")
 	remote := netip.MustParseAddr("192.0.2.151")
 	stack := newMulticastTestStack(t, []netip.Prefix{netip.MustParsePrefix("192.0.2.150/24")}, 1400)
-	packet, err := stack.ListenUDPReusePort(context.Background(), "udp4", netip.MustParseAddrPort("0.0.0.0:54000"))
+	listenConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReusePort(true)}}
+	packet, err := listenConfig.ListenUDP(context.Background(), stack, "udp4", netip.MustParseAddrPort("0.0.0.0:54000"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2567,7 +2615,8 @@ func BenchmarkUDPInboundDispatch(b *testing.B) {
 				if test.members == 1 && !test.join {
 					packet, err = stack.ListenUDP(context.Background(), "udp4", netip.MustParseAddrPort("0.0.0.0:55000"))
 				} else {
-					packet, err = stack.ListenUDPReusePort(context.Background(), "udp4", netip.MustParseAddrPort("0.0.0.0:55000"))
+					listenConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReusePort(true)}}
+					packet, err = listenConfig.ListenUDP(context.Background(), stack, "udp4", netip.MustParseAddrPort("0.0.0.0:55000"))
 				}
 				if err != nil {
 					b.Fatal(err)
@@ -2607,7 +2656,8 @@ func BenchmarkUDPInboundDispatch(b *testing.B) {
 func BenchmarkMulticastSourceFilterUpdate(b *testing.B) {
 	group := netip.MustParseAddr("239.201.0.1")
 	stack := newMulticastTestStack(b, []netip.Prefix{netip.MustParsePrefix("192.0.2.200/24")}, 1400)
-	packet, err := stack.ListenUDPReusePort(context.Background(), "udp4", netip.MustParseAddrPort("0.0.0.0:55100"))
+	listenConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReusePort(true)}}
+	packet, err := listenConfig.ListenUDP(context.Background(), stack, "udp4", netip.MustParseAddrPort("0.0.0.0:55100"))
 	if err != nil {
 		b.Fatal(err)
 	}

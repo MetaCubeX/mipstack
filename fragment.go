@@ -2,6 +2,7 @@ package mipstack
 
 import (
 	"encoding/binary"
+	"errors"
 	"net/netip"
 	"syscall"
 	"time"
@@ -953,6 +954,22 @@ func (s *Stack) writeIPPayloadUntilOptions(source, target netip.Addr, protocol b
 // lets UDP prepend its virtual header without gathering the complete datagram.
 func (s *Stack) writeIPFragmentsUntilOptionsForMTU(source, target netip.Addr, protocol byte, first, second []byte, options ipPacketOptions, mtu int, state socketWriteState) error {
 	payloadSize := len(first) + len(second)
+	if state.dontWait {
+		payload := first
+		if len(second) != 0 {
+			payload = make([]byte, payloadSize)
+			copy(payload, first)
+			copy(payload[len(first):], second)
+		}
+		packets, err := s.ipPayloadPacketsForMTU(source, target, protocol, payload, sourceFragmentation{allow: true}, options, mtu)
+		if err != nil {
+			return err
+		}
+		if err = s.tryWritePackets(packets); errors.Is(err, ErrResourceLimit) {
+			return syscall.EAGAIN
+		}
+		return err
+	}
 	maximum := (mtu - 20) &^ 7
 	headerSize := 20
 	identification4 := uint16(0)

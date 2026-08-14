@@ -179,8 +179,8 @@ type Message struct {
 	// Buffers contains the contiguous payload regions read or written in order.
 	// A batch operation requires their combined length to be nonzero.
 	Buffers [][]byte
-	// OOB contains Linux-compatible packet-info, hop-limit, traffic-class, and
-	// IPv6 flow-label ancillary data.
+	// OOB contains Linux-compatible packet-info, hop-limit, traffic-class,
+	// IPv6 flow-label, or asynchronous-error ancillary data.
 	OOB []byte
 	// Addr specifies the destination for an unconnected write and receives the
 	// source address after a successful read. It must be nil for a connected
@@ -190,22 +190,28 @@ type Message struct {
 	N int
 	// NN is the number of ancillary bytes read or written through OOB.
 	NN int
-	// Flags contains Linux-compatible MSG_TRUNC and MSG_CTRUNC results after a
-	// successful read.
+	// Flags contains Linux-compatible MSG_TRUNC, MSG_CTRUNC, and MSG_ERRQUEUE
+	// results after a successful read.
 	Flags int
 }
 
 const (
+	// MessagePeek is Linux MSG_PEEK. Ordinary ReadBatch calls copy the oldest
+	// queued payload without consuming it. A pending socket error and a
+	// MessageErrorQueue result are still consumed, matching Linux recvmsg.
+	MessagePeek = 0x02
 	// MessageControlTruncated is Linux MSG_CTRUNC. ReadMsg and ReadBatch include
 	// it in the result flags when the supplied OOB buffer was too small.
 	MessageControlTruncated = 0x08
 	// MessageTruncated is Linux MSG_TRUNC. ReadMsg and ReadBatch include it in
 	// the result flags when the supplied payload buffers were too small.
 	MessageTruncated = 0x20
-	// MessageDontWait is Linux MSG_DONTWAIT for ReadBatch. It makes the first
-	// message nonblocking; draining after a successful first message is always
-	// nonblocking.
+	// MessageDontWait is Linux MSG_DONTWAIT. Reads and writes return EAGAIN
+	// instead of waiting for queue state to change.
 	MessageDontWait = 0x40
+	// MessageErrorQueue is Linux MSG_ERRQUEUE. ReadBatch reads asynchronous
+	// network errors instead of ordinary payloads and never blocks.
+	MessageErrorQueue = 0x2000
 )
 
 // DatagramSocketDefaults configures policies inherited by newly created UDP
@@ -565,8 +571,9 @@ const socketErrorMetadataSize = 192
 // queuedSocketError retains one asynchronous network error and its
 // conservative receive-buffer charge.
 type queuedSocketError struct {
-	err  *net.OpError
-	size int
+	err     *net.OpError
+	payload []byte
+	size    int
 }
 
 // socketErrorSize returns the receive-buffer charge for an asynchronous
@@ -575,7 +582,11 @@ func socketErrorSize(err error) int {
 	size := socketErrorMetadataSize
 	var networkError ICMPError
 	if errors.As(err, &networkError) {
-		size += len(networkError.QuotedPayload)
+		if len(networkError.QuotedPacket) != 0 {
+			size += len(networkError.QuotedPacket)
+		} else {
+			size += len(networkError.QuotedPayload)
+		}
 	}
 	return size
 }
@@ -646,6 +657,52 @@ func gatherMessagePayload(buffers [][]byte, maximum int) ([]byte, error) {
 	return payload, nil
 }
 
+// fillSocketErrorMessage copies one immutable error-queue entry into the
+// public scatter/gather representation.
+func fillSocketErrorMessage(message *Message, queued queuedSocketError, returnLength bool) error {
+	if _, err := messageBufferLength(message.Buffers); err != nil {
+		return err
+	}
+	control, err := socketErrorControlForRead(queued.err)
+	if err != nil {
+		return err
+	}
+	copied := copyMessagePayload(message.Buffers, queued.payload)
+	n := copied
+	flags := MessageErrorQueue
+	if copied < len(queued.payload) {
+		flags |= MessageTruncated
+		if returnLength {
+			n = len(queued.payload)
+		}
+	}
+	oobn := copy(message.OOB, control)
+	if oobn < len(control) {
+		flags |= MessageControlTruncated
+	}
+	message.N, message.NN, message.Flags, message.Addr = n, oobn, flags, queued.err.Addr
+	return nil
+}
+
+// readSocketErrorMessage fills one message from the queue head and consumes it
+// only after every validation and ancillary-data conversion succeeds. Linux
+// MSG_ERRQUEUE ignores MSG_PEEK, so a successful read always removes the
+// error. The caller must hold the owning socket mutex for the complete call.
+func readSocketErrorMessage(queue *datagramQueue[queuedSocketError], message *Message, flags int) (size int, ok bool, err error) {
+	queued, ok := queue.peek()
+	if !ok {
+		return 0, false, nil
+	}
+	if err := fillSocketErrorMessage(message, queued, flags&MessageTruncated != 0); err != nil {
+		return 0, true, err
+	}
+	consumed, popped := queue.pop()
+	if !popped {
+		panic("mipstack: socket error queue changed while locked")
+	}
+	return consumed.size, true, nil
+}
+
 // len returns the number of queued values.
 func (q *datagramQueue[T]) len() int { return len(q.values) - q.head }
 
@@ -662,6 +719,15 @@ func (q *datagramQueue[T]) push(value T) {
 		q.head = 0
 	}
 	q.values = append(q.values, value)
+}
+
+// peek returns the oldest value without changing queue ownership.
+func (q *datagramQueue[T]) peek() (T, bool) {
+	var zero T
+	if q.head == len(q.values) {
+		return zero, false
+	}
+	return q.values[q.head], true
 }
 
 // pop removes the oldest value and releases oversized drained backing storage.
@@ -2311,13 +2377,15 @@ func (s *Stack) isLocal(address netip.Addr) bool {
 
 // allocateUDPPortLocked reserves one collision-free automatic local endpoint
 // while s.mu is held.
-func (s *Stack) allocateUDPPortLocked(binding udpSocketBinding, address netip.Addr, dual bool) (uint16, error) {
+func (s *Stack) allocateUDPPortLocked(address netip.Addr, dual bool) (uint16, error) {
 	index := 0
 	if address.Is6() {
 		index = 1
 	}
 	return allocateAutomaticPort(&s.nextPort[index], func(port uint16) bool {
-		return s.udpEndpointAvailableLocked(binding, address, port, dual)
+		// Like bind(2) with port zero, automatic allocation selects an unused
+		// endpoint even when the eventual socket requested a reuse option.
+		return s.udpEndpointAvailableLocked(exclusiveUDPSocketBinding{}, address, port, dual)
 	})
 }
 
@@ -2449,7 +2517,7 @@ func (s *Stack) listenUDP(ctx context.Context, network string, local netip.AddrP
 	local = netip.AddrPortFrom(address, local.Port())
 	port := local.Port()
 	if port == 0 {
-		port, err = s.allocateUDPPortLocked(binding, address, dual)
+		port, err = s.allocateUDPPortLocked(address, dual)
 		if err != nil {
 			return wrap(err)
 		}
@@ -2498,7 +2566,7 @@ func (s *Stack) DialUDP(ctx context.Context, network string, source, remote neti
 	localAddress := net.UDPAddrFromAddrPort(local)
 	port := local.Port()
 	if port == 0 {
-		port, err = s.allocateUDPPortLocked(exclusiveUDPSocketBinding{}, local.Addr(), false)
+		port, err = s.allocateUDPPortLocked(local.Addr(), false)
 		if err != nil {
 			return wrap(localAddress, err)
 		}
@@ -2710,12 +2778,22 @@ func (s *Stack) tryWritePackets(packets [][]byte) error {
 	if len(packets) == 1 {
 		return s.tryWritePacket(packets[0])
 	}
+	queue, loopback := s.outputQueue(packets[0])
+	return s.tryWritePacketsTo(packets, queue, loopback)
+}
+
+// tryWritePacketsTo atomically queues packets into one explicitly selected
+// output queue. It underpins nonblocking non-unicast output, where external
+// and local delivery are selected independently of the packet destination.
+func (s *Stack) tryWritePacketsTo(packets [][]byte, queue *packetQueue, loopback bool) error {
+	if len(packets) == 0 {
+		return nil
+	}
 	select {
 	case <-s.closeCh:
 		return ErrClosed
 	default:
 	}
-	queue, loopback := s.outputQueue(packets[0])
 	if len(packets) > cap(queue.free) {
 		return ErrResourceLimit
 	}
@@ -2774,6 +2852,22 @@ func (s *Stack) writePacketUntil(packet []byte, state socketWriteState) error {
 	return nil
 }
 
+// writeCompletePacketUntil queues a caller-owned complete packet using an
+// independently selected route destination. Header-included sockets may route
+// through a send address that differs from the destination in the IP header.
+func (s *Stack) writeCompletePacketUntil(packet []byte, routeTarget netip.Addr, state socketWriteState) error {
+	queue, loopback := s.outputQueueFor(routeTarget)
+	slot, err := s.reservePacketUntil(queue, loopback, state)
+	if err != nil {
+		return err
+	}
+	if !queue.enqueueReservedPacket(slot, packet, false) {
+		return ErrClosed
+	}
+	s.recordOutput(loopback)
+	return nil
+}
+
 // reservePacketUntil acquires one queue slot while observing a socket's
 // mutable write deadline. Callers must release the slot if packet construction
 // fails before enqueueReserved publishes it.
@@ -2783,6 +2877,14 @@ func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, state sock
 	}
 	if slot, reserved := queue.tryReserve(); reserved {
 		return slot, nil
+	}
+	if state.dontWait {
+		select {
+		case <-s.closeCh:
+			return 0, ErrClosed
+		default:
+			return 0, syscall.EAGAIN
+		}
 	}
 	if loopback {
 		select {
@@ -2923,6 +3025,7 @@ func (d *socketDeadline) stop() {
 type socketWriteState struct {
 	deadline *socketDeadline
 	closed   <-chan struct{}
+	dontWait bool
 }
 
 // err reports an already-observable close before a deadline, matching socket

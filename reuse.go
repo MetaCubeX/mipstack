@@ -1,16 +1,16 @@
 package mipstack
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"net"
 	"net/netip"
 )
 
 // reuseTCPListenerBinding permits a port to be shared only with other
 // REUSEPORT listeners.
-type reuseTCPListenerBinding struct{}
+type reuseTCPListenerBinding struct {
+	reuseAddress bool
+}
 
 // tcpReuseRegistry owns flow-distributed TCP listener groups. Stack.mu
 // protects its maps and group slices. Its unpredictable SipHash key prevents
@@ -20,20 +20,14 @@ type tcpReuseRegistry struct {
 	groups map[tcpListenKey][]*TCPListener
 }
 
-// udpReuseRegistry owns flow-distributed UDP socket groups. Stack.mu protects
-// its maps and group slices. Its unpredictable SipHash key prevents a remote
-// peer that controls flow tuples from targeting one socket.
+// udpReuseRegistry owns SO_REUSEADDR and flow-distributed SO_REUSEPORT UDP
+// groups. Stack.mu protects its maps and group slices. Its unpredictable
+// SipHash key prevents a remote peer that controls flow tuples from targeting
+// one SO_REUSEPORT socket.
 type udpReuseRegistry struct {
 	key    [16]byte
 	groups map[udpKey][]*UDPConn
 	all    []*UDPConn
-}
-
-// ListenTCPReusePort creates a passive TCP endpoint that may share its
-// address and port with other ListenTCPReusePort listeners. Incoming flows
-// are assigned consistently from their local and remote tuples.
-func (s *Stack) ListenTCPReusePort(ctx context.Context, network string, local netip.AddrPort) (*TCPListener, error) {
-	return s.listenTCP(ctx, network, local, reuseTCPListenerBinding{})
 }
 
 // available rejects overlap with an ordinary listener. Other REUSEPORT
@@ -54,7 +48,7 @@ func (reuseTCPListenerBinding) available(state *tcpPassiveState, address netip.A
 }
 
 // register adds one TCP listener to its REUSEPORT group.
-func (reuseTCPListenerBinding) register(state *tcpPassiveState, listener *TCPListener) error {
+func (binding reuseTCPListenerBinding) register(state *tcpPassiveState, listener *TCPListener) error {
 	registry, ok := state.reuse.(*tcpReuseRegistry)
 	if !ok {
 		registry = &tcpReuseRegistry{groups: make(map[tcpListenKey][]*TCPListener)}
@@ -63,8 +57,17 @@ func (reuseTCPListenerBinding) register(state *tcpPassiveState, listener *TCPLis
 		}
 		state.reuse = registry
 	}
+	listener.reuseAddress = binding.reuseAddress
+	listener.reusePort = true
 	registry.add(listener)
 	return nil
+}
+
+// connectionReusable implements tcpListenerBinding. Linux permits an active
+// tuple to coexist when both sockets share either SO_REUSEADDR or
+// SO_REUSEPORT; the two options remain independent.
+func (binding reuseTCPListenerBinding) connectionReusable(connection *TCPConn) bool {
+	return binding.reuseAddress && connection.reuseAddress || connection.reusePort
 }
 
 // empty reports whether no TCP REUSEPORT groups remain.
@@ -123,29 +126,27 @@ func (registry *tcpReuseRegistry) remove(listener *TCPListener) bool {
 	return false
 }
 
-// reuseUDPSocketBinding permits a port to be shared only with other
-// REUSEPORT packet sockets.
-type reuseUDPSocketBinding struct{}
-
-// ListenUDPReusePort creates an unconnected UDP packet socket that may share
-// its address and port with other ListenUDPReusePort sockets. Incoming flows
-// are assigned consistently from their local and remote tuples.
-func (s *Stack) ListenUDPReusePort(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error) {
-	return s.listenUDP(ctx, network, local, reuseUDPSocketBinding{})
+// reuseUDPSocketBinding requests SO_REUSEPORT and retains whether the same
+// bind also requested SO_REUSEADDR for pairwise Linux compatibility checks.
+type reuseUDPSocketBinding struct {
+	reuseAddress bool
 }
 
 // available accepts overlap with existing REUSEPORT sockets. The shared
 // listen core separately rejects every overlapping ordinary UDP socket.
-func (reuseUDPSocketBinding) available(stack *Stack, address netip.Addr, port uint16, dual bool) bool {
-	if registry, ok := stack.udpReuse.(*udpReuseRegistry); ok {
-		group := registry.groups[udpKey{address: address, port: port}]
-		return len(group) == 0 || group[0].dual == dual
-	}
-	return true
+func (binding reuseUDPSocketBinding) available(stack *Stack, address netip.Addr, port uint16, dual bool) bool {
+	return reusableUDPBindingAvailable(stack, address, port, dual, binding.reuseAddress, true)
 }
 
 // register adds one UDP socket to its REUSEPORT group.
-func (reuseUDPSocketBinding) register(stack *Stack, connection *UDPConn) error {
+func (binding reuseUDPSocketBinding) register(stack *Stack, connection *UDPConn) error {
+	connection.reuseAddress = binding.reuseAddress
+	connection.reusePort = true
+	return registerReusableUDP(stack, connection)
+}
+
+// registerReusableUDP initializes the shared registry and adds one endpoint.
+func registerReusableUDP(stack *Stack, connection *UDPConn) error {
 	registry, ok := stack.udpReuse.(*udpReuseRegistry)
 	if !ok {
 		registry = &udpReuseRegistry{groups: make(map[udpKey][]*UDPConn)}
@@ -156,6 +157,30 @@ func (reuseUDPSocketBinding) register(stack *Stack, connection *UDPConn) error {
 	}
 	registry.add(connection)
 	return nil
+}
+
+// reusableUDPBindingAvailable applies Linux's pairwise bind rule to every
+// overlapping reusable socket. Two endpoints may coexist when both selected
+// SO_REUSEADDR or both selected SO_REUSEPORT; an endpoint selecting both can
+// therefore join either kind of group. Identical IPv6 wildcard bindings must
+// still agree about whether they also accept IPv4 traffic.
+func reusableUDPBindingAvailable(stack *Stack, address netip.Addr, port uint16, dual, reuseAddress, reusePort bool) bool {
+	registry, ok := stack.udpReuse.(*udpReuseRegistry)
+	if !ok {
+		return true
+	}
+	for _, connection := range registry.all {
+		if connection.port != port || !listenAddressesOverlap(connection.local, connection.dual, address, dual) {
+			continue
+		}
+		if connection.local == address && connection.dual != dual {
+			return false
+		}
+		if !(reuseAddress && connection.reuseAddress || reusePort && connection.reusePort) {
+			return false
+		}
+	}
+	return true
 }
 
 // empty reports whether no UDP REUSEPORT groups remain.
@@ -193,6 +218,11 @@ func (registry *udpReuseRegistry) connection(binding, local, remote netip.AddrPo
 	if len(group) == 0 {
 		return nil
 	}
+	for _, connection := range group {
+		if !connection.reusePort {
+			return group[len(group)-1]
+		}
+	}
 	return group[reuseFlowIndex(registry.key, local, remote, len(group))]
 }
 
@@ -212,7 +242,7 @@ func (registry *udpReuseRegistry) remove(connection *UDPConn) bool {
 			continue
 		}
 		last := len(group) - 1
-		group[index] = group[last]
+		copy(group[index:], group[index+1:])
 		group[last] = nil
 		if last == 0 {
 			delete(registry.groups, key)

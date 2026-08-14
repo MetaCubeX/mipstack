@@ -33,8 +33,10 @@ type ipDatagram struct {
 }
 
 // IPInfo is a point-in-time diagnostic snapshot of one IP protocol socket.
-// Traffic byte counters measure protocol payload; receive-queue byte values
-// also include the stack's per-datagram accounting overhead.
+// Traffic byte counters measure the representation exposed by the socket:
+// protocol payloads by default or complete packets when the corresponding
+// header option is enabled. Receive-queue byte values also include the stack's
+// per-datagram accounting overhead.
 type IPInfo struct {
 	// LocalAddress is the bound local address; an unspecified address denotes
 	// a wildcard binding.
@@ -44,9 +46,15 @@ type IPInfo struct {
 	RemoteAddress netip.Addr
 	// Protocol is the IANA IP protocol number carried by the socket.
 	Protocol uint8
+	// IPHeaderIncludedOnWrite reports whether writes contain complete IP
+	// packets rather than protocol payloads.
+	IPHeaderIncludedOnWrite bool
+	// IPHeaderIncludedOnRead reports whether reads return complete reassembled
+	// IP packets rather than protocol payloads.
+	IPHeaderIncludedOnRead bool
 	// Closed reports whether the socket was closed when the snapshot was taken.
 	Closed bool
-	// ReceiveQueuePackets is the number of complete payloads awaiting a read.
+	// ReceiveQueuePackets is the number of complete messages awaiting a read.
 	ReceiveQueuePackets int
 	// ReceiveQueueBytes is the accounted payload and metadata retained by the
 	// receive queue.
@@ -66,14 +74,13 @@ type IPInfo struct {
 	// ErrorsDropped counts asynchronous network errors discarded because the
 	// configured receive-buffer budget was exhausted.
 	ErrorsDropped uint64
-	// PacketsSent counts successfully emitted protocol payloads.
+	// PacketsSent counts successfully emitted socket messages.
 	PacketsSent uint64
-	// BytesSent counts successfully emitted protocol payload bytes.
+	// BytesSent counts successfully emitted bytes in the write representation.
 	BytesSent uint64
-	// PacketsReceived counts protocol payloads accepted into the receive queue.
+	// PacketsReceived counts socket messages accepted into the receive queue.
 	PacketsReceived uint64
-	// BytesReceived counts protocol payload bytes accepted into the receive
-	// queue.
+	// BytesReceived counts bytes accepted in the configured read representation.
 	BytesReceived uint64
 	// PacketsDropped counts payloads rejected because the socket was closed or
 	// its receive queue lacked capacity.
@@ -132,15 +139,20 @@ type ipEndpointState struct {
 }
 
 // IPConn is a connected or unconnected userspace IP protocol socket. It
-// exchanges protocol payloads; mipstack owns the IPv4 or IPv6 header.
+// exchanges protocol payloads by default.
+// SocketOptions.IPHeaderIncludedOnWrite and
+// SocketOptions.IPHeaderIncludedOnRead independently expose complete packets
+// on the write and read sides.
 type IPConn struct {
-	stack    *Stack
-	net      string
-	protocol byte
-	v6       bool
-	dual     bool
-	local    netip.Addr
-	remote   netip.Addr
+	stack                   *Stack
+	net                     string
+	protocol                byte
+	v6                      bool
+	dual                    bool
+	local                   netip.Addr
+	remote                  netip.Addr
+	ipHeaderIncludedOnWrite atomic.Bool
+	ipHeaderIncludedOnRead  bool
 
 	closed chan struct{}
 	once   sync.Once
@@ -182,11 +194,21 @@ type ipWriteParameters struct {
 	nonUnicast       bool
 }
 
+// ipPayloadWriter emits one prepared protocol payload under a per-call queue
+// wait policy.
+type ipPayloadWriter func(source, target netip.Addr, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast, dontWait bool) error
+
 // ListenIP creates an unconnected IPv4 or IPv6 protocol socket. Network must
 // be an IP network with a numeric or well-known protocol, such as ip4:icmp or
 // ip:99. An empty Local selects the network's wildcard address; a generic ip
 // wildcard is dual-stack when both address families are configured.
 func (s *Stack) ListenIP(ctx context.Context, network string, local netip.Addr) (*IPConn, error) {
+	return s.listenIP(ctx, network, local, socketOptionSet{})
+}
+
+// listenIP contains protocol-socket construction shared by Stack and
+// ListenConfig.
+func (s *Stack) listenIP(ctx context.Context, network string, local netip.Addr, options socketOptionSet) (*IPConn, error) {
 	local = local.Unmap()
 	target := ipNetAddr(local)
 	wrap := func(err error) (*IPConn, error) {
@@ -224,6 +246,8 @@ func (s *Stack) ListenIP(ctx context.Context, network string, local netip.Addr) 
 	}
 	connection := newIPConn(s, network, protocol, local, netip.Addr{})
 	connection.dual = dual
+	connection.ipHeaderIncludedOnWrite.Store(options.ipHeaderIncludedOnWrite)
+	connection.ipHeaderIncludedOnRead = options.ipHeaderIncludedOnRead
 	s.ipEndpointStateLocked().register(connection)
 	s.stats.activeIPSockets.Add(1)
 	return connection, nil
@@ -234,6 +258,12 @@ func (s *Stack) ListenIP(ctx context.Context, network string, local netip.Addr) 
 // ip:99. An invalid or unspecified source selects a managed address using the
 // route table.
 func (s *Stack) DialIP(ctx context.Context, network string, source, remote netip.Addr) (net.Conn, error) {
+	return s.dialIP(ctx, network, source, remote, socketOptionSet{})
+}
+
+// dialIP contains connected protocol-socket construction shared by Stack and
+// Dialer.
+func (s *Stack) dialIP(ctx context.Context, network string, source, remote netip.Addr, options socketOptionSet) (net.Conn, error) {
 	remote = remote.Unmap()
 	target := ipNetAddr(remote)
 	wrap := func(local net.Addr, err error) (net.Conn, error) {
@@ -274,6 +304,8 @@ func (s *Stack) DialIP(ctx context.Context, network string, source, remote netip
 		return wrap(ipNetAddr(source), err)
 	}
 	connection := newIPConn(s, network, protocol, local, remote)
+	connection.ipHeaderIncludedOnWrite.Store(options.ipHeaderIncludedOnWrite)
+	connection.ipHeaderIncludedOnRead = options.ipHeaderIncludedOnRead
 	s.ipEndpointStateLocked().register(connection)
 	s.stats.activeIPSockets.Add(1)
 	return connection, nil
@@ -397,7 +429,7 @@ func (state *ipEndpointState) deliver(stack *Stack, packet ipPacket) bool {
 			continue
 		}
 		accepted = true
-		connection.enqueue(packet.payload, packet.source, packet.target, options)
+		connection.enqueuePacket(packet, options)
 	}
 	return accepted
 }
@@ -444,8 +476,7 @@ func (state *ipEndpointState) deliverError(stack *Stack, networkError ICMPError)
 		}
 		accepted = true
 		acceptedPathMTU = acceptedPathMTU || connection.acceptsPathMTU()
-		connectionError := networkError
-		connectionError.QuotedPayload = append([]byte(nil), networkError.QuotedPayload...)
+		connectionError := cloneICMPError(networkError)
 		connection.deliverError(networkError.QuotedTarget, connectionError)
 	}
 	if acceptedPathMTU && networkError.MTU != 0 && stack.observePathMTU(networkError.QuotedTarget, networkError.MTU) {
@@ -514,6 +545,16 @@ func (state *ipEndpointState) remove(connection *IPConn) bool {
 		delete(state.bindings, key)
 	}
 	return true
+}
+
+// enqueuePacket selects one socket's configured read representation without
+// retaining both the protocol payload and complete packet.
+func (c *IPConn) enqueuePacket(packet ipPacket, options ipPacketOptions) {
+	payload := packet.payload
+	if c.ipHeaderIncludedOnRead {
+		payload = packet.original
+	}
+	c.enqueue(payload, packet.source, packet.target, options)
 }
 
 // enqueue copies one payload unless the configured receive capacity is full.
@@ -589,8 +630,10 @@ func (c *IPConn) ReadFromIP(buffer []byte) (int, *net.IPAddr, error) {
 	return n, address, nil
 }
 
-// ReadMsgIP reads one protocol payload and Linux-compatible packet info,
-// hop-limit, and traffic-class ancillary data.
+// ReadMsgIP reads one socket message and Linux-compatible packet info,
+// hop-limit, and traffic-class ancillary data. An IPHeaderIncludedOnRead
+// socket returns a complete reassembled IP packet instead of a protocol
+// payload.
 func (c *IPConn) ReadMsgIP(buffer, oob []byte) (n, oobn, flags int, address *net.IPAddr, err error) {
 	var datagram ipDatagram
 	var truncated bool
@@ -621,12 +664,15 @@ func (c *IPConn) ReadMsgIP(buffer, oob []byte) (n, oobn, flags int, address *net
 // messages already queued. MessageDontWait also makes the first read
 // nonblocking.
 func (c *IPConn) ReadBatch(messages []Message, flags int) (int, error) {
-	if flags&^MessageDontWait != 0 {
+	if flags&^(MessagePeek|MessageDontWait|MessageTruncated|MessageErrorQueue) != 0 {
 		return 0, c.operationError("read", syscall.EOPNOTSUPP)
+	}
+	if flags&MessageErrorQueue != 0 {
+		return c.readErrorBatch(messages, flags)
 	}
 	for index := range messages {
 		wait := index == 0 && flags&MessageDontWait == 0
-		err := c.readBatchMessage(&messages[index], wait, index == 0)
+		err := c.readBatchMessage(&messages[index], flags, wait, index == 0)
 		if err != nil {
 			// recvmmsg reports a completed prefix without the error that stopped
 			// the next message. A retry starting at index exposes that error.
@@ -642,11 +688,11 @@ func (c *IPConn) ReadBatch(messages []Message, flags int) (int, error) {
 // readBatchMessage receives one scatter/gather message without waiting when
 // wait is false. consumeErrors is false after a successful prefix so an
 // asynchronous error remains available to the next socket operation.
-func (c *IPConn) readBatchMessage(message *Message, wait, consumeErrors bool) error {
+func (c *IPConn) readBatchMessage(message *Message, flags int, wait, consumeErrors bool) error {
 	if _, err := messageBufferLength(message.Buffers); err != nil {
 		return c.operationError("read", err)
 	}
-	n, datagram, truncated, err := c.readDatagramBuffers(message.Buffers, wait, consumeErrors)
+	n, datagram, truncated, err := c.readDatagramBuffers(message.Buffers, wait, consumeErrors, flags&MessagePeek != 0, flags&MessageTruncated != 0)
 	if err != nil {
 		return c.operationError("read", err)
 	}
@@ -654,15 +700,15 @@ func (c *IPConn) readBatchMessage(message *Message, wait, consumeErrors bool) er
 	if err != nil {
 		return c.operationError("read", err)
 	}
-	flags := 0
+	resultFlags := 0
 	if truncated {
-		flags |= MessageTruncated
+		resultFlags |= MessageTruncated
 	}
 	oobn := copy(message.OOB, control)
 	if oobn < len(control) {
-		flags |= MessageControlTruncated
+		resultFlags |= MessageControlTruncated
 	}
-	message.N, message.NN, message.Flags, message.Addr = n, oobn, flags, ipNetAddr(datagram.source)
+	message.N, message.NN, message.Flags, message.Addr = n, oobn, resultFlags, ipNetAddr(datagram.source)
 	return nil
 }
 
@@ -677,13 +723,6 @@ func (c *IPConn) Read(buffer []byte) (int, error) {
 
 // readDatagram returns one payload without adding the public operation wrapper.
 func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, truncated bool, err error) {
-	return c.readDatagramBuffers([][]byte{buffer}, true, true)
-}
-
-// readDatagramBuffers is the scatter/gather and nonblocking form used by
-// ReadBatch. It returns EAGAIN without consuming state when wait is false and
-// neither a payload nor an ordinary-read error is ready.
-func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors bool) (n int, datagram ipDatagram, truncated bool, err error) {
 	for {
 		c.mu.Lock()
 		select {
@@ -699,12 +738,13 @@ func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors bool)
 			return 0, ipDatagram{}, false, os.ErrDeadlineExceeded
 		default:
 		}
-		if queued, ok := c.receive.pop(); ok {
+		queued, ok := c.receive.pop()
+		if ok {
 			datagram = queued
 			c.queuedBytes -= ipDatagramMetadataSize + len(datagram.payload)
 			c.notifyReceiveLocked()
 			c.mu.Unlock()
-			n = copyMessagePayload(buffers, datagram.payload)
+			n = copy(buffer, datagram.payload)
 			if cap(datagram.payload) != 0 && cap(datagram.payload) <= datagramReusablePayloadLimit {
 				c.mu.Lock()
 				select {
@@ -718,8 +758,84 @@ func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors bool)
 			}
 			return n, datagram, n < len(datagram.payload), nil
 		}
+		if !c.receiveErrors {
+			queuedError, queued := c.errorQueue.pop()
+			if queued {
+				c.errorQueuedBytes -= queuedError.size
+				c.notifyReceiveLocked()
+				c.mu.Unlock()
+				return 0, ipDatagram{}, false, queuedError.err
+			}
+		}
+		notified := c.receiveNotify
+		c.mu.Unlock()
+		select {
+		case <-notified:
+		case <-timeout:
+			return 0, ipDatagram{}, false, os.ErrDeadlineExceeded
+		case <-c.closed:
+			return 0, ipDatagram{}, false, net.ErrClosed
+		}
+	}
+}
+
+// readDatagramBuffers is the scatter/gather and nonblocking form used by
+// ReadBatch. It returns EAGAIN without consuming state when wait is false and
+// neither a payload nor an ordinary-read error is ready.
+func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, peek, returnLength bool) (n int, datagram ipDatagram, truncated bool, err error) {
+	for {
+		c.mu.Lock()
+		select {
+		case <-c.closed:
+			c.mu.Unlock()
+			return 0, ipDatagram{}, false, net.ErrClosed
+		default:
+		}
+		timeout := c.readDeadline.wait()
+		select {
+		case <-timeout:
+			c.mu.Unlock()
+			return 0, ipDatagram{}, false, os.ErrDeadlineExceeded
+		default:
+		}
+		var queued ipDatagram
+		var ok bool
+		if peek {
+			queued, ok = c.receive.peek()
+		} else {
+			queued, ok = c.receive.pop()
+		}
+		if ok {
+			datagram = queued
+			if !peek {
+				c.queuedBytes -= ipDatagramMetadataSize + len(datagram.payload)
+				c.notifyReceiveLocked()
+			}
+			n = copyMessagePayload(buffers, datagram.payload)
+			truncated = n < len(datagram.payload)
+			if truncated && returnLength {
+				n = len(datagram.payload)
+			}
+			c.mu.Unlock()
+			if !peek && cap(datagram.payload) != 0 && cap(datagram.payload) <= datagramReusablePayloadLimit {
+				c.mu.Lock()
+				select {
+				case <-c.closed:
+				default:
+					if cap(datagram.payload) > cap(c.receiveSpare) {
+						c.receiveSpare = datagram.payload[:0]
+					}
+				}
+				c.mu.Unlock()
+			}
+			return n, datagram, truncated, nil
+		}
 		if !c.receiveErrors && consumeErrors {
-			if queued, ok := c.errorQueue.pop(); ok {
+			var queued queuedSocketError
+			queued, ok = c.errorQueue.pop()
+			if ok {
+				// Linux MSG_PEEK preserves queued payloads but consumes a pending
+				// socket error returned by the ordinary receive path.
 				c.errorQueuedBytes -= queued.size
 				c.notifyReceiveLocked()
 				c.mu.Unlock()
@@ -742,6 +858,44 @@ func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors bool)
 	}
 }
 
+// readErrorBatch consumes a prefix of the asynchronous error queue. Linux
+// MSG_ERRQUEUE is nonblocking regardless of socket deadlines or MSG_DONTWAIT.
+func (c *IPConn) readErrorBatch(messages []Message, flags int) (int, error) {
+	for index := range messages {
+		c.mu.Lock()
+		select {
+		case <-c.closed:
+			c.mu.Unlock()
+			if index != 0 {
+				return index, nil
+			}
+			return 0, c.operationError("read", net.ErrClosed)
+		default:
+		}
+		size, ok, err := readSocketErrorMessage(&c.errorQueue, &messages[index], flags)
+		if !ok {
+			c.mu.Unlock()
+			if index != 0 {
+				return index, nil
+			}
+			return 0, c.operationError("read", syscall.EAGAIN)
+		}
+		if err != nil {
+			c.mu.Unlock()
+			if index != 0 {
+				return index, nil
+			}
+			return 0, c.operationError("read", err)
+		}
+		if size != 0 {
+			c.errorQueuedBytes -= size
+			c.notifyReceiveLocked()
+		}
+		c.mu.Unlock()
+	}
+	return len(messages), nil
+}
+
 // WriteTo sends one payload to an unconnected destination.
 func (c *IPConn) WriteTo(payload []byte, address net.Addr) (int, error) {
 	ipAddress, ok := address.(*net.IPAddr)
@@ -761,7 +915,12 @@ func (c *IPConn) WriteToIP(payload []byte, address *net.IPAddr) (int, error) {
 	if err != nil {
 		return 0, c.operationErrorTo("write", netAddress, err)
 	}
-	n, err := c.writeTo(payload, target, netip.Addr{}, ipPacketOptions{})
+	var n int
+	if c.ipHeaderIncludedOnWrite.Load() {
+		n, err = c.writeHeaderIncluded(payload, target, netip.Addr{}, ipPacketOptions{}, false)
+	} else {
+		n, err = c.writeTo(payload, target, netip.Addr{}, ipPacketOptions{})
+	}
 	if err != nil {
 		return n, c.operationErrorTo("write", netAddress, err)
 	}
@@ -773,7 +932,13 @@ func (c *IPConn) Write(payload []byte) (int, error) {
 	if !c.remote.IsValid() {
 		return 0, c.operationError("write", errors.New("mipstack: IP socket is not connected"))
 	}
-	n, err := c.writeTo(payload, c.remote, netip.Addr{}, ipPacketOptions{})
+	var n int
+	var err error
+	if c.ipHeaderIncludedOnWrite.Load() {
+		n, err = c.writeHeaderIncluded(payload, c.remote, netip.Addr{}, ipPacketOptions{}, false)
+	} else {
+		n, err = c.writeTo(payload, c.remote, netip.Addr{}, ipPacketOptions{})
+	}
 	if err != nil {
 		return n, c.operationError("write", err)
 	}
@@ -790,7 +955,7 @@ func (c *IPConn) WritePathMTUProbe(payload []byte) (int, error) {
 	if c.remote.IsMulticast() || c.stack.network.Load().broadcastDestination(c.remote) {
 		return 0, c.operationError("write", syscall.EOPNOTSUPP)
 	}
-	n, err := c.writeToWith(payload, c.remote, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
+	n, err := c.writeToWith(payload, c.remote, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload, false)
 	if err != nil {
 		return n, c.operationError("write", err)
 	}
@@ -805,7 +970,7 @@ func (c *IPConn) WritePathMTUProbeTo(payload []byte, target netip.Addr) (int, er
 	if target.IsMulticast() || c.stack.network.Load().broadcastDestination(target) {
 		return 0, c.operationErrorTo("write", ipNetAddr(target), syscall.EOPNOTSUPP)
 	}
-	n, err := c.writeToWith(payload, target, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
+	n, err := c.writeToWith(payload, target, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload, false)
 	if err != nil {
 		return n, c.operationErrorTo("write", ipNetAddr(target), err)
 	}
@@ -860,7 +1025,11 @@ func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn i
 	if err != nil {
 		return 0, 0, c.operationErrorTo("write", netAddress, err)
 	}
-	n, err = c.writeTo(payload, target, source, options)
+	if c.ipHeaderIncludedOnWrite.Load() {
+		n, err = c.writeHeaderIncluded(payload, target, source, options, false)
+	} else {
+		n, err = c.writeTo(payload, target, source, options)
+	}
 	if err != nil {
 		return n, 0, c.operationErrorTo("write", netAddress, err)
 	}
@@ -868,16 +1037,19 @@ func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn i
 }
 
 // WriteBatch writes a prefix of IP protocol messages using scatter/gather
-// payloads. Flags other than zero are unsupported because packet-queue
-// backpressure and deadlines are expressed by the socket rather than an
-// operating-system fd.
+// payloads. MessageDontWait bypasses packet-queue waiting; other flags are
+// unsupported.
 func (c *IPConn) WriteBatch(messages []Message, flags int) (int, error) {
-	if flags != 0 {
+	if flags&^MessageDontWait != 0 {
 		return 0, c.operationError("write", syscall.EOPNOTSUPP)
+	}
+	dontWait := flags&MessageDontWait != 0
+	if c.ipHeaderIncludedOnWrite.Load() {
+		return c.writeHeaderIncludedBatch(messages, dontWait)
 	}
 	for index := range messages {
 		message := &messages[index]
-		n, oobn, err := c.writeBatchMessage(message)
+		n, oobn, err := c.writeBatchMessage(message, dontWait)
 		if err != nil {
 			// sendmmsg reports a completed prefix without the error that stopped
 			// the next message. A retry starting at index exposes that error.
@@ -893,7 +1065,7 @@ func (c *IPConn) WriteBatch(messages []Message, flags int) (int, error) {
 
 // writeBatchMessage validates one destination and sends a scatter/gather
 // payload through the ordinary ancillary-data and output policy.
-func (c *IPConn) writeBatchMessage(message *Message) (int, int, error) {
+func (c *IPConn) writeBatchMessage(message *Message, dontWait bool) (int, int, error) {
 	var target netip.Addr
 	var address net.Addr
 	if c.remote.IsValid() {
@@ -936,7 +1108,7 @@ func (c *IPConn) writeBatchMessage(message *Message) (int, int, error) {
 		if parseErr != nil {
 			return 0, 0, c.operationErrorTo("write", address, parseErr)
 		}
-		n, writeErr := c.writeTo(message.Buffers[0], validated, source, options)
+		n, writeErr := c.writeToWith(message.Buffers[0], validated, source, options, c.writePayload, dontWait)
 		if writeErr != nil {
 			return n, 0, c.operationErrorTo("write", address, writeErr)
 		}
@@ -949,7 +1121,77 @@ func (c *IPConn) writeBatchMessage(message *Message) (int, int, error) {
 	if err != nil {
 		return 0, 0, c.operationErrorTo("write", address, err)
 	}
-	n, err := c.writeBuffersTo(message.Buffers, payloadSize, validated, source, options)
+	n, err := c.writeBuffersTo(message.Buffers, payloadSize, validated, source, options, dontWait)
+	if err != nil {
+		return n, 0, c.operationErrorTo("write", address, err)
+	}
+	return n, len(message.OOB), nil
+}
+
+// writeHeaderIncludedBatch writes complete IP packets after WriteBatch has
+// selected the header-included representation once for the whole operation.
+func (c *IPConn) writeHeaderIncludedBatch(messages []Message, dontWait bool) (int, error) {
+	for index := range messages {
+		message := &messages[index]
+		n, oobn, err := c.writeHeaderIncludedBatchMessage(message, dontWait)
+		if err != nil {
+			if index != 0 {
+				return index, nil
+			}
+			return index, err
+		}
+		message.N, message.NN, message.Flags = n, oobn, 0
+	}
+	return len(messages), nil
+}
+
+// writeHeaderIncludedBatchMessage validates and writes one complete IP packet.
+func (c *IPConn) writeHeaderIncludedBatchMessage(message *Message, dontWait bool) (int, int, error) {
+	var target netip.Addr
+	var address net.Addr
+	if c.remote.IsValid() {
+		if message.Addr != nil {
+			return 0, 0, c.operationErrorTo("write", message.Addr, net.ErrWriteToConnected)
+		}
+		target, address = c.remote, c.remoteAddr()
+	} else {
+		address = message.Addr
+		ipAddress, ok := address.(*net.IPAddr)
+		if !ok || ipAddress == nil {
+			return 0, 0, c.operationErrorTo("write", address, syscall.EINVAL)
+		}
+		var err error
+		target, err = ipAddr(ipAddress)
+		if err != nil {
+			return 0, 0, c.operationErrorTo("write", address, err)
+		}
+	}
+	validated, err := c.validateWriteTarget(target)
+	if err != nil {
+		return 0, 0, c.operationErrorTo("write", address, err)
+	}
+	payloadSize, err := messageBufferLength(message.Buffers)
+	if err != nil {
+		return 0, 0, c.operationErrorTo("write", address, err)
+	}
+	if payloadSize > 65535 {
+		return 0, 0, c.operationErrorTo("write", address, syscall.EMSGSIZE)
+	}
+	if err = (socketWriteState{deadline: &c.writeDeadline, closed: c.closed}).err(); err != nil {
+		return 0, 0, c.operationErrorTo("write", address, err)
+	}
+	source, options, err := parseControlMessageForWrite(message.OOB, validated.Is6())
+	if err != nil {
+		return 0, 0, c.operationErrorTo("write", address, err)
+	}
+	payload := message.Buffers[0]
+	if len(message.Buffers) != 1 {
+		payload, err = gatherMessagePayload(message.Buffers, 65535)
+		if err != nil {
+			return 0, 0, c.operationErrorTo("write", address, err)
+		}
+	}
+	n, err := c.writeHeaderIncluded(payload, validated, source, options, dontWait)
 	if err != nil {
 		return n, 0, c.operationErrorTo("write", address, err)
 	}
@@ -959,7 +1201,85 @@ func (c *IPConn) writeBatchMessage(message *Message) (int, int, error) {
 // writeTo selects a source, repairs ICMPv6 checksum, and emits one ordinary
 // fragmentable payload.
 func (c *IPConn) writeTo(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
-	return c.writeToWith(payload, target, packetInfoSource, options, c.writePayload)
+	return c.writeToWith(payload, target, packetInfoSource, options, c.writePayload, false)
+}
+
+// writeHeaderIncluded validates and queues one caller-supplied IPv4 or IPv6
+// packet. target selects the route while the supplied IP header remains the
+// packet delivered on the wire, matching Linux header-included raw sockets.
+func (c *IPConn) writeHeaderIncluded(input []byte, target, packetInfoSource netip.Addr, options ipPacketOptions, dontWait bool) (int, error) {
+	parameters, err := c.prepareWrite(target, packetInfoSource, options)
+	if err != nil {
+		return 0, err
+	}
+	if len(input) > c.stack.network.Load().mtu {
+		return 0, syscall.EMSGSIZE
+	}
+	packet, packetTarget, hopLimit, err := c.prepareHeaderIncludedPacket(input, parameters.source, parameters.target)
+	if err != nil {
+		return 0, err
+	}
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
+	if parameters.nonUnicast {
+		c.mu.Lock()
+		_, external, loopback, policyErr := nonUnicastOutputPolicy(parameters.target, c.multicastHopLimit, c.multicastLoopback, c.broadcast, ipPacketOptions{hopLimit: hopLimit, hopLimitSet: true})
+		c.mu.Unlock()
+		if policyErr != nil {
+			return 0, policyErr
+		}
+		err = c.stack.writeNonUnicastPacketUntil(len(packet), external, loopback, state, func(destination []byte) bool {
+			copy(destination, packet)
+			return true
+		})
+	} else {
+		err = c.stack.writeCompletePacketUntil(packet, parameters.target, state)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !parameters.nonUnicast {
+		c.rememberTarget(packetTarget)
+	}
+	c.packetsSent.Add(1)
+	c.bytesSent.Add(uint64(len(input)))
+	return len(input), nil
+}
+
+// prepareHeaderIncludedPacket copies and applies the limited IPv4 mutations
+// made by Linux raw_send_hdrinc. IPv6 and transport headers remain unchanged.
+func (c *IPConn) prepareHeaderIncludedPacket(input []byte, selectedSource, routeTarget netip.Addr) ([]byte, netip.Addr, byte, error) {
+	if len(input) == 0 || !routeTarget.IsValid() {
+		return nil, netip.Addr{}, 0, syscall.EINVAL
+	}
+	packet := append([]byte(nil), input...)
+	switch packet[0] >> 4 {
+	case 4:
+		if !routeTarget.Is4() || len(packet) < 20 || len(packet) > 65535 {
+			return nil, netip.Addr{}, 0, syscall.EINVAL
+		}
+		headerSize := int(packet[0]&0x0f) * 4
+		if headerSize < 20 || headerSize > len(packet) {
+			return nil, netip.Addr{}, 0, syscall.EINVAL
+		}
+		if binary.BigEndian.Uint32(packet[12:16]) == 0 {
+			value := selectedSource.As4()
+			copy(packet[12:16], value[:])
+		}
+		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+		if binary.BigEndian.Uint16(packet[4:6]) == 0 {
+			binary.BigEndian.PutUint16(packet[4:6], uint16(c.stack.ipv4ID.Add(1)))
+		}
+		packet[10], packet[11] = 0, 0
+		binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:headerSize]))
+		return packet, netip.AddrFrom4([4]byte(packet[16:20])), packet[8], nil
+	case 6:
+		if !routeTarget.Is6() || len(packet) < 40 {
+			return nil, netip.Addr{}, 0, syscall.EINVAL
+		}
+		return packet, netip.AddrFrom16([16]byte(packet[24:40])), packet[7], nil
+	default:
+		return nil, netip.Addr{}, 0, syscall.EINVAL
+	}
 }
 
 // prepareWrite snapshots socket policy and selects the source for one output
@@ -993,7 +1313,7 @@ func (c *IPConn) prepareWrite(target, packetInfoSource netip.Addr, options ipPac
 
 // writeToWith keeps routing, checksums, deadlines, accounting, and ICMP
 // correlation shared between ordinary writes and PLPMTUD probes.
-func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, []byte, ipPacketOptions, PathMTUDiscovery, bool) error) (int, error) {
+func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write ipPayloadWriter, dontWait bool) (int, error) {
 	parameters, err := c.prepareWrite(target, packetInfoSource, options)
 	if err != nil {
 		return 0, err
@@ -1003,7 +1323,8 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource
 		payload[2], payload[3] = 0, 0
 		binary.BigEndian.PutUint16(payload[2:4], transportChecksum(parameters.source, parameters.target, protocolICMPv6, payload))
 	}
-	if err = write(parameters.source, parameters.target, payload, parameters.options, parameters.pathMTUDiscovery, parameters.nonUnicast); err != nil {
+	err = write(parameters.source, parameters.target, payload, parameters.options, parameters.pathMTUDiscovery, parameters.nonUnicast, dontWait)
+	if err != nil {
 		if errors.Is(err, syscall.EMSGSIZE) {
 			return 0, syscall.EMSGSIZE
 		}
@@ -1020,7 +1341,7 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource
 // writeBuffersTo sends one validated scatter/gather protocol payload. A
 // fitting unicast packet is assembled directly in queue-owned storage;
 // fragmentation and non-unicast output retain the established path.
-func (c *IPConn) writeBuffersTo(buffers [][]byte, payloadSize int, target, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
+func (c *IPConn) writeBuffersTo(buffers [][]byte, payloadSize int, target, packetInfoSource netip.Addr, options ipPacketOptions, dontWait bool) (int, error) {
 	parameters, err := c.prepareWrite(target, packetInfoSource, options)
 	if err != nil {
 		return 0, err
@@ -1041,10 +1362,10 @@ func (c *IPConn) writeBuffersTo(buffers [][]byte, payloadSize int, target, packe
 			payload[2], payload[3] = 0, 0
 			binary.BigEndian.PutUint16(payload[2:4], transportChecksum(parameters.source, parameters.target, protocolICMPv6, payload))
 		}
-		err = c.writeNonUnicastPayload(parameters.source, parameters.target, payload, parameters.options, parameters.pathMTUDiscovery)
+		err = c.writeNonUnicastPayload(parameters.source, parameters.target, payload, parameters.options, parameters.pathMTUDiscovery, dontWait)
 	} else {
 		mtu, fragmentation := c.stack.pathMTUOutputPolicy(parameters.target, parameters.pathMTUDiscovery)
-		err = c.writePayloadBuffersForMTU(parameters.source, parameters.target, buffers, payloadSize, parameters.options, fragmentation, mtu)
+		err = c.writePayloadBuffersForMTU(parameters.source, parameters.target, buffers, payloadSize, parameters.options, fragmentation, mtu, dontWait)
 	}
 	if err != nil {
 		if errors.Is(err, syscall.EMSGSIZE) {
@@ -1062,11 +1383,11 @@ func (c *IPConn) writeBuffersTo(buffers [][]byte, payloadSize int, target, packe
 
 // writePayload emits ordinary output against the confirmed path MTU and
 // permits source fragmentation.
-func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast bool) error {
+func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast, dontWait bool) error {
 	if nonUnicast {
-		return c.writeNonUnicastPayload(source, target, payload, options, pathMTUDiscovery)
+		return c.writeNonUnicastPayload(source, target, payload, options, pathMTUDiscovery, dontWait)
 	}
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 	mtu, fragmentation := c.stack.pathMTUOutputPolicy(target, pathMTUDiscovery)
 	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, fragmentation, options, mtu, state)
 }
@@ -1074,7 +1395,7 @@ func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options
 // writePayloadBuffersForMTU is the allocation-free scatter/gather form of
 // writePayload for a fitting packet. Fragmentation joins the payload once and
 // then uses the existing fragment writer.
-func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers [][]byte, payloadSize int, options ipPacketOptions, fragmentation sourceFragmentation, mtu int) error {
+func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers [][]byte, payloadSize int, options ipPacketOptions, fragmentation sourceFragmentation, mtu int, dontWait bool) error {
 	headerSize := ipHeaderSize(source, target, payloadSize)
 	if headerSize == 0 {
 		return syscall.EMSGSIZE
@@ -1091,7 +1412,7 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 			payload[2], payload[3] = 0, 0
 			binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, protocolICMPv6, payload))
 		}
-		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 		return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, fragmentation, options, mtu, state)
 	}
 	if source.Is6() && !options.flowLabelSet {
@@ -1105,7 +1426,7 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 		identification = uint16(c.stack.ipv4ID.Add(1))
 	}
 	queue, loopback := c.stack.outputQueueFor(target)
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 	slot, err := c.stack.reservePacketUntil(queue, loopback, state)
 	if err != nil {
 		return err
@@ -1135,8 +1456,8 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 
 // writePathMTUProbePayload emits explicitly unfragmented output against the
 // first-hop MTU.
-func (c *IPConn) writePathMTUProbePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, _ PathMTUDiscovery, _ bool) error {
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+func (c *IPConn) writePathMTUProbePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, _ PathMTUDiscovery, _, dontWait bool) error {
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, sourceFragmentation{dontFragment: true}, options, c.stack.network.Load().mtu, state)
 }
 
@@ -1183,6 +1504,7 @@ func (c *IPConn) Info() IPInfo {
 	}
 	info := IPInfo{
 		LocalAddress: c.local, RemoteAddress: c.remote, Protocol: c.protocol,
+		IPHeaderIncludedOnWrite: c.ipHeaderIncludedOnWrite.Load(), IPHeaderIncludedOnRead: c.ipHeaderIncludedOnRead,
 		ReceiveQueuePackets: c.receive.len(), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
 		ReceiveErrors: c.receiveErrors, ErrorQueueEntries: c.errorQueue.len(), ErrorQueueBytes: c.errorQueuedBytes,
 		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass,
@@ -1205,6 +1527,20 @@ func (c *IPConn) Info() IPInfo {
 		info.PathMTU = c.stack.mtuFor(c.remote)
 	}
 	return info
+}
+
+// SetIPHeaderIncludedOnWrite controls whether subsequent writes contain
+// complete IP packets rather than protocol payloads.
+func (c *IPConn) SetIPHeaderIncludedOnWrite(enabled bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		return c.setOperationError(net.ErrClosed)
+	default:
+		c.ipHeaderIncludedOnWrite.Store(enabled)
+		return nil
+	}
 }
 
 // remoteAddr returns the connected peer without wrapping a nil pointer in a
@@ -1496,7 +1832,15 @@ func (c *IPConn) deliverError(target netip.Addr, err error) {
 		c.errorsDropped.Add(1)
 		return
 	}
-	c.errorQueue.push(queuedSocketError{err: operationError, size: size})
+	var payload []byte
+	var networkError ICMPError
+	if errors.As(err, &networkError) {
+		payload = networkError.QuotedPayload
+		if c.ipHeaderIncludedOnWrite.Load() && len(networkError.QuotedPacket) != 0 {
+			payload = networkError.QuotedPacket
+		}
+	}
+	c.errorQueue.push(queuedSocketError{err: operationError, payload: payload, size: size})
 	c.errorQueuedBytes += size
 	c.notifyReceiveLocked()
 	c.mu.Unlock()

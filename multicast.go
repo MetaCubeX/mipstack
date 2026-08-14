@@ -3,6 +3,7 @@ package mipstack
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"net"
 	"net/netip"
 	"sort"
@@ -324,7 +325,8 @@ func newMulticastState(stack *Stack) *multicastState {
 // ListenMulticastUDP creates a reusable UDP socket, disables multicast
 // loopback like net.ListenMulticastUDP, and joins group. Mipstack has one
 // embedding interface, so no interface selector is required. Source-specific
-// groups return EINVAL; use ListenUDPReusePort and JoinSourceSpecificGroup.
+// groups return EINVAL; use ListenConfig with SocketOptions.ReuseAddress and
+// JoinSourceSpecificGroup.
 func (s *Stack) ListenMulticastUDP(ctx context.Context, network string, group netip.AddrPort) (*UDPConn, error) {
 	group = netip.AddrPortFrom(group.Addr().Unmap(), group.Port())
 	target := net.UDPAddrFromAddrPort(group)
@@ -347,7 +349,8 @@ func (s *Stack) ListenMulticastUDP(ctx context.Context, network string, group ne
 	} else if network == "udp" {
 		listenNetwork = "udp4"
 	}
-	packetConnection, err := s.ListenUDPReusePort(ctx, listenNetwork, netip.AddrPortFrom(localAddress, group.Port()))
+	listenConfig := ListenConfig{Options: []SocketOption{SocketOptions.ReuseAddress(true)}}
+	packetConnection, err := listenConfig.ListenUDP(ctx, s, listenNetwork, netip.AddrPortFrom(localAddress, group.Port()))
 	if err != nil {
 		return nil, err
 	}
@@ -1366,7 +1369,7 @@ func (s *multicastState) deliverIP(packet ipPacket) bool {
 		if !connection.local.IsUnspecified() || connection.protocol != packet.protocol || connection.remote.IsValid() && connection.remote != packet.source || !endpoint.filter.accepts(packet.source) {
 			continue
 		}
-		connection.enqueue(packet.payload, packet.source, packet.target, options)
+		connection.enqueuePacket(packet, options)
 		delivered = true
 	}
 	return delivered
@@ -1409,7 +1412,7 @@ func (s *multicastState) deliverImplicitIP(packet ipPacket, endpoints ipEndpoint
 			continue
 		}
 		delivered = true
-		connection.enqueue(packet.payload, packet.source, packet.target, options)
+		connection.enqueuePacket(packet, options)
 	}
 	return delivered
 }
@@ -1447,7 +1450,7 @@ func nonUnicastOutputPolicy(target netip.Addr, multicastHopLimit byte, multicast
 // writeNonUnicastDatagram emits broadcast or multicast output against the
 // interface MTU. It deliberately bypasses destination PMTU state and ICMP
 // correlation, neither of which identifies one non-unicast receiver.
-func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery) error {
+func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, dontWait bool) error {
 	udpSize := udpHeaderSize + len(payload)
 	if udpSize > 65535 || target.Is4() && udpSize > 65515 {
 		return syscall.EMSGSIZE
@@ -1463,7 +1466,7 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 		if !external {
 			return nil
 		}
-		return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, fragmentation, c.stack.network.Load().mtu)
+		return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, fragmentation, c.stack.network.Load().mtu, dontWait)
 	}
 	if source.Is6() && !options.flowLabelSet {
 		options.flowLabel = c.stack.automaticTransportFlowLabel(source, target, protocolUDP, sourcePort, targetPort)
@@ -1474,7 +1477,7 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 	if ipSize == 0 {
 		return syscall.EMSGSIZE
 	}
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 	if ipSize+udpSize <= mtu {
 		identification := uint16(0)
 		if source.Is4() && fragmentation.requiresIPv4ID() {
@@ -1502,7 +1505,7 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 
 // writeNonUnicastPayload is the raw-protocol counterpart of UDP multicast and
 // broadcast output.
-func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery) error {
+func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, dontWait bool) error {
 	ipSize := ipHeaderSize(source, target, len(payload))
 	if ipSize == 0 {
 		return syscall.EMSGSIZE
@@ -1518,7 +1521,7 @@ func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byt
 		if !external {
 			return nil
 		}
-		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 		return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, fragmentation, options, c.stack.network.Load().mtu, state)
 	}
 	if source.Is6() && !options.flowLabelSet {
@@ -1526,7 +1529,7 @@ func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byt
 		options.flowLabelSet = true
 	}
 	mtu := c.stack.network.Load().mtu
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 	if ipSize+len(payload) <= mtu {
 		identification := uint16(0)
 		if source.Is4() && fragmentation.requiresIPv4ID() {
@@ -1622,6 +1625,22 @@ func (s *Stack) writeNonUnicastPacketsUntil(packets [][]byte, external, loopback
 	}
 	if err := state.err(); err != nil {
 		return err
+	}
+	if state.dontWait {
+		if external {
+			if err := s.tryWritePacketsTo(packets, &s.outbound, false); err != nil {
+				if errors.Is(err, ErrResourceLimit) {
+					return syscall.EAGAIN
+				}
+				return err
+			}
+		}
+		if loopback {
+			// Local delivery remains best effort, but reassembly must never see
+			// only the prefix of a datagram because its queue filled mid-send.
+			_ = s.tryWritePacketsTo(packets, &s.loopback, true)
+		}
+		return nil
 	}
 	for _, packet := range packets {
 		var slot uint16

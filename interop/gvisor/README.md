@@ -38,7 +38,9 @@ The suite covers:
 - IPv4 limited and directed broadcast, bidirectional IPv4/IPv6 ASM multicast,
   and mipstack SSM INCLUDE filtering plus atomic source-set replacement using
   two gVisor source addresses;
-- bidirectional raw IP payload sockets using IANA protocol 99;
+- bidirectional raw IP payload sockets using IANA protocol 99, mipstack
+  header-included complete-packet sends, complete-packet receive reassembly,
+  and UDP ICMP error-queue delivery from a native gVisor peer;
 - IPv4 router-generated PMTU discovery at next-hop MTUs 68, 576, 1,280, and
   1,420, subsequent local EMSGSIZE behavior, and invalid IPv6 Packet Too Big
   rejection at 1,280 and 1,420;

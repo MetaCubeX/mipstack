@@ -17,6 +17,8 @@ type ICMPError struct {
 	Code byte
 	// MTU is present for fragmentation-needed and packet-too-big errors.
 	MTU uint32
+	// Pointer is present for IPv4 or IPv6 Parameter Problem errors.
+	Pointer uint32
 	// QuotedSource and QuotedTarget identify the failed original packet.
 	QuotedSource netip.Addr
 	// QuotedTarget is the destination of the failed original packet.
@@ -24,6 +26,9 @@ type ICMPError struct {
 	// QuotedProtocol and QuotedPayload locate the available original transport
 	// header bytes.
 	QuotedProtocol byte
+	// QuotedPacket contains the available original IP packet, including its IP
+	// header. QuotedPayload aliases its upper-layer suffix when both are present.
+	QuotedPacket []byte
 	// QuotedPayload contains the available original transport header bytes.
 	QuotedPayload []byte
 	// QuotedSourcePort and QuotedTargetPort identify TCP or UDP endpoints when
@@ -298,8 +303,7 @@ func (s *Stack) deliverICMPError(remoteError ICMPError) bool {
 						s.notifyTCPPathMTU(remoteError.QuotedTarget, nil)
 					}
 				}
-				remoteError.QuotedPayload = append([]byte(nil), remoteError.QuotedPayload...)
-				connection.deliverError(target, remoteError)
+				connection.deliverError(target, cloneICMPError(remoteError))
 				accepted = true
 			}
 		}
@@ -322,8 +326,7 @@ func (s *Stack) deliverICMPError(remoteError ICMPError) bool {
 						s.notifyTCPPathMTU(remoteError.QuotedTarget, nil)
 					}
 				}
-				remoteError.QuotedPayload = append([]byte(nil), remoteError.QuotedPayload...)
-				connection.deliverError(remoteError)
+				connection.deliverError(cloneICMPError(remoteError))
 				accepted = true
 			}
 		}
@@ -477,12 +480,15 @@ func parseICMPError(packet ipPacket) (ICMPError, bool) {
 		if !ok || !source.Is4() || !target.Is4() {
 			return ICMPError{}, false
 		}
-		result := ICMPError{Reporter: packet.source, Type: icmp[0], Code: icmp[1], QuotedSource: source, QuotedTarget: target, QuotedProtocol: protocol, QuotedPayload: payload}
+		result := ICMPError{Reporter: packet.source, Type: icmp[0], Code: icmp[1], QuotedSource: source, QuotedTarget: target, QuotedProtocol: protocol, QuotedPacket: icmp[8:], QuotedPayload: payload}
 		if icmp[0] == 3 && icmp[1] == 4 {
 			result.MTU = uint32(binary.BigEndian.Uint16(icmp[6:8]))
 			if result.MTU == 0 {
 				result.MTU = legacyIPv4PathMTU(icmp[8:])
 			}
+		}
+		if icmp[0] == 12 {
+			result.Pointer = uint32(icmp[4])
 		}
 		return result, true
 	}
@@ -491,13 +497,36 @@ func parseICMPError(packet ipPacket) (ICMPError, bool) {
 		if !ok || !source.Is6() || !target.Is6() {
 			return ICMPError{}, false
 		}
-		result := ICMPError{Reporter: packet.source, Type: icmp[0], Code: icmp[1], QuotedSource: source, QuotedTarget: target, QuotedProtocol: protocol, QuotedPayload: payload}
+		result := ICMPError{Reporter: packet.source, Type: icmp[0], Code: icmp[1], QuotedSource: source, QuotedTarget: target, QuotedProtocol: protocol, QuotedPacket: icmp[8:], QuotedPayload: payload}
 		if icmp[0] == 2 {
 			result.MTU = binary.BigEndian.Uint32(icmp[4:8])
+		}
+		if icmp[0] == 4 {
+			result.Pointer = binary.BigEndian.Uint32(icmp[4:8])
 		}
 		return result, true
 	}
 	return ICMPError{}, false
+}
+
+// cloneICMPError gives one queued consumer independent ownership while keeping
+// QuotedPayload as a suffix of QuotedPacket whenever the parsed error did so.
+func cloneICMPError(networkError ICMPError) ICMPError {
+	if len(networkError.QuotedPacket) != 0 && len(networkError.QuotedPayload) == 0 {
+		networkError.QuotedPacket = append([]byte(nil), networkError.QuotedPacket...)
+		return networkError
+	}
+	if len(networkError.QuotedPacket) != 0 && len(networkError.QuotedPayload) <= len(networkError.QuotedPacket) {
+		payloadOffset := len(networkError.QuotedPacket) - len(networkError.QuotedPayload)
+		if &networkError.QuotedPayload[0] == &networkError.QuotedPacket[payloadOffset] {
+			networkError.QuotedPacket = append([]byte(nil), networkError.QuotedPacket...)
+			networkError.QuotedPayload = networkError.QuotedPacket[payloadOffset:]
+			return networkError
+		}
+	}
+	networkError.QuotedPacket = append([]byte(nil), networkError.QuotedPacket...)
+	networkError.QuotedPayload = append([]byte(nil), networkError.QuotedPayload...)
+	return networkError
 }
 
 // validICMPErrorCode rejects unassigned type/code combinations before they

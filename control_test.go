@@ -6,6 +6,73 @@ import (
 	"testing"
 )
 
+func TestSocketErrorControlMessageMarshalAndParse(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   ICMPError
+		want    SocketErrorControlMessage
+		control int
+	}{
+		{
+			name:  "IPv4 network administratively prohibited",
+			input: ICMPError{Reporter: netip.MustParseAddr("198.51.100.1"), Type: 3, Code: 9},
+			want: SocketErrorControlMessage{
+				Errno: 101, Origin: SocketErrorOriginICMP, Type: 3, Code: 9,
+				Offender: netip.MustParseAddr("198.51.100.1"),
+			},
+			control: 48,
+		},
+		{
+			name:  "IPv6 packet too big",
+			input: ICMPError{Reporter: netip.MustParseAddr("2001:db8::1"), Type: 2, MTU: 1280},
+			want: SocketErrorControlMessage{
+				Errno: 90, Origin: SocketErrorOriginICMP6, Type: 2, Info: 1280,
+				Offender: netip.MustParseAddr("2001:db8::1"),
+			},
+			control: 64,
+		},
+		{
+			name:  "IPv6 parameter problem",
+			input: ICMPError{Reporter: netip.MustParseAddr("2001:db8::2"), Type: 4, Code: 1, Pointer: 48},
+			want: SocketErrorControlMessage{
+				Errno: 71, Origin: SocketErrorOriginICMP6, Type: 4, Code: 1, Info: 48,
+				Offender: netip.MustParseAddr("2001:db8::2"),
+			},
+			control: 64,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			control, err := socketErrorControlForRead(test.input)
+			if err != nil || len(control) != test.control {
+				t.Fatalf("socket error control = %d bytes, %v, want %d", len(control), err, test.control)
+			}
+			var message SocketErrorControlMessage
+			if err = message.Parse(control); err != nil || message != test.want {
+				t.Fatalf("parsed socket error = %+v, %v, want %+v", message, err, test.want)
+			}
+			packetInfo := appendLinuxPacketInfoControl(nil, test.input.Reporter)
+			packetInfo = append(packetInfo, control...)
+			if err = message.Parse(packetInfo); err != nil || message != test.want {
+				t.Fatalf("socket error with packet info = %+v, %v", message, err)
+			}
+			if err = message.Parse(append(control, control...)); err == nil {
+				t.Fatal("duplicate socket error control message parsed successfully")
+			}
+			if err = message.Parse(control[:len(control)-1]); err == nil {
+				t.Fatal("truncated socket error control message parsed successfully")
+			}
+		})
+	}
+	var message *SocketErrorControlMessage
+	if err := message.Parse(nil); err == nil {
+		t.Fatal("nil socket error control receiver parsed successfully")
+	}
+	if _, err := socketErrorControlForRead(ICMPError{Type: 3, Code: 3}); err == nil {
+		t.Fatal("socket error without reporter marshaled successfully")
+	}
+}
+
 func TestIPv4ControlMessageMarshalAndParse(t *testing.T) {
 	source := netip.MustParseAddr("192.0.2.123")
 	outgoing := &IPv4ControlMessage{TTL: 31, TOS: 0xb8, Src: source}

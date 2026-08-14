@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -518,20 +519,42 @@ func TestUDPClosedPortInterop(t *testing.T) {
 			if _, err = mipstackConnection.Write([]byte{2}); err != nil {
 				t.Fatalf("write to closed gVisor UDP port: %v", err)
 			}
-			if _, err = mipstackConnection.Read(buffer); err == nil {
-				t.Fatal("mipstack read after gVisor port unreachable succeeded")
+			mipstackUDP := mipstackConnection.(*mipstack.UDPConn)
+			if err = mipstackUDP.SetReceiveErrors(true); err != nil {
+				t.Fatalf("reserve gVisor ICMP error for MSG_ERRQUEUE: %v", err)
 			}
-			var networkError mipstack.ICMPError
-			if !errors.As(err, &networkError) {
-				t.Fatalf("mipstack UDP error = %T %v, want ICMPError", err, err)
+			message := []mipstack.Message{{Buffers: [][]byte{buffer}, OOB: make([]byte, 128)}}
+			deadlineTimer := time.NewTimer(time.Until(deadline))
+			defer deadlineTimer.Stop()
+			for {
+				count, readErr := mipstackUDP.ReadBatch(message, mipstack.MessageErrorQueue)
+				if readErr == nil && count == 1 {
+					break
+				}
+				if !errors.Is(readErr, syscall.EAGAIN) {
+					t.Fatalf("read gVisor ICMP through MSG_ERRQUEUE: %d, %v", count, readErr)
+				}
+				select {
+				case <-deadlineTimer.C:
+					t.Fatal("timed out waiting for gVisor ICMP error queue entry")
+				case <-time.After(time.Millisecond):
+				}
+			}
+			if message[0].N != 1 || buffer[0] != 2 || message[0].Flags != mipstack.MessageErrorQueue || message[0].Addr.(*net.UDPAddr).AddrPort() != netipAddrPort(family.gvisorAddress, 44994) {
+				t.Fatalf("gVisor ICMP error-queue message = %+v payload=%x", message[0], buffer[:message[0].N])
+			}
+			var socketError mipstack.SocketErrorControlMessage
+			if err = socketError.Parse(message[0].OOB[:message[0].NN]); err != nil {
+				t.Fatalf("parse gVisor ICMP error control: %v", err)
 			}
 			wantType, wantCode := byte(3), byte(3)
+			wantOrigin := mipstack.SocketErrorOriginICMP
 			if family.mipstackAddress.Is6() {
 				wantType, wantCode = 1, 4
+				wantOrigin = mipstack.SocketErrorOriginICMP6
 			}
-			if networkError.Reporter != family.gvisorAddress || networkError.Type != wantType || networkError.Code != wantCode ||
-				networkError.QuotedSource != family.mipstackAddress || networkError.QuotedTarget != family.gvisorAddress || networkError.QuotedTargetPort != 44994 {
-				t.Fatalf("mipstack UDP ICMP error = %+v", networkError)
+			if socketError.Errno != 111 || socketError.Origin != wantOrigin || socketError.Type != wantType || socketError.Code != wantCode || socketError.Offender != family.gvisorAddress {
+				t.Fatalf("mipstack UDP MSG_ERRQUEUE control = %+v", socketError)
 			}
 		})
 	}

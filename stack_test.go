@@ -18,8 +18,8 @@ var _ func(*Stack, context.Context, string, netip.AddrPort, netip.AddrPort) (net
 var _ func(*Stack, context.Context, string, netip.Addr, netip.Addr) (net.Conn, error) = (*Stack).DialIP
 var _ func(*Stack, context.Context, string, netip.AddrPort) (*TCPListener, error) = (*Stack).ListenTCP
 var _ func(*Stack, context.Context, string, netip.AddrPort) (net.PacketConn, error) = (*Stack).ListenUDP
-var _ func(*Stack, context.Context, string, netip.AddrPort) (*TCPListener, error) = (*Stack).ListenTCPReusePort
-var _ func(*Stack, context.Context, string, netip.AddrPort) (net.PacketConn, error) = (*Stack).ListenUDPReusePort
+var _ func(*ListenConfig, context.Context, *Stack, string, netip.AddrPort) (*TCPListener, error) = (*ListenConfig).ListenTCP
+var _ func(*ListenConfig, context.Context, *Stack, string, netip.AddrPort) (net.PacketConn, error) = (*ListenConfig).ListenUDP
 
 func TestStackReadCompletedPacketWinsCloseRace(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.249")
@@ -66,6 +66,129 @@ func TestStackReadCompletedPacketWinsCloseRace(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("completed Read remained blocked")
+	}
+}
+
+func TestMessagePeekTruncationAndErrorQueue(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.226")
+	remote := netip.MustParseAddrPort("198.51.100.226:5353")
+	reporter := netip.MustParseAddr("198.51.100.1")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	packetConnection, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(local, 5300))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := packetConnection.(*UDPConn)
+	defer connection.Close()
+
+	payload := []byte("ordinary-datagram")
+	if err = writeTestPacket(stack, buildTestUDP(remote.Addr(), local, remote.Port(), 5300, payload)); err != nil {
+		t.Fatal(err)
+	}
+	peekBuffer := make([]byte, 4)
+	peek := []Message{{Buffers: [][]byte{peekBuffer}, OOB: make([]byte, 128)}}
+	if count, readErr := connection.ReadBatch(peek, MessagePeek|MessageTruncated); readErr != nil || count != 1 || peek[0].N != len(payload) || peek[0].Flags != MessageTruncated || !bytes.Equal(peekBuffer, payload[:len(peekBuffer)]) {
+		t.Fatalf("peeked truncated datagram = count %d message %+v payload %q, %v", count, peek[0], peekBuffer, readErr)
+	}
+	ordinary := make([]byte, len(payload))
+	if count, readErr := connection.ReadBatch([]Message{{Buffers: [][]byte{ordinary}}}, 0); readErr != nil || count != 1 || !bytes.Equal(ordinary, payload) {
+		t.Fatalf("read after peek = count %d payload %q, %v", count, ordinary, readErr)
+	}
+
+	quotedPayload := []byte("quoted-udp-payload")
+	quotedPacket := buildTestUDP(local, remote.Addr(), 5300, remote.Port(), quotedPayload)
+	quoted, ok := parseIPPacket(quotedPacket)
+	if !ok {
+		t.Fatal("failed to parse quoted UDP packet")
+	}
+	networkError := ICMPError{
+		Reporter: reporter, Type: 3, Code: 3,
+		QuotedSource: local, QuotedTarget: remote.Addr(), QuotedProtocol: protocolUDP,
+		QuotedPacket: quotedPacket, QuotedPayload: quoted.payload,
+	}
+	if err = connection.SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
+	connection.deliverError(remote, networkError)
+	invalid := []Message{{OOB: make([]byte, 128)}}
+	if count, readErr := connection.ReadBatch(invalid, MessageErrorQueue); count != 0 || !errors.Is(readErr, syscall.EINVAL) {
+		t.Fatalf("invalid error-queue read = %d, %v", count, readErr)
+	}
+	if info := connection.Info(); info.ErrorQueueEntries != 1 {
+		t.Fatalf("invalid error-queue read consumed entry: %+v", info)
+	}
+	if err = connection.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	shortPayload := make([]byte, 3)
+	shortControl := make([]byte, 8)
+	short := []Message{{Buffers: [][]byte{shortPayload}, OOB: shortControl}}
+	if count, readErr := connection.ReadBatch(short, MessageErrorQueue|MessagePeek); readErr != nil || count != 1 || short[0].N != len(shortPayload) ||
+		short[0].NN != len(shortControl) || short[0].Flags != MessageErrorQueue|MessageTruncated|MessageControlTruncated || !bytes.Equal(shortPayload, quotedPayload[:len(shortPayload)]) {
+		t.Fatalf("short peek error-queue read = %d message %+v payload %q, %v", count, short[0], shortPayload, readErr)
+	}
+	if count, readErr := connection.ReadBatch([]Message{{Buffers: [][]byte{make([]byte, 1)}}}, MessageErrorQueue); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("MSG_ERRQUEUE|MSG_PEEK did not consume = %d, %v", count, readErr)
+	}
+
+	connection.deliverError(remote, networkError)
+	fullPayload := make([]byte, 2)
+	fullControl := make([]byte, 128)
+	full := []Message{{Buffers: [][]byte{fullPayload}, OOB: fullControl}}
+	if count, readErr := connection.ReadBatch(full, MessageErrorQueue|MessageTruncated); readErr != nil || count != 1 || full[0].N != len(quotedPayload) ||
+		full[0].Flags != MessageErrorQueue|MessageTruncated || full[0].Addr.(*net.UDPAddr).AddrPort() != remote {
+		t.Fatalf("full-length error-queue read = %d message %+v, %v", count, full[0], readErr)
+	}
+	var control SocketErrorControlMessage
+	if parseErr := control.Parse(fullControl[:full[0].NN]); parseErr != nil || control.Errno != 111 || control.Origin != SocketErrorOriginICMP ||
+		control.Type != 3 || control.Code != 3 || control.Offender != reporter {
+		t.Fatalf("error-queue control = %+v, %v", control, parseErr)
+	}
+
+	if err = connection.SetReceiveErrors(false); err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	connection.deliverError(remote, networkError)
+	if count, readErr := connection.ReadBatch([]Message{{Buffers: [][]byte{make([]byte, 1)}}}, MessagePeek); count != 0 || readErr == nil {
+		t.Fatalf("ordinary MSG_PEEK pending error = %d, %v", count, readErr)
+	}
+	if info := connection.Info(); info.ErrorQueueEntries != 0 || info.ErrorQueueBytes != 0 {
+		t.Fatalf("ordinary MSG_PEEK retained pending error: %+v", info)
+	}
+	if count, readErr := connection.ReadBatch([]Message{{Buffers: [][]byte{make([]byte, 1)}}}, MessageDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("read after pending error consumption = %d, %v", count, readErr)
+	}
+
+	ipConnection := newIPConn(stack, "ip4:99", 99, local, remote.Addr())
+	defer ipConnection.closeFromStack()
+	ipConnection.ipHeaderIncludedOnWrite.Store(true)
+	if err = ipConnection.SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
+	rawPacket := buildIPPacket(local, remote.Addr(), 99, []byte("raw-quote"), 7, true)
+	raw, ok := parseIPPacket(rawPacket)
+	if !ok {
+		t.Fatal("failed to parse raw quoted packet")
+	}
+	ipConnection.deliverError(remote.Addr(), ICMPError{
+		Reporter: reporter, Type: 3, Code: 2,
+		QuotedSource: local, QuotedTarget: remote.Addr(), QuotedProtocol: 99,
+		QuotedPacket: rawPacket, QuotedPayload: raw.payload,
+	})
+	rawBuffer := make([]byte, len(rawPacket))
+	rawMessage := []Message{{Buffers: [][]byte{rawBuffer}, OOB: make([]byte, 128)}}
+	if count, readErr := ipConnection.ReadBatch(rawMessage, MessageErrorQueue); readErr != nil || count != 1 || !bytes.Equal(rawBuffer, rawPacket) || rawMessage[0].Addr.String() != remote.Addr().String() {
+		t.Fatalf("header-included raw error queue = %d message %+v, %v", count, rawMessage[0], readErr)
 	}
 }
 

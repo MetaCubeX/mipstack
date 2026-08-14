@@ -93,10 +93,8 @@ MIPS provides:
 
 - `DialTCP` for active IPv4 and IPv6 TCP connections;
 - `ListenTCP` for specific or wildcard passive TCP endpoints;
-- `ListenTCPReusePort` for flow-distributed shared TCP bindings;
 - `DialUDP` for connected UDP sockets;
 - `ListenUDP` for unconnected UDP packet sockets;
-- `ListenUDPReusePort` for flow-distributed shared UDP bindings;
 - `ListenMulticastUDP` for a reusable wildcard UDP binding joined to one IPv4
   or IPv6 multicast group;
 - `DialIP` and `ListenIP` for connected and unconnected IPv4 or IPv6 protocol
@@ -107,6 +105,34 @@ MIPS provides:
   destinations;
 - exported `TCPConn`, `TCPListener`, `UDPConn`, and `IPConn` implementations of the
   corresponding standard `net` interfaces.
+
+The zero-value `ListenConfig` and `Dialer` mirror the creation-time policy
+pattern used by `net.ListenConfig` and `net.Dialer`. Their `Options` slices are
+read in order and are not retained. `SocketOptions` constructs sealed,
+strongly typed policies without adding a top-level exported type for every
+option:
+
+- `ReuseAddress` selects Linux `SO_REUSEADDR` bind compatibility;
+- `ReusePort` selects Linux `SO_REUSEPORT` flow distribution;
+- `IPHeaderIncludedOnWrite` makes `IPConn` writes carry a complete IP packet;
+- `IPHeaderIncludedOnRead` makes `IPConn` reads return a complete reassembled
+  packet.
+
+Each boolean constructor is an explicit choice, including `false`. The
+corresponding `UnsetReuseAddress`, `UnsetReusePort`,
+`UnsetIPHeaderIncludedOnWrite`, and `UnsetIPHeaderIncludedOnRead` constructors
+remove an earlier choice of the same kind and restore the operation-specific
+default. This supports layered option slices without treating an explicit
+disable as absence.
+
+An option used with an inapplicable protocol or operation reports
+`ENOPROTOOPT` before an endpoint is created. Repeated option kinds use the last
+value or unset marker. `IPConn.SetIPHeaderIncludedOnWrite` may change the write
+representation of an existing socket between operations; `SocketOption`
+values are consumed only during socket creation. Like Linux raw sockets, an
+ICMP error delivered after such a change uses the write representation in
+effect when the error arrives. The direct `Stack` methods remain concise
+default-policy entry points.
 
 The three `DialTCP`, `DialUDP`, and `DialIP` entry points mirror the netip-based
 methods available on newer `net.Dialer` versions: they accept a context,
@@ -126,12 +152,18 @@ are configured. On unconnected UDP and IP sockets, `Read` reads a payload and
 discards its source address, matching the corresponding standard connection
 types; `ReadFrom` and message reads retain it.
 
-Ordinary listeners have exclusive bindings. The explicit `ReusePort` methods
-may share an address and port only with other `ReusePort` listeners. Exact
-bindings take precedence over wildcard bindings, and a per-registry keyed hash
-keeps each TCP or UDP flow on one group member. Closing a TCP listener permits
-an immediate rebind while its already accepted connections remain active,
-matching the `SO_REUSEADDR` behavior used by standard Go listeners.
+Direct TCP listeners enable `ReuseAddress` by default, matching Go's standard
+listener setup; direct UDP listeners use exclusive bindings. A
+`ListenConfig` can override the TCP default or opt UDP into reuse. Two
+overlapping UDP bindings are compatible only when both enable `ReuseAddress`
+or both enable `ReusePort`. A group in which every member enables `ReusePort`
+uses a per-registry keyed flow hash; a `ReuseAddress` group otherwise delivers
+unicast to its most recently bound member. TCP permits simultaneous shared
+listeners only through `ReusePort`. Exact bindings take precedence over
+wildcards. Port zero always allocates a distinct unused ephemeral port even
+when reuse is enabled. Accepted TCP connections inherit both policies, so a
+listener can be rebound over a live accepted connection only when the old and
+new sockets share the applicable Linux reuse policy.
 
 UDP and raw IP sockets expose the single-interface equivalents of Go's
 `x/net/ipv4` and `x/net/ipv6` multicast controls: `JoinGroup`, `LeaveGroup`,
@@ -469,6 +501,30 @@ preserving the original socket behavior. `ReceiveErrors` reports the current
 mode. UDP and IP writes are synchronous with packet delivery to the embedding
 device, so `SetWriteBuffer` is a validated no-op.
 
+UDP and IP `ReadBatch`/`WriteBatch` also accept Linux-compatible message flags.
+`MessagePeek` preserves an ordinary queued payload, while pending socket errors
+and successful `MessageErrorQueue` reads are consumed like Linux. A
+`MessageErrorQueue` read never blocks and returns the quoted failed payload,
+the original destination in `Addr`, and a Linux `sock_extended_err` record in
+`OOB`; `SocketErrorControlMessage.Parse` provides its structured form.
+`MessageDontWait` makes packet-queue reads and writes return `EAGAIN` instead
+of waiting. `MessageTruncated` requests the complete payload length and, along
+with `MessageControlTruncated`, also reports output truncation. Nonblocking
+fragmented output reserves the complete fragment set before publishing it, so
+a failed send cannot leave a partial datagram on the link or loopback path.
+
+An ordinary `IPConn` exchanges upper-layer protocol payloads. With
+`IPHeaderIncludedOnWrite`, IPv4 writes follow Linux `IP_HDRINCL`: the stack
+fills a zero source and ID, repairs Total Length and the header checksum, and
+otherwise preserves the caller's header and payload. Linux IPv6
+`IPV6_HDRINCL` preserves the supplied packet byte-for-byte, and MIPS does the
+same. The destination argument selects routing independently from the
+destination stored in either header. `IPHeaderIncludedOnRead` returns the
+complete packet after validation and reassembly, retaining IPv4 options and
+IPv6 extension headers while removing fragmentation state. Caller write
+buffers and packets queued to different raw sockets have independent
+ownership.
+
 `TCPConn.Info` returns a consistent live diagnostic snapshot from the
 connection actor and retains the final snapshot after close. It includes RFC
 9293 state, endpoints, negotiated extensions, RTT/RTO, congestion controller,
@@ -520,7 +576,7 @@ first message and then drains only the currently ready prefix;
 host. Batch operations follow Linux `recvmmsg`/`sendmmsg` successful-prefix
 semantics: an error after one or more completed messages is deferred until the
 caller retries the unprocessed suffix, whose result fields remain unchanged.
-Batch writes currently require zero flags; nonzero write flags return
+Batch writes accept `MessageDontWait`; other nonzero write flags return
 `EOPNOTSUPP`.
 
 ## Protocol behavior
@@ -756,7 +812,9 @@ complete L3 packets over an IPv4 MTU matrix from 68 through 9,000 bytes and an
 IPv6 matrix from 1,280 through 9,000 bytes. Coverage includes bidirectional
 TCP, UDP, ICMP echo, fragmentation and impairment recovery, every built-in TCP
 congestion controller, socket errors and ancillary data, transparent
-Forwarders, broadcast, multicast, PMTU handling, and raw IP payload sockets.
+Forwarders, broadcast, multicast, PMTU handling, raw IP payload sockets,
+header-included complete packets, complete-packet reassembly, and Linux-style
+ICMP error queues.
 Keeping the tests behind a nested module preserves the root module's
 standard-library-only dependency graph.
 
@@ -766,16 +824,15 @@ transport behavior.
 
 ## Scope
 
-MIPS is an endpoint stack, not a general host network stack. `IPConn`
-exchanges protocol payloads while MIPS owns the IP header; header-included
-raw packets and operating-system file descriptors are deliberately absent. It
-also does not implement forwarding, NAT, multicast routing, TCP urgent data,
-or next-hop routing. `LocalAddresses` controls endpoint ownership and source
-selection. `Routes` provides destination admission, longest-prefix selection,
-metrics, and optional preferred sources, while the lower link remains
-responsible for gateways, next hops, and L2 neighbor handling. Applications
-requiring those facilities should use a mature general-purpose userspace
-stack.
+MIPS is an endpoint stack, not a general host network stack. `IPConn` supports
+protocol-payload and complete-packet raw socket representations, but
+operating-system file descriptors are deliberately absent. MIPS also does not
+implement forwarding, NAT, multicast routing, TCP urgent data, or next-hop
+routing. `LocalAddresses` controls endpoint ownership and source selection.
+`Routes` provides destination admission, longest-prefix selection, metrics,
+and optional preferred sources, while the lower link remains responsible for
+gateways, next hops, and L2 neighbor handling. Applications requiring those
+facilities should use a mature general-purpose userspace stack.
 
 TCP Fast Open is also intentionally absent. A complete server implementation
 must deliver SYN data before the handshake completes and integrate cookie,

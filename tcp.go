@@ -1585,10 +1585,16 @@ type TCPConn struct {
 	mtu   int
 	net   string
 	// passive is set before registration for connections created by a
-	// listener. Such accepted connections do not prevent rebinding a closed
-	// listener's local endpoint, matching the listener SO_REUSEADDR behavior
-	// used by the standard library.
+	// listener. The inherited reuseAddress and reusePort policies decide
+	// whether such a connection permits rebinding after its listener closes.
 	passive bool
+	// reuseAddress is inherited from the listener that created a passive
+	// connection. It controls whether a later listener may overlap the retained
+	// established or TIME_WAIT tuple after the original listener closes.
+	reuseAddress bool
+	// reusePort is inherited independently so a SO_REUSEPORT-only listener may
+	// be replaced while one of its accepted connections remains active.
+	reusePort bool
 	// forwarded authorizes this connection to retain an intercepted nonlocal
 	// destination as its local endpoint while promiscuous admission remains
 	// enabled.
@@ -1736,10 +1742,15 @@ type tcpListenerBinding interface {
 	available(state *tcpPassiveState, address netip.Addr, port uint16, dual bool) bool
 	// register publishes one validated listener binding.
 	register(state *tcpPassiveState, listener *TCPListener) error
+	// connectionReusable reports whether this binding and an existing
+	// connection share a Linux address- or port-reuse policy.
+	connectionReusable(*TCPConn) bool
 }
 
-// exclusiveTCPListenerBinding is the default one-owner bind policy.
-type exclusiveTCPListenerBinding struct{}
+// exclusiveTCPListenerBinding is the default one-listener bind policy.
+type exclusiveTCPListenerBinding struct {
+	reuseAddress bool
+}
 
 // TCPListenerInfo is a point-in-time diagnostic snapshot of one passive TCP
 // endpoint. Queue peaks and counters cover the listener's complete lifetime.
@@ -1784,11 +1795,13 @@ type TCPListenerInfo struct {
 
 // TCPListener is a passive userspace TCP endpoint.
 type TCPListener struct {
-	stack *Stack
-	key   tcpListenKey
-	local netip.AddrPort
-	dual  bool
-	net   string
+	stack        *Stack
+	key          tcpListenKey
+	local        netip.AddrPort
+	dual         bool
+	net          string
+	reuseAddress bool
+	reusePort    bool
 
 	accept         chan *TCPConn
 	closed         chan struct{}
@@ -1819,7 +1832,7 @@ type TCPListener struct {
 // tcp6. A wildcard with tcp uses one dual-stack endpoint when both families
 // are configured. Port zero selects an automatic port.
 func (s *Stack) ListenTCP(ctx context.Context, network string, local netip.AddrPort) (*TCPListener, error) {
-	return s.listenTCP(ctx, network, local, exclusiveTCPListenerBinding{})
+	return s.listenTCP(ctx, network, local, exclusiveTCPListenerBinding{reuseAddress: true})
 }
 
 // listenTCP contains validation, automatic port allocation, and listener
@@ -1868,7 +1881,7 @@ func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrP
 	}()
 	port := local.Port()
 	if port == 0 {
-		port, err = s.allocateTCPListenPortLocked(passive, binding, address, dual)
+		port, err = s.allocateTCPListenPortLocked(passive, address, dual)
 		if err != nil {
 			return wrap(err)
 		}
@@ -1902,13 +1915,15 @@ func (s *Stack) tcpPassiveStateLocked() *tcpPassiveState {
 
 // allocateTCPListenPortLocked selects an unused passive endpoint while s.mu
 // is held.
-func (s *Stack) allocateTCPListenPortLocked(state *tcpPassiveState, binding tcpListenerBinding, address netip.Addr, dual bool) (uint16, error) {
+func (s *Stack) allocateTCPListenPortLocked(state *tcpPassiveState, address netip.Addr, dual bool) (uint16, error) {
 	index := 0
 	if address.Is6() {
 		index = 1
 	}
 	return allocateAutomaticPort(&s.nextPort[index], func(port uint16) bool {
-		return s.tcpListenEndpointAvailableLocked(state, binding, address, port, dual)
+		// Like bind(2) with port zero, automatic allocation selects an unused
+		// endpoint even when the eventual listener requested a reuse option.
+		return s.tcpListenEndpointAvailableLocked(state, exclusiveTCPListenerBinding{}, address, port, dual)
 	})
 }
 
@@ -1919,12 +1934,11 @@ func (s *Stack) tcpListenEndpointAvailableLocked(state *tcpPassiveState, binding
 		return false
 	}
 	for key, connection := range s.tcp {
-		if connection.passive {
-			continue
-		}
 		local := key.local
 		if local.Port() == port && listenAddressesOverlap(local.Addr(), false, address, dual) {
-			return false
+			if !binding.connectionReusable(connection) {
+				return false
+			}
 		}
 	}
 	return true
@@ -1936,9 +1950,15 @@ func (exclusiveTCPListenerBinding) available(state *tcpPassiveState, address net
 }
 
 // register adds one exclusive listener while Stack.mu is held.
-func (exclusiveTCPListenerBinding) register(state *tcpPassiveState, listener *TCPListener) error {
+func (binding exclusiveTCPListenerBinding) register(state *tcpPassiveState, listener *TCPListener) error {
+	listener.reuseAddress = binding.reuseAddress
 	state.exclusive[listener.key] = listener
 	return nil
+}
+
+// connectionReusable implements tcpListenerBinding.
+func (binding exclusiveTCPListenerBinding) connectionReusable(connection *TCPConn) bool {
+	return binding.reuseAddress && connection.reuseAddress
 }
 
 // empty reports whether the passive dispatcher has no listeners.
@@ -2610,6 +2630,7 @@ func (state *tcpPassiveState) handleSYN(stack *Stack, packet ipPacket, segment t
 		initialSequence := stack.tcpInitialSequence(key, tcpSegmentEventTime(segment, time.Now(), time.Time{}, stack.timestampEpoch))
 		connection := newTCPConn(stack, listener.net, key, stack.mtuFor(packet.source))
 		connection.passive = true
+		connection.reuseAddress, connection.reusePort = listener.reuseAddress, listener.reusePort
 		connection.publishICMPSequenceRange(initialSequence, initialSequence+1)
 		if listener.trackHandshake(connection) {
 			listener.statefulHandshakes.Add(1)
@@ -2674,6 +2695,7 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 	}
 	connection := newTCPConn(stack, listener.net, key, stack.mtuFor(key.remote.Addr()))
 	connection.passive = true
+	connection.reuseAddress, connection.reusePort = listener.reuseAddress, listener.reusePort
 	connection.publishICMPSequenceRange(initialSequence+1, initialSequence+1)
 	connection.peerMSS = options.mss
 	connection.peerWindowScale = options.windowScale

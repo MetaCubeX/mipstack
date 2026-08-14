@@ -318,9 +318,10 @@ func TestUDPBatchWrite(t *testing.T) {
 			t.Fatalf("batch result %d = %+v", index, messages[index])
 		}
 	}
-	if n, err = connection.WriteBatch(messages[:1], MessageDontWait); n != 0 || !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("unsupported WriteBatch flags = %d, %v", n, err)
+	if n, err = connection.WriteBatch(messages[:1], MessageDontWait); n != 1 || err != nil {
+		t.Fatalf("nonblocking WriteBatch = %d, %v", n, err)
 	}
+	_ = readOutboundPacket(t, stack)
 	prefix := []Message{messages[0], {Buffers: nil, Addr: messages[1].Addr, N: 91, NN: 92, Flags: 93}}
 	if n, err = connection.WriteBatch(prefix, 0); n != 1 || err != nil {
 		t.Fatalf("partial WriteBatch = %d, %v", n, err)
@@ -347,6 +348,40 @@ func TestUDPBatchWrite(t *testing.T) {
 	connectedMessage[0].Addr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5352))
 	if n, err = connected.WriteBatch(connectedMessage, 0); n != 0 || !errors.Is(err, net.ErrWriteToConnected) {
 		t.Fatalf("addressed connected WriteBatch = %d, %v", n, err)
+	}
+}
+
+func TestUDPNonblockingFragmentedWriteIsAtomic(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.237")
+	remote := netip.MustParseAddrPort("198.51.100.237:5353")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 600})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	packetConnection, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(local, 5341))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := packetConnection.(*UDPConn)
+	defer connection.Close()
+
+	dummy := buildIPPacket(local, remote.Addr(), protocolUDP, make([]byte, udpHeaderSize), 1, false)
+	for stack.outbound.len() < outboundPacketQueue-1 {
+		if !stack.outbound.tryEnqueue(dummy) {
+			t.Fatal("outbound queue filled before the expected boundary")
+		}
+	}
+	before := stack.outbound.len()
+	message := []Message{{Buffers: [][]byte{bytes.Repeat([]byte{0x71}, 1200)}, Addr: net.UDPAddrFromAddrPort(remote)}}
+	if count, writeErr := connection.WriteBatch(message, MessageDontWait); count != 0 || !errors.Is(writeErr, syscall.EAGAIN) {
+		t.Fatalf("nonblocking fragmented write = %d, %v", count, writeErr)
+	}
+	if after := stack.outbound.len(); after != before {
+		t.Fatalf("failed fragmented write changed queue depth from %d to %d", before, after)
 	}
 }
 
@@ -590,7 +625,7 @@ func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
 					stack.outbound.release(entry)
 				}
 			}
-			if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, sourceFragmentation{allow: true}, 1280); err != nil {
+			if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, sourceFragmentation{allow: true}, 1280, false); err != nil {
 				b.Fatal(err)
 			}
 			drain()
@@ -598,7 +633,7 @@ func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
-				if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, sourceFragmentation{allow: true}, 1280); err != nil {
+				if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, sourceFragmentation{allow: true}, 1280, false); err != nil {
 					b.Fatal(err)
 				}
 				drain()

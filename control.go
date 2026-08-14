@@ -20,10 +20,14 @@ const (
 	linuxIPTimeToLive = 2
 	// linuxIPPacketInfo is Linux IP_PKTINFO.
 	linuxIPPacketInfo = 8
+	// linuxIPReceiveError is Linux IP_RECVERR.
+	linuxIPReceiveError = 11
 	// linuxLevelIPv6 is Linux IPPROTO_IPV6.
 	linuxLevelIPv6 = 41
 	// linuxIPv6FlowInfo is Linux IPV6_FLOWINFO.
 	linuxIPv6FlowInfo = 11
+	// linuxIPv6ReceiveError is Linux IPV6_RECVERR.
+	linuxIPv6ReceiveError = 25
 	// linuxIPv6PacketInfo is Linux IPV6_PKTINFO.
 	linuxIPv6PacketInfo = 50
 	// linuxIPv6HopLimit is Linux IPV6_HOPLIMIT.
@@ -31,6 +35,123 @@ const (
 	// linuxIPv6TrafficClass is Linux IPV6_TCLASS.
 	linuxIPv6TrafficClass = 67
 )
+
+// SocketErrorOrigin identifies the Linux sock_extended_err producer encoded
+// in a SocketErrorControlMessage.
+type SocketErrorOrigin uint8
+
+const (
+	// SocketErrorOriginNone is Linux SO_EE_ORIGIN_NONE.
+	SocketErrorOriginNone SocketErrorOrigin = iota
+	// SocketErrorOriginLocal is Linux SO_EE_ORIGIN_LOCAL.
+	SocketErrorOriginLocal
+	// SocketErrorOriginICMP is Linux SO_EE_ORIGIN_ICMP.
+	SocketErrorOriginICMP
+	// SocketErrorOriginICMP6 is Linux SO_EE_ORIGIN_ICMP6.
+	SocketErrorOriginICMP6
+	// SocketErrorOriginTXStatus is Linux SO_EE_ORIGIN_TXSTATUS.
+	SocketErrorOriginTXStatus
+	// SocketErrorOriginZeroCopy is Linux SO_EE_ORIGIN_ZEROCOPY.
+	SocketErrorOriginZeroCopy
+	// SocketErrorOriginTXTime is Linux SO_EE_ORIGIN_TXTIME.
+	SocketErrorOriginTXTime
+)
+
+// SocketErrorControlMessage is the structured form of one Linux
+// sock_extended_err ancillary record returned by MessageErrorQueue reads.
+type SocketErrorControlMessage struct {
+	// Errno is the Linux errno number associated with the failed operation.
+	Errno uint32
+	// Origin identifies the subsystem that generated the error.
+	Origin SocketErrorOrigin
+	// Type and Code retain the ICMP or ICMPv6 classification.
+	Type uint8
+	// Code is the ICMP or ICMPv6 subtype associated with Type.
+	Code uint8
+	// Info contains the discovered MTU or parameter-problem pointer when the
+	// ICMP type defines one.
+	Info uint32
+	// Data is the protocol-specific sock_extended_err data field.
+	Data uint32
+	// Offender is the router or destination that reported the failure.
+	Offender netip.Addr
+}
+
+// Parse replaces message with the one error record found in control. Other
+// well-formed ancillary records are ignored so packet metadata may coexist in
+// the same OOB buffer.
+func (message *SocketErrorControlMessage) Parse(control []byte) error {
+	if message == nil {
+		return errors.New("mipstack: nil socket-error control-message receiver")
+	}
+	var parsed SocketErrorControlMessage
+	found := false
+	for len(control) != 0 {
+		if len(control) < linuxControlHeaderSize {
+			return errors.New("mipstack: truncated Linux control header")
+		}
+		length64 := binary.LittleEndian.Uint64(control[:8])
+		if length64 < linuxControlHeaderSize || length64 > uint64(len(control)) {
+			return errors.New("mipstack: invalid Linux control length")
+		}
+		length := int(length64)
+		level := binary.LittleEndian.Uint32(control[8:12])
+		kind := binary.LittleEndian.Uint32(control[12:16])
+		if level == linuxLevelIP && kind == linuxIPReceiveError || level == linuxLevelIPv6 && kind == linuxIPv6ReceiveError {
+			if found {
+				return errors.New("mipstack: duplicate socket-error control message")
+			}
+			value, err := parseSocketErrorControl(level == linuxLevelIPv6, control[linuxControlHeaderSize:length])
+			if err != nil {
+				return err
+			}
+			parsed, found = value, true
+		}
+		aligned := (length + linuxControlAlignment - 1) &^ (linuxControlAlignment - 1)
+		if aligned > len(control) {
+			if length == len(control) {
+				control = nil
+				break
+			}
+			return errors.New("mipstack: truncated Linux control padding")
+		}
+		control = control[aligned:]
+	}
+	if !found {
+		return errors.New("mipstack: socket-error control message not found")
+	}
+	*message = parsed
+	return nil
+}
+
+// parseSocketErrorControl decodes sock_extended_err followed by its offender
+// sockaddr using MIPS's fixed Linux 64-bit little-endian ancillary layout.
+func parseSocketErrorControl(v6 bool, data []byte) (SocketErrorControlMessage, error) {
+	want := 32
+	if v6 {
+		want = 44
+	}
+	if len(data) != want {
+		return SocketErrorControlMessage{}, errors.New("mipstack: invalid socket-error control message")
+	}
+	message := SocketErrorControlMessage{
+		Errno: binary.LittleEndian.Uint32(data[:4]), Origin: SocketErrorOrigin(data[4]),
+		Type: data[5], Code: data[6], Info: binary.LittleEndian.Uint32(data[8:12]), Data: binary.LittleEndian.Uint32(data[12:16]),
+	}
+	family := binary.LittleEndian.Uint16(data[16:18])
+	if v6 {
+		if family != 10 {
+			return SocketErrorControlMessage{}, errors.New("mipstack: invalid IPv6 socket-error offender")
+		}
+		message.Offender = netip.AddrFrom16([16]byte(data[24:40]))
+	} else {
+		if family != 2 {
+			return SocketErrorControlMessage{}, errors.New("mipstack: invalid IPv4 socket-error offender")
+		}
+		message.Offender = netip.AddrFrom4([4]byte(data[20:24]))
+	}
+	return message, nil
+}
 
 // IPv4ControlMessage represents per-packet IPv4 metadata carried by
 // UDPConn.ReadMsgUDP, UDPConn.WriteMsgUDP, IPConn.ReadMsgIP, and
@@ -315,6 +436,72 @@ func appendLinuxControlInt32(control []byte, level, kind uint32, value int32) []
 	var data [4]byte
 	binary.LittleEndian.PutUint32(data[:], uint32(value))
 	return appendLinuxControl(control, level, kind, data[:])
+}
+
+// socketErrorControlForRead encodes one queued ICMP error as Linux
+// sock_extended_err followed by the reporting address.
+func socketErrorControlForRead(err error) ([]byte, error) {
+	var networkError ICMPError
+	if !errors.As(err, &networkError) || !networkError.Reporter.IsValid() {
+		return nil, errors.New("mipstack: asynchronous error has no ICMP metadata")
+	}
+	v6 := networkError.Reporter.Is6()
+	size := 32
+	level, kind := uint32(linuxLevelIP), uint32(linuxIPReceiveError)
+	origin := SocketErrorOriginICMP
+	if v6 {
+		size, level, kind, origin = 44, linuxLevelIPv6, linuxIPv6ReceiveError, SocketErrorOriginICMP6
+	}
+	data := make([]byte, size)
+	binary.LittleEndian.PutUint32(data[:4], linuxICMPErrno(networkError))
+	data[4], data[5], data[6] = byte(origin), networkError.Type, networkError.Code
+	info := networkError.MTU
+	if info == 0 {
+		info = networkError.Pointer
+	}
+	binary.LittleEndian.PutUint32(data[8:12], info)
+	if v6 {
+		binary.LittleEndian.PutUint16(data[16:18], 10)
+		address := networkError.Reporter.As16()
+		copy(data[24:40], address[:])
+	} else {
+		binary.LittleEndian.PutUint16(data[16:18], 2)
+		address := networkError.Reporter.As4()
+		copy(data[20:24], address[:])
+	}
+	return appendLinuxControl(nil, level, kind, data), nil
+}
+
+// linuxICMPErrno applies the errno mappings used by Linux ICMP error handlers.
+func linuxICMPErrno(networkError ICMPError) uint32 {
+	if networkError.Reporter.Is4() {
+		switch networkError.Type {
+		case 3:
+			values := [...]uint32{101, 113, 92, 111, 90, 95, 101, 112, 64, 101, 113, 101, 113, 113, 113, 113}
+			if int(networkError.Code) < len(values) {
+				return values[networkError.Code]
+			}
+		case 11:
+			return 113
+		case 12:
+			return 71
+		}
+		return 71
+	}
+	switch networkError.Type {
+	case 1:
+		values := [...]uint32{101, 13, 113, 113, 111, 13, 13}
+		if int(networkError.Code) < len(values) {
+			return values[networkError.Code]
+		}
+	case 2:
+		return 90
+	case 3:
+		return 113
+	case 4:
+		return 71
+	}
+	return 71
 }
 
 // parseControlMessageForWrite decodes send metadata through the public control

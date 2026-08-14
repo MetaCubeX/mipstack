@@ -102,9 +102,9 @@ type UDPInfo struct {
 	LastError error
 }
 
-// udpReuseEndpoints is the optional REUSEPORT dispatcher retained by Stack.
-// The concrete registry is linked only when its public listen entry point is
-// referenced.
+// udpReuseEndpoints is the optional reusable-binding dispatcher retained by
+// Stack. The concrete registry is linked only when a public listen operation
+// requests address or port reuse.
 type udpReuseEndpoints interface {
 	// empty reports whether the registry contains no sockets.
 	empty() bool
@@ -116,14 +116,14 @@ type udpReuseEndpoints interface {
 	overlaps(address netip.Addr, port uint16, dual bool) bool
 	// connection selects a socket for one local and remote endpoint pair.
 	connection(binding, local, remote netip.AddrPort) *UDPConn
-	// add registers a socket in its reuse-port group.
+	// add registers a socket in its reusable binding group.
 	add(connection *UDPConn)
 	// remove unregisters a socket and reports whether it was present.
 	remove(connection *UDPConn) bool
 }
 
-// udpSocketBinding supplies the registration policy shared by ListenUDP and
-// ListenUDPReusePort.
+// udpSocketBinding supplies the registration policy shared by ordinary and
+// reusable ListenConfig sockets.
 type udpSocketBinding interface {
 	// available reports whether the requested socket binding can be registered.
 	available(stack *Stack, address netip.Addr, port uint16, dual bool) bool
@@ -134,6 +134,11 @@ type udpSocketBinding interface {
 // exclusiveUDPSocketBinding is the default one-owner bind policy.
 type exclusiveUDPSocketBinding struct{}
 
+// reuseAddressUDPSocketBinding permits overlap only with other SO_REUSEADDR-
+// style sockets. Unicast delivery selects the most recently registered exact
+// or wildcard binding, matching Linux UDP binding precedence.
+type reuseAddressUDPSocketBinding struct{}
+
 // UDPConn is a connected or unconnected userspace UDP socket.
 type UDPConn struct {
 	stack *Stack
@@ -143,9 +148,11 @@ type UDPConn struct {
 	dual  bool
 	// forwarded authorizes this socket's intercepted nonlocal address as an
 	// explicit output source while promiscuous admission remains enabled.
-	forwarded bool
-	local     netip.Addr
-	remote    netip.AddrPort
+	forwarded    bool
+	reuseAddress bool
+	reusePort    bool
+	local        netip.Addr
+	remote       netip.AddrPort
 
 	closed chan struct{}
 	once   sync.Once
@@ -188,6 +195,10 @@ type udpWriteParameters struct {
 	nonUnicast       bool
 }
 
+// udpDatagramWriter emits one prepared datagram under a per-call queue wait
+// policy.
+type udpDatagramWriter func(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast, dontWait bool) error
+
 // newUDPConn creates an unregistered UDP socket.
 func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.Addr, remote netip.AddrPort) *UDPConn {
 	defaults := DatagramSocketDefaults{ReceiveBuffer: udpDefaultReceiveCapacity, HopLimit: 64, MulticastHopLimit: 1}
@@ -220,6 +231,18 @@ func (exclusiveUDPSocketBinding) available(stack *Stack, address netip.Addr, por
 func (exclusiveUDPSocketBinding) register(stack *Stack, connection *UDPConn) error {
 	stack.udp[udpKey{address: connection.local, port: connection.port}] = connection
 	return nil
+}
+
+// available accepts an exact group with matching dual-stack behavior. The
+// shared listen core separately rejects overlap with every exclusive socket.
+func (reuseAddressUDPSocketBinding) available(stack *Stack, address netip.Addr, port uint16, dual bool) bool {
+	return reusableUDPBindingAvailable(stack, address, port, dual, true, false)
+}
+
+// register adds one SO_REUSEADDR-style UDP socket to the shared registry.
+func (reuseAddressUDPSocketBinding) register(stack *Stack, connection *UDPConn) error {
+	connection.reuseAddress = true
+	return registerReusableUDP(stack, connection)
 }
 
 // handleUDP validates and dispatches one unicast, broadcast, or multicast UDP
@@ -653,12 +676,15 @@ func (c *UDPConn) readMsgUDPAddrPort(buffer, oob []byte) (n, oobn, flags int, so
 // and deadline semantics; after it succeeds, the method drains only messages
 // already queued. MessageDontWait also makes the first read nonblocking.
 func (c *UDPConn) ReadBatch(messages []Message, flags int) (int, error) {
-	if flags&^MessageDontWait != 0 {
+	if flags&^(MessagePeek|MessageDontWait|MessageTruncated|MessageErrorQueue) != 0 {
 		return 0, c.operationError("read", c.remoteAddr(), syscall.EOPNOTSUPP)
+	}
+	if flags&MessageErrorQueue != 0 {
+		return c.readErrorBatch(messages, flags)
 	}
 	for index := range messages {
 		wait := index == 0 && flags&MessageDontWait == 0
-		err := c.readBatchMessage(&messages[index], wait, index == 0)
+		err := c.readBatchMessage(&messages[index], flags, wait, index == 0)
 		if err != nil {
 			// recvmmsg reports a completed prefix without the error that stopped
 			// the next message. A retry starting at index exposes that error.
@@ -674,11 +700,11 @@ func (c *UDPConn) ReadBatch(messages []Message, flags int) (int, error) {
 // readBatchMessage receives one scatter/gather message without waiting when
 // wait is false. consumeErrors is false after a successful prefix so an
 // asynchronous error remains available to the next socket operation.
-func (c *UDPConn) readBatchMessage(message *Message, wait, consumeErrors bool) error {
+func (c *UDPConn) readBatchMessage(message *Message, flags int, wait, consumeErrors bool) error {
 	if _, err := messageBufferLength(message.Buffers); err != nil {
 		return c.operationError("read", c.remoteAddr(), err)
 	}
-	n, source, target, options, truncated, err := c.readDatagramBuffers(message.Buffers, wait, consumeErrors)
+	n, source, target, options, truncated, err := c.readDatagramBuffers(message.Buffers, wait, consumeErrors, flags&MessagePeek != 0, flags&MessageTruncated != 0)
 	if err != nil {
 		return c.operationError("read", c.remoteAddr(), err)
 	}
@@ -686,15 +712,15 @@ func (c *UDPConn) readBatchMessage(message *Message, wait, consumeErrors bool) e
 	if err != nil {
 		return c.operationError("read", c.remoteAddr(), err)
 	}
-	flags := 0
+	resultFlags := 0
 	if truncated {
-		flags |= MessageTruncated
+		resultFlags |= MessageTruncated
 	}
 	oobn := copy(message.OOB, control)
 	if oobn < len(control) {
-		flags |= MessageControlTruncated
+		resultFlags |= MessageControlTruncated
 	}
-	message.N, message.NN, message.Flags = n, oobn, flags
+	message.N, message.NN, message.Flags = n, oobn, resultFlags
 	if source.IsValid() {
 		message.Addr = net.UDPAddrFromAddrPort(source)
 	} else {
@@ -715,13 +741,6 @@ func (c *UDPConn) Read(buffer []byte) (int, error) {
 // readDatagram returns one datagram without adding the public net.OpError
 // wrapper. truncated reports that the payload did not fit in buffer.
 func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, target netip.Addr, options ipPacketOptions, truncated bool, err error) {
-	return c.readDatagramBuffers([][]byte{buffer}, true, true)
-}
-
-// readDatagramBuffers is the scatter/gather and nonblocking form used by
-// ReadBatch. It returns EAGAIN without consuming state when wait is false and
-// neither a datagram nor an ordinary-read error is ready.
-func (c *UDPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors bool) (n int, source netip.AddrPort, target netip.Addr, options ipPacketOptions, truncated bool, err error) {
 	for {
 		c.mu.Lock()
 		select {
@@ -737,11 +756,12 @@ func (c *UDPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors bool
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
 		default:
 		}
-		if datagram, ok := c.receive.pop(); ok {
+		datagram, ok := c.receive.pop()
+		if ok {
 			c.queuedBytes -= udpDatagramSize(datagram.payload)
 			c.notifyReceiveLocked()
 			c.mu.Unlock()
-			n = copyMessagePayload(buffers, datagram.payload)
+			n = copy(buffer, datagram.payload)
 			if cap(datagram.payload) != 0 && cap(datagram.payload) <= datagramReusablePayloadLimit {
 				c.mu.Lock()
 				select {
@@ -755,8 +775,83 @@ func (c *UDPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors bool
 			}
 			return n, datagram.source, datagram.target, datagram.options, n < len(datagram.payload), nil
 		}
+		if !c.receiveErrors {
+			queued, queuedOK := c.errorQueue.pop()
+			if queuedOK {
+				c.errorQueuedBytes -= queued.size
+				c.notifyReceiveLocked()
+				c.mu.Unlock()
+				return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, queued.err
+			}
+		}
+		notified := c.receiveNotify
+		c.mu.Unlock()
+		select {
+		case <-notified:
+		case <-timeout:
+			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
+		case <-c.closed:
+			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, net.ErrClosed
+		}
+	}
+}
+
+// readDatagramBuffers is the scatter/gather and nonblocking form used by
+// ReadBatch. It returns EAGAIN without consuming state when wait is false and
+// neither a datagram nor an ordinary-read error is ready.
+func (c *UDPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, peek, returnLength bool) (n int, source netip.AddrPort, target netip.Addr, options ipPacketOptions, truncated bool, err error) {
+	for {
+		c.mu.Lock()
+		select {
+		case <-c.closed:
+			c.mu.Unlock()
+			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, net.ErrClosed
+		default:
+		}
+		timeout := c.readDeadline.wait()
+		select {
+		case <-timeout:
+			c.mu.Unlock()
+			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
+		default:
+		}
+		var datagram udpDatagram
+		var ok bool
+		if peek {
+			datagram, ok = c.receive.peek()
+		} else {
+			datagram, ok = c.receive.pop()
+		}
+		if ok {
+			if !peek {
+				c.queuedBytes -= udpDatagramSize(datagram.payload)
+				c.notifyReceiveLocked()
+			}
+			n = copyMessagePayload(buffers, datagram.payload)
+			truncated = n < len(datagram.payload)
+			if truncated && returnLength {
+				n = len(datagram.payload)
+			}
+			c.mu.Unlock()
+			if !peek && cap(datagram.payload) != 0 && cap(datagram.payload) <= datagramReusablePayloadLimit {
+				c.mu.Lock()
+				select {
+				case <-c.closed:
+				default:
+					if cap(datagram.payload) > cap(c.receiveSpare) {
+						c.receiveSpare = datagram.payload[:0]
+					}
+				}
+				c.mu.Unlock()
+			}
+			return n, datagram.source, datagram.target, datagram.options, truncated, nil
+		}
 		if !c.receiveErrors && consumeErrors {
-			if queued, ok := c.errorQueue.pop(); ok {
+			var queued queuedSocketError
+			queued, ok = c.errorQueue.pop()
+			if ok {
+				// Linux MSG_PEEK preserves queued datagrams but consumes a pending
+				// socket error returned by the ordinary receive path.
 				c.errorQueuedBytes -= queued.size
 				c.notifyReceiveLocked()
 				c.mu.Unlock()
@@ -777,6 +872,44 @@ func (c *UDPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors bool
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, net.ErrClosed
 		}
 	}
+}
+
+// readErrorBatch consumes a prefix of the asynchronous error queue. Linux
+// MSG_ERRQUEUE is nonblocking regardless of socket deadlines or MSG_DONTWAIT.
+func (c *UDPConn) readErrorBatch(messages []Message, flags int) (int, error) {
+	for index := range messages {
+		c.mu.Lock()
+		select {
+		case <-c.closed:
+			c.mu.Unlock()
+			if index != 0 {
+				return index, nil
+			}
+			return 0, c.operationError("read", c.remoteAddr(), net.ErrClosed)
+		default:
+		}
+		size, ok, err := readSocketErrorMessage(&c.errorQueue, &messages[index], flags)
+		if !ok {
+			c.mu.Unlock()
+			if index != 0 {
+				return index, nil
+			}
+			return 0, c.operationError("read", c.remoteAddr(), syscall.EAGAIN)
+		}
+		if err != nil {
+			c.mu.Unlock()
+			if index != 0 {
+				return index, nil
+			}
+			return 0, c.operationError("read", c.remoteAddr(), err)
+		}
+		if size != 0 {
+			c.errorQueuedBytes -= size
+			c.notifyReceiveLocked()
+		}
+		c.mu.Unlock()
+	}
+	return len(messages), nil
 }
 
 // WriteTo sends one datagram, fragmenting its IP payload when required.
@@ -864,7 +997,7 @@ func (c *UDPConn) WritePathMTUProbe(payload []byte) (int, error) {
 	if c.remote.Addr().IsMulticast() || c.stack.network.Load().broadcastDestination(c.remote.Addr()) {
 		return 0, c.operationError("write", c.remoteAddr(), syscall.EOPNOTSUPP)
 	}
-	n, err := c.writeToFromWith(payload, c.remote, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram)
+	n, err := c.writeToFromWith(payload, c.remote, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram, false)
 	if err != nil {
 		return n, c.operationError("write", c.remoteAddr(), err)
 	}
@@ -879,7 +1012,7 @@ func (c *UDPConn) WritePathMTUProbeTo(payload []byte, target netip.AddrPort) (in
 	if target.Addr().IsMulticast() || c.stack.network.Load().broadcastDestination(target.Addr()) {
 		return 0, c.operationError("write", net.UDPAddrFromAddrPort(target), syscall.EOPNOTSUPP)
 	}
-	n, err := c.writeToFromWith(payload, target, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram)
+	n, err := c.writeToFromWith(payload, target, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbeDatagram, false)
 	if err != nil {
 		return n, c.operationError("write", net.UDPAddrFromAddrPort(target), err)
 	}
@@ -954,15 +1087,15 @@ func (c *UDPConn) WriteMsgUDPAddrPort(payload, oob []byte, address netip.AddrPor
 }
 
 // WriteBatch writes a prefix of UDP messages using scatter/gather payloads.
-// Flags other than zero are unsupported because packet-queue backpressure and
-// deadlines are expressed by the socket rather than an operating-system fd.
+// MessageDontWait bypasses packet-queue waiting; other flags are unsupported.
 func (c *UDPConn) WriteBatch(messages []Message, flags int) (int, error) {
-	if flags != 0 {
+	if flags&^MessageDontWait != 0 {
 		return 0, c.operationError("write", c.remoteAddr(), syscall.EOPNOTSUPP)
 	}
+	dontWait := flags&MessageDontWait != 0
 	for index := range messages {
 		message := &messages[index]
-		n, oobn, err := c.writeBatchMessage(message)
+		n, oobn, err := c.writeBatchMessage(message, dontWait)
 		if err != nil {
 			// sendmmsg reports a completed prefix without the error that stopped
 			// the next message. A retry starting at index exposes that error.
@@ -978,7 +1111,7 @@ func (c *UDPConn) WriteBatch(messages []Message, flags int) (int, error) {
 
 // writeBatchMessage validates one destination and sends a scatter/gather
 // payload through the ordinary ancillary-data and output policy.
-func (c *UDPConn) writeBatchMessage(message *Message) (int, int, error) {
+func (c *UDPConn) writeBatchMessage(message *Message, dontWait bool) (int, int, error) {
 	var target netip.AddrPort
 	var address net.Addr
 	if c.remote.IsValid() {
@@ -1011,11 +1144,18 @@ func (c *UDPConn) writeBatchMessage(message *Message) (int, int, error) {
 		return 0, 0, c.operationError("write", address, syscall.EMSGSIZE)
 	}
 	if len(message.Buffers) == 1 {
-		n, oobn, err := c.writeMsgUDPAddrPort(message.Buffers[0], message.OOB, validated)
-		if err != nil {
-			return n, oobn, c.operationError("write", address, err)
+		if err = (socketWriteState{deadline: &c.writeDeadline, closed: c.closed}).err(); err != nil {
+			return 0, 0, c.operationError("write", address, err)
 		}
-		return n, oobn, nil
+		source, options, parseErr := parseControlMessageForWrite(message.OOB, validated.Addr().Is6())
+		if parseErr != nil {
+			return 0, 0, c.operationError("write", address, parseErr)
+		}
+		n, err := c.writeToFromWith(message.Buffers[0], validated, source, options, c.writeDatagram, dontWait)
+		if err != nil {
+			return n, 0, c.operationError("write", address, err)
+		}
+		return n, len(message.OOB), nil
 	}
 	if err = (socketWriteState{deadline: &c.writeDeadline, closed: c.closed}).err(); err != nil {
 		return 0, 0, c.operationError("write", address, err)
@@ -1024,7 +1164,7 @@ func (c *UDPConn) writeBatchMessage(message *Message) (int, int, error) {
 	if err != nil {
 		return 0, 0, c.operationError("write", address, err)
 	}
-	n, err := c.writeBuffersToFrom(message.Buffers, payloadSize, validated, source, options)
+	n, err := c.writeBuffersToFrom(message.Buffers, payloadSize, validated, source, options, dontWait)
 	if err != nil {
 		return n, 0, c.operationError("write", address, err)
 	}
@@ -1063,7 +1203,7 @@ func (c *UDPConn) writeTo(payload []byte, target netip.AddrPort) (int, error) {
 
 // writeToFrom sends one datagram with an optional packet-info source address.
 func (c *UDPConn) writeToFrom(payload []byte, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
-	return c.writeToFromWith(payload, target, packetInfoSource, options, c.writeDatagram)
+	return c.writeToFromWith(payload, target, packetInfoSource, options, c.writeDatagram, false)
 }
 
 // prepareWrite snapshots socket policy and selects the source for one output
@@ -1114,7 +1254,7 @@ func (c *UDPConn) prepareWrite(target netip.AddrPort, packetInfoSource netip.Add
 // writeToFromWith keeps source selection, checksums, deadlines, accounting,
 // and ICMP correlation shared while leaving optional output policies
 // independently reachable by the linker.
-func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions, write func(netip.Addr, netip.Addr, uint16, uint16, []byte, ipPacketOptions, PathMTUDiscovery, bool) error) (int, error) {
+func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions, write udpDatagramWriter, dontWait bool) (int, error) {
 	parameters, err := c.prepareWrite(target, packetInfoSource, options)
 	if err != nil {
 		return 0, err
@@ -1126,7 +1266,7 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetI
 	if len(payload) > maximumPayload {
 		return 0, syscall.EMSGSIZE
 	}
-	writeErr := write(parameters.source, parameters.target.Addr(), c.port, parameters.target.Port(), payload, parameters.options, parameters.pathMTUDiscovery, parameters.nonUnicast)
+	writeErr := write(parameters.source, parameters.target.Addr(), c.port, parameters.target.Port(), payload, parameters.options, parameters.pathMTUDiscovery, parameters.nonUnicast, dontWait)
 	if writeErr != nil {
 		if errors.Is(writeErr, syscall.EMSGSIZE) {
 			return 0, syscall.EMSGSIZE
@@ -1144,7 +1284,7 @@ func (c *UDPConn) writeToFromWith(payload []byte, target netip.AddrPort, packetI
 // writeBuffersToFrom sends one validated scatter/gather payload. The common
 // unicast, unfragmented case copies directly into queue-owned packet storage;
 // uncommon fragmentation and non-unicast cases retain the established path.
-func (c *UDPConn) writeBuffersToFrom(buffers [][]byte, payloadSize int, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
+func (c *UDPConn) writeBuffersToFrom(buffers [][]byte, payloadSize int, target netip.AddrPort, packetInfoSource netip.Addr, options ipPacketOptions, dontWait bool) (int, error) {
 	parameters, err := c.prepareWrite(target, packetInfoSource, options)
 	if err != nil {
 		return 0, err
@@ -1161,10 +1301,10 @@ func (c *UDPConn) writeBuffersToFrom(buffers [][]byte, payloadSize int, target n
 		if gatherErr != nil {
 			return 0, gatherErr
 		}
-		err = c.writeNonUnicastDatagram(parameters.source, parameters.target.Addr(), c.port, parameters.target.Port(), payload, parameters.options, parameters.pathMTUDiscovery)
+		err = c.writeNonUnicastDatagram(parameters.source, parameters.target.Addr(), c.port, parameters.target.Port(), payload, parameters.options, parameters.pathMTUDiscovery, dontWait)
 	} else {
 		mtu, fragmentation := c.stack.pathMTUOutputPolicy(parameters.target.Addr(), parameters.pathMTUDiscovery)
-		err = c.writeDatagramBuffersForMTU(parameters.source, parameters.target.Addr(), c.port, parameters.target.Port(), buffers, payloadSize, parameters.options, fragmentation, mtu)
+		err = c.writeDatagramBuffersForMTU(parameters.source, parameters.target.Addr(), c.port, parameters.target.Port(), buffers, payloadSize, parameters.options, fragmentation, mtu, dontWait)
 	}
 	if err != nil {
 		return 0, err
@@ -1179,12 +1319,12 @@ func (c *UDPConn) writeBuffersToFrom(buffers [][]byte, payloadSize int, target n
 
 // writeDatagram emits ordinary UDP output against the confirmed path MTU and
 // permits source fragmentation.
-func (c *UDPConn) writeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast bool) error {
+func (c *UDPConn) writeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast, dontWait bool) error {
 	if nonUnicast {
-		return c.writeNonUnicastDatagram(source, target, sourcePort, targetPort, payload, options, pathMTUDiscovery)
+		return c.writeNonUnicastDatagram(source, target, sourcePort, targetPort, payload, options, pathMTUDiscovery, dontWait)
 	}
 	mtu, fragmentation := c.stack.pathMTUOutputPolicy(target, pathMTUDiscovery)
-	return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, fragmentation, mtu)
+	return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, fragmentation, mtu, dontWait)
 }
 
 // tryWriteUDPDatagram atomically queues one best-effort UDP datagram or all of
@@ -1206,14 +1346,14 @@ func (s *Stack) tryWriteUDPDatagram(source, target netip.Addr, sourcePort, targe
 
 // writePathMTUProbeDatagram is retained only when an application references
 // the UDP packetization-layer probing API.
-func (c *UDPConn) writePathMTUProbeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, _ PathMTUDiscovery, _ bool) error {
-	return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, sourceFragmentation{dontFragment: true}, c.stack.network.Load().mtu)
+func (c *UDPConn) writePathMTUProbeDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, _ PathMTUDiscovery, _, dontWait bool) error {
+	return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, sourceFragmentation{dontFragment: true}, c.stack.network.Load().mtu, dontWait)
 }
 
 // writeDatagramForMTU serializes the common unfragmented case directly into
 // its final IP packet. Only datagrams that actually require source
 // fragmentation need a separate contiguous UDP segment.
-func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, fragmentation sourceFragmentation, mtu int) error {
+func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, fragmentation sourceFragmentation, mtu int, dontWait bool) error {
 	udpSize := udpHeaderSize + len(payload)
 	ipSize := ipHeaderSize(source, target, udpSize)
 	if ipSize == 0 {
@@ -1232,7 +1372,7 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 			identification = uint16(c.stack.ipv4ID.Add(1))
 		}
 		queue, loopback := c.stack.outputQueueFor(target)
-		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 		slot, err := c.stack.reservePacketUntil(queue, loopback, state)
 		if err != nil {
 			return err
@@ -1263,14 +1403,14 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 		value = 0xffff
 	}
 	binary.BigEndian.PutUint16(udpHeader[6:8], value)
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 	return c.stack.writeIPFragmentsUntilOptionsForMTU(source, target, protocolUDP, udpHeader[:], payload, options, mtu, state)
 }
 
 // writeDatagramBuffersForMTU is the allocation-free scatter/gather form of
 // writeDatagramForMTU for a fitting packet. Fragmentation falls back to one
 // contiguous payload because the fragment writer streams contiguous regions.
-func (c *UDPConn) writeDatagramBuffersForMTU(source, target netip.Addr, sourcePort, targetPort uint16, buffers [][]byte, payloadSize int, options ipPacketOptions, fragmentation sourceFragmentation, mtu int) error {
+func (c *UDPConn) writeDatagramBuffersForMTU(source, target netip.Addr, sourcePort, targetPort uint16, buffers [][]byte, payloadSize int, options ipPacketOptions, fragmentation sourceFragmentation, mtu int, dontWait bool) error {
 	udpSize := udpHeaderSize + payloadSize
 	ipSize := ipHeaderSize(source, target, udpSize)
 	if ipSize == 0 {
@@ -1284,7 +1424,7 @@ func (c *UDPConn) writeDatagramBuffersForMTU(source, target netip.Addr, sourcePo
 		if err != nil {
 			return err
 		}
-		return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, fragmentation, mtu)
+		return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, fragmentation, mtu, dontWait)
 	}
 	if source.Is6() && !options.flowLabelSet {
 		options.flowLabel = c.automaticLabel
@@ -1298,7 +1438,7 @@ func (c *UDPConn) writeDatagramBuffersForMTU(source, target netip.Addr, sourcePo
 		identification = uint16(c.stack.ipv4ID.Add(1))
 	}
 	queue, loopback := c.stack.outputQueueFor(target)
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed}
+	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 	slot, err := c.stack.reservePacketUntil(queue, loopback, state)
 	if err != nil {
 		return err
@@ -1406,7 +1546,12 @@ func (c *UDPConn) deliverError(target netip.AddrPort, err error) {
 		c.errorsDropped.Add(1)
 		return
 	}
-	c.errorQueue.push(queuedSocketError{err: operationError, size: size})
+	var payload []byte
+	var networkError ICMPError
+	if errors.As(err, &networkError) && len(networkError.QuotedPayload) >= udpHeaderSize {
+		payload = networkError.QuotedPayload[udpHeaderSize:]
+	}
+	c.errorQueue.push(queuedSocketError{err: operationError, payload: payload, size: size})
 	c.errorQueuedBytes += size
 	c.notifyReceiveLocked()
 	c.mu.Unlock()
