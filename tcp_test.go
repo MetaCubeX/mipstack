@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -4813,12 +4814,337 @@ func FuzzTCPOptions(f *testing.F) {
 	f.Add([]byte{2, 4, 0x05, 0xb4, 1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0}, uint32(100), uint32(200))
 	f.Add([]byte{5, 10, 0, 0, 0, 120, 0, 0, 0, 160}, uint32(100), uint32(200))
 	f.Fuzz(func(t *testing.T, options []byte, acknowledged, sendNext uint32) {
-		if len(options) > 256 {
-			options = options[:256]
+		if len(options) > 40 {
+			options = options[:40]
 		}
-		_, _, _, _, _, _ = parseTCPOptions(options, 536, 1360)
+		before := append([]byte(nil), options...)
+		window := sendNext % (tcpMaximumScaledWindow + 1)
+		sendNext = acknowledged + window
+		mss, scale, _, _, _, _ := parseTCPOptions(options, 536, 1360)
+		if mss < tcpMinimumPeerMSS || mss > 1360 {
+			t.Fatalf("parsed MSS %d is outside [%d, 1360]", mss, tcpMinimumPeerMSS)
+		}
+		if scale > 14 {
+			t.Fatalf("parsed window scale = %d, want <= 14", scale)
+		}
 		_, _, _ = parseTCPTimestamp(options)
-		_ = parseTCPSACKOptions(options, acknowledged, sendNext)
+		blocks := parseTCPSACKOptions(options, acknowledged, sendNext)
+		for index, block := range blocks {
+			leftDistance, rightDistance := block.left-acknowledged, block.right-acknowledged
+			if leftDistance >= rightDistance || rightDistance > window {
+				t.Fatalf("SACK block %d = [%#x,%#x) outside %#x-byte send window", index, block.left, block.right, window)
+			}
+			if index != 0 && blocks[index-1].right-acknowledged >= leftDistance {
+				t.Fatalf("SACK blocks %d and %d are unordered or unmerged", index-1, index)
+			}
+		}
+		if block, ok := parseTCPDSACKOption(options, acknowledged, sendNext, window); ok && !tcpSequenceLess(block.left, block.right) {
+			t.Fatalf("invalid DSACK block [%#x,%#x)", block.left, block.right)
+		}
+		if !bytes.Equal(options, before) {
+			t.Fatal("TCP option parsing modified its input")
+		}
+	})
+}
+
+// FuzzTCPSACKScoreboard verifies sender-side SACK splitting and marking keep
+// sequence ranges byte-exact, bounded, and internally consistent.
+func FuzzTCPSACKScoreboard(f *testing.F) {
+	f.Add([]byte{0, 0, 10, 0, 0, 20, 40, 1}, uint32(100), uint16(256), uint16(64))
+	f.Add([]byte{0, 1, 1, 0, 0, 2, 1, 0}, uint32(0xfffffff0), uint16(96), uint16(32))
+	f.Add([]byte(nil), uint32(0xfffffff0), uint16(4095), uint16(0))
+	f.Fuzz(func(t *testing.T, events []byte, base uint32, totalValue, segmentValue uint16) {
+		if len(events) > 128 {
+			events = events[:128]
+		}
+		total := int(totalValue%4096) + 1
+		segmentSize := int(segmentValue%512) + 1
+		epoch := time.Unix(300, 0)
+		outstanding := make([]sentTCPSegment, 0, (total+segmentSize-1)/segmentSize)
+		for start := 0; start < total; start += segmentSize {
+			end := start + segmentSize
+			if end > total {
+				end = total
+			}
+			flags := byte(tcpFlagACK)
+			if end == total {
+				flags |= tcpFlagPSH
+			}
+			outstanding = append(outstanding, sentTCPSegment{
+				sequence:  base + uint32(start),
+				end:       base + uint32(end),
+				flags:     flags,
+				state:     sentTCPSegmentTransmitted,
+				timestamp: uint32(start),
+				hostQueue: testPacketQueueTicketAt(epoch, epoch.Add(time.Duration(start)*time.Microsecond)),
+				delivery:  tcpDeliverySnapshot{deliveredStamp: tcpDeliveryTimestamp(start + 1), deliveredFlags: uint32(start)},
+			})
+		}
+		check := func() {
+			var totalBytes, sackedBytes uint32
+			sackedRanges := 0
+			for index, segment := range outstanding {
+				start := segment.sequence - base
+				end := segment.end - base
+				if start >= end || end > uint32(total) {
+					t.Fatalf("segment %d outside send window: [%#x,%#x) base %#x total %d", index, segment.sequence, segment.end, base, total)
+				}
+				if index != 0 && outstanding[index-1].end != segment.sequence {
+					t.Fatalf("segments %d and %d are not contiguous: %#x != %#x", index-1, index, outstanding[index-1].end, segment.sequence)
+				}
+				size := segment.end - segment.sequence
+				totalBytes += size
+				if segment.state.has(sentTCPSegmentSACKed) {
+					sackedRanges++
+					sackedBytes += size
+				}
+			}
+			if totalBytes != uint32(total) {
+				t.Fatalf("scoreboard covers %d bytes, want %d", totalBytes, total)
+			}
+			if ranges, bytes := tcpSACKedState(outstanding); ranges != sackedRanges || bytes != sackedBytes {
+				t.Fatalf("SACK aggregate = %d/%d, want %d/%d", ranges, bytes, sackedRanges, sackedBytes)
+			}
+			splitRanges := 0
+			for index := range outstanding {
+				if outstanding[index].state.has(sentTCPSegmentSACKSplit) {
+					splitRanges++
+				}
+			}
+			if splitRanges > tcpMaximumSACKSplitRanges {
+				t.Fatalf("SACK-created ranges = %d, limit %d", splitRanges, tcpMaximumSACKSplitRanges)
+			}
+		}
+		check()
+		for offset := 0; offset+4 <= len(events); offset += 4 {
+			left := int(binary.BigEndian.Uint16(events[offset:offset+2])) % total
+			width := int(events[offset+2])%(total-left) + 1
+			right := left + width
+			if events[offset+3]&1 != 0 && right-left > 1 {
+				left++
+			}
+			block := tcpSACKBlock{left: base + uint32(left), right: base + uint32(right)}
+			var highest uint32
+			var present, fresh bool
+			var newlySACKed []sentTCPSegment
+			outstanding, highest, present, fresh, _, newlySACKed = applyTCPSACK(outstanding, []tcpSACKBlock{block}, epoch)
+			if !present || highest != block.right {
+				t.Fatalf("SACK apply metadata = present %t highest %#x, want true/%#x", present, highest, block.right)
+			}
+			if fresh != (len(newlySACKed) != 0) {
+				t.Fatalf("fresh SACK metadata = %t with %d newly SACKed ranges", fresh, len(newlySACKed))
+			}
+			for _, segment := range newlySACKed {
+				if segment.sequence-base < uint32(left) || segment.end-base > uint32(right) || !segment.state.has(sentTCPSegmentTransmitted) {
+					t.Fatalf("newly SACKed range [%#x,%#x) outside block [%#x,%#x)", segment.sequence, segment.end, block.left, block.right)
+				}
+			}
+			check()
+		}
+	})
+}
+
+// FuzzTCPOutOfOrderRanges verifies receive scoreboard accounting, ordering,
+// overlap removal, FIN placement, and sequence-number wraparound.
+func FuzzTCPOutOfOrderRanges(f *testing.F) {
+	f.Add([]byte{0, 4, 8, 1, 0, 0, 0, 8, 2, 0, 0, 8, 8, 3, 1}, uint32(100), uint16(64))
+	f.Add([]byte{0, 16, 16, 4, 0, 0, 0, 32, 5, 1, 0, 8, 32, 6, 0}, uint32(0xfffffff0), uint16(128))
+	f.Fuzz(func(t *testing.T, events []byte, receiveNext uint32, capacityValue uint16) {
+		if len(events) > 320 {
+			events = events[:320]
+		}
+		capacity := int(capacityValue)
+		if capacity == 0 {
+			capacity = 1
+		}
+		connection := &TCPConn{receiveCapacity: capacity}
+		var pieces []tcpReceivedPiece
+		outOfOrderBytes := 0
+		check := func() {
+			bytes := 0
+			previousEnd := uint32(0)
+			finCount := 0
+			for index, piece := range pieces {
+				start := piece.sequence - receiveNext
+				end := start + uint32(len(piece.payload))
+				if len(piece.payload) == 0 && !piece.fin {
+					t.Fatalf("empty non-FIN receive piece at %d", index)
+				}
+				if end > uint32(capacity) || index != 0 && start < previousEnd {
+					t.Fatalf("receive piece %d = [%d,%d) outside or overlapping a %d-byte window", index, start, end, capacity)
+				}
+				if piece.fin {
+					finCount++
+					if index != len(pieces)-1 {
+						t.Fatalf("FIN appears before receive piece %d", index+1)
+					}
+				}
+				previousEnd = end
+				bytes += len(piece.payload)
+			}
+			if finCount > 1 || len(pieces) > tcpMaximumOutOfOrder || bytes != outOfOrderBytes || bytes > capacity {
+				t.Fatalf("receive scoreboard = %d FINs, %d pieces, %d/%d bytes", finCount, len(pieces), bytes, outOfOrderBytes)
+			}
+			if got := connection.outOfOrderUnread.Load(); got != int64(outOfOrderBytes) {
+				t.Fatalf("published out-of-order bytes = %d, want %d", got, outOfOrderBytes)
+			}
+		}
+		for offset := 0; offset+5 <= len(events); offset += 5 {
+			distance := uint32(binary.BigEndian.Uint16(events[offset : offset+2]))
+			length := int(events[offset+2] & 63)
+			payload := make([]byte, length)
+			for index := range payload {
+				payload[index] = events[offset+3] + byte(index)
+			}
+			connection.storeTCPOutOfOrder(
+				receiveNext, uint32(capacity), receiveNext+distance, payload, payload,
+				events[offset+4]&1 != 0, &pieces, &outOfOrderBytes,
+			)
+			check()
+		}
+		normalized := normalizeTCPReceivedPieces(receiveNext, append([]tcpReceivedPiece(nil), pieces...))
+		if len(normalized) != len(pieces) {
+			t.Fatalf("normalizing an existing scoreboard changed its length from %d to %d", len(pieces), len(normalized))
+		}
+		for index := range pieces {
+			if normalized[index].sequence != pieces[index].sequence || normalized[index].fin != pieces[index].fin || !bytes.Equal(normalized[index].payload, pieces[index].payload) {
+				t.Fatalf("normalizing an existing scoreboard changed piece %d", index)
+			}
+		}
+	})
+}
+
+// FuzzTCPEstablishedSegmentSequence drives checksum-valid peer segments
+// through a live established connection and verifies bounded actor ownership.
+func FuzzTCPEstablishedSegmentSequence(f *testing.F) {
+	f.Add([]byte{0, 0, 1, 0xff, 0xff, 4, 0, 'a', 0, 0, 1, 0xff, 0xff, 4, 1, 'b'}, false)
+	f.Add([]byte{4, 0, 1, 0x40, 0, 6, 2, 'c', 0, 0, 3, 0x20, 0, 0, 0, 0}, true)
+	f.Add([]byte{0, 0, 4, 0xff, 0xff, 0, 0, 0}, false)
+	f.Fuzz(func(t *testing.T, events []byte, ipv6 bool) {
+		if len(events) > 128 {
+			events = events[:128]
+		}
+		local := netip.MustParseAddr("192.0.2.250")
+		remote := netip.MustParseAddr("198.51.100.250")
+		if ipv6 {
+			local = netip.MustParseAddr("2001:db8::250")
+			remote = netip.MustParseAddr("2001:db8:1::250")
+		}
+		link, stack := newTestStack(t, local, remote)
+		link.echoTCP = true
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		netConnection, err := stack.DialTCP(ctx, "tcp", netip.AddrPort{}, netip.AddrPortFrom(remote, 8080))
+		if err != nil {
+			t.Fatal(err)
+		}
+		connection := netConnection.(*TCPConn)
+
+		link.mu.Lock()
+		peer := link.tcp[connection.key.local.Port()]
+		if peer == nil {
+			link.mu.Unlock()
+			t.Fatal("emulated peer did not retain the established connection")
+		}
+		remoteNext, localNext := peer.serverNext, peer.clientNext
+		link.mu.Unlock()
+
+		for offset := 0; offset+8 <= len(events); offset += 8 {
+			event := events[offset : offset+8]
+			sequence := remoteNext + uint32(int32(int8(event[0])))
+			acknowledgement := localNext + uint32(int32(int8(event[1])))
+			switch event[6] >> 6 {
+			case 1:
+				sequence = uint32(event[0])
+			case 2:
+				sequence = ^uint32(event[0])
+			case 3:
+				acknowledgement = ^uint32(event[1])
+			}
+			flags := byte(tcpFlagACK)
+			if event[2]&1 != 0 {
+				flags |= tcpFlagPSH
+			}
+			if event[2]&2 != 0 {
+				flags |= tcpFlagFIN
+			}
+			if event[2]&4 != 0 {
+				flags |= tcpFlagRST
+			}
+			if event[2]&8 != 0 {
+				flags |= tcpFlagSYN
+			}
+			if event[2]&16 != 0 {
+				flags |= tcpFlagECE
+			}
+			if event[2]&32 != 0 {
+				flags |= tcpFlagCWR
+			}
+			if event[2]&64 != 0 {
+				flags |= 0x20
+			}
+			if event[2]&128 != 0 {
+				flags &^= tcpFlagACK
+			}
+			window := binary.BigEndian.Uint16(event[3:5])
+			payload := bytes.Repeat(event[7:8], int(event[5]&15))
+			var options []byte
+			switch event[6] & 3 {
+			case 1:
+				options = tcpTimestampOptions(uint32(event[7])<<24|uint32(event[0]), uint32(event[1]))
+			case 2:
+				options = make([]byte, 12)
+				options[0], options[1], options[2], options[3] = 1, 1, 5, 10
+				left := localNext + uint32(int32(int8(event[0])))
+				right := left + 1 + uint32(event[7]&15)
+				binary.BigEndian.PutUint32(options[4:8], left)
+				binary.BigEndian.PutUint32(options[8:12], right)
+			case 3:
+				options = append([]byte(nil), event[4:8]...)
+			}
+			packet := buildTestTCP(remote, local, 8080, connection.key.local.Port(), sequence, acknowledgement, flags, window, options, payload)
+			if event[6]&0x10 != 0 {
+				setPacketECN(packet, 3)
+			}
+			if err = writeTestPacket(stack, packet); err != nil {
+				t.Fatal(err)
+			}
+			if sequence == remoteNext && acknowledgement == localNext && flags&tcpFlagACK != 0 && flags&(tcpFlagSYN|tcpFlagRST) == 0 {
+				remoteNext += uint32(len(payload))
+				if flags&tcpFlagFIN != 0 {
+					remoteNext++
+				}
+			}
+			if flags&tcpFlagRST != 0 {
+				break
+			}
+		}
+
+		deadline := time.Now().Add(time.Second)
+		for connection.inbound.len() != 0 && time.Now().Before(deadline) {
+			runtime.Gosched()
+		}
+		if queued := connection.inbound.len(); queued != 0 {
+			t.Fatalf("established connection retained %d actor segments after drain deadline", queued)
+		}
+		if retained := connection.inbound.retainedBytes(); retained < 0 || retained > tcpInboundByteCapacity {
+			t.Fatalf("established input retained %d bytes, capacity %d", retained, tcpInboundByteCapacity)
+		}
+		info := connection.Info()
+		if info.InboundQueueBytes < 0 || info.InboundQueueBytes > int64(info.InboundQueueCapacity) || info.InboundQueuePeak > int64(info.InboundQueueCapacity) {
+			t.Fatalf("established input queue diagnostics = %+v", info)
+		}
+		if err = stack.Close(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-connection.done:
+		case <-time.After(time.Second):
+			t.Fatal("established connection did not stop with its stack")
+		}
+		if connection.inbound.len() != 0 || connection.inbound.retainedBytes() != 0 {
+			t.Fatalf("closed established connection retained %d segments and %d bytes", connection.inbound.len(), connection.inbound.retainedBytes())
+		}
 	})
 }
 

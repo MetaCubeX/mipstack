@@ -107,6 +107,87 @@ func TestQuotedIPv6FirstFragmentIgnoresReservedBits(t *testing.T) {
 	}
 }
 
+// FuzzICMPErrorQuotes verifies truncated quoted-packet parsing, family
+// validation, suffix ownership, and independent queued-error cloning.
+func FuzzICMPErrorQuotes(f *testing.F) {
+	source4 := netip.MustParseAddr("192.0.2.1")
+	target4 := netip.MustParseAddr("198.51.100.1")
+	source6 := netip.MustParseAddr("2001:db8::1")
+	target6 := netip.MustParseAddr("2001:db8:1::1")
+	quoted4 := buildIPPacket(source4, target4, protocolUDP, make([]byte, udpHeaderSize), 1, true)
+	quoted6 := buildIPPacket(source6, target6, protocolTCP, make([]byte, tcpHeaderSize), 0, true)
+	fragment := make([]byte, 8+udpHeaderSize)
+	fragment[0] = protocolUDP
+	binary.BigEndian.PutUint16(fragment[2:4], 1)
+	quotedFragment6 := buildIPPacket(source6, target6, 44, fragment, 0, false)
+	authentication := make([]byte, 12+udpHeaderSize)
+	authentication[0], authentication[1] = protocolUDP, 1
+	quotedAuthentication6 := buildIPPacket(source6, target6, 51, authentication, 0, false)
+	f.Add([]byte(nil), false, byte(3), byte(1))
+	f.Add(quoted4, false, byte(3), byte(4))
+	f.Add(quoted6, true, byte(1), byte(0))
+	f.Add(quotedFragment6, true, byte(2), byte(0))
+	f.Add(quotedAuthentication6, true, byte(4), byte(1))
+	f.Add(buildTestIPv6Extension(source6, target6, 60, []byte{protocolUDP, 4, 0, 0, 0, 0, 0, 0}), true, byte(3), byte(0))
+	f.Fuzz(func(t *testing.T, quote []byte, ipv6 bool, messageType, code byte) {
+		if len(quote) > 65575 {
+			quote = quote[:65575]
+		}
+		before := append([]byte(nil), quote...)
+		_, _, _, _, _ = quotedIPPayload(quote)
+		_ = legacyIPv4PathMTU(quote)
+		_ = packetInvokesICMPError(quote)
+		message := make([]byte, 8+len(quote))
+		message[0], message[1] = messageType, code
+		copy(message[8:], quote)
+		protocol := byte(protocolICMPv4)
+		reporter := netip.MustParseAddr("203.0.113.1")
+		if ipv6 {
+			protocol = protocolICMPv6
+			reporter = netip.MustParseAddr("2001:db8:ffff::1")
+		}
+		networkError, ok := parseICMPError(ipPacket{source: reporter, protocol: protocol, payload: message})
+		if !bytes.Equal(quote, before) {
+			t.Fatal("ICMP quote parsing modified its input")
+		}
+		if !ok {
+			return
+		}
+		if !validICMPErrorCode(protocol, messageType, code) {
+			t.Fatalf("accepted invalid ICMP type/code %d/%d for protocol %d", messageType, code, protocol)
+		}
+		if networkError.Reporter != reporter || networkError.QuotedSource.Is6() != ipv6 || networkError.QuotedTarget.Is6() != ipv6 ||
+			!networkError.QuotedSource.IsValid() || !networkError.QuotedTarget.IsValid() {
+			t.Fatalf("invalid parsed ICMP endpoints: reporter %v, quote %v -> %v", networkError.Reporter, networkError.QuotedSource, networkError.QuotedTarget)
+		}
+		if !bytes.Equal(networkError.QuotedPacket, quote) {
+			t.Fatal("parsed ICMP quote differs from its input")
+		}
+		if len(networkError.QuotedPayload) > len(networkError.QuotedPacket) ||
+			!bytes.Equal(networkError.QuotedPayload, networkError.QuotedPacket[len(networkError.QuotedPacket)-len(networkError.QuotedPayload):]) {
+			t.Fatal("parsed ICMP payload is not a quoted-packet suffix")
+		}
+		cloned := cloneICMPError(networkError)
+		clonedPacket := append([]byte(nil), cloned.QuotedPacket...)
+		clonedPayload := append([]byte(nil), cloned.QuotedPayload...)
+		if len(cloned.QuotedPayload) != 0 {
+			offset := len(cloned.QuotedPacket) - len(cloned.QuotedPayload)
+			if &cloned.QuotedPayload[0] != &cloned.QuotedPacket[offset] {
+				t.Fatal("cloned ICMP payload does not retain its packet-suffix relationship")
+			}
+		}
+		if len(networkError.QuotedPacket) != 0 {
+			networkError.QuotedPacket[0] ^= 0xff
+		}
+		if len(networkError.QuotedPayload) != 0 {
+			networkError.QuotedPayload[0] ^= 0xff
+		}
+		if !bytes.Equal(cloned.QuotedPacket, clonedPacket) || !bytes.Equal(cloned.QuotedPayload, clonedPayload) {
+			t.Fatal("cloned ICMP error retained caller-owned storage")
+		}
+	})
+}
+
 // TestTCPICMPSequenceCorrelation verifies inclusive transmitted ranges,
 // rejection of stale quotations, and modulo-2^32 sequence arithmetic.
 func TestTCPICMPSequenceCorrelation(t *testing.T) {

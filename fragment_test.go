@@ -1107,8 +1107,75 @@ func FuzzFragmentParsing(f *testing.F) {
 	f.Add(fragments[0])
 	f.Add(fragments6[0])
 	f.Fuzz(func(t *testing.T, packet []byte) {
-		_, _ = parseFragment(packet)
+		if len(packet) > 65575 {
+			packet = packet[:65575]
+		}
+		before := append([]byte(nil), packet...)
+		fragment, ok := parseFragment(packet)
+		if !bytes.Equal(packet, before) {
+			t.Fatal("parseFragment modified its input")
+		}
+		if !ok {
+			return
+		}
+		if len(fragment.original) == 0 || len(fragment.original) > len(packet) || !bytes.Equal(fragment.original, packet[:len(fragment.original)]) {
+			t.Fatalf("fragment original length %d is not an input prefix of %d bytes", len(fragment.original), len(packet))
+		}
+		if !fragment.key.source.IsValid() || !fragment.key.target.IsValid() || fragment.key.source.Is4() != fragment.key.target.Is4() {
+			t.Fatalf("fragment address families are invalid: %v -> %v", fragment.key.source, fragment.key.target)
+		}
+		if fragment.parameter {
+			if fragment.parameterAt >= uint32(len(fragment.original)) {
+				t.Fatalf("fragment parameter pointer %d is outside %d-byte packet", fragment.parameterAt, len(fragment.original))
+			}
+			return
+		}
+		if fragment.offset < 0 || fragment.offset&7 != 0 || fragment.maximum < 0 || len(fragment.payload) > fragment.maximum {
+			t.Fatalf("invalid fragment bounds: offset %d payload %d maximum %d", fragment.offset, len(fragment.payload), fragment.maximum)
+		}
+		if len(fragment.header) == 0 || len(fragment.header) > len(fragment.original) || !bytes.Equal(fragment.header, fragment.original[:len(fragment.header)]) {
+			t.Fatalf("fragment header length %d is not an original-packet prefix", len(fragment.header))
+		}
+		if fragment.nextHeader < 0 || fragment.nextHeader >= len(fragment.header) {
+			t.Fatalf("next-header offset %d is outside %d-byte header", fragment.nextHeader, len(fragment.header))
+		}
+		if len(fragment.payload) > len(fragment.original) || !bytes.Equal(fragment.payload, fragment.original[len(fragment.original)-len(fragment.payload):]) {
+			t.Fatalf("fragment payload length %d is not an original-packet suffix", len(fragment.payload))
+		}
 	})
+}
+
+// checkFragmentFuzzResources verifies bounded reassembly storage and exact
+// retained-byte accounting after each fuzzed fragment.
+func checkFragmentFuzzResources(t testing.TB, stack *Stack) {
+	t.Helper()
+	stack.fragmentMu.Lock()
+	defer stack.fragmentMu.Unlock()
+	if len(stack.fragments) > fragmentMaximumSets || stack.fragmentBytes < 0 || stack.fragmentBytes > fragmentMaximumBytes {
+		t.Fatalf("fragment resources = %d sets, %d bytes", len(stack.fragments), stack.fragmentBytes)
+	}
+	retainedBytes := 0
+	for _, set := range stack.fragments {
+		if len(set.pieces) > fragmentMaximumPieces || set.bytes < 0 {
+			t.Fatalf("fragment set resources = %d pieces, %d bytes", len(set.pieces), set.bytes)
+		}
+		payloadBytes := 0
+		previousEnd := 0
+		for index, piece := range set.pieces {
+			if len(piece.data) == 0 || piece.offset < 0 || index != 0 && piece.offset < previousEnd {
+				t.Fatalf("invalid retained fragment piece at %d: offset %d length %d after %d", index, piece.offset, len(piece.data), previousEnd)
+			}
+			previousEnd = piece.offset + len(piece.data)
+			payloadBytes += len(piece.data)
+		}
+		if payloadBytes > set.bytes {
+			t.Fatalf("fragment set retained %d payload bytes but accounts for %d", payloadBytes, set.bytes)
+		}
+		retainedBytes += set.bytes
+	}
+	if retainedBytes != stack.fragmentBytes {
+		t.Fatalf("fragment byte accounting = %d, want %d", stack.fragmentBytes, retainedBytes)
+	}
 }
 
 // FuzzFragmentReassemblyOrder exercises duplicate, missing, and reordered
@@ -1133,6 +1200,7 @@ func FuzzFragmentReassemblyOrder(f *testing.F) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer stack.Close()
 		payload := make([]byte, 3000)
 		for index := range payload {
 			payload[index] = byte(index*31 + 7)
@@ -1146,6 +1214,7 @@ func FuzzFragmentReassemblyOrder(f *testing.F) {
 		now := time.Unix(100, 0)
 		for _, selected := range order {
 			packet := stack.reassemblePacket(fragments[int(selected)%len(fragments)], now)
+			checkFragmentFuzzResources(t, stack)
 			if packet == nil {
 				continue
 			}
@@ -1153,6 +1222,189 @@ func FuzzFragmentReassemblyOrder(f *testing.F) {
 			if !ok || parsed.protocol != protocolUDP || !bytes.Equal(parsed.payload, payload) {
 				t.Fatalf("reassembled fuzz datagram = protocol %d payload %d parsed %t", parsed.protocol, len(parsed.payload), ok)
 			}
+		}
+	})
+}
+
+// FuzzFragmentReassemblyOverlap varies offsets and payload bytes to exercise
+// duplicate acceptance, RFC 5722 overlap rejection, and resource accounting.
+func FuzzFragmentReassemblyOverlap(f *testing.F) {
+	f.Add([]byte{0, 0, 1, 0, 1, 1, 1, 1}, false)
+	f.Add([]byte{1, 0, 1, 7, 0, 1, 1, 9}, true)
+	f.Add([]byte{
+		0, 0, 1, 0,
+		1, 1, 1, 0,
+		2, 2, 1, 0,
+		3, 3, 1, 0,
+		4, 4, 1, 0,
+		5, 5, 1, 0,
+		0, 6, 0, 0,
+	}, false)
+	f.Fuzz(func(t *testing.T, events []byte, ipv6 bool) {
+		if len(events) > 160 {
+			events = events[:160]
+		}
+		local := netip.MustParseAddr("192.0.2.34")
+		remote := netip.MustParseAddr("198.51.100.34")
+		bits := 32
+		payload := make([]byte, 48)
+		for index := range payload {
+			payload[index] = byte(index*17 + 5)
+		}
+		var fragments [][]byte
+		if ipv6 {
+			local = netip.MustParseAddr("2001:db8::34")
+			remote = netip.MustParseAddr("2001:db8:1::34")
+			bits = 128
+			fragments = buildIPv6FragmentsWithOptions(remote, local, protocolUDP, payload, 56, 78, ipPacketOptions{})
+		} else {
+			fragments = buildIPv4Fragments(remote, local, protocolUDP, payload, 28, 78)
+		}
+		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, bits)}, MTU: 1280})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stack.Close()
+		now := time.Unix(200, 0)
+		maximumEnd := 0
+		for offset := 0; offset+4 <= len(events); offset += 4 {
+			packet := append([]byte(nil), fragments[int(events[offset])%len(fragments)]...)
+			fragment, ok := parseFragment(packet)
+			if !ok || len(fragment.payload) == 0 {
+				t.Fatal("generated base fragment is not parseable")
+			}
+			payloadOffset := len(fragment.original) - len(fragment.payload)
+			packet[payloadOffset] ^= events[offset+3]
+			fragmentOffset := int(events[offset+1]&7) * 8
+			if end := fragmentOffset + len(fragment.payload); end > maximumEnd {
+				maximumEnd = end
+			}
+			more := events[offset+2]&1 != 0
+			if events[offset+2]&2 != 0 {
+				more = false
+			}
+			if ipv6 {
+				field := uint16(fragmentOffset &^ 7)
+				if more {
+					field |= 1
+				}
+				binary.BigEndian.PutUint16(packet[42:44], field)
+			} else {
+				field := uint16(fragmentOffset / 8)
+				if more {
+					field |= 0x2000
+				}
+				binary.BigEndian.PutUint16(packet[6:8], field)
+				packet[10], packet[11] = 0, 0
+				binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:20]))
+			}
+			reassembled := stack.reassemblePacket(packet, now)
+			checkFragmentFuzzResources(t, stack)
+			if reassembled == nil {
+				continue
+			}
+			parsed, valid := parseIPPacket(reassembled)
+			if !valid || parsed.protocol != protocolUDP || len(parsed.payload) > maximumEnd {
+				t.Fatalf("overlap reassembly produced invalid packet: parsed=%t protocol=%d payload=%d", valid, parsed.protocol, len(parsed.payload))
+			}
+		}
+	})
+}
+
+// FuzzIPPayloadFragmentationRoundTrip verifies that source fragmentation and
+// inbound reassembly are inverse operations across packet-size boundaries.
+func FuzzIPPayloadFragmentationRoundTrip(f *testing.F) {
+	f.Add([]byte("short"), false, uint16(1500), byte(protocolUDP), byte(64), byte(0), uint32(0), false)
+	f.Add(make([]byte, 1500), false, uint16(68), byte(protocolTCP), byte(1), byte(0xff), uint32(0), true)
+	f.Add(make([]byte, 3000), true, uint16(1280), byte(99), byte(255), byte(0x2e), uint32(0xabcde), true)
+	f.Fuzz(func(t *testing.T, payload []byte, ipv6 bool, mtuSeed uint16, protocol, hopLimit, trafficClass byte, flowLabel uint32, reverse bool) {
+		if len(payload) > 4096 {
+			payload = payload[:4096]
+		}
+		original := append([]byte(nil), payload...)
+		source := netip.MustParseAddr("198.51.100.35")
+		target := netip.MustParseAddr("192.0.2.35")
+		mtu := 68 + int(mtuSeed)%1433
+		if ipv6 {
+			source = netip.MustParseAddr("2001:db8:1::35")
+			target = netip.MustParseAddr("2001:db8::35")
+			mtu = ipv6MinimumMTU + int(mtuSeed)%(1501-ipv6MinimumMTU)
+			protocols := [...]byte{protocolTCP, protocolUDP, protocolICMPv6, 253, 254}
+			protocol = protocols[int(protocol)%len(protocols)]
+		} else {
+			protocols := [...]byte{protocolTCP, protocolUDP, protocolICMPv4, 253, 254}
+			protocol = protocols[int(protocol)%len(protocols)]
+		}
+		stack, err := New(Config{
+			LocalAddresses: []netip.Prefix{netip.PrefixFrom(target, target.BitLen())},
+			MTU:            1500,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stack.Close()
+		if hopLimit == 0 {
+			hopLimit = 1
+		}
+		options := ipPacketOptions{
+			hopLimit: hopLimit, trafficClass: trafficClass, flowLabel: flowLabel & ipv6MaximumFlowLabel,
+			hopLimitSet: true, trafficClassSet: true, flowLabelSet: true,
+		}
+		packets, err := stack.ipPayloadPacketsForMTU(
+			source, target, protocol, payload, sourceFragmentation{allow: true}, options, mtu,
+		)
+		if err != nil {
+			t.Fatalf("fragmentation of %d-byte payload at MTU %d: %v", len(payload), mtu, err)
+		}
+		if len(packets) == 0 {
+			t.Fatal("fragmentation returned no packets")
+		}
+		if !bytes.Equal(payload, original) {
+			t.Fatal("fragmentation modified caller payload")
+		}
+		for index, packet := range packets {
+			if len(packet) > mtu {
+				t.Fatalf("fragment %d has %d bytes, want at most MTU %d", index, len(packet), mtu)
+			}
+			if len(packets) > 1 {
+				if _, ok := parseFragment(packet); !ok {
+					t.Fatalf("generated fragment %d is not parseable", index)
+				}
+			}
+		}
+
+		var completed []byte
+		if len(packets) == 1 {
+			completed = packets[0]
+		} else {
+			now := time.Unix(300, 0)
+			for step := range packets {
+				index := step
+				if reverse {
+					index = len(packets) - 1 - step
+				}
+				packet := stack.reassemblePacket(packets[index], now)
+				if step != len(packets)-1 && packet != nil {
+					t.Fatalf("reassembly completed after %d of %d fragments", step+1, len(packets))
+				}
+				if packet != nil {
+					completed = packet
+				}
+			}
+			checkFragmentFuzzResources(t, stack)
+		}
+		parsed, ok := parseIPPacket(completed)
+		if !ok || parsed.parameterError {
+			t.Fatalf("fragmentation round trip produced an invalid packet: parsed=%t metadata=%+v", ok, parsed)
+		}
+		if parsed.source != source || parsed.target != target || parsed.protocol != protocol || !bytes.Equal(parsed.payload, payload) {
+			t.Fatalf("fragmentation round trip = %s -> %s protocol %d payload %d", parsed.source, parsed.target, parsed.protocol, len(parsed.payload))
+		}
+		if parsed.hopLimit != hopLimit || parsed.trafficClass != trafficClass {
+			t.Fatalf("fragmentation changed hop limit/traffic class to %d/%#x, want %d/%#x", parsed.hopLimit, parsed.trafficClass, hopLimit, trafficClass)
+		}
+		if ipv6 && parsed.flowLabel != options.flowLabel {
+			t.Fatalf("fragmentation changed flow label to %#x, want %#x", parsed.flowLabel, options.flowLabel)
 		}
 	})
 }

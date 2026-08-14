@@ -939,6 +939,90 @@ func TestIPConnIPv6ChecksumHeaderIncludedOwnership(t *testing.T) {
 	}
 }
 
+// FuzzIPHeaderIncludedPreparation verifies the Linux IP_HDRINCL mutations,
+// result ownership, and family validation for arbitrary complete packets.
+func FuzzIPHeaderIncludedPreparation(f *testing.F) {
+	v4Source := netip.MustParseAddr("192.0.2.154")
+	v4Target := netip.MustParseAddr("198.51.100.154")
+	v6Source := netip.MustParseAddr("2001:db8::154")
+	v6Target := netip.MustParseAddr("2001:db8:1::154")
+	v4 := buildIPPacket(v4Source, v4Target, 99, []byte("IPv4"), 1, false)
+	v4[2], v4[3], v4[4], v4[5], v4[10], v4[11] = 0, 1, 0, 0, 0xaa, 0xbb
+	v4ZeroSource := append([]byte(nil), v4...)
+	copy(v4ZeroSource[12:16], []byte{0, 0, 0, 0})
+	v6 := buildIPPacket(v6Source, v6Target, 99, []byte("IPv6"), 0, false)
+	f.Add([]byte(nil), false)
+	f.Add(v4, false)
+	f.Add(v4ZeroSource, false)
+	f.Add(v6, true)
+	f.Add(v4, true)
+	f.Fuzz(func(t *testing.T, input []byte, routeIPv6 bool) {
+		if len(input) > 65575 {
+			input = input[:65575]
+		}
+		original := append([]byte(nil), input...)
+		selectedSource, routeTarget := v4Source, v4Target
+		bits := 32
+		if routeIPv6 {
+			selectedSource, routeTarget = v6Source, v6Target
+			bits = 128
+		}
+		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(selectedSource, bits)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stack.Close()
+		connection := IPConn{stack: stack}
+		packet, packetTarget, hopLimit, err := connection.prepareHeaderIncludedPacket(input, selectedSource, routeTarget)
+		if !bytes.Equal(input, original) {
+			t.Fatal("header-included preparation modified caller storage")
+		}
+		if err != nil {
+			return
+		}
+		expectedVersion := byte(4)
+		if routeIPv6 {
+			expectedVersion = 6
+		}
+		if len(packet) != len(input) || packet[0]>>4 != expectedVersion {
+			t.Fatalf("accepted header-included packet has version/length %d/%d", packet[0]>>4, len(packet))
+		}
+		if routeIPv6 {
+			if !bytes.Equal(packet, input) || packetTarget != netip.AddrFrom16([16]byte(packet[24:40])) || hopLimit != packet[7] {
+				t.Fatalf("IPv6 header-included result changed caller fields: target=%s hop=%d", packetTarget, hopLimit)
+			}
+		} else {
+			headerSize := int(packet[0]&0x0f) * 4
+			if headerSize < 20 || headerSize > len(packet) || binary.BigEndian.Uint16(packet[2:4]) != uint16(len(packet)) || checksum(packet[:headerSize]) != 0 {
+				t.Fatalf("IPv4 header-included result has invalid header: %x", packet)
+			}
+			if packetTarget != netip.AddrFrom4([4]byte(packet[16:20])) || hopLimit != packet[8] {
+				t.Fatalf("IPv4 header-included metadata = target %s hop %d", packetTarget, hopLimit)
+			}
+			if binary.BigEndian.Uint32(input[12:16]) == 0 {
+				if !bytes.Equal(packet[12:16], selectedSource.AsSlice()) {
+					t.Fatalf("IPv4 zero source repaired to %x, want %s", packet[12:16], selectedSource)
+				}
+			} else if !bytes.Equal(packet[12:16], input[12:16]) {
+				t.Fatal("IPv4 explicit source was changed")
+			}
+			expected := append([]byte(nil), input...)
+			copy(expected[2:6], packet[2:6])
+			copy(expected[10:12], packet[10:12])
+			copy(expected[12:16], packet[12:16])
+			if !bytes.Equal(packet, expected) {
+				t.Fatal("IPv4 header-included preparation changed a caller-owned field")
+			}
+		}
+		if len(packet) != 0 {
+			packet[0] ^= 0xff
+			if !bytes.Equal(input, original) {
+				t.Fatal("header-included result aliases caller storage")
+			}
+		}
+	})
+}
+
 func TestIPPathMTUProbing(t *testing.T) {
 	for _, test := range []struct {
 		name      string

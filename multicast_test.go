@@ -199,6 +199,209 @@ func buildMulticastTestMLDQuery(source, target, group netip.Addr, responseCode u
 	return packet
 }
 
+// FuzzMulticastQueryParsing keeps IGMPv3 and MLDv2 Query parsing inside
+// checksum-valid envelopes while varying group and source forms, trailing
+// data, and Router Alert presence.
+func FuzzMulticastQueryParsing(f *testing.F) {
+	network4, err := buildNetworkState(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/24")}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	network6, err := buildNetworkState(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("fe80::1/128")}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add([]byte{0, 0, 0, 0}, false, true)
+	f.Add([]byte{3, 1, 2, 0xff, 1, 2, 3}, false, false)
+	f.Add([]byte{2, 0, 1, 0xff, 4, 5}, true, true)
+	f.Fuzz(func(t *testing.T, data []byte, ipv6 bool, routerAlert bool) {
+		if len(data) > 96 {
+			data = data[:96]
+		}
+		sourceCount := 0
+		if len(data) != 0 {
+			sourceCount = int(data[0] & 15)
+		}
+		responseCode := byte(1)
+		if len(data) > 3 {
+			responseCode = data[3]
+		}
+		control := byte(0)
+		if len(data) > 4 {
+			control = data[4]
+		}
+		extra := 0
+		if len(data) > 5 {
+			extra = int(data[5] & 31)
+			if extra > len(data)-6 {
+				extra = len(data) - 6
+			}
+		}
+
+		if !ipv6 {
+			querier := netip.MustParseAddr("192.0.2.2")
+			allHosts := netip.MustParseAddr("224.0.0.1")
+			group := allHosts
+			if len(data) > 1 {
+				switch data[1] & 3 {
+				case 0:
+					group = netip.IPv4Unspecified()
+				case 2:
+					group = netip.MustParseAddr("192.0.2.99")
+				case 3:
+					group = netip.MustParseAddr("232.0.0.1")
+				}
+			}
+			target := group
+			if target.IsUnspecified() {
+				target = allHosts
+			}
+			if len(data) > 2 {
+				switch data[2] & 3 {
+				case 1:
+					target = netip.MustParseAddr("192.0.2.1")
+				case 2:
+					target = netip.MustParseAddr("198.51.100.1")
+				}
+			}
+			sources := make([]netip.Addr, sourceCount)
+			for index := range sources {
+				value := byte(index + 10)
+				if 6+index < len(data) {
+					value = data[6+index]
+				}
+				switch value & 3 {
+				case 0:
+					sources[index] = netip.AddrFrom4([4]byte{198, 51, 100, value})
+				case 1:
+					sources[index] = netip.IPv4Unspecified()
+				case 2:
+					sources[index] = netip.AddrFrom4([4]byte{224, 0, 0, value})
+				default:
+					sources[index] = netip.AddrFrom4([4]byte{192, 0, 2, 255})
+				}
+			}
+			packet := buildMulticastTestIGMPQuery(querier, target, group, responseCode, sources, routerAlert)
+			headerSize := int(packet[0]&0x0f) * 4
+			if extra != 0 {
+				packet = append(packet, data[6:6+extra]...)
+			}
+			if control&1 != 0 && len(packet)-headerSize >= 12 {
+				binary.BigEndian.PutUint16(packet[headerSize+10:headerSize+12], uint16(sourceCount+1))
+			}
+			binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+			if len(packet)-headerSize >= 4 {
+				packet[headerSize+2], packet[headerSize+3] = 0, 0
+				binary.BigEndian.PutUint16(packet[headerSize+2:headerSize+4], checksum(packet[headerSize:]))
+			}
+			packet[10], packet[11] = 0, 0
+			binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:headerSize]))
+			parsed, ok := parseIPPacket(packet)
+			if !ok {
+				t.Fatal("generated IGMP query has an invalid IPv4 envelope")
+			}
+			query, expected, valid := parseIGMPQuery(parsed, network4)
+			if !valid {
+				return
+			}
+			if query.v6 || query.version == 0 || query.version > 3 || !expected.Is4() || !expected.IsMulticast() {
+				t.Fatalf("valid IGMP query produced inconsistent metadata: query=%+v expected=%s", query, expected)
+			}
+			if len(query.sources) != 0 && query.group.IsUnspecified() {
+				t.Fatalf("source-specific IGMP query without a group: %+v", query)
+			}
+			for _, source := range query.sources {
+				if !validMulticastSourceAddress(network4, source, false) {
+					t.Fatalf("valid IGMP query retained invalid source %s", source)
+				}
+			}
+			return
+		}
+
+		querier := netip.MustParseAddr("fe80::2")
+		allNodes := netip.MustParseAddr("ff02::1")
+		group := allNodes
+		if len(data) > 1 {
+			switch data[1] & 3 {
+			case 0:
+				group = netip.IPv6Unspecified()
+			case 2:
+				group = netip.MustParseAddr("2001:db8::99")
+			case 3:
+				group = netip.MustParseAddr("ff3e::1")
+			}
+		}
+		target := group
+		if target.IsUnspecified() {
+			target = allNodes
+		}
+		if len(data) > 2 {
+			switch data[2] & 3 {
+			case 1:
+				target = netip.MustParseAddr("fe80::1")
+			case 2:
+				target = netip.MustParseAddr("2001:db8::1")
+			}
+		}
+		if control&2 != 0 {
+			querier = netip.MustParseAddr("2001:db8::2")
+		}
+		sources := make([]netip.Addr, sourceCount)
+		for index := range sources {
+			value := byte(index + 10)
+			if 6+index < len(data) {
+				value = data[6+index]
+			}
+			switch value & 3 {
+			case 0:
+				sources[index] = netip.MustParseAddr("2001:db8::100")
+			case 1:
+				sources[index] = netip.IPv6Unspecified()
+			case 2:
+				sources[index] = netip.MustParseAddr("ff02::1")
+			default:
+				sources[index] = netip.MustParseAddr("fe80::abcd")
+			}
+		}
+		packet := buildMulticastTestMLDQuery(querier, target, group, uint16(responseCode)<<8|uint16(responseCode), sources)
+		if !routerAlert {
+			copy(packet[42:46], []byte{1, 2, 0, 0})
+		}
+		if extra != 0 {
+			packet = append(packet, data[6:6+extra]...)
+		}
+		if control&1 != 0 && len(packet) >= 76 {
+			binary.BigEndian.PutUint16(packet[74:76], uint16(sourceCount+1))
+		}
+		binary.BigEndian.PutUint16(packet[4:6], uint16(len(packet)-40))
+		if len(packet) >= 52 {
+			packet[50], packet[51] = 0, 0
+			source := netip.AddrFrom16([16]byte(packet[8:24]))
+			target := netip.AddrFrom16([16]byte(packet[24:40]))
+			binary.BigEndian.PutUint16(packet[50:52], transportChecksum(source, target, protocolICMPv6, packet[48:]))
+		}
+		parsed, ok := parseIPPacket(packet)
+		if !ok {
+			t.Fatal("generated MLD query has an invalid IPv6 envelope")
+		}
+		query, expected, valid := parseMLDQuery(parsed, network6)
+		if !valid {
+			return
+		}
+		if !query.v6 || query.version == 0 || query.version > 2 || !expected.Is6() || !expected.IsMulticast() {
+			t.Fatalf("valid MLD query produced inconsistent metadata: query=%+v expected=%s", query, expected)
+		}
+		if len(query.sources) != 0 && query.group.IsUnspecified() {
+			t.Fatalf("source-specific MLD query without a group: %+v", query)
+		}
+		for _, source := range query.sources {
+			if !validMulticastSourceAddress(network6, source, true) {
+				t.Fatalf("valid MLD query retained invalid source %s", source)
+			}
+		}
+	})
+}
+
 func multicastTestReportRecords(t testing.TB, packet ipPacket) []multicastReportRecord {
 	t.Helper()
 	payload := packet.payload

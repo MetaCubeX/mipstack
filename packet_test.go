@@ -1,6 +1,7 @@
 package mipstack
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net/netip"
 	"testing"
@@ -81,6 +82,43 @@ func TestTransportChecksumPartsMatchesContiguousPayload(t *testing.T) {
 	}
 }
 
+// FuzzChecksumParts verifies the Internet checksum and both pseudo-header
+// variants across every odd or even split between adjacent payload regions.
+func FuzzChecksumParts(f *testing.F) {
+	f.Add([]byte(nil), uint16(0), false, byte(protocolUDP))
+	f.Add([]byte{1}, uint16(1), false, byte(protocolTCP))
+	f.Add([]byte{1, 2, 3, 4, 5}, uint16(3), true, byte(protocolICMPv6))
+	f.Fuzz(func(t *testing.T, payload []byte, splitAt uint16, ipv6 bool, protocol byte) {
+		if len(payload) > 65535 {
+			payload = payload[:65535]
+		}
+		if got, want := checksum(payload), referenceChecksum(payload); got != want {
+			t.Fatalf("checksum(%d bytes) = %#x, want %#x", len(payload), got, want)
+		}
+
+		source := netip.MustParseAddr("192.0.2.129")
+		target := netip.MustParseAddr("198.51.100.231")
+		if ipv6 {
+			source = netip.MustParseAddr("2001:db8:ffff:1::abcd")
+			target = netip.MustParseAddr("fdff:ffff:ffff:ffff::1234")
+		}
+		pseudoHeader := make([]byte, 0, 40+len(payload))
+		pseudoHeader = append(pseudoHeader, source.AsSlice()...)
+		pseudoHeader = append(pseudoHeader, target.AsSlice()...)
+		if ipv6 {
+			length := uint32(len(payload))
+			pseudoHeader = append(pseudoHeader, byte(length>>24), byte(length>>16), byte(length>>8), byte(length), 0, 0, 0, protocol)
+		} else {
+			pseudoHeader = append(pseudoHeader, 0, protocol, byte(len(payload)>>8), byte(len(payload)))
+		}
+		pseudoHeader = append(pseudoHeader, payload...)
+		split := int(splitAt) % (len(payload) + 1)
+		if got, want := transportChecksumParts(source, target, protocol, len(payload), payload[:split], payload[split:]), referenceChecksum(pseudoHeader); got != want {
+			t.Fatalf("transport checksum at split %d/%d = %#x, want %#x", split, len(payload), got, want)
+		}
+	})
+}
+
 func TestIPv6RouterAlertValidation(t *testing.T) {
 	valid := []byte{protocolICMPv6, 0, 5, 2, 0, 0, 1, 0}
 	if !ipv6RouterAlert(valid) {
@@ -150,6 +188,251 @@ func FuzzInboundPacket(f *testing.F) {
 		defer stack.Close()
 		_ = writeTestPacket(stack, packet)
 	})
+}
+
+// FuzzInboundChecksummedTransportPackets keeps transport validation past the
+// checksum gate for UDP, TCP, and ICMP packets with valid pseudo-headers.
+func FuzzInboundChecksummedTransportPackets(f *testing.F) {
+	f.Add([]byte("udp"), false, byte(0), uint16(49152), uint16(53), byte(0))
+	f.Add([]byte("tcp"), false, byte(1), uint16(49153), uint16(80), byte(tcpFlagSYN))
+	f.Add([]byte("icmp"), true, byte(2), uint16(1), uint16(2), byte(0))
+	f.Fuzz(func(t *testing.T, payload []byte, ipv6 bool, protocolSelector byte, sourcePort, targetPort uint16, flags byte) {
+		if len(payload) > 256 {
+			payload = payload[:256]
+		}
+		local := netip.MustParseAddr("192.0.2.1")
+		remote := netip.MustParseAddr("198.51.100.1")
+		if ipv6 {
+			local = netip.MustParseAddr("2001:db8::1")
+			remote = netip.MustParseAddr("2001:db8:1::1")
+		}
+		_, stack := newTestStack(t, local, remote)
+		defer stack.Close()
+
+		var packet []byte
+		switch protocolSelector % 3 {
+		case 0:
+			packet = buildTestUDP(remote, local, sourcePort, targetPort, payload)
+		case 1:
+			if flags == 0 {
+				flags = tcpFlagACK
+			}
+			options := []byte(nil)
+			if flags&tcpFlagSYN != 0 {
+				options = []byte{2, 4, 0x05, 0xb4, 4, 2}
+			}
+			packet = buildTestTCP(remote, local, sourcePort, targetPort, 1000, 2000, flags, 65535, options, payload)
+		default:
+			message := make([]byte, 8+len(payload))
+			if ipv6 {
+				message[0] = 128
+			} else {
+				message[0] = 8
+			}
+			binary.BigEndian.PutUint16(message[4:6], sourcePort)
+			binary.BigEndian.PutUint16(message[6:8], targetPort)
+			copy(message[8:], payload)
+			if ipv6 {
+				binary.BigEndian.PutUint16(message[2:4], transportChecksum(remote, local, protocolICMPv6, message))
+				packet = buildIPPacket(remote, local, protocolICMPv6, message, 1, true)
+			} else {
+				binary.BigEndian.PutUint16(message[2:4], checksum(message))
+				packet = buildIPPacket(remote, local, protocolICMPv4, message, 1, true)
+			}
+		}
+		if err := writeTestPacket(stack, packet); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// FuzzIPPacketParsing verifies deterministic parsing, input ownership, and
+// slice bounds for arbitrary IPv4 and IPv6 envelopes.
+func FuzzIPPacketParsing(f *testing.F) {
+	local4 := netip.MustParseAddr("192.0.2.1")
+	remote4 := netip.MustParseAddr("198.51.100.1")
+	local6 := netip.MustParseAddr("2001:db8::1")
+	remote6 := netip.MustParseAddr("2001:db8:1::1")
+	f.Add([]byte(nil))
+	f.Add(buildIPPacket(remote4, local4, protocolUDP, make([]byte, udpHeaderSize), 1, false))
+	f.Add(buildTestIPv4Options(remote4, local4, []byte{1, 1, 0, 0}))
+	f.Add(buildIPPacket(remote6, local6, protocolTCP, make([]byte, tcpHeaderSize), 0, true))
+	f.Add(buildTestIPv6Extension(remote6, local6, 60, []byte{protocolUDP, 0, 1, 0, 0, 0, 0, 0}))
+	f.Fuzz(func(t *testing.T, packet []byte) {
+		if len(packet) > 65575 {
+			packet = packet[:65575]
+		}
+		before := append([]byte(nil), packet...)
+		parsed, ok := parseIPPacket(packet)
+		if !bytes.Equal(packet, before) {
+			t.Fatal("parseIPPacket modified its input")
+		}
+		repeated, repeatedOK := parseIPPacket(packet)
+		if repeatedOK != ok {
+			t.Fatal("parseIPPacket returned a nondeterministic validity result")
+		}
+		if !ok {
+			return
+		}
+		if parsed.source != repeated.source || parsed.target != repeated.target || parsed.protocol != repeated.protocol ||
+			parsed.protocolOffset != repeated.protocolOffset || parsed.parameterError != repeated.parameterError ||
+			parsed.parameterCode != repeated.parameterCode || parsed.parameterAt != repeated.parameterAt ||
+			parsed.ecn != repeated.ecn || parsed.hopLimit != repeated.hopLimit || parsed.trafficClass != repeated.trafficClass ||
+			parsed.flowLabel != repeated.flowLabel || !bytes.Equal(parsed.payload, repeated.payload) || !bytes.Equal(parsed.original, repeated.original) {
+			t.Fatal("parseIPPacket returned nondeterministic packet metadata")
+		}
+		if len(parsed.original) == 0 || len(parsed.original) > len(packet) || !bytes.Equal(parsed.original, packet[:len(parsed.original)]) {
+			t.Fatalf("parsed original length %d is not an input prefix of %d bytes", len(parsed.original), len(packet))
+		}
+		if !parsed.source.IsValid() || !parsed.target.IsValid() || parsed.source.Is4() != parsed.target.Is4() {
+			t.Fatalf("parsed address families are invalid: %v -> %v", parsed.source, parsed.target)
+		}
+		if parsed.parameterError {
+			if parsed.parameterAt >= uint32(len(parsed.original)) {
+				t.Fatalf("parameter pointer %d is outside %d-byte packet", parsed.parameterAt, len(parsed.original))
+			}
+			return
+		}
+		if parsed.protocolOffset < 0 || parsed.protocolOffset >= len(parsed.original) {
+			t.Fatalf("protocol offset %d is outside %d-byte packet", parsed.protocolOffset, len(parsed.original))
+		}
+		if len(parsed.payload) > len(parsed.original) || !bytes.Equal(parsed.payload, parsed.original[len(parsed.original)-len(parsed.payload):]) {
+			t.Fatalf("parsed payload length %d is not an original-packet suffix", len(parsed.payload))
+		}
+	})
+}
+
+// FuzzIPv4OptionParsing builds checksum-valid IPv4 packets with arbitrary
+// padded options so malformedIPv4Option and validateIPv4Options are exercised
+// behind the normal header checksum gate.
+func FuzzIPv4OptionParsing(f *testing.F) {
+	local := netip.MustParseAddr("192.0.2.171")
+	remote := netip.MustParseAddr("198.51.100.171")
+	f.Add([]byte(nil))
+	f.Add([]byte{1, 1, 0, 0})
+	f.Add([]byte{148, 4, 0, 0})
+	f.Add([]byte{148, 3, 0, 0})
+	f.Add([]byte{131, 3, 4, 0})
+	f.Add([]byte{7, 3, 3, 0})
+	f.Add([]byte{68, 4, 5, 0xf0})
+	f.Fuzz(func(t *testing.T, input []byte) {
+		options := paddedIPv4FuzzOptions(input)
+		packet := buildTestIPv4Options(remote, local, options)
+		before := append([]byte(nil), packet...)
+		parsed, ok := parseIPPacket(packet)
+		if !bytes.Equal(packet, before) {
+			t.Fatal("parseIPPacket modified an IPv4 option packet")
+		}
+		repeated, repeatedOK := parseIPPacket(packet)
+		if repeatedOK != ok || parsed.parameterError != repeated.parameterError || parsed.parameterAt != repeated.parameterAt ||
+			parsed.parameterCode != repeated.parameterCode || parsed.protocol != repeated.protocol || !bytes.Equal(parsed.payload, repeated.payload) {
+			t.Fatal("IPv4 option parsing was nondeterministic")
+		}
+
+		optionAt, malformed := malformedIPv4Option(options)
+		if malformed {
+			if optionAt < 0 || optionAt >= len(options) {
+				t.Fatalf("malformed IPv4 option pointer %d outside %d-byte option area", optionAt, len(options))
+			}
+			if !ok || !parsed.parameterError || parsed.parameterCode != 0 || parsed.parameterAt != uint32(20+optionAt) {
+				t.Fatalf("malformed IPv4 options %x parsed as %+v, ok=%t", options, parsed, ok)
+			}
+			return
+		}
+		if !validateIPv4Options(options) {
+			if ok {
+				t.Fatalf("policy-rejected IPv4 options %x were accepted as %+v", options, parsed)
+			}
+			return
+		}
+		if !ok || parsed.parameterError || parsed.protocol != protocolUDP || len(parsed.payload) != udpHeaderSize || parsed.hasRouterAlert() != ipv4RouterAlert(options) {
+			t.Fatalf("valid IPv4 options %x parsed as %+v, ok=%t", options, parsed, ok)
+		}
+	})
+}
+
+// paddedIPv4FuzzOptions bounds arbitrary input to IPv4's 40-byte option area
+// and pads it to the header's four-byte unit.
+func paddedIPv4FuzzOptions(input []byte) []byte {
+	if len(input) > 40 {
+		input = input[:40]
+	}
+	size := (len(input) + 3) &^ 3
+	options := make([]byte, size)
+	copy(options, input)
+	return options
+}
+
+// FuzzIPv6OptionParsing frames arbitrary bytes as Hop-by-Hop or Destination
+// options so inspectIPv6Options is checked through complete IPv6 packets.
+func FuzzIPv6OptionParsing(f *testing.F) {
+	local := netip.MustParseAddr("2001:db8::171")
+	remote := netip.MustParseAddr("2001:db8:1::171")
+	multicast := netip.MustParseAddr("ff02::1")
+	f.Add([]byte(nil), true, false)
+	f.Add([]byte{5, 2, 0, 0}, true, false)
+	f.Add([]byte{0x40, 0}, true, false)
+	f.Add([]byte{0x80, 0}, false, false)
+	f.Add([]byte{0xc0, 0}, true, true)
+	f.Fuzz(func(t *testing.T, input []byte, hopByHop bool, multicastTarget bool) {
+		options := paddedIPv6FuzzOptions(input)
+		header := make([]byte, 8+len(options))
+		header[0] = protocolUDP
+		header[1] = byte(len(header)/8 - 1)
+		copy(header[2:], options)
+		extensionType := byte(60)
+		if hopByHop {
+			extensionType = 0
+		}
+		target := local
+		if multicastTarget {
+			target = multicast
+		}
+		packet := buildTestIPv6Extension(remote, target, extensionType, header)
+		before := append([]byte(nil), packet...)
+		parsed, ok := parseIPPacket(packet)
+		if !bytes.Equal(packet, before) {
+			t.Fatal("parseIPPacket modified an IPv6 option packet")
+		}
+		repeated, repeatedOK := parseIPPacket(packet)
+		if repeatedOK != ok || parsed.parameterError != repeated.parameterError || parsed.parameterAt != repeated.parameterAt ||
+			parsed.parameterCode != repeated.parameterCode || parsed.protocol != repeated.protocol || !bytes.Equal(parsed.payload, repeated.payload) {
+			t.Fatal("IPv6 option parsing was nondeterministic")
+		}
+
+		valid, action, optionAt := inspectIPv6Options(header)
+		if !valid {
+			if optionAt < 0 || optionAt >= len(header) {
+				t.Fatalf("invalid IPv6 option pointer %d outside %d-byte header", optionAt, len(header))
+			}
+			if action >= 2 && (action == 2 || !target.IsMulticast()) {
+				if !ok || !parsed.parameterError || parsed.parameterCode != 2 || parsed.parameterAt != uint32(40+optionAt) {
+					t.Fatalf("invalid IPv6 options %x parsed as %+v, ok=%t", header, parsed, ok)
+				}
+			} else if ok {
+				t.Fatalf("silently discarded IPv6 options %x were accepted as %+v", header, parsed)
+			}
+			return
+		}
+		if !ok || parsed.parameterError || parsed.protocol != protocolUDP || len(parsed.payload) != 0 {
+			t.Fatalf("valid IPv6 options %x parsed as %+v, ok=%t", header, parsed, ok)
+		}
+		if hopByHop && parsed.hasRouterAlert() != ipv6RouterAlert(header) {
+			t.Fatalf("IPv6 Router Alert mismatch for %x", header)
+		}
+	})
+}
+
+// paddedIPv6FuzzOptions bounds arbitrary option bytes and pads them to the
+// eight-byte extension-header unit used by the enclosing fuzz packet.
+func paddedIPv6FuzzOptions(input []byte) []byte {
+	if len(input) > 62 {
+		input = input[:62]
+	}
+	size := (len(input) + 7) &^ 7
+	options := make([]byte, size)
+	copy(options, input)
+	return options
 }
 
 func TestIPv6FlowLabelEncodingAndFragmentation(t *testing.T) {

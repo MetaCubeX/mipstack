@@ -1,6 +1,7 @@
 package mipstack
 
 import (
+	"bytes"
 	"encoding/binary"
 	"net/netip"
 	"testing"
@@ -214,16 +215,66 @@ func TestControlMessageValidation(t *testing.T) {
 func FuzzControlMessageParsing(f *testing.F) {
 	control4, _ := (&IPv4ControlMessage{TTL: 31, TOS: 0xb8, Src: netip.MustParseAddr("192.0.2.1")}).Marshal()
 	control6, _ := (&IPv6ControlMessage{HopLimit: 29, TrafficClass: 0x2e, FlowLabel: 0x12345, Src: netip.MustParseAddr("2001:db8::1")}).Marshal()
+	error4, _ := socketErrorControlForRead(ICMPError{Reporter: netip.MustParseAddr("198.51.100.1"), Type: 3, Code: 1})
+	error6, _ := socketErrorControlForRead(ICMPError{Reporter: netip.MustParseAddr("2001:db8::2"), Type: 2, MTU: 1280})
 	f.Add([]byte(nil))
 	f.Add(control4)
 	f.Add(control6)
+	f.Add(error4)
+	f.Add(error6)
 	f.Fuzz(func(t *testing.T, control []byte) {
-		var ipv4 IPv4ControlMessage
-		_ = ipv4.Parse(control)
+		if len(control) > 4096 {
+			control = control[:4096]
+		}
+		before := append([]byte(nil), control...)
+		initial4 := IPv4ControlMessage{TTL: -1, TOS: 256, Src: netip.MustParseAddr("192.0.2.200"), Dst: netip.MustParseAddr("192.0.2.201"), IfIndex: 7}
+		ipv4 := initial4
+		if err := ipv4.Parse(control); err != nil {
+			if ipv4 != initial4 {
+				t.Fatal("failed IPv4 control parse modified its receiver")
+			}
+		} else {
+			encoded, marshalErr := ipv4.marshalForRead()
+			var repeated IPv4ControlMessage
+			if marshalErr != nil || repeated.Parse(encoded) != nil || repeated != ipv4 {
+				t.Fatalf("IPv4 control round trip = %+v, %v, want %+v", repeated, marshalErr, ipv4)
+			}
+		}
 		_, _, _ = parseControlMessageForWrite(control, false)
-		var ipv6 IPv6ControlMessage
-		_ = ipv6.Parse(control)
+
+		initial6 := IPv6ControlMessage{
+			TrafficClass: -1, HopLimit: 256, FlowLabel: ipv6MaximumFlowLabel + 1,
+			Src: netip.MustParseAddr("2001:db8::200"), Dst: netip.MustParseAddr("2001:db8::201"), IfIndex: 7,
+		}
+		ipv6 := initial6
+		if err := ipv6.Parse(control); err != nil {
+			if ipv6 != initial6 {
+				t.Fatal("failed IPv6 control parse modified its receiver")
+			}
+		} else {
+			encoded, marshalErr := ipv6.marshalForRead()
+			var repeated IPv6ControlMessage
+			if marshalErr != nil || repeated.Parse(encoded) != nil || repeated != ipv6 {
+				t.Fatalf("IPv6 control round trip = %+v, %v, want %+v", repeated, marshalErr, ipv6)
+			}
+		}
 		_, _, _ = parseControlMessageForWrite(control, true)
+
+		initialError := SocketErrorControlMessage{
+			Errno: 1, Origin: SocketErrorOriginLocal, Type: 2, Code: 3, Info: 4, Data: 5,
+			Offender: netip.MustParseAddr("192.0.2.202"),
+		}
+		socketError := initialError
+		if err := socketError.Parse(control); err != nil {
+			if socketError != initialError {
+				t.Fatal("failed socket-error control parse modified its receiver")
+			}
+		} else if !socketError.Offender.Is4() && !socketError.Offender.Is6() {
+			t.Fatalf("parsed invalid socket-error offender %v", socketError.Offender)
+		}
+		if !bytes.Equal(control, before) {
+			t.Fatal("control-message parsing modified its input")
+		}
 	})
 }
 

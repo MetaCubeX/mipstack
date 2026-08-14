@@ -3000,6 +3000,110 @@ func FuzzICMPForwarderReplyIPPacket(f *testing.F) {
 	})
 }
 
+// FuzzICMPForwarderReplyIPPacketFragmentation drives accepted header-included
+// ICMP replies through dynamic MTU fragmentation and reassembly.
+func FuzzICMPForwarderReplyIPPacketFragmentation(f *testing.F) {
+	v4Source := netip.MustParseAddr("198.51.100.191")
+	v4Target := netip.MustParseAddr("192.0.2.191")
+	v6Source := netip.MustParseAddr("2001:db8:1::191")
+	v6Target := netip.MustParseAddr("2001:db8::191")
+	v4WithOptions := makeForwarderICMPErrorPacket(v4Source, v4Target, bytes.Repeat([]byte{0x41}, 1800))
+	options := []byte{7, 7, 8, 0, 0, 0, 0, 148, 4, 0, 0, 0}
+	headerSize := 20 + len(options)
+	v4OptionPacket := make([]byte, headerSize+len(v4WithOptions)-20)
+	copy(v4OptionPacket[:20], v4WithOptions[:20])
+	copy(v4OptionPacket[20:headerSize], options)
+	copy(v4OptionPacket[headerSize:], v4WithOptions[20:])
+	v4OptionPacket[0] = 0x40 | byte(headerSize/4)
+	binary.BigEndian.PutUint16(v4OptionPacket[2:4], uint16(len(v4OptionPacket)))
+	v4OptionPacket[10], v4OptionPacket[11] = 0, 0
+	binary.BigEndian.PutUint16(v4OptionPacket[10:12], checksum(v4OptionPacket[:headerSize]))
+	v6WithExtension := makeForwarderICMPEchoReplyPacket(v6Source, v6Target, bytes.Repeat([]byte{0x42}, 1800))
+	extension := []byte{protocolICMPv6, 0, 0, 0, 0, 0, 0, 0}
+	v6WithExtension[6] = 60
+	v6WithExtension = append(append(v6WithExtension[:40:40], extension...), v6WithExtension[40:]...)
+	binary.BigEndian.PutUint16(v6WithExtension[4:6], uint16(len(v6WithExtension)-40))
+	f.Add(makeForwarderICMPEchoReplyPacket(v4Source, v4Target, []byte("IPv4")), false, uint16(1500), false)
+	f.Add(v4OptionPacket, false, uint16(600), true)
+	f.Add(makeForwarderICMPEchoReplyPacket(v6Source, v6Target, []byte("IPv6")), true, uint16(1500), false)
+	f.Add(v6WithExtension, true, uint16(1280), true)
+	f.Add(makeNoncanonicalIPv6AtomicFragmentPacket(makeForwarderICMPEchoReplyPacket(v6Source, v6Target, bytes.Repeat([]byte{0x43}, 1800)), 191), true, uint16(1280), false)
+	f.Fuzz(func(t *testing.T, input []byte, ipv6 bool, mtuSeed uint16, reverse bool) {
+		if len(input) > 65575 {
+			input = input[:65575]
+		}
+		destination := v4Target
+		if ipv6 {
+			destination = v6Target
+		}
+		reply, err := prepareICMPForwarderIPPacket(input, destination)
+		if err != nil {
+			return
+		}
+		expectedSource := reply.parsed.source
+		expectedTarget := reply.parsed.target
+		expectedProtocol := reply.parsed.protocol
+		expectedPayload := append([]byte(nil), reply.parsed.payload...)
+		mtu := 68 + int(mtuSeed)%1433
+		bits := 32
+		if ipv6 {
+			mtu = ipv6MinimumMTU + int(mtuSeed)%(1501-ipv6MinimumMTU)
+			bits = 128
+		}
+		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(destination, bits)}, MTU: 1500})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stack.Close()
+		packets, err := stack.icmpForwarderIPPackets(reply, mtu)
+		if err != nil {
+			if len(reply.packet) <= mtu {
+				t.Fatalf("fitting ReplyIPPacket failed at MTU %d: %v", mtu, err)
+			}
+			return
+		}
+		if len(packets) == 0 {
+			t.Fatal("ReplyIPPacket fragmentation returned no packets")
+		}
+		var completed []byte
+		if len(packets) == 1 {
+			completed = packets[0]
+		} else {
+			now := time.Unix(400, 0)
+			for step := range packets {
+				index := step
+				if reverse {
+					index = len(packets) - 1 - step
+				}
+				packet := packets[index]
+				if len(packet) > mtu {
+					t.Fatalf("ReplyIPPacket fragment %d has %d bytes, want at most MTU %d", index, len(packet), mtu)
+				}
+				if output := stack.reassemblePacket(packet, now); output != nil {
+					completed = output
+				}
+				checkFragmentFuzzResources(t, stack)
+			}
+			if len(completed) == 0 {
+				t.Fatalf("ReplyIPPacket emitted %d fragments but did not reassemble", len(packets))
+			}
+		}
+		parsed, ok := parseIPPacket(completed)
+		if !ok || parsed.parameterError || parsed.source != expectedSource || parsed.target != expectedTarget ||
+			parsed.protocol != expectedProtocol || !bytes.Equal(parsed.payload, expectedPayload) {
+			t.Fatalf("ReplyIPPacket reassembly = valid %t %s -> %s protocol %d payload %d, want %s -> %s protocol %d payload %d",
+				ok, parsed.source, parsed.target, parsed.protocol, len(parsed.payload), expectedSource, expectedTarget, expectedProtocol, len(expectedPayload))
+		}
+		if parsed.source.Is4() {
+			if checksum(parsed.payload) != 0 {
+				t.Fatal("reassembled IPv4 ReplyIPPacket has an invalid ICMP checksum")
+			}
+		} else if transportChecksum(parsed.source, parsed.target, protocolICMPv6, parsed.payload) != 0 {
+			t.Fatal("reassembled IPv6 ReplyIPPacket has an invalid ICMP checksum")
+		}
+	})
+}
+
 func TestForwarderFailedRequestReplyAllowsTerminalAction(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.168")
 	remote := netip.MustParseAddr("192.0.2.169")
