@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"reflect"
 	"syscall"
 	"testing"
 	"time"
@@ -120,9 +121,9 @@ func FuzzICMPErrorQuotes(f *testing.F) {
 	fragment[0] = ProtocolUDP
 	binary.BigEndian.PutUint16(fragment[2:4], 1)
 	quotedFragment6 := buildIPPacket(source6, target6, 44, fragment, 0, false)
-	authentication := make([]byte, 12+udpHeaderSize)
-	authentication[0], authentication[1] = ProtocolUDP, 1
-	quotedAuthentication6 := buildIPPacket(source6, target6, 51, authentication, 0, false)
+	authentication := make([]byte, 16+udpHeaderSize)
+	authentication[0], authentication[1] = ProtocolUDP, 2
+	quotedAuthentication6 := buildIPPacket(source6, target6, IPv6ExtensionHeaderAuthentication, authentication, 0, false)
 	f.Add([]byte(nil), false, byte(3), byte(1))
 	f.Add(quoted4, false, byte(3), byte(4))
 	f.Add(quoted6, true, byte(1), byte(0))
@@ -147,11 +148,29 @@ func FuzzICMPErrorQuotes(f *testing.F) {
 			reporter = netip.MustParseAddr("2001:db8:ffff::1")
 		}
 		networkError, ok := parseICMPError(ipPacket{source: reporter, protocol: protocol, payload: message})
+		destination := target4
+		if ipv6 {
+			destination = target6
+		}
+		publicMessage := ICMPMessage{
+			Source: reporter, Destination: destination,
+			Type: messageType, Code: code, Body: message[4:],
+		}
+		publicError, publicErr := publicMessage.ICMPError()
 		if !bytes.Equal(quote, before) {
 			t.Fatal("ICMP quote parsing modified its input")
 		}
 		if !ok {
+			if publicErr == nil {
+				t.Fatalf("public parser accepted an error rejected by the stack parser: %+v", publicError)
+			}
 			return
+		}
+		if publicErr != nil {
+			t.Fatalf("public parser rejected an error accepted by the stack parser: %v", publicErr)
+		}
+		if !reflect.DeepEqual(publicError, networkError) {
+			t.Fatalf("public and stack ICMP parsers disagree:\n public: %+v\n  stack: %+v", publicError, networkError)
 		}
 		if !validICMPErrorCode(protocol, messageType, code) {
 			t.Fatalf("accepted invalid ICMP type/code %d/%d for protocol %d", messageType, code, protocol)
@@ -254,6 +273,115 @@ func TestPublicICMPMessageCodec(t *testing.T) {
 			roundTrip, err := parsed.MarshalBinary()
 			if err != nil || !bytes.Equal(roundTrip, wire) {
 				t.Fatalf("ICMP round trip: error=%v\n got %x\nwant %x", err, roundTrip, wire)
+			}
+		})
+	}
+}
+
+func TestPublicICMPError(t *testing.T) {
+	source4 := netip.MustParseAddr("192.0.2.1")
+	target4 := netip.MustParseAddr("198.51.100.1")
+	udp := make([]byte, udpHeaderSize)
+	binary.BigEndian.PutUint16(udp[0:2], 42000)
+	binary.BigEndian.PutUint16(udp[2:4], 53)
+	quoted4 := buildIPPacket(source4, target4, ProtocolUDP, udp, 7, true)
+	body4 := make([]byte, 4+len(quoted4))
+	binary.BigEndian.PutUint16(body4[2:4], 1280)
+	copy(body4[4:], quoted4)
+	message4 := ICMPMessage{
+		Source: netip.MustParseAddr("198.51.100.254"), Destination: source4,
+		Type: 3, Code: 4, Body: body4,
+	}
+	if !message4.IsError() {
+		t.Fatal("IPv4 Fragmentation Needed was not classified as an error")
+	}
+	error4, err := message4.ICMPError()
+	if err != nil {
+		t.Fatalf("parse IPv4 ICMP error: %v", err)
+	}
+	if error4.Reporter != message4.Source || error4.Type != message4.Type || error4.Code != message4.Code || error4.MTU != 1280 ||
+		error4.QuotedSource != source4 || error4.QuotedTarget != target4 || error4.QuotedProtocol != ProtocolUDP ||
+		error4.QuotedSourcePort != 42000 || error4.QuotedTargetPort != 53 || !bytes.Equal(error4.QuotedPacket, quoted4) ||
+		!bytes.Equal(error4.QuotedPayload, udp) {
+		t.Fatalf("IPv4 ICMP error = %+v", error4)
+	}
+	if &error4.QuotedPacket[0] != &message4.Body[4] || &error4.QuotedPayload[0] != &message4.Body[4+20] {
+		t.Fatal("public ICMP error parser copied its quoted packet")
+	}
+
+	source6 := netip.MustParseAddr("2001:db8::1")
+	target6 := netip.MustParseAddr("2001:db8:1::1")
+	tcp := make([]byte, tcpHeaderSize)
+	binary.BigEndian.PutUint16(tcp[0:2], 443)
+	binary.BigEndian.PutUint16(tcp[2:4], 51000)
+	quoted6 := buildIPPacket(source6, target6, ProtocolTCP, tcp, 0, true)
+	body6 := make([]byte, 4+len(quoted6))
+	binary.BigEndian.PutUint32(body6[:4], 17)
+	copy(body6[4:], quoted6)
+	message6 := ICMPMessage{
+		Source: netip.MustParseAddr("2001:db8:ffff::1"), Destination: source6,
+		Type: 4, Code: 0, Body: body6,
+	}
+	error6, err := message6.ICMPError()
+	if err != nil {
+		t.Fatalf("parse IPv6 ICMP error: %v", err)
+	}
+	if !message6.IsError() || error6.Pointer != 17 || error6.QuotedSourcePort != 443 || error6.QuotedTargetPort != 51000 ||
+		error6.QuotedSource != source6 || error6.QuotedTarget != target6 || error6.QuotedProtocol != ProtocolTCP {
+		t.Fatalf("IPv6 ICMP error = %+v", error6)
+	}
+
+	quotedNoNext := buildIPPacket(source6, target6, ProtocolNoNextHeader, []byte{1, 2, 3, 4}, 0, true)
+	noNext := ICMPMessage{
+		Source: message6.Source, Destination: source6, Type: 1, Code: 0,
+		Body: append(make([]byte, 4), quotedNoNext...),
+	}
+	noNextError, err := noNext.ICMPError()
+	if err != nil || noNextError.QuotedProtocol != ProtocolNoNextHeader || noNextError.QuotedPayload != nil ||
+		!bytes.Equal(noNextError.QuotedPacket, quotedNoNext) {
+		t.Fatalf("IPv6 No Next Header quote = %+v, %v", noNextError, err)
+	}
+}
+
+func TestPublicICMPErrorFailures(t *testing.T) {
+	v4 := ICMPMessage{
+		Source: netip.MustParseAddr("192.0.2.254"), Destination: netip.MustParseAddr("192.0.2.1"),
+		Type: 3, Code: 1, Body: make([]byte, 4),
+	}
+	v6Quote := buildIPPacket(
+		netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2"),
+		ProtocolUDP, make([]byte, udpHeaderSize), 0, true,
+	)
+	mappedQuote := append([]byte(nil), v6Quote...)
+	mappedSource := netip.MustParseAddr("::ffff:192.0.2.1").As16()
+	copy(mappedQuote[8:24], mappedSource[:])
+	crossFamily := v4
+	crossFamily.Body = append(make([]byte, 4), v6Quote...)
+	mapped := ICMPMessage{
+		Source: netip.MustParseAddr("2001:db8::ff"), Destination: netip.MustParseAddr("2001:db8::1"),
+		Type: 1, Code: 0, Body: append(make([]byte, 4), mappedQuote...),
+	}
+	invalidCode := v4
+	invalidCode.Code = 16
+	shortBody := v4
+	shortBody.Body = make([]byte, 3)
+	for _, test := range []struct {
+		name       string
+		message    ICMPMessage
+		classified bool
+	}{
+		{name: "missing quote", message: v4, classified: true},
+		{name: "cross-family quote", message: crossFamily, classified: true},
+		{name: "mapped IPv6 quote", message: mapped, classified: true},
+		{name: "invalid code", message: invalidCode},
+		{name: "short body", message: shortBody, classified: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.message.IsError() != test.classified {
+				t.Fatalf("IsError classification for %s is inconsistent", test.name)
+			}
+			if result, err := test.message.ICMPError(); !errors.Is(err, syscall.EINVAL) || !reflect.ValueOf(result).IsZero() {
+				t.Fatalf("ICMPError = %+v, %v; want zero value and EINVAL", result, err)
 			}
 		})
 	}

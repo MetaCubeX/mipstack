@@ -1202,7 +1202,7 @@ func outputPacketFlowHash(secret [16]byte, packet []byte) uint64 {
 		flowLabel := uint32(packet[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(packet[2:4]))
 		if flowLabel != 0 {
 			hash = outputHashWord(hash, uint64(flowLabel))
-		} else if protocol == 44 && len(packet) >= 48 {
+		} else if protocol == IPv6ExtensionHeaderFragment && len(packet) >= 48 {
 			// Locally fragmented packets carry the Fragment header directly
 			// after the IPv6 header. Offset and M differ between fragments, so
 			// use Next Header and Identification to keep one datagram ordered.
@@ -3278,7 +3278,7 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 		}
 	default:
 	}
-	noNextHeader := parsed.source.Is6() && parsed.protocol == 59
+	noNextHeader := parsed.source.Is6() && parsed.protocol == ProtocolNoNextHeader
 	if (destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast) &&
 		!noNextHeader && !rawDelivered && ipForwarder != nil && ipForwarder.handlePacket(parsed) {
 		return nil

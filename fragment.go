@@ -39,7 +39,7 @@ func inspectIPv6ForwarderFragmentPoint(packet []byte) (ipv6ForwarderFragmentPoin
 	seenHop := false
 	for offset <= end {
 		switch next {
-		case 0:
+		case IPv6ExtensionHeaderHopByHop:
 			if offset != 40 || seenHop || end-offset < 8 {
 				return ipv6ForwarderFragmentPoint{}, false
 			}
@@ -50,7 +50,7 @@ func inspectIPv6ForwarderFragmentPoint(packet []byte) (ipv6ForwarderFragmentPoin
 			seenHop = true
 			next, previous, offset = packet[offset], offset, offset+length
 			point.previous, point.insertion, point.next = previous, offset, next
-		case 43:
+		case IPv6ExtensionHeaderRouting:
 			if end-offset < 8 {
 				return ipv6ForwarderFragmentPoint{}, false
 			}
@@ -60,7 +60,7 @@ func inspectIPv6ForwarderFragmentPoint(packet []byte) (ipv6ForwarderFragmentPoin
 			}
 			next, previous, offset = packet[offset], offset, offset+length
 			point.previous, point.insertion, point.next = previous, offset, next
-		case 60:
+		case IPv6ExtensionHeaderDestination:
 			if end-offset < 8 {
 				return ipv6ForwarderFragmentPoint{}, false
 			}
@@ -75,7 +75,7 @@ func inspectIPv6ForwarderFragmentPoint(packet []byte) (ipv6ForwarderFragmentPoin
 			// headers, while an upper-layer header leaves this header in the
 			// fragmentable part. Continuing the scan also finds a Fragment header
 			// that appears after final-destination options.
-		case 44:
+		case IPv6ExtensionHeaderFragment:
 			if end-offset < 8 || point.atomicOffset >= 0 {
 				return ipv6ForwarderFragmentPoint{}, false
 			}
@@ -595,8 +595,8 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 	seenHop := false
 	for offset <= end {
 		switch next {
-		case 0, 60:
-			if next == 0 && (offset != 40 || seenHop) {
+		case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination:
+			if next == IPv6ExtensionHeaderHopByHop && (offset != 40 || seenHop) {
 				return parsedFragment{
 					key: fragmentKey{source: source, target: target, v6: true}, original: packet[:end],
 					parameter: true, parameterCode: 1, parameterAt: uint32(nextHeader),
@@ -619,11 +619,11 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 				}
 				return parsedFragment{}, false
 			}
-			if next == 0 {
+			if next == IPv6ExtensionHeaderHopByHop {
 				seenHop = true
 			}
 			next, nextHeader, offset = packet[offset], offset, offset+length
-		case 43:
+		case IPv6ExtensionHeaderRouting:
 			if end-offset < 8 {
 				return parsedFragment{}, false
 			}
@@ -638,7 +638,7 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 				}, true
 			}
 			next, nextHeader, offset = packet[offset], offset, offset+length
-		case 44:
+		case IPv6ExtensionHeaderFragment:
 			if end-offset < 8 {
 				return parsedFragment{}, false
 			}
@@ -686,25 +686,15 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 func ipv6FirstFragmentHeaderComplete(next byte, payload []byte) bool {
 	for offset := 0; ; {
 		switch next {
-		case 0, 43, 60, 135:
-			if len(payload)-offset < 8 {
-				return false
-			}
-			length := (int(payload[offset+1]) + 1) * 8
-			if length > len(payload)-offset {
-				return false
-			}
-			next, offset = payload[offset], offset+length
-		case 51:
-			if len(payload)-offset < 8 {
-				return false
-			}
-			length := (int(payload[offset+1]) + 2) * 4
-			if length > len(payload)-offset {
+		case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting,
+			IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderAuthentication,
+			IPv6ExtensionHeaderMobility:
+			length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
+			if !valid {
 				return false
 			}
 			next, offset = payload[offset], offset+length
-		case 44:
+		case IPv6ExtensionHeaderFragment:
 			return false
 		case ProtocolTCP:
 			if len(payload)-offset < tcpHeaderSize {
@@ -712,11 +702,11 @@ func ipv6FirstFragmentHeaderComplete(next byte, payload []byte) bool {
 			}
 			headerSize := int(payload[offset+12]>>4) * 4
 			return headerSize < tcpHeaderSize || headerSize <= len(payload)-offset
-		case ProtocolUDP, ProtocolICMPv4, ProtocolICMPv6, 50:
+		case ProtocolUDP, ProtocolICMPv4, ProtocolICMPv6, ProtocolESP:
 			return len(payload)-offset >= 8
 		case 33, 132:
 			return len(payload)-offset >= 12
-		case 59:
+		case ProtocolNoNextHeader:
 			return true
 		default:
 			return true
@@ -1012,7 +1002,7 @@ func (s *Stack) writeIPFragmentsUntilOptionsForMTU(source, target netip.Addr, pr
 			packet[10], packet[11] = 0, 0
 			binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:20]))
 		} else {
-			if !marshalIPHeader(packet, source, target, 44, 0, false, options) {
+			if !marshalIPHeader(packet, source, target, IPv6ExtensionHeaderFragment, 0, false, options) {
 				queue.releaseBuffer(packet, reusable)
 				queue.releaseReserved(slot)
 				return syscall.EMSGSIZE
@@ -1089,7 +1079,7 @@ func buildIPv6FragmentsWithOptions(source, target netip.Addr, protocol byte, pay
 			size = maximum
 		}
 		packet := make([]byte, 48+size)
-		if !marshalIPHeader(packet, source, target, 44, 0, false, options) {
+		if !marshalIPHeader(packet, source, target, IPv6ExtensionHeaderFragment, 0, false, options) {
 			return nil
 		}
 		fragment := packet[40:]
@@ -1173,10 +1163,13 @@ func laterIPv4FragmentOptions(options []byte) []byte {
 	result := append([]byte(nil), options...)
 	for offset := 0; offset < len(options); {
 		kind := options[offset]
-		if kind == 0 {
+		if kind == IPv4HeaderOptionEnd {
+			for index := offset + 1; index < len(result); index++ {
+				result[index] = 0
+			}
 			break
 		}
-		if kind == 1 {
+		if kind == IPv4HeaderOptionNOP {
 			offset++
 			continue
 		}
@@ -1215,6 +1208,11 @@ func fragmentICMPForwarderIPv4(packet []byte, mtu int, identification uint16) []
 		fragment := make([]byte, headerSize+size)
 		copy(fragment[:20], packet[:20])
 		copy(fragment[20:headerSize], options)
+		if contentSize, valid := ipv4OptionsContentLength(fragment[20:headerSize]); valid {
+			for index := 20 + contentSize; index < headerSize; index++ {
+				fragment[index] = 0
+			}
+		}
 		fragment[0] = 0x40 | byte(headerSize/4)
 		binary.BigEndian.PutUint16(fragment[2:4], uint16(len(fragment)))
 		binary.BigEndian.PutUint16(fragment[4:6], identification)
@@ -1255,7 +1253,7 @@ func fragmentICMPForwarderIPv6(packet []byte, point ipv6ForwarderFragmentPoint, 
 		}
 		fragment := make([]byte, len(prefix)+8+size)
 		copy(fragment, prefix)
-		fragment[point.previous] = 44
+		fragment[point.previous] = IPv6ExtensionHeaderFragment
 		header := fragment[len(prefix) : len(prefix)+8]
 		header[0], header[1] = point.next, 0
 		field := uint16(offset)

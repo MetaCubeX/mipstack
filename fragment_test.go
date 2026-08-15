@@ -259,6 +259,7 @@ func TestIPv6FirstFragmentHeaderCompleteness(t *testing.T) {
 		return append(header, tail...)
 	}
 	udp := make([]byte, udpHeaderSize)
+	authentication := append(extension(ProtocolUDP, 2, make([]byte, 8)), udp...)
 	tcp := make([]byte, tcpHeaderSize)
 	tcp[12] = 5 << 4
 	invalidTCPSize := append([]byte(nil), tcp...)
@@ -274,8 +275,10 @@ func TestIPv6FirstFragmentHeaderCompleteness(t *testing.T) {
 		{name: "destination to UDP", next: 60, payload: extension(ProtocolUDP, 0, udp), want: true},
 		{name: "mobility to UDP", next: 135, payload: extension(ProtocolUDP, 0, udp), want: true},
 		{name: "truncated extension", next: 60, payload: extension(ProtocolUDP, 1, nil)},
-		{name: "AH to UDP", next: 51, payload: extension(ProtocolUDP, 0, udp), want: true},
-		{name: "truncated AH", next: 51, payload: []byte{ProtocolUDP}},
+		{name: "AH to UDP", next: IPv6ExtensionHeaderAuthentication, payload: authentication, want: true},
+		{name: "short AH", next: IPv6ExtensionHeaderAuthentication, payload: extension(ProtocolUDP, 0, udp)},
+		{name: "misaligned AH", next: IPv6ExtensionHeaderAuthentication, payload: extension(ProtocolUDP, 1, append(make([]byte, 4), udp...))},
+		{name: "truncated AH", next: IPv6ExtensionHeaderAuthentication, payload: []byte{ProtocolUDP}},
 		{name: "nested fragment", next: 44, payload: make([]byte, 8)},
 		{name: "TCP", next: ProtocolTCP, payload: tcp, want: true},
 		{name: "TCP short", next: ProtocolTCP, payload: tcp[:tcpHeaderSize-1]},

@@ -97,6 +97,41 @@ func (m ICMPMessage) EchoReply(source netip.Addr) (ICMPMessage, error) {
 	return normalized, nil
 }
 
+// IsError reports whether m has a supported, family-appropriate ICMP error
+// type and code. It classifies the message without parsing its quoted packet;
+// ICMPError performs complete quote validation.
+func (m ICMPMessage) IsError() bool {
+	source, destination := m.Source.Unmap(), m.Destination.Unmap()
+	if !source.IsValid() || !destination.IsValid() || source.Is4() != destination.Is4() {
+		return false
+	}
+	protocol := byte(ProtocolICMPv4)
+	if source.Is6() {
+		protocol = ProtocolICMPv6
+	}
+	return validICMPErrorCode(protocol, m.Type, m.Code)
+}
+
+// ICMPError validates and decodes m as a supported ICMP error. QuotedPacket
+// and QuotedPayload borrow m.Body, and available TCP or UDP ports are populated
+// immediately. The parser accepts the intentionally truncated quotations that
+// RFC 792 and RFC 4443 permit and does not apply socket-correlation policy.
+func (m ICMPMessage) ICMPError() (ICMPError, error) {
+	normalized, _, err := m.wireLayout()
+	if err != nil {
+		return ICMPError{}, err
+	}
+	protocol := byte(ProtocolICMPv4)
+	if normalized.Source.Is6() {
+		protocol = ProtocolICMPv6
+	}
+	result, valid := parseICMPErrorFields(normalized.Source, protocol, normalized.Type, normalized.Code, normalized.Body)
+	if !valid {
+		return ICMPError{}, syscall.EINVAL
+	}
+	return result, nil
+}
+
 // MarshalBinary returns the complete ICMP message wire encoding. Source and
 // Destination select the family and contribute to the ICMPv6 pseudo-header
 // checksum but are not themselves encoded. MarshalBinary is semantically
@@ -154,7 +189,7 @@ func marshalPublicICMPMessage(dst []byte, m ICMPMessage) {
 type ICMPError struct {
 	// Reporter is the router or destination that generated the error.
 	Reporter netip.Addr
-	// Type and Code retain the wire ICMP classification.
+	// Type is the wire ICMP error type.
 	Type byte
 	// Code retains the wire subtype within Type.
 	Code byte
@@ -162,20 +197,18 @@ type ICMPError struct {
 	MTU uint32
 	// Pointer is present for IPv4 or IPv6 Parameter Problem errors.
 	Pointer uint32
-	// QuotedSource and QuotedTarget identify the failed original packet.
+	// QuotedSource is the source of the failed original packet.
 	QuotedSource netip.Addr
 	// QuotedTarget is the destination of the failed original packet.
 	QuotedTarget netip.Addr
-	// QuotedProtocol and QuotedPayload locate the available original transport
-	// header bytes.
+	// QuotedProtocol is the final protocol identified in the available quote.
 	QuotedProtocol byte
 	// QuotedPacket contains the available original IP packet, including its IP
 	// header. QuotedPayload aliases its upper-layer suffix when both are present.
 	QuotedPacket []byte
 	// QuotedPayload contains the available original transport header bytes.
 	QuotedPayload []byte
-	// QuotedSourcePort and QuotedTargetPort identify TCP or UDP endpoints when
-	// the quoted transport header contains them.
+	// QuotedSourcePort is the original TCP or UDP source port when present.
 	QuotedSourcePort uint16
 	// QuotedTargetPort is the original TCP or UDP destination port when present.
 	QuotedTargetPort uint16
@@ -241,6 +274,13 @@ func prepareICMPForwarderIPPacket(input []byte, destination netip.Addr) (icmpFor
 		field := binary.BigEndian.Uint16(packet[6:8])
 		if headerSize < 20 || headerSize > len(packet)-8 || field&0xbfff != 0 || packet[9] != ProtocolICMPv4 {
 			return icmpForwarderIPPacket{}, syscall.EINVAL
+		}
+		contentSize, validOptions := ipv4OptionsContentLength(packet[20:headerSize])
+		if !validOptions {
+			return icmpForwarderIPPacket{}, syscall.EINVAL
+		}
+		for index := 20 + contentSize; index < headerSize; index++ {
+			packet[index] = 0
 		}
 		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
 		packet[10], packet[11] = 0, 0
@@ -423,10 +463,8 @@ func (s *Stack) deliverICMPError(remoteError ICMPError) bool {
 	switch remoteError.QuotedProtocol {
 	case ProtocolUDP:
 		if len(remoteError.QuotedPayload) >= udpHeaderSize {
-			sourcePort := binary.BigEndian.Uint16(remoteError.QuotedPayload[0:2])
-			targetPort := binary.BigEndian.Uint16(remoteError.QuotedPayload[2:4])
-			remoteError.QuotedSourcePort = sourcePort
-			remoteError.QuotedTargetPort = targetPort
+			sourcePort := remoteError.QuotedSourcePort
+			targetPort := remoteError.QuotedTargetPort
 			local := netip.AddrPortFrom(remoteError.QuotedSource, sourcePort)
 			target := netip.AddrPortFrom(remoteError.QuotedTarget, targetPort)
 			s.mu.RLock()
@@ -449,10 +487,8 @@ func (s *Stack) deliverICMPError(remoteError ICMPError) bool {
 		}
 	case ProtocolTCP:
 		if len(remoteError.QuotedPayload) >= 8 {
-			sourcePort := binary.BigEndian.Uint16(remoteError.QuotedPayload[0:2])
-			targetPort := binary.BigEndian.Uint16(remoteError.QuotedPayload[2:4])
-			remoteError.QuotedSourcePort = sourcePort
-			remoteError.QuotedTargetPort = targetPort
+			sourcePort := remoteError.QuotedSourcePort
+			targetPort := remoteError.QuotedTargetPort
 			key := tcpKey{
 				local:  netip.AddrPortFrom(remoteError.QuotedSource, sourcePort),
 				remote: netip.AddrPortFrom(remoteError.QuotedTarget, targetPort),
@@ -612,41 +648,52 @@ func parseICMPError(packet ipPacket) (ICMPError, bool) {
 	if len(icmp) < 8 {
 		return ICMPError{}, false
 	}
-	if packet.protocol == ProtocolICMPv4 {
-		if !validICMPErrorCode(ProtocolICMPv4, icmp[0], icmp[1]) {
-			return ICMPError{}, false
-		}
-		source, target, protocol, payload, ok := quotedIPPayload(icmp[8:])
-		if !ok || !source.Is4() || !target.Is4() {
-			return ICMPError{}, false
-		}
-		result := ICMPError{Reporter: packet.source, Type: icmp[0], Code: icmp[1], QuotedSource: source, QuotedTarget: target, QuotedProtocol: protocol, QuotedPacket: icmp[8:], QuotedPayload: payload}
-		if icmp[0] == 3 && icmp[1] == 4 {
-			result.MTU = uint32(binary.BigEndian.Uint16(icmp[6:8]))
+	return parseICMPErrorFields(packet.source, packet.protocol, icmp[0], icmp[1], icmp[4:])
+}
+
+// parseICMPErrorFields extracts a transport-relevant quoted packet from the
+// semantic fields shared by the public codec and the stack receive path.
+func parseICMPErrorFields(reporter netip.Addr, protocol, messageType, code byte, body []byte) (ICMPError, bool) {
+	if len(body) < 4 || !validICMPErrorCode(protocol, messageType, code) {
+		return ICMPError{}, false
+	}
+	quote := body[4:]
+	source, target, quotedProtocol, payload, ok := quotedIPPayload(quote)
+	if !ok || protocol == ProtocolICMPv4 && (!source.Is4() || !target.Is4()) ||
+		protocol == ProtocolICMPv6 && (!source.Is6() || !target.Is6()) {
+		return ICMPError{}, false
+	}
+	if protocol != ProtocolICMPv4 && protocol != ProtocolICMPv6 {
+		return ICMPError{}, false
+	}
+	result := ICMPError{
+		Reporter: reporter, Type: messageType, Code: code,
+		QuotedSource: source, QuotedTarget: target, QuotedProtocol: quotedProtocol,
+		QuotedPacket: quote, QuotedPayload: payload,
+	}
+	if (quotedProtocol == ProtocolTCP || quotedProtocol == ProtocolUDP) && len(payload) >= 4 {
+		result.QuotedSourcePort = binary.BigEndian.Uint16(payload[:2])
+		result.QuotedTargetPort = binary.BigEndian.Uint16(payload[2:4])
+	}
+	if protocol == ProtocolICMPv4 {
+		if messageType == 3 && code == 4 {
+			result.MTU = uint32(binary.BigEndian.Uint16(body[2:4]))
 			if result.MTU == 0 {
-				result.MTU = legacyIPv4PathMTU(icmp[8:])
+				result.MTU = legacyIPv4PathMTU(quote)
 			}
 		}
-		if icmp[0] == 12 {
-			result.Pointer = uint32(icmp[4])
+		if messageType == 12 {
+			result.Pointer = uint32(body[0])
 		}
-		return result, true
+	} else {
+		if messageType == 2 {
+			result.MTU = binary.BigEndian.Uint32(body[:4])
+		}
+		if messageType == 4 {
+			result.Pointer = binary.BigEndian.Uint32(body[:4])
+		}
 	}
-	if packet.protocol == ProtocolICMPv6 && validICMPErrorCode(ProtocolICMPv6, icmp[0], icmp[1]) {
-		source, target, protocol, payload, ok := quotedIPPayload(icmp[8:])
-		if !ok || !source.Is6() || !target.Is6() {
-			return ICMPError{}, false
-		}
-		result := ICMPError{Reporter: packet.source, Type: icmp[0], Code: icmp[1], QuotedSource: source, QuotedTarget: target, QuotedProtocol: protocol, QuotedPacket: icmp[8:], QuotedPayload: payload}
-		if icmp[0] == 2 {
-			result.MTU = binary.BigEndian.Uint32(icmp[4:8])
-		}
-		if icmp[0] == 4 {
-			result.Pointer = binary.BigEndian.Uint32(icmp[4:8])
-		}
-		return result, true
-	}
-	return ICMPError{}, false
+	return result, true
 }
 
 // cloneICMPError gives one queued consumer independent ownership while keeping
@@ -737,19 +784,24 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 	if packet[0]>>4 == 6 && len(packet) >= 40 {
 		source := netip.AddrFrom16([16]byte(packet[8:24]))
 		target := netip.AddrFrom16([16]byte(packet[24:40]))
+		if source.Is4In6() || target.Is4In6() {
+			return netip.Addr{}, netip.Addr{}, 0, nil, false
+		}
 		next, offset := packet[6], 40
 		for offset <= len(packet) {
+			if next == ProtocolNoNextHeader {
+				return source, target, next, nil, true
+			}
 			switch next {
-			case 0, 43, 60, 135:
-				if len(packet)-offset < 8 {
-					return netip.Addr{}, netip.Addr{}, 0, nil, false
-				}
-				length := (int(packet[offset+1]) + 1) * 8
-				if length > len(packet)-offset {
+			case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting,
+				IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderAuthentication,
+				IPv6ExtensionHeaderMobility:
+				length, valid := ipv6ExtensionHeaderLength(next, packet[offset:])
+				if !valid {
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
 				}
 				next, offset = packet[offset], offset+length
-			case 44:
+			case IPv6ExtensionHeaderFragment:
 				if len(packet)-offset < 8 {
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
 				}
@@ -760,15 +812,6 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
 				}
 				next, offset = packet[offset], offset+8
-			case 51:
-				if len(packet)-offset < 8 {
-					return netip.Addr{}, netip.Addr{}, 0, nil, false
-				}
-				length := (int(packet[offset+1]) + 2) * 4
-				if length > len(packet)-offset {
-					return netip.Addr{}, netip.Addr{}, 0, nil, false
-				}
-				next, offset = packet[offset], offset+length
 			default:
 				return source, target, next, packet[offset:], true
 			}

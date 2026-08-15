@@ -111,12 +111,18 @@ identical to `AppendBinary(nil)`. For TCP, UDP, and ICMP, source and destination
 addresses provide address-family and pseudo-header checksum context but are not
 part of the returned transport wire. IPv4-mapped input addresses are normalized
 to IPv4 during construction, while an IPv4-mapped address encoded in an IPv6
-header is rejected. TCP encoding clears the three unexposed reserved
-bits and normalizes every byte after End of Option List to RFC 9293's required
-zero padding while parsing remains compatible with Linux's tolerant receive
-behavior. The historic NS bit remains explicitly available. IPv6 encoding
-similarly clears Fragment Header reserved fields and PadN data without hiding
-the received bytes from a parsed `IPPacket`.
+header is rejected, including inside a quoted packet carried by an ICMP
+error. TCP encoding clears the three unexposed reserved bits and normalizes
+every byte after End of Option List to RFC 9293's required zero padding while
+parsing remains compatible with Linux's tolerant receive behavior. The
+historic NS bit remains explicitly available. IPv6 encoding similarly clears
+PadN data and Fragment reserved fields without hiding the received bytes from
+a parsed `IPPacket`.
+
+IPv4 option parsing likewise follows Linux's tolerant EOL behavior: received
+bytes after End remain available in `IPPacket.IPv4Options`, while structured
+option traversal stops at End and packet encoding writes canonical zero
+padding.
 
 `ICMPMessage.IsEchoRequest` identifies complete IPv4 and IPv6 Echo Requests.
 `EchoReply` creates a zero-copy semantic Echo Reply using a caller-selected
@@ -124,22 +130,57 @@ source address; explicit selection is required because multicast, broadcast,
 and anycast destinations cannot be reused blindly as reply sources. The reply
 shares `Body` with the request, while `MarshalBinary` and `AppendBinary` encode
 the complete message and calculate its address-family checksum.
+`ICMPMessage.IsError` classifies supported family-specific error type/code
+pairs, while `ICMPMessage.ICMPError` validates the available quoted structure
+and returns its addresses, protocol, TCP or UDP ports, path MTU, and parameter
+pointer. Quoted packet and payload slices borrow `ICMPMessage.Body`; socket
+delivery takes an independent copy when it must retain them. For IPv6 No Next
+Header, `QuotedPacket` retains ignored trailing bytes while `QuotedPayload` is
+empty, matching `IPPacket.UpperLayer`.
 
-`IPPacket.UpperLayer` walks IPv6 Hop-by-Hop, Destination Options, Routing, and
-atomic Fragment headers. Stateful fragment reassembly belongs to `Stack`, not
-the standalone codec, while IPv6 jumbograms are not supported. Non-atomic
-fragments and every Jumbo Payload option are therefore rejected. A decoder
-that must validate an address-dependent pseudo-header (TCP, checksummed UDP,
-or ICMPv6) rejects an active IPv4 source route, active IPv6 Routing Header, or
-Mobile IPv6 Home Address option because it lacks the corresponding routing
-state. ICMPv4 and checksum-disabled IPv4 UDP remain decodable.
+TCP options are available in wire order through `TCPSegment.HeaderOptions` and
+`SetHeaderOptions`. `TCPHeaderOption` preserves unknown and repeated kinds and
+provides typed construction and inspection for MSS, Window Scale,
+SACK-Permitted, SACK blocks, and Timestamps. `TCPSACKBlock` uses the original
+wrapping 32-bit sequence edges without applying connection-specific window
+policy. IPv4 options use the corresponding `IPv4HeaderOptions` and
+`SetIPv4HeaderOptions` methods; `IPv4HeaderOption` also exposes the copied,
+class, and number fields of its complete option type.
 
-`ProtocolICMPv4`, `ProtocolTCP`, `ProtocolUDP`, and `ProtocolICMPv6` are
-untyped protocol-number constants. `TCPSegment.Flags` is a `uint16`; combine
-the untyped `TCPFlagFIN` through the historic `TCPFlagNS` constants directly.
-The package also exposes `InternetChecksum` and `IPTransportChecksum` for
-callers building other upper-layer protocols. The codec intentionally stops at
-the 65,535-byte non-jumbogram IP model used by the Stack.
+`IPPacket.IPv6ExtensionHeaders` and `SetIPv6ExtensionHeaders` expose and build
+the linked extension-header sequence without making callers write Next Header
+links themselves. Hop-by-Hop and Destination Options headers additionally use
+`IPv6ExtensionHeader.Options` and `SetOptions` for their option TLVs. Set
+methods copy caller data and leave their receiver unchanged on failure; parse
+methods return caller-owned descriptors whose data slices borrow the original
+wire storage. Parsing preserves received sender-reserved fields for inspection;
+serialization clears PadN data and Fragment reserved fields. Authentication and
+Mobility headers remain opaque: their reserved fields are integrity-protected,
+so callers constructing either header must provide canonical fields together
+with a matching ICV or checksum.
+
+`IPPacket.UpperLayer` structurally walks IPv6 Hop-by-Hop, Destination Options,
+Routing, atomic Fragment, Authentication, and Mobility headers. ESP and
+unknown values terminate traversal, while No Next Header returns no upper-layer
+payload even if preserved trailing bytes are available through the structural
+extension API. Structural AH or Mobility traversal does not authenticate or
+otherwise implement those protocols; AH framing still requires its complete
+fixed fields and IPv6's eight-octet alignment. Stateful fragment reassembly
+belongs to `Stack`, not the standalone codec, while IPv6 jumbograms are not
+supported. Non-atomic fragments and every Jumbo Payload option are therefore
+rejected. A decoder that must validate an address-dependent pseudo-header
+(TCP, checksummed UDP, or ICMPv6) rejects an active IPv4 source route, active
+IPv6 Routing Header, or Mobile IPv6 Home Address option because it lacks the
+corresponding routing state. ICMPv4 and checksum-disabled IPv4 UDP remain
+decodable.
+
+Protocol numbers, TCP flags, TCP and IP option kinds, and IPv6 extension-header
+identifiers are exposed as untyped constants so callers can use them directly
+with the wire-sized integer fields. This includes `ProtocolESP` and
+`ProtocolNoNextHeader`. `TCPSegment.Flags` remains a `uint16`. The package also
+exposes `InternetChecksum` and `IPTransportChecksum` for callers building
+other upper-layer protocols. The codec intentionally stops at the 65,535-byte
+non-jumbogram IP model used by the Stack.
 
 ## Socket API
 

@@ -110,6 +110,85 @@ func TestPublicIPPacketCodecInterop(t *testing.T) {
 	}
 }
 
+// TestPublicIPHeaderOptionsInterop verifies that gVisor accepts IPv4 options
+// and an IPv6 extension chain constructed through the semantic API.
+func TestPublicIPHeaderOptionsInterop(t *testing.T) {
+	const (
+		mipstackPort = 44031
+		gvisorPort   = 44032
+	)
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			network := newFamilyInteropNetwork(t, family, 1500)
+			peer := newGVisorUDPSocket(
+				t, network, family.networkProtocol,
+				gvisorFullAddress(family.gvisorAddress, gvisorPort), func(tcpip.Endpoint) {},
+			)
+			defer peer.Close()
+
+			payload := []byte("public-ip-options")
+			datagram := mipstack.UDPDatagram{
+				Source:      netipAddrPort(family.mipstackAddress, mipstackPort),
+				Destination: netipAddrPort(family.gvisorAddress, gvisorPort),
+				Payload:     payload,
+			}
+			udpWire, err := datagram.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public UDP datagram: %v", err)
+			}
+			packet := mipstack.IPPacket{
+				Source: family.mipstackAddress, Destination: family.gvisorAddress,
+				Protocol: mipstack.ProtocolUDP, HopLimit: 37, TrafficClass: 0x2e, Payload: udpWire,
+			}
+			if family.mipstackAddress.Is4() {
+				if err = packet.SetIPv4HeaderOptions([]mipstack.IPv4HeaderOption{
+					{Type: mipstack.IPv4HeaderOptionNOP},
+					{Type: mipstack.IPv4HeaderOptionRouterAlert, Data: []byte{0, 0}},
+				}); err != nil {
+					t.Fatalf("construct public IPv4 options: %v", err)
+				}
+			} else {
+				hopByHop := mipstack.IPv6ExtensionHeader{Type: mipstack.IPv6ExtensionHeaderHopByHop}
+				if err = hopByHop.SetOptions([]mipstack.IPv6ExtensionOption{
+					{Type: mipstack.IPv6ExtensionOptionRouterAlert, Data: []byte{0, 0}},
+				}); err != nil {
+					t.Fatalf("construct public Hop-by-Hop options: %v", err)
+				}
+				destination := mipstack.IPv6ExtensionHeader{Type: mipstack.IPv6ExtensionHeaderDestination}
+				if err = destination.SetOptions([]mipstack.IPv6ExtensionOption{
+					{Type: 0x1e, Data: []byte("opaque")},
+				}); err != nil {
+					t.Fatalf("construct public Destination options: %v", err)
+				}
+				if err = packet.SetIPv6ExtensionHeaders(
+					[]mipstack.IPv6ExtensionHeader{hopByHop, destination}, mipstack.ProtocolUDP, udpWire,
+				); err != nil {
+					t.Fatalf("construct public IPv6 extension chain: %v", err)
+				}
+			}
+			wire, err := packet.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public option packet: %v", err)
+			}
+			if err = network.deliverToGVisor(wire); err != nil {
+				t.Fatalf("deliver public option packet: %v", err)
+			}
+			if err = peer.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			storage := make([]byte, 64)
+			read, source, err := peer.ReadFrom(storage)
+			if err != nil {
+				t.Fatalf("read public option packet in gVisor: %v", err)
+			}
+			if !bytes.Equal(storage[:read], payload) || source.String() != netipAddrPort(family.mipstackAddress, mipstackPort).String() {
+				t.Fatalf("gVisor option payload/source = %q/%v", storage[:read], source)
+			}
+		})
+	}
+}
+
 // TestIPv6RawChecksumInterop verifies RFC 3542 IPV6_CHECKSUM insertion and
 // receive verification in both directions. Fragmented output is delivered to
 // gVisor's UDP transport because the pinned gVisor raw demultiplexer observes

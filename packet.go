@@ -13,8 +13,51 @@ const (
 	ProtocolTCP = 6
 	// ProtocolUDP is the User Datagram Protocol number.
 	ProtocolUDP = 17
+	// ProtocolESP is the Encapsulating Security Payload protocol number.
+	ProtocolESP = 50
 	// ProtocolICMPv6 is the IPv6 Internet Control Message Protocol number.
 	ProtocolICMPv6 = 58
+	// ProtocolNoNextHeader is the IPv6 No Next Header value.
+	ProtocolNoNextHeader = 59
+
+	// IPv4HeaderOptionEnd terminates the IPv4 option list.
+	IPv4HeaderOptionEnd = 0
+	// IPv4HeaderOptionNOP is the one-byte IPv4 No Operation option.
+	IPv4HeaderOptionNOP = 1
+	// IPv4HeaderOptionRecordRoute records routers traversed by a datagram.
+	IPv4HeaderOptionRecordRoute = 7
+	// IPv4HeaderOptionTimestamp records router timestamps and optional addresses.
+	IPv4HeaderOptionTimestamp = 68
+	// IPv4HeaderOptionLooseSourceRoute carries a loose source route.
+	IPv4HeaderOptionLooseSourceRoute = 131
+	// IPv4HeaderOptionStrictSourceRoute carries a strict source route.
+	IPv4HeaderOptionStrictSourceRoute = 137
+	// IPv4HeaderOptionRouterAlert requests examination by transit routers.
+	IPv4HeaderOptionRouterAlert = 148
+
+	// IPv6ExtensionHeaderHopByHop identifies a Hop-by-Hop Options header.
+	IPv6ExtensionHeaderHopByHop = 0
+	// IPv6ExtensionHeaderRouting identifies a Routing header.
+	IPv6ExtensionHeaderRouting = 43
+	// IPv6ExtensionHeaderFragment identifies a Fragment header.
+	IPv6ExtensionHeaderFragment = 44
+	// IPv6ExtensionHeaderAuthentication identifies an Authentication header.
+	IPv6ExtensionHeaderAuthentication = 51
+	// IPv6ExtensionHeaderDestination identifies a Destination Options header.
+	IPv6ExtensionHeaderDestination = 60
+	// IPv6ExtensionHeaderMobility identifies a Mobility header.
+	IPv6ExtensionHeaderMobility = 135
+
+	// IPv6ExtensionOptionPad1 is the one-byte IPv6 padding option.
+	IPv6ExtensionOptionPad1 = 0
+	// IPv6ExtensionOptionPadN is variable-length IPv6 padding.
+	IPv6ExtensionOptionPadN = 1
+	// IPv6ExtensionOptionRouterAlert requests examination by transit routers.
+	IPv6ExtensionOptionRouterAlert = 5
+	// IPv6ExtensionOptionJumboPayload carries an IPv6 jumbogram length.
+	IPv6ExtensionOptionJumboPayload = 194
+	// IPv6ExtensionOptionHomeAddress carries a Mobile IPv6 home address.
+	IPv6ExtensionOptionHomeAddress = 201
 
 	// ipv6MaximumFlowLabel is the 20-bit RFC 8200 Flow Label ceiling.
 	ipv6MaximumFlowLabel = 1<<20 - 1
@@ -43,12 +86,334 @@ type IPPacket struct {
 	Identification uint16
 	// DontFragment is the IPv4 Don't Fragment flag and must be false for IPv6.
 	DontFragment bool
-	// IPv4Options contains the exact IPv4 option area, including parsed padding.
-	// Construction also accepts an unpadded option sequence and adds zero padding.
+	// IPv4Options contains the exact IPv4 option area, including received padding.
+	// Construction also accepts an unpadded option sequence; encoding adds final
+	// alignment and normalizes every byte after End to zero.
 	IPv4Options []byte
 	// Payload is the complete IP payload. It includes IPv6 extension headers.
 	Payload []byte
 }
+
+// IPv4HeaderOption is one IPv4 header option in semantic wire order. Data
+// excludes the Type and Length bytes. End and NOP require empty Data; every
+// other type is encoded with a Length byte. IPv4HeaderOptions returns Data
+// slices that borrow IPPacket.IPv4Options, while SetIPv4HeaderOptions copies
+// every Data slice.
+type IPv4HeaderOption struct {
+	// Type is the complete eight-bit IPv4 option type.
+	Type uint8
+	// Data is the option value following Type and Length.
+	Data []byte
+}
+
+// IPv6ExtensionHeader is one structurally traversable IPv6 extension header.
+// Type is the value naming the header in the preceding Next Header field. Data
+// excludes this header's own Next Header byte but includes every remaining raw
+// field, including its length byte when present. IPv6ExtensionHeaders returns
+// Data slices that borrow IPPacket.Payload. Parsing preserves received PadN
+// data and sender-reserved fields; IPPacket.MarshalBinary and
+// IPPacket.AppendBinary clear PadN data and the reserved Fragment fields.
+// Authentication and Mobility data remains opaque because changing it would
+// invalidate the header's ICV or checksum.
+type IPv6ExtensionHeader struct {
+	// Type identifies the extension-header wire format.
+	Type uint8
+	// Data contains the raw header bytes following Next Header.
+	Data []byte
+}
+
+// IPv6ExtensionOption is one option in a Hop-by-Hop or Destination Options
+// header. Data excludes Option Type and Opt Data Len. Options returns Data
+// slices that borrow IPv6ExtensionHeader.Data, while SetOptions copies them.
+type IPv6ExtensionOption struct {
+	// Type is the complete eight-bit IPv6 option type.
+	Type uint8
+	// Data is the option value following Type and Opt Data Len.
+	Data []byte
+}
+
+// IPv4HeaderOptions parses the exact IPv4 option sequence. The returned slice
+// owns its descriptors, but each Data field borrows IPv4Options. End is
+// returned as the final descriptor; its following received padding is omitted.
+func (p IPPacket) IPv4HeaderOptions() ([]IPv4HeaderOption, error) {
+	if !p.Source.Unmap().Is4() || !p.Destination.Unmap().Is4() {
+		return nil, syscall.EAFNOSUPPORT
+	}
+	if len(p.IPv4Options) > 40 {
+		return nil, syscall.EMSGSIZE
+	}
+	var result []IPv4HeaderOption
+	for offset := 0; offset < len(p.IPv4Options); {
+		optionType := p.IPv4Options[offset]
+		switch optionType {
+		case IPv4HeaderOptionEnd:
+			return append(result, IPv4HeaderOption{Type: optionType}), nil
+		case IPv4HeaderOptionNOP:
+			result = append(result, IPv4HeaderOption{Type: optionType})
+			offset++
+			continue
+		}
+		if len(p.IPv4Options)-offset < 2 {
+			return nil, syscall.EINVAL
+		}
+		length := int(p.IPv4Options[offset+1])
+		if length < 2 || length > len(p.IPv4Options)-offset {
+			return nil, syscall.EINVAL
+		}
+		result = append(result, IPv4HeaderOption{Type: optionType, Data: p.IPv4Options[offset+2 : offset+length]})
+		offset += length
+	}
+	return result, nil
+}
+
+// SetIPv4HeaderOptions replaces IPv4Options with the encoded option sequence.
+// It preserves unknown types, duplicates, and order, copies every input Data
+// slice, and leaves p unchanged on failure. End must be last. MarshalBinary or
+// AppendBinary adds any final four-byte header alignment.
+func (p *IPPacket) SetIPv4HeaderOptions(options []IPv4HeaderOption) error {
+	if p == nil {
+		return syscall.EINVAL
+	}
+	if !p.Source.Unmap().Is4() || !p.Destination.Unmap().Is4() {
+		return syscall.EAFNOSUPPORT
+	}
+	size := 0
+	ended := false
+	for _, option := range options {
+		if ended {
+			return syscall.EINVAL
+		}
+		switch option.Type {
+		case IPv4HeaderOptionEnd, IPv4HeaderOptionNOP:
+			if len(option.Data) != 0 {
+				return syscall.EINVAL
+			}
+			size++
+			ended = option.Type == IPv4HeaderOptionEnd
+		default:
+			if len(option.Data) > 253 {
+				return syscall.EINVAL
+			}
+			size += 2 + len(option.Data)
+		}
+		if size > 40 {
+			return syscall.EMSGSIZE
+		}
+	}
+	var encoded []byte
+	if size != 0 {
+		encoded = make([]byte, 0, size)
+	}
+	for _, option := range options {
+		encoded = append(encoded, option.Type)
+		if option.Type == IPv4HeaderOptionEnd || option.Type == IPv4HeaderOptionNOP {
+			continue
+		}
+		encoded = append(encoded, byte(2+len(option.Data)))
+		encoded = append(encoded, option.Data...)
+	}
+	p.IPv4Options = encoded
+	return nil
+}
+
+// Copied reports the IPv4 option's copied flag, which requests copying into
+// every fragment.
+func (o IPv4HeaderOption) Copied() bool { return o.Type&0x80 != 0 }
+
+// Class returns the IPv4 option's two-bit class field.
+func (o IPv4HeaderOption) Class() uint8 { return o.Type >> 5 & 0x03 }
+
+// Number returns the IPv4 option's five-bit option number.
+func (o IPv4HeaderOption) Number() uint8 { return o.Type & 0x1f }
+
+// IPv6ExtensionHeaders returns the structurally traversable extension-header
+// chain, the final Next Header value, and the remaining payload. The returned
+// descriptor slice is caller-owned; header Data and payload borrow p.Payload.
+// ESP, No Next Header, and unknown values terminate traversal. Bytes following
+// No Next Header are returned as payload for lossless structural reconstruction
+// even though UpperLayer intentionally ignores them.
+func (p IPPacket) IPv6ExtensionHeaders() (headers []IPv6ExtensionHeader, protocol int, payload []byte, err error) {
+	if !p.Source.Is6() || p.Source.Is4In6() || !p.Destination.Is6() || p.Destination.Is4In6() {
+		return nil, 0, nil, syscall.EAFNOSUPPORT
+	}
+	if p.Protocol < 0 || p.Protocol > 255 || len(p.IPv4Options) != 0 {
+		return nil, 0, nil, syscall.EINVAL
+	}
+	next, offset := byte(p.Protocol), 0
+	seenHop := false
+	for offset <= len(p.Payload) {
+		if !isTraversableIPv6ExtensionHeader(next) {
+			return headers, int(next), p.Payload[offset:], nil
+		}
+		if next == IPv6ExtensionHeaderHopByHop && (offset != 0 || seenHop) {
+			return nil, 0, nil, syscall.EINVAL
+		}
+		length, valid := ipv6ExtensionHeaderLength(next, p.Payload[offset:])
+		if !valid {
+			return nil, 0, nil, syscall.EINVAL
+		}
+		header := p.Payload[offset : offset+length]
+		if next == IPv6ExtensionHeaderHopByHop || next == IPv6ExtensionHeaderDestination {
+			validOptions, _, jumboPayload := inspectIPv6OptionsForCodec(header)
+			if !validOptions || jumboPayload {
+				return nil, 0, nil, syscall.EINVAL
+			}
+		}
+		if next == IPv6ExtensionHeaderFragment && binary.BigEndian.Uint16(header[2:4])&0xfff9 != 0 {
+			return nil, 0, nil, syscall.EINVAL
+		}
+		headers = append(headers, IPv6ExtensionHeader{Type: next, Data: header[1:]})
+		if next == IPv6ExtensionHeaderHopByHop {
+			seenHop = true
+		}
+		next, offset = header[0], offset+length
+	}
+	return nil, 0, nil, syscall.EINVAL
+}
+
+// SetIPv6ExtensionHeaders replaces Protocol and Payload with one complete
+// extension chain and final upper-layer payload. It generates every Next
+// Header link, copies all caller storage, and leaves p unchanged on failure.
+// Each header Data excludes its Next Header byte and must otherwise contain a
+// complete header-specific wire representation.
+func (p *IPPacket) SetIPv6ExtensionHeaders(headers []IPv6ExtensionHeader, protocol int, payload []byte) error {
+	if p == nil {
+		return syscall.EINVAL
+	}
+	if !p.Source.Is6() || p.Source.Is4In6() || !p.Destination.Is6() || p.Destination.Is4In6() {
+		return syscall.EAFNOSUPPORT
+	}
+	if protocol < 0 || protocol > 255 || isTraversableIPv6ExtensionHeader(byte(protocol)) {
+		return syscall.EINVAL
+	}
+	if len(payload) > 65535 {
+		return syscall.EMSGSIZE
+	}
+	total := len(payload)
+	seenHop := false
+	for index, header := range headers {
+		if !isTraversableIPv6ExtensionHeader(header.Type) {
+			return syscall.EPROTONOSUPPORT
+		}
+		if header.Type == IPv6ExtensionHeaderHopByHop {
+			if index != 0 || seenHop {
+				return syscall.EINVAL
+			}
+			seenHop = true
+		}
+		length, valid := ipv6ExtensionHeaderDataLength(header.Type, header.Data)
+		if !valid || length != 1+len(header.Data) {
+			return syscall.EINVAL
+		}
+		if header.Type == IPv6ExtensionHeaderHopByHop || header.Type == IPv6ExtensionHeaderDestination {
+			validOptions, _, jumboPayload := inspectIPv6OptionBytesForCodec(header.Data[1:])
+			if !validOptions || jumboPayload {
+				return syscall.EINVAL
+			}
+		}
+		if header.Type == IPv6ExtensionHeaderFragment && binary.BigEndian.Uint16(header.Data[1:3])&0xfff9 != 0 {
+			return syscall.EINVAL
+		}
+		total += length
+		if total > 65535 {
+			return syscall.EMSGSIZE
+		}
+	}
+	encoded := make([]byte, 0, total)
+	for index, header := range headers {
+		next := byte(protocol)
+		if index+1 < len(headers) {
+			next = headers[index+1].Type
+		}
+		encoded = append(encoded, next)
+		encoded = append(encoded, header.Data...)
+	}
+	encoded = append(encoded, payload...)
+	if len(headers) == 0 {
+		p.Protocol = protocol
+	} else {
+		p.Protocol = int(headers[0].Type)
+	}
+	p.Payload = encoded
+	return nil
+}
+
+// Options parses a Hop-by-Hop or Destination Options header. The returned
+// slice owns its descriptors, but every Data field borrows h.Data. Unknown
+// option types, action bits, duplicates, and padding remain in wire order.
+func (h IPv6ExtensionHeader) Options() ([]IPv6ExtensionOption, error) {
+	if h.Type != IPv6ExtensionHeaderHopByHop && h.Type != IPv6ExtensionHeaderDestination {
+		return nil, syscall.EPROTONOSUPPORT
+	}
+	length, valid := ipv6ExtensionHeaderDataLength(h.Type, h.Data)
+	if !valid || length != 1+len(h.Data) {
+		return nil, syscall.EINVAL
+	}
+	return parseIPv6ExtensionOptions(h.Data[1:])
+}
+
+// SetOptions replaces Data in a Hop-by-Hop or Destination Options header. It
+// preserves unknown types, duplicates, and order, copies every input Data
+// slice, and adds canonical trailing Pad1 or PadN alignment. It leaves h
+// unchanged on failure.
+func (h *IPv6ExtensionHeader) SetOptions(options []IPv6ExtensionOption) error {
+	if h == nil {
+		return syscall.EINVAL
+	}
+	if h.Type != IPv6ExtensionHeaderHopByHop && h.Type != IPv6ExtensionHeaderDestination {
+		return syscall.EPROTONOSUPPORT
+	}
+	optionSize := 0
+	for _, option := range options {
+		if option.Type == IPv6ExtensionOptionPad1 {
+			if len(option.Data) != 0 {
+				return syscall.EINVAL
+			}
+			optionSize++
+		} else {
+			if len(option.Data) > 255 {
+				return syscall.EINVAL
+			}
+			optionSize += 2 + len(option.Data)
+		}
+		if optionSize > 2046 {
+			return syscall.EMSGSIZE
+		}
+	}
+	total := 2 + optionSize
+	padding := -total & 7
+	total += padding
+	if total > 2048 {
+		return syscall.EMSGSIZE
+	}
+	data := make([]byte, total-1)
+	data[0] = byte(total/8 - 1)
+	offset := 1
+	for _, option := range options {
+		data[offset] = option.Type
+		offset++
+		if option.Type == IPv6ExtensionOptionPad1 {
+			continue
+		}
+		data[offset] = byte(len(option.Data))
+		offset++
+		copy(data[offset:], option.Data)
+		offset += len(option.Data)
+	}
+	if padding == 1 {
+		data[offset] = IPv6ExtensionOptionPad1
+	} else if padding > 1 {
+		data[offset], data[offset+1] = IPv6ExtensionOptionPadN, byte(padding-2)
+	}
+	h.Data = data
+	return nil
+}
+
+// Action returns the option's two-bit RFC 8200 action on an unrecognized type.
+func (o IPv6ExtensionOption) Action() uint8 { return o.Type >> 6 }
+
+// MayChangeInTransit reports the RFC 8200 mutable-data flag.
+func (o IPv6ExtensionOption) MayChangeInTransit() bool { return o.Type&0x20 != 0 }
 
 // ParseIPPacket validates packet and returns a zero-copy semantic value. It
 // validates declared lengths, the IPv4 header checksum, option framing, IPv6
@@ -230,7 +595,8 @@ func (p IPPacket) wireLayout() (IPPacket, int, int, error) {
 func marshalPublicIPPacket(dst []byte, p IPPacket, headerSize int) {
 	if p.Source.Is4() {
 		var options [40]byte
-		copy(options[:], p.IPv4Options)
+		contentSize, _ := ipv4OptionsContentLength(p.IPv4Options)
+		copy(options[:], p.IPv4Options[:contentSize])
 		copy(dst[headerSize:], p.Payload)
 		copy(dst[20:headerSize], options[:len(p.IPv4Options)])
 		for index := 20 + len(p.IPv4Options); index < headerSize; index++ {
@@ -263,23 +629,24 @@ func marshalPublicIPPacket(dst []byte, p IPPacket, headerSize int) {
 	copy(dst[24:40], destination[:])
 }
 
-// normalizeIPv6ExtensionFields applies RFC 8200's sender requirements to a
-// validated extension chain. Receivers ignore these fields, so parsing keeps
-// the original bytes available while every newly encoded packet writes zeros.
+// normalizeIPv6ExtensionFields applies sender requirements that cannot
+// invalidate an opaque integrity value. Authentication and Mobility headers
+// are deliberately left untouched: their ICV or checksum covers reserved
+// fields, and this structural codec lacks the state required to recompute it.
 func normalizeIPv6ExtensionFields(first byte, payload []byte) {
 	next, offset := first, 0
 	for offset <= len(payload) {
 		switch next {
-		case 0, 60:
+		case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination:
 			length := (int(payload[offset+1]) + 1) * 8
 			for optionOffset := offset + 2; optionOffset < offset+length; {
 				kind := payload[optionOffset]
-				if kind == 0 {
+				if kind == IPv6ExtensionOptionPad1 {
 					optionOffset++
 					continue
 				}
 				optionLength := int(payload[optionOffset+1])
-				if kind == 1 {
+				if kind == IPv6ExtensionOptionPadN {
 					for index := optionOffset + 2; index < optionOffset+2+optionLength; index++ {
 						payload[index] = 0
 					}
@@ -287,10 +654,16 @@ func normalizeIPv6ExtensionFields(first byte, payload []byte) {
 				optionOffset += optionLength + 2
 			}
 			next, offset = payload[offset], offset+length
-		case 43:
+		case IPv6ExtensionHeaderRouting:
 			length := (int(payload[offset+1]) + 1) * 8
 			next, offset = payload[offset], offset+length
-		case 44:
+		case IPv6ExtensionHeaderAuthentication:
+			length := (int(payload[offset+1]) + 2) * 4
+			next, offset = payload[offset], offset+length
+		case IPv6ExtensionHeaderMobility:
+			length := (int(payload[offset+1]) + 1) * 8
+			next, offset = payload[offset], offset+length
+		case IPv6ExtensionHeaderFragment:
 			next = payload[offset]
 			payload[offset+1] = 0
 			field := binary.BigEndian.Uint16(payload[offset+2 : offset+4])
@@ -536,8 +909,8 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 		seenHop := false
 		for offset <= end {
 			switch next {
-			case 0, 60:
-				if next == 0 && (offset != 40 || seenHop) {
+			case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination:
+				if next == IPv6ExtensionHeaderHopByHop && (offset != 40 || seenHop) {
 					// RFC 8200 permits Hop-by-Hop only immediately after the
 					// IPv6 header. A later value zero is therefore an
 					// unrecognized Next Header, not another extension header.
@@ -565,11 +938,11 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 					}
 					return ipPacket{}, false
 				}
-				if next == 0 {
+				if next == IPv6ExtensionHeaderHopByHop {
 					seenHop = true
 				}
 				next, nextOffset, offset = packet[offset], offset, offset+length
-			case 43:
+			case IPv6ExtensionHeaderRouting:
 				if end-offset < 8 {
 					return ipPacket{}, false
 				}
@@ -585,7 +958,7 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 					}, true
 				}
 				next, nextOffset, offset = packet[offset], offset, offset+length
-			case 44:
+			case IPv6ExtensionHeaderFragment:
 				// Non-atomic fragments require bounded reassembly. Atomic
 				// fragments can safely continue as an ordinary packet. RFC
 				// 8200 requires receivers to ignore both reserved fields.
@@ -616,7 +989,7 @@ func (p ipPacket) hasRouterAlert() bool {
 		headerSize := int(p.original[0]&0x0f) * 4
 		return headerSize >= 20 && headerSize <= len(p.original) && ipv4RouterAlert(p.original[20:headerSize])
 	}
-	if !p.source.Is6() || len(p.original) < 48 || p.original[6] != 0 {
+	if !p.source.Is6() || len(p.original) < 48 || p.original[6] != IPv6ExtensionHeaderHopByHop {
 		return false
 	}
 	length := (int(p.original[41]) + 1) * 8
@@ -630,78 +1003,149 @@ func walkIPv6UpperLayer(first byte, payload []byte) (protocol byte, upper []byte
 	next, offset := first, 0
 	seenHop := false
 	for offset <= len(payload) {
-		switch next {
-		case 0, 60:
-			if next == 0 && (offset != 0 || seenHop) || len(payload)-offset < 8 {
-				return 0, nil, false, false
-			}
-			length := (int(payload[offset+1]) + 1) * 8
-			if length > len(payload)-offset {
-				return 0, nil, false, false
-			}
-			valid, homeAddress, jumboPayload := inspectIPv6OptionsForCodec(payload[offset : offset+length])
-			if !valid || jumboPayload {
-				return 0, nil, false, false
-			}
-			pseudoHeaderUnsafe = pseudoHeaderUnsafe || homeAddress
-			if next == 0 {
-				seenHop = true
-			}
-			next, offset = payload[offset], offset+length
-		case 43:
-			if len(payload)-offset < 8 {
-				return 0, nil, false, false
-			}
-			length := (int(payload[offset+1]) + 1) * 8
-			if length > len(payload)-offset {
-				return 0, nil, false, false
-			}
-			pseudoHeaderUnsafe = pseudoHeaderUnsafe || payload[offset+3] != 0
-			next, offset = payload[offset], offset+length
-		case 44:
-			// Only atomic fragments contain a complete upper-layer unit. The
-			// two reserved bits are ignored as RFC 8200 requires.
-			if len(payload)-offset < 8 || binary.BigEndian.Uint16(payload[offset+2:offset+4])&0xfff9 != 0 {
-				return 0, nil, false, false
-			}
-			next, offset = payload[offset], offset+8
-		case 59:
+		if next == ProtocolNoNextHeader {
 			// RFC 8200 requires receivers to ignore bytes following No Next
 			// Header. IPPacket.Payload still preserves them for round trips.
 			return next, nil, pseudoHeaderUnsafe, true
-		default:
+		}
+		if !isTraversableIPv6ExtensionHeader(next) {
 			return next, payload[offset:], pseudoHeaderUnsafe, true
 		}
+		if next == IPv6ExtensionHeaderHopByHop && (offset != 0 || seenHop) {
+			return 0, nil, false, false
+		}
+		length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
+		if !valid {
+			return 0, nil, false, false
+		}
+		header := payload[offset : offset+length]
+		switch next {
+		case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination:
+			validOptions, homeAddress, jumboPayload := inspectIPv6OptionsForCodec(header)
+			if !validOptions || jumboPayload {
+				return 0, nil, false, false
+			}
+			pseudoHeaderUnsafe = pseudoHeaderUnsafe || homeAddress
+		case IPv6ExtensionHeaderRouting:
+			pseudoHeaderUnsafe = pseudoHeaderUnsafe || header[3] != 0
+		case IPv6ExtensionHeaderFragment:
+			// Only atomic fragments contain a complete upper-layer unit. The
+			// two reserved fields are ignored as RFC 8200 requires.
+			if binary.BigEndian.Uint16(header[2:4])&0xfff9 != 0 {
+				return 0, nil, false, false
+			}
+		}
+		if next == IPv6ExtensionHeaderHopByHop {
+			seenHop = true
+		}
+		next, offset = header[0], offset+length
 	}
 	return 0, nil, false, false
+}
+
+// isTraversableIPv6ExtensionHeader reports headers whose length and following
+// Next Header can be determined without security or transport state. ESP is
+// intentionally terminal because its encrypted trailer identifies the next
+// protocol only after decryption.
+func isTraversableIPv6ExtensionHeader(headerType byte) bool {
+	switch headerType {
+	case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting,
+		IPv6ExtensionHeaderFragment, IPv6ExtensionHeaderAuthentication,
+		IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderMobility:
+		return true
+	default:
+		return false
+	}
+}
+
+// ipv6ExtensionHeaderLength validates one header prefix within a remaining
+// packet and returns its complete length, including Next Header.
+func ipv6ExtensionHeaderLength(headerType byte, header []byte) (int, bool) {
+	if len(header) < 2 {
+		return 0, false
+	}
+	length, valid := ipv6ExtensionHeaderDataLength(headerType, header[1:])
+	return length, valid && length <= len(header)
+}
+
+// ipv6ExtensionHeaderDataLength validates the length field available after a
+// header's Next Header byte and returns the complete header length.
+func ipv6ExtensionHeaderDataLength(headerType byte, data []byte) (int, bool) {
+	switch headerType {
+	case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting,
+		IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderMobility:
+		if len(data) < 1 {
+			return 0, false
+		}
+		return (int(data[0]) + 1) * 8, true
+	case IPv6ExtensionHeaderFragment:
+		return 8, len(data) >= 7
+	case IPv6ExtensionHeaderAuthentication:
+		if len(data) < 1 {
+			return 0, false
+		}
+		length := (int(data[0]) + 2) * 4
+		// RFC 4302 requires the fixed fields through Sequence Number and,
+		// for IPv6, pads the complete AH to an eight-octet boundary.
+		return length, length >= 16 && length%8 == 0
+	default:
+		return 0, false
+	}
+}
+
+// parseIPv6ExtensionOptions parses the option bytes following the common
+// Next Header and Hdr Ext Len fields.
+func parseIPv6ExtensionOptions(options []byte) ([]IPv6ExtensionOption, error) {
+	var result []IPv6ExtensionOption
+	for offset := 0; offset < len(options); {
+		optionType := options[offset]
+		if optionType == IPv6ExtensionOptionPad1 {
+			result = append(result, IPv6ExtensionOption{Type: optionType})
+			offset++
+			continue
+		}
+		if len(options)-offset < 2 {
+			return nil, syscall.EINVAL
+		}
+		length := int(options[offset+1])
+		if length > len(options)-offset-2 {
+			return nil, syscall.EINVAL
+		}
+		result = append(result, IPv6ExtensionOption{Type: optionType, Data: options[offset+2 : offset+2+length]})
+		offset += 2 + length
+	}
+	return result, nil
+}
+
+// ipv4OptionsContentLength validates IPv4 option framing and returns the bytes
+// through End. Like Linux, receivers ignore later padding bytes; encoders use
+// the returned length to write canonical zero padding.
+func ipv4OptionsContentLength(options []byte) (int, bool) {
+	for offset := 0; offset < len(options); {
+		switch options[offset] {
+		case IPv4HeaderOptionEnd:
+			return offset + 1, true
+		case IPv4HeaderOptionNOP:
+			offset++
+			continue
+		}
+		if len(options)-offset < 2 {
+			return 0, false
+		}
+		length := int(options[offset+1])
+		if length < 2 || length > len(options)-offset {
+			return 0, false
+		}
+		offset += length
+	}
+	return len(options), true
 }
 
 // validIPv4OptionsForCodec validates only the wire framing of IPv4 options.
 // Host policy such as source-route rejection remains in validateIPv4Options.
 func validIPv4OptionsForCodec(options []byte) bool {
-	for offset := 0; offset < len(options); {
-		switch options[offset] {
-		case 0:
-			for _, padding := range options[offset+1:] {
-				if padding != 0 {
-					return false
-				}
-			}
-			return true
-		case 1:
-			offset++
-			continue
-		}
-		if len(options)-offset < 2 {
-			return false
-		}
-		length := int(options[offset+1])
-		if length < 2 || length > len(options)-offset {
-			return false
-		}
-		offset += length
-	}
-	return true
+	_, valid := ipv4OptionsContentLength(options)
+	return valid
 }
 
 // hasActiveIPv4SourceRoute reports a loose or strict source route whose next
@@ -710,10 +1154,10 @@ func validIPv4OptionsForCodec(options []byte) bool {
 func hasActiveIPv4SourceRoute(options []byte) bool {
 	for offset := 0; offset < len(options); {
 		kind := options[offset]
-		if kind == 0 {
+		if kind == IPv4HeaderOptionEnd {
 			return false
 		}
-		if kind == 1 {
+		if kind == IPv4HeaderOptionNOP {
 			offset++
 			continue
 		}
@@ -724,7 +1168,7 @@ func hasActiveIPv4SourceRoute(options []byte) bool {
 		if length < 2 || length > len(options)-offset {
 			return false
 		}
-		if kind == 131 || kind == 137 {
+		if kind == IPv4HeaderOptionLooseSourceRoute || kind == IPv4HeaderOptionStrictSourceRoute {
 			if length < 3 {
 				return true
 			}
@@ -747,20 +1191,26 @@ func inspectIPv6OptionsForCodec(header []byte) (valid, homeAddress, jumboPayload
 	if len(header) < 8 || len(header)%8 != 0 {
 		return false, false, false
 	}
-	for offset := 2; offset < len(header); {
-		if header[offset] == 0 {
+	return inspectIPv6OptionBytesForCodec(header[2:])
+}
+
+// inspectIPv6OptionBytesForCodec validates a complete IPv6 option area and
+// reports options that need state unavailable to the standalone codec.
+func inspectIPv6OptionBytesForCodec(options []byte) (valid, homeAddress, jumboPayload bool) {
+	for offset := 0; offset < len(options); {
+		if options[offset] == IPv6ExtensionOptionPad1 {
 			offset++
 			continue
 		}
-		if len(header)-offset < 2 {
+		if len(options)-offset < 2 {
 			return false, false, false
 		}
-		length := int(header[offset+1]) + 2
-		if length > len(header)-offset {
+		length := int(options[offset+1]) + 2
+		if length > len(options)-offset {
 			return false, false, false
 		}
-		homeAddress = homeAddress || header[offset] == 201
-		jumboPayload = jumboPayload || header[offset] == 194
+		homeAddress = homeAddress || options[offset] == IPv6ExtensionOptionHomeAddress
+		jumboPayload = jumboPayload || options[offset] == IPv6ExtensionOptionJumboPayload
 		offset += length
 	}
 	return true, homeAddress, jumboPayload
@@ -771,15 +1221,10 @@ func ipv4RouterAlert(options []byte) bool {
 	found := false
 	for offset := 0; offset < len(options); {
 		kind := options[offset]
-		if kind == 0 {
-			for _, padding := range options[offset+1:] {
-				if padding != 0 {
-					return false
-				}
-			}
+		if kind == IPv4HeaderOptionEnd {
 			return found
 		}
-		if kind == 1 {
+		if kind == IPv4HeaderOptionNOP {
 			offset++
 			continue
 		}
@@ -790,7 +1235,7 @@ func ipv4RouterAlert(options []byte) bool {
 		if length < 2 || length > len(options)-offset {
 			return false
 		}
-		if kind == 148 {
+		if kind == IPv4HeaderOptionRouterAlert {
 			if found || length != 4 || options[offset+2] != 0 || options[offset+3] != 0 {
 				return false
 			}
@@ -807,7 +1252,7 @@ func ipv6RouterAlert(header []byte) bool {
 	found := false
 	for offset := 2; offset < len(header); {
 		kind := header[offset]
-		if kind == 0 {
+		if kind == IPv6ExtensionOptionPad1 {
 			offset++
 			continue
 		}
@@ -818,7 +1263,7 @@ func ipv6RouterAlert(header []byte) bool {
 		if length > len(header)-offset {
 			return false
 		}
-		if kind == 5 {
+		if kind == IPv6ExtensionOptionRouterAlert {
 			if found || length != 4 || header[offset+2] != 0 || header[offset+3] != 0 {
 				return false
 			}
@@ -838,14 +1283,9 @@ func malformedIPv4Option(options []byte) (int, bool) {
 	for offset := 0; offset < len(options); {
 		kind := options[offset]
 		switch kind {
-		case 0:
-			for padding := offset + 1; padding < len(options); padding++ {
-				if options[padding] != 0 {
-					return padding, true
-				}
-			}
+		case IPv4HeaderOptionEnd:
 			return 0, false
-		case 1:
+		case IPv4HeaderOptionNOP:
 			offset++
 			continue
 		}
@@ -857,7 +1297,7 @@ func malformedIPv4Option(options []byte) (int, bool) {
 			return offset, true
 		}
 		switch kind {
-		case 131, 137: // Loose and strict source route.
+		case IPv4HeaderOptionLooseSourceRoute, IPv4HeaderOptionStrictSourceRoute:
 			if length < 3 {
 				return offset + 1, true
 			}
@@ -868,7 +1308,7 @@ func malformedIPv4Option(options []byte) (int, bool) {
 				return offset, true
 			}
 			sourceRoute = true
-		case 7: // Record route.
+		case IPv4HeaderOptionRecordRoute:
 			if recordRoute {
 				return offset, true
 			}
@@ -883,7 +1323,7 @@ func malformedIPv4Option(options []byte) (int, bool) {
 			if pointer <= length && pointer+3 > length {
 				return offset + 2, true
 			}
-		case 68: // Internet timestamp.
+		case IPv4HeaderOptionTimestamp:
 			if timestamp {
 				return offset, true
 			}
@@ -907,7 +1347,7 @@ func malformedIPv4Option(options []byte) (int, bool) {
 			} else if flag != 3 && options[offset+3]>>4 == 15 {
 				return offset + 3, true
 			}
-		case 148: // Router Alert.
+		case IPv4HeaderOptionRouterAlert:
 			if length != 4 {
 				return offset + 1, true
 			}
@@ -927,17 +1367,12 @@ func validateIPv4Options(options []byte) bool {
 	for offset := 0; offset < len(options); {
 		kind := options[offset]
 		switch kind {
-		case 0:
-			for _, padding := range options[offset+1:] {
-				if padding != 0 {
-					return false
-				}
-			}
+		case IPv4HeaderOptionEnd:
 			return true
-		case 1:
+		case IPv4HeaderOptionNOP:
 			offset++
 			continue
-		case 131, 137:
+		case IPv4HeaderOptionLooseSourceRoute, IPv4HeaderOptionStrictSourceRoute:
 			return false
 		}
 		if len(options)-offset < 2 {
@@ -960,7 +1395,7 @@ func inspectIPv6Options(header []byte) (bool, byte, int) {
 	}
 	for offset := 2; offset < len(header); {
 		kind := header[offset]
-		if kind == 0 {
+		if kind == IPv6ExtensionOptionPad1 {
 			offset++
 			continue
 		}

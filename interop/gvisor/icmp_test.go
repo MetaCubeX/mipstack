@@ -119,6 +119,78 @@ func TestPublicICMPMessageCodecInterop(t *testing.T) {
 	}
 }
 
+// TestPublicICMPErrorInterop verifies that the semantic API decodes native
+// gVisor errors and their quoted transport tuple in both address families.
+func TestPublicICMPErrorInterop(t *testing.T) {
+	const (
+		mipstackPort = 44021
+		gvisorPort   = 44022
+	)
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			captured := make(chan []byte, 4)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					select {
+					case captured <- append([]byte(nil), packet...):
+					default:
+					}
+					return false
+				},
+			})
+			datagram := mipstack.UDPDatagram{
+				Source:      netipAddrPort(family.mipstackAddress, mipstackPort),
+				Destination: netipAddrPort(family.gvisorAddress, gvisorPort),
+				Payload:     []byte("unbound-public-udp"),
+			}
+			udpWire, err := datagram.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode UDP probe: %v", err)
+			}
+			packet := mipstack.IPPacket{
+				Source: family.mipstackAddress, Destination: family.gvisorAddress,
+				Protocol: mipstack.ProtocolUDP, HopLimit: 64, Payload: udpWire,
+			}
+			wire, err := packet.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode UDP probe packet: %v", err)
+			}
+			if err = network.deliverToGVisor(wire); err != nil {
+				t.Fatalf("deliver UDP probe: %v", err)
+			}
+			select {
+			case responseWire := <-captured:
+				response, parseErr := mipstack.ParseIPPacket(responseWire)
+				if parseErr != nil {
+					t.Fatalf("parse gVisor ICMP error packet: %v", parseErr)
+				}
+				message, parseErr := response.ICMPMessage()
+				if parseErr != nil {
+					t.Fatalf("parse gVisor ICMP error message: %v", parseErr)
+				}
+				networkError, parseErr := message.ICMPError()
+				if parseErr != nil {
+					t.Fatalf("parse gVisor quoted packet: %v", parseErr)
+				}
+				wantType, wantCode := uint8(header.ICMPv4DstUnreachable), uint8(header.ICMPv4PortUnreachable)
+				if family.mipstackAddress.Is6() {
+					wantType, wantCode = uint8(header.ICMPv6DstUnreachable), uint8(header.ICMPv6PortUnreachable)
+				}
+				if !message.IsError() || message.Type != wantType || message.Code != wantCode ||
+					networkError.Reporter != family.gvisorAddress || networkError.QuotedSource != family.mipstackAddress ||
+					networkError.QuotedTarget != family.gvisorAddress || networkError.QuotedProtocol != mipstack.ProtocolUDP ||
+					networkError.QuotedSourcePort != mipstackPort || networkError.QuotedTargetPort != gvisorPort {
+					t.Fatalf("decoded gVisor ICMP error = message %+v, error %+v", message, networkError)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("timed out waiting for gVisor ICMP error")
+			}
+		})
+	}
+}
+
 // TestMipstackICMPFilterInterop verifies that native gVisor raw ICMP traffic
 // observes mipstack's Linux-compatible IPv4 and RFC 3542 IPv6 type filters.
 func TestMipstackICMPFilterInterop(t *testing.T) {

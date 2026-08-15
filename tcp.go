@@ -35,6 +35,21 @@ const (
 	// TCPFlagNS is the historic ECN Nonce Sum bit, now reserved by RFC 9293.
 	TCPFlagNS
 
+	// TCPHeaderOptionEnd terminates the TCP option list.
+	TCPHeaderOptionEnd = 0
+	// TCPHeaderOptionNOP is the one-byte No-Operation TCP option.
+	TCPHeaderOptionNOP = 1
+	// TCPHeaderOptionMSS carries a two-byte Maximum Segment Size.
+	TCPHeaderOptionMSS = 2
+	// TCPHeaderOptionWindowScale carries an unmodified one-byte window scale.
+	TCPHeaderOptionWindowScale = 3
+	// TCPHeaderOptionSACKPermitted negotiates selective acknowledgments.
+	TCPHeaderOptionSACKPermitted = 4
+	// TCPHeaderOptionSACK carries one to four selective-acknowledgment blocks.
+	TCPHeaderOptionSACK = 5
+	// TCPHeaderOptionTimestamp carries TSval and TSecr values.
+	TCPHeaderOptionTimestamp = 8
+
 	// tcpHeaderSize is the TCP header length without options.
 	tcpHeaderSize = 20
 	// tcpActorWakeSend reports application send-buffer progress. Wake bits
@@ -188,6 +203,27 @@ const (
 	tcpMinimumRTTWindow = 300 * time.Second
 )
 
+// TCPHeaderOption is one TCP option in semantic wire order. Data excludes the
+// Kind and Length bytes. End and NOP require empty Data; every other kind is
+// encoded with a Length byte. HeaderOptions returns Data slices that borrow
+// TCPSegment.Options, while SetHeaderOptions copies every Data slice.
+type TCPHeaderOption struct {
+	// Kind is the TCP option kind.
+	Kind uint8
+	// Data is the option value following Kind and Length.
+	Data []byte
+}
+
+// TCPSACKBlock is one half-open sequence range carried by a TCP SACK option.
+// Edges use TCP's wrapping 32-bit sequence space; interpreting their order
+// requires connection context that the standalone wire codec does not have.
+type TCPSACKBlock struct {
+	// LeftEdge is the sequence number of the first acknowledged byte.
+	LeftEdge uint32
+	// RightEdge is the sequence number immediately after the acknowledged range.
+	RightEdge uint32
+}
+
 // TCPSegment is the semantic representation of one checksummed TCP segment.
 // Source and Destination provide both wire ports and the IP pseudo-header
 // addresses. IPPacket.TCPSegment borrows Options and Payload from the packet;
@@ -215,6 +251,179 @@ type TCPSegment struct {
 	Options []byte
 	// Payload is the segment's application data.
 	Payload []byte
+}
+
+// HeaderOptions parses the exact TCP option sequence. The returned slice owns
+// its option descriptors, but each Data field borrows Options. End is returned
+// as the final descriptor and bytes after it are ignored as receiver padding.
+// Recognized kinds with nonstandard lengths remain available as raw options;
+// their typed accessors report ok=false.
+func (s TCPSegment) HeaderOptions() ([]TCPHeaderOption, error) {
+	if len(s.Options) > 40 {
+		return nil, syscall.EMSGSIZE
+	}
+	var result []TCPHeaderOption
+	for offset := 0; offset < len(s.Options); {
+		kind := s.Options[offset]
+		switch kind {
+		case TCPHeaderOptionEnd:
+			return append(result, TCPHeaderOption{Kind: kind}), nil
+		case TCPHeaderOptionNOP:
+			result = append(result, TCPHeaderOption{Kind: kind})
+			offset++
+			continue
+		}
+		if len(s.Options)-offset < 2 {
+			return nil, syscall.EINVAL
+		}
+		length := int(s.Options[offset+1])
+		if length < 2 || length > len(s.Options)-offset {
+			return nil, syscall.EINVAL
+		}
+		result = append(result, TCPHeaderOption{Kind: kind, Data: s.Options[offset+2 : offset+length]})
+		offset += length
+	}
+	return result, nil
+}
+
+// SetHeaderOptions replaces Options with the encoded option sequence. It
+// preserves unknown kinds, duplicates, and order, copies all input data, and
+// leaves s unchanged on failure. An End option must be last. The final TCP
+// header padding is added by MarshalBinary or AppendBinary.
+func (s *TCPSegment) SetHeaderOptions(options []TCPHeaderOption) error {
+	if s == nil {
+		return syscall.EINVAL
+	}
+	size := 0
+	ended := false
+	for _, option := range options {
+		if ended {
+			return syscall.EINVAL
+		}
+		switch option.Kind {
+		case TCPHeaderOptionEnd, TCPHeaderOptionNOP:
+			if len(option.Data) != 0 {
+				return syscall.EINVAL
+			}
+			size++
+			ended = option.Kind == TCPHeaderOptionEnd
+		default:
+			if len(option.Data) > 253 {
+				return syscall.EINVAL
+			}
+			size += 2 + len(option.Data)
+		}
+		if size > 40 {
+			return syscall.EMSGSIZE
+		}
+	}
+	var encoded []byte
+	if size != 0 {
+		encoded = make([]byte, 0, size)
+	}
+	for _, option := range options {
+		encoded = append(encoded, option.Kind)
+		if option.Kind == TCPHeaderOptionEnd || option.Kind == TCPHeaderOptionNOP {
+			continue
+		}
+		encoded = append(encoded, byte(2+len(option.Data)))
+		encoded = append(encoded, option.Data...)
+	}
+	s.Options = encoded
+	return nil
+}
+
+// MaximumSegmentSize returns the raw MSS value when o is a well-formed MSS
+// option. It does not replace zero or clamp the value to a path limit.
+func (o TCPHeaderOption) MaximumSegmentSize() (uint16, bool) {
+	if o.Kind != TCPHeaderOptionMSS || len(o.Data) != 2 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(o.Data), true
+}
+
+// SetMaximumSegmentSize replaces o with an MSS option containing value.
+func (o *TCPHeaderOption) SetMaximumSegmentSize(value uint16) {
+	o.Kind = TCPHeaderOptionMSS
+	o.Data = make([]byte, 2)
+	binary.BigEndian.PutUint16(o.Data, value)
+}
+
+// WindowScale returns the raw scale when o is a well-formed Window Scale
+// option. Values above RFC 7323's operational maximum are not clamped.
+func (o TCPHeaderOption) WindowScale() (uint8, bool) {
+	if o.Kind != TCPHeaderOptionWindowScale || len(o.Data) != 1 {
+		return 0, false
+	}
+	return o.Data[0], true
+}
+
+// SetWindowScale replaces o with a Window Scale option containing value.
+func (o *TCPHeaderOption) SetWindowScale(value uint8) {
+	o.Kind = TCPHeaderOptionWindowScale
+	o.Data = []byte{value}
+}
+
+// IsSACKPermitted reports whether o is a well-formed SACK-Permitted option.
+func (o TCPHeaderOption) IsSACKPermitted() bool {
+	return o.Kind == TCPHeaderOptionSACKPermitted && len(o.Data) == 0
+}
+
+// SetSACKPermitted replaces o with a SACK-Permitted option.
+func (o *TCPHeaderOption) SetSACKPermitted() {
+	o.Kind = TCPHeaderOptionSACKPermitted
+	o.Data = nil
+}
+
+// Timestamp returns the raw TSval and TSecr values when o is a well-formed
+// Timestamp option.
+func (o TCPHeaderOption) Timestamp() (value, echo uint32, ok bool) {
+	if o.Kind != TCPHeaderOptionTimestamp || len(o.Data) != 8 {
+		return 0, 0, false
+	}
+	return binary.BigEndian.Uint32(o.Data[:4]), binary.BigEndian.Uint32(o.Data[4:]), true
+}
+
+// SetTimestamp replaces o with a Timestamp option containing value and echo.
+func (o *TCPHeaderOption) SetTimestamp(value, echo uint32) {
+	o.Kind = TCPHeaderOptionTimestamp
+	o.Data = make([]byte, 8)
+	binary.BigEndian.PutUint32(o.Data[:4], value)
+	binary.BigEndian.PutUint32(o.Data[4:], echo)
+}
+
+// SACKBlocks returns the raw blocks when o is a well-formed SACK option. It
+// does not classify DSACK, filter blocks against a send window, or merge them.
+func (o TCPHeaderOption) SACKBlocks() ([]TCPSACKBlock, bool) {
+	if o.Kind != TCPHeaderOptionSACK || len(o.Data) < 8 || len(o.Data) > 32 || len(o.Data)%8 != 0 {
+		return nil, false
+	}
+	blocks := make([]TCPSACKBlock, len(o.Data)/8)
+	for index := range blocks {
+		offset := index * 8
+		blocks[index] = TCPSACKBlock{
+			LeftEdge:  binary.BigEndian.Uint32(o.Data[offset : offset+4]),
+			RightEdge: binary.BigEndian.Uint32(o.Data[offset+4 : offset+8]),
+		}
+	}
+	return blocks, true
+}
+
+// SetSACKBlocks replaces o with a SACK option containing one to four blocks.
+// It copies the block values and leaves o unchanged when the count is invalid.
+func (o *TCPHeaderOption) SetSACKBlocks(blocks []TCPSACKBlock) error {
+	if o == nil || len(blocks) < 1 || len(blocks) > 4 {
+		return syscall.EINVAL
+	}
+	data := make([]byte, len(blocks)*8)
+	for index, block := range blocks {
+		offset := index * 8
+		binary.BigEndian.PutUint32(data[offset:offset+4], block.LeftEdge)
+		binary.BigEndian.PutUint32(data[offset+4:offset+8], block.RightEdge)
+	}
+	o.Kind = TCPHeaderOptionSACK
+	o.Data = data
+	return nil
 }
 
 // TCPSegment validates and decodes the packet's TCP upper layer. The three
@@ -280,7 +489,7 @@ func (s TCPSegment) wireLayout() (TCPSegment, int, int, error) {
 	}
 	source, destination := s.Source.Addr().Unmap(), s.Destination.Addr().Unmap()
 	if !s.Source.IsValid() || !s.Destination.IsValid() || source.Is4() != destination.Is4() ||
-		s.Flags&^uint16(0x1ff) != 0 || len(s.Options) > 40 {
+		s.Flags&^uint16(TCPFlagFIN|TCPFlagSYN|TCPFlagRST|TCPFlagPSH|TCPFlagACK|TCPFlagURG|TCPFlagECE|TCPFlagCWR|TCPFlagNS) != 0 || len(s.Options) > 40 {
 		return TCPSegment{}, 0, 0, syscall.EINVAL
 	}
 	if _, valid := tcpOptionsContentLength(s.Options); !valid {
@@ -321,9 +530,9 @@ func marshalPublicTCPSegment(dst []byte, s TCPSegment, headerSize int) {
 func tcpOptionsContentLength(options []byte) (int, bool) {
 	for offset := 0; offset < len(options); {
 		switch options[offset] {
-		case 0:
+		case TCPHeaderOptionEnd:
 			return offset + 1, true
-		case 1:
+		case TCPHeaderOptionNOP:
 			offset++
 			continue
 		}
@@ -1316,11 +1525,11 @@ func (u *tcpRecoveryUndo) detectEifel(timestampEcho uint32, currentDSACK, priorD
 
 // observeDSACK marks retransmitted ranges and reports when RFC 3708 has
 // accounted every retransmission in the recovery window as duplicated.
-func (u *tcpRecoveryUndo) observeDSACK(block tcpSACKBlock, acknowledgement, sendUnacknowledged uint32, scoreboardEmpty bool) bool {
+func (u *tcpRecoveryUndo) observeDSACK(block TCPSACKBlock, acknowledgement, sendUnacknowledged uint32, scoreboardEmpty bool) bool {
 	if !u.active || u.dsackDisabled {
 		return false
 	}
-	if scoreboardEmpty && block.left == sendUnacknowledged {
+	if scoreboardEmpty && block.LeftEdge == sendUnacknowledged {
 		// RFC 3708 A.1 treats loss of an entire ACK window as reverse-path
 		// congestion, so this recovery episode must not be undone.
 		u.dsackDisabled = true
@@ -1329,7 +1538,7 @@ func (u *tcpRecoveryUndo) observeDSACK(block tcpSACKBlock, acknowledgement, send
 	matched := false
 	for index := range u.ranges {
 		candidate := &u.ranges[index]
-		if tcpSequenceLessEqual(block.left, candidate.sequence) && tcpSequenceGreaterEqual(block.right, candidate.end) {
+		if tcpSequenceLessEqual(block.LeftEdge, candidate.sequence) && tcpSequenceGreaterEqual(block.RightEdge, candidate.end) {
 			candidate.duplicated = true
 			matched = true
 		}
@@ -1439,10 +1648,10 @@ func (h *tcpRetransmissionHistory) record(sequence, end uint32) {
 
 // match reports whether a DSACK covers a known retransmission and whether
 // that range was retransmitted more than once.
-func (h *tcpRetransmissionHistory) match(block tcpSACKBlock) (bool, bool) {
+func (h *tcpRetransmissionHistory) match(block TCPSACKBlock) (bool, bool) {
 	matched, repeated := false, false
 	for _, rangeState := range h.ranges {
-		if tcpSequenceLessEqual(block.left, rangeState.sequence) && tcpSequenceGreaterEqual(block.right, rangeState.end) {
+		if tcpSequenceLessEqual(block.LeftEdge, rangeState.sequence) && tcpSequenceGreaterEqual(block.RightEdge, rangeState.end) {
 			matched = true
 			repeated = repeated || rangeState.count > 1
 		}
@@ -4593,7 +4802,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		outstandingHead     int
 		outOfOrder          []tcpReceivedPiece
 		outOfOrderBytes     int
-		recentDSACK         tcpSACKBlock
+		recentDSACK         TCPSACKBlock
 		haveRecentDSACK     bool
 		localFINSent        bool
 		localFINAcked       bool
@@ -6158,7 +6367,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				if bytesAcknowledged > uint64(tcpMaximumScaledWindow) {
 					history = tcpMaximumScaledWindow
 				}
-				dsack, hasDSACK := tcpSACKBlock{}, false
+				dsack, hasDSACK := TCPSACKBlock{}, false
 				if peerSACK {
 					dsack, hasDSACK = parseTCPDSACKOption(segment.optionBytes(), ack, sendNext, history)
 				}
@@ -6189,7 +6398,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 						rackDSACKRound = sendNext
 						rackDSACKRoundSet = true
 					}
-					if tailProbeActive && tailProbeRetransmit && tcpSequenceLess(dsack.left, tailProbeEnd) && tcpSequenceGreaterEqual(dsack.right, tailProbeEnd) {
+					if tailProbeActive && tailProbeRetransmit && tcpSequenceLess(dsack.LeftEdge, tailProbeEnd) && tcpSequenceGreaterEqual(dsack.RightEdge, tailProbeEnd) {
 						tailProbeActive = false
 						tailProbeRetransmit = false
 					}
@@ -7224,16 +7433,16 @@ func tcpSYNOptions(storage []byte, mss int, windowScale uint8, timestamp uint32)
 // while MSS is always present. Callers provide enough storage to avoid one
 // allocation for every connection and handshake retransmission.
 func tcpPassiveSYNOptions(storage []byte, mss int, sack, windowScaling, timestamp bool, windowScale uint8, timestampValue, timestampEcho uint32) []byte {
-	options := append(storage[:0], 2, 4, byte(mss>>8), byte(mss))
+	options := append(storage[:0], TCPHeaderOptionMSS, 4, byte(mss>>8), byte(mss))
 	if sack {
-		options = append(options, 4, 2)
+		options = append(options, TCPHeaderOptionSACKPermitted, 2)
 	}
 	if windowScaling {
-		options = append(options, 1, 3, 3, windowScale)
+		options = append(options, TCPHeaderOptionNOP, TCPHeaderOptionWindowScale, 3, windowScale)
 	}
 	if timestamp {
 		offset := len(options)
-		options = append(options, 1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0)
+		options = append(options, TCPHeaderOptionNOP, TCPHeaderOptionNOP, TCPHeaderOptionTimestamp, 10, 0, 0, 0, 0, 0, 0, 0, 0)
 		binary.BigEndian.PutUint32(options[offset+4:offset+8], timestampValue)
 		binary.BigEndian.PutUint32(options[offset+8:offset+12], timestampEcho)
 	}
@@ -7250,9 +7459,9 @@ func parseTCPOptions(options []byte, fallback, localMaximum int) (int, uint8, bo
 	var timestampValue uint32
 	for offset := 0; offset < len(options); {
 		switch options[offset] {
-		case 0:
+		case TCPHeaderOptionEnd:
 			return clampMSS(mss, localMaximum), scale, windowScaling, sack, timestamp, timestampValue
-		case 1:
+		case TCPHeaderOptionNOP:
 			offset++
 			continue
 		}
@@ -7264,14 +7473,14 @@ func parseTCPOptions(options []byte, fallback, localMaximum int) (int, uint8, bo
 			break
 		}
 		switch options[offset] {
-		case 2:
+		case TCPHeaderOptionMSS:
 			if length == 4 {
 				value := int(binary.BigEndian.Uint16(options[offset+2 : offset+4]))
 				if value != 0 {
 					mss = value
 				}
 			}
-		case 3:
+		case TCPHeaderOptionWindowScale:
 			if length == 3 {
 				windowScaling = true
 				scale = options[offset+2]
@@ -7279,9 +7488,9 @@ func parseTCPOptions(options []byte, fallback, localMaximum int) (int, uint8, bo
 					scale = 14
 				}
 			}
-		case 4:
+		case TCPHeaderOptionSACKPermitted:
 			sack = length == 2
-		case 8:
+		case TCPHeaderOptionTimestamp:
 			if length == 10 {
 				timestamp = true
 				timestampValue = binary.BigEndian.Uint32(options[offset+2 : offset+6])
@@ -7296,10 +7505,10 @@ func parseTCPOptions(options []byte, fallback, localMaximum int) (int, uint8, bo
 func parseTCPTimestamp(options []byte) (uint32, uint32, bool) {
 	for offset := 0; offset < len(options); {
 		kind := options[offset]
-		if kind == 0 {
+		if kind == TCPHeaderOptionEnd {
 			break
 		}
-		if kind == 1 {
+		if kind == TCPHeaderOptionNOP {
 			offset++
 			continue
 		}
@@ -7310,7 +7519,7 @@ func parseTCPTimestamp(options []byte) (uint32, uint32, bool) {
 		if length < 2 || length > len(options)-offset {
 			break
 		}
-		if kind == 8 && length == 10 {
+		if kind == TCPHeaderOptionTimestamp && length == 10 {
 			return binary.BigEndian.Uint32(options[offset+2 : offset+6]), binary.BigEndian.Uint32(options[offset+6 : offset+10]), true
 		}
 		offset += length
@@ -7321,16 +7530,10 @@ func parseTCPTimestamp(options []byte) (uint32, uint32, bool) {
 // tcpTimestampOptions serializes TSval and the most recent peer TSval.
 func tcpTimestampOptions(value, echo uint32) []byte {
 	options := make([]byte, 12)
-	options[0], options[1], options[2], options[3] = 1, 1, 8, 10
+	options[0], options[1], options[2], options[3] = TCPHeaderOptionNOP, TCPHeaderOptionNOP, TCPHeaderOptionTimestamp, 10
 	binary.BigEndian.PutUint32(options[4:8], value)
 	binary.BigEndian.PutUint32(options[8:12], echo)
 	return options
-}
-
-// tcpSACKBlock is one half-open sequence range reported by a peer.
-type tcpSACKBlock struct {
-	left  uint32
-	right uint32
 }
 
 // tcpSACKBlockLimit returns the largest SACK option fitting both TCP's
@@ -7368,24 +7571,24 @@ func tcpSACKBlockLimit(mtu int, address netip.Addr, timestamp bool, reservePaylo
 // duplicate range. DSACK occupies the first block; otherwise the range
 // containing the segment that triggered the ACK is first as required by RFC
 // 2018.
-func tcpSACKOptions(pieces []tcpReceivedPiece, recent uint32, maximumBlocks int, dsack tcpSACKBlock, haveDSACK bool, workspace *[34]byte) []byte {
+func tcpSACKOptions(pieces []tcpReceivedPiece, recent uint32, maximumBlocks int, dsack TCPSACKBlock, haveDSACK bool, workspace *[34]byte) []byte {
 	if maximumBlocks < 1 {
 		return nil
 	}
 	if maximumBlocks > 4 {
 		maximumBlocks = 4
 	}
-	var recentBlock tcpSACKBlock
+	var recentBlock TCPSACKBlock
 	haveRecent := false
 	for index := 0; index < len(pieces); {
 		block, next := tcpReceivedSACKBlockForward(pieces, index)
-		if tcpSequenceGreaterEqual(recent, block.left) && tcpSequenceLess(recent, block.right) {
+		if tcpSequenceGreaterEqual(recent, block.LeftEdge) && tcpSequenceLess(recent, block.RightEdge) {
 			recentBlock, haveRecent = block, true
 			break
 		}
 		index = next
 	}
-	var ordered [4]tcpSACKBlock
+	var ordered [4]TCPSACKBlock
 	count := 0
 	if haveDSACK {
 		ordered[count] = dsack
@@ -7408,22 +7611,22 @@ func tcpSACKOptions(pieces []tcpReceivedPiece, recent uint32, maximumBlocks int,
 		return nil
 	}
 	options := workspace[:2+8*count]
-	options[0], options[1] = 5, byte(len(options))
+	options[0], options[1] = TCPHeaderOptionSACK, byte(len(options))
 	for index, block := range ordered[:count] {
 		offset := 2 + 8*index
-		binary.BigEndian.PutUint32(options[offset:offset+4], block.left)
-		binary.BigEndian.PutUint32(options[offset+4:offset+8], block.right)
+		binary.BigEndian.PutUint32(options[offset:offset+4], block.LeftEdge)
+		binary.BigEndian.PutUint32(options[offset+4:offset+8], block.RightEdge)
 	}
 	return options
 }
 
 // tcpReceivedSACKBlockForward merges one contiguous receive range and returns
 // the first piece index after it.
-func tcpReceivedSACKBlockForward(pieces []tcpReceivedPiece, index int) (tcpSACKBlock, int) {
+func tcpReceivedSACKBlockForward(pieces []tcpReceivedPiece, index int) (TCPSACKBlock, int) {
 	piece := pieces[index]
-	block := tcpSACKBlock{left: piece.sequence, right: piece.sequence + uint32(len(piece.payload))}
+	block := TCPSACKBlock{LeftEdge: piece.sequence, RightEdge: piece.sequence + uint32(len(piece.payload))}
 	if piece.fin {
-		block.right++
+		block.RightEdge++
 	}
 	index++
 	for index < len(pieces) {
@@ -7432,11 +7635,11 @@ func tcpReceivedSACKBlockForward(pieces []tcpReceivedPiece, index int) (tcpSACKB
 		if piece.fin {
 			right++
 		}
-		if tcpSequenceGreater(piece.sequence, block.right) {
+		if tcpSequenceGreater(piece.sequence, block.RightEdge) {
 			break
 		}
-		if tcpSequenceGreater(right, block.right) {
-			block.right = right
+		if tcpSequenceGreater(right, block.RightEdge) {
+			block.RightEdge = right
 		}
 		index++
 	}
@@ -7445,11 +7648,11 @@ func tcpReceivedSACKBlockForward(pieces []tcpReceivedPiece, index int) (tcpSACKB
 
 // tcpReceivedSACKBlockBackward is the reverse iterator used to prefer the most
 // recently received high ranges after the RFC 2018 recent block.
-func tcpReceivedSACKBlockBackward(pieces []tcpReceivedPiece, index int) (tcpSACKBlock, int) {
+func tcpReceivedSACKBlockBackward(pieces []tcpReceivedPiece, index int) (TCPSACKBlock, int) {
 	piece := pieces[index]
-	block := tcpSACKBlock{left: piece.sequence, right: piece.sequence + uint32(len(piece.payload))}
+	block := TCPSACKBlock{LeftEdge: piece.sequence, RightEdge: piece.sequence + uint32(len(piece.payload))}
 	if piece.fin {
-		block.right++
+		block.RightEdge++
 	}
 	index--
 	for index >= 0 {
@@ -7458,12 +7661,12 @@ func tcpReceivedSACKBlockBackward(pieces []tcpReceivedPiece, index int) (tcpSACK
 		if piece.fin {
 			right++
 		}
-		if tcpSequenceGreater(block.left, right) {
+		if tcpSequenceGreater(block.LeftEdge, right) {
 			break
 		}
-		block.left = piece.sequence
-		if tcpSequenceGreater(right, block.right) {
-			block.right = right
+		block.LeftEdge = piece.sequence
+		if tcpSequenceGreater(right, block.RightEdge) {
+			block.RightEdge = right
 		}
 		index--
 	}
@@ -7473,13 +7676,13 @@ func tcpReceivedSACKBlockBackward(pieces []tcpReceivedPiece, index int) (tcpSACK
 // tcpDuplicateSACKBlock finds the first duplicate sequence range in an
 // incoming segment. Ranges below RCV.NXT and overlaps with retained
 // out-of-order data use the two DSACK forms defined by RFC 2883.
-func tcpDuplicateSACKBlock(sequence uint32, payloadLength int, fin bool, receiveNext uint32, pieces []tcpReceivedPiece) (tcpSACKBlock, bool) {
+func tcpDuplicateSACKBlock(sequence uint32, payloadLength int, fin bool, receiveNext uint32, pieces []tcpReceivedPiece) (TCPSACKBlock, bool) {
 	length := uint32(payloadLength)
 	if fin {
 		length++
 	}
 	if length == 0 {
-		return tcpSACKBlock{}, false
+		return TCPSACKBlock{}, false
 	}
 	end := sequence + length
 	if tcpSequenceLess(sequence, receiveNext) {
@@ -7488,14 +7691,14 @@ func tcpDuplicateSACKBlock(sequence uint32, payloadLength int, fin bool, receive
 			right = receiveNext
 		}
 		if tcpSequenceGreater(right, sequence) {
-			return tcpSACKBlock{left: sequence, right: right}, true
+			return TCPSACKBlock{LeftEdge: sequence, RightEdge: right}, true
 		}
 		sequence = receiveNext
 	}
 	incomingStart := sequence - receiveNext
 	incomingEnd := end - receiveNext
 	if incomingStart >= incomingEnd {
-		return tcpSACKBlock{}, false
+		return TCPSACKBlock{}, false
 	}
 	for _, piece := range pieces {
 		pieceStart := piece.sequence - receiveNext
@@ -7512,23 +7715,23 @@ func tcpDuplicateSACKBlock(sequence uint32, payloadLength int, fin bool, receive
 			right = pieceEnd
 		}
 		if left < right {
-			return tcpSACKBlock{left: receiveNext + left, right: receiveNext + right}, true
+			return TCPSACKBlock{LeftEdge: receiveNext + left, RightEdge: receiveNext + right}, true
 		}
 	}
-	return tcpSACKBlock{}, false
+	return TCPSACKBlock{}, false
 }
 
 // parseTCPDSACKOption returns RFC 2883's distinguished first SACK block when
 // it describes already cumulatively acknowledged data or is contained in the
 // following ordinary SACK block. history bounds below-ACK reports to sequence
 // space this connection actually acknowledged recently.
-func parseTCPDSACKOption(options []byte, acknowledged, sendNext, history uint32) (tcpSACKBlock, bool) {
+func parseTCPDSACKOption(options []byte, acknowledged, sendNext, history uint32) (TCPSACKBlock, bool) {
 	for offset := 0; offset < len(options); {
 		kind := options[offset]
-		if kind == 0 {
+		if kind == TCPHeaderOptionEnd {
 			break
 		}
-		if kind == 1 {
+		if kind == TCPHeaderOptionNOP {
 			offset++
 			continue
 		}
@@ -7539,10 +7742,10 @@ func parseTCPDSACKOption(options []byte, acknowledged, sendNext, history uint32)
 		if length < 2 || length > len(options)-offset {
 			break
 		}
-		if kind == 5 && length >= 10 && (length-2)%8 == 0 {
+		if kind == TCPHeaderOptionSACK && length >= 10 && (length-2)%8 == 0 {
 			left := binary.BigEndian.Uint32(options[offset+2 : offset+6])
 			right := binary.BigEndian.Uint32(options[offset+6 : offset+10])
-			block := tcpSACKBlock{left: left, right: right}
+			block := TCPSACKBlock{LeftEdge: left, RightEdge: right}
 			if tcpSequenceLess(left, right) && tcpSequenceLessEqual(right, acknowledged) && acknowledged-left <= history {
 				return block, true
 			}
@@ -7555,24 +7758,24 @@ func parseTCPDSACKOption(options []byte, acknowledged, sendNext, history uint32)
 					return block, true
 				}
 			}
-			return tcpSACKBlock{}, false
+			return TCPSACKBlock{}, false
 		}
 		offset += length
 	}
-	return tcpSACKBlock{}, false
+	return TCPSACKBlock{}, false
 }
 
 // parseTCPSACKOptions validates and merges ordinary SACK ranges within the
 // current send window. The distinguished DSACK block is handled separately.
-func parseTCPSACKOptions(options []byte, acknowledged, sendNext uint32) []tcpSACKBlock {
+func parseTCPSACKOptions(options []byte, acknowledged, sendNext uint32) []TCPSACKBlock {
 	window := sendNext - acknowledged
-	var blocks []tcpSACKBlock
+	var blocks []TCPSACKBlock
 	for offset := 0; offset < len(options); {
 		kind := options[offset]
-		if kind == 0 {
+		if kind == TCPHeaderOptionEnd {
 			break
 		}
-		if kind == 1 {
+		if kind == TCPHeaderOptionNOP {
 			offset++
 			continue
 		}
@@ -7583,27 +7786,29 @@ func parseTCPSACKOptions(options []byte, acknowledged, sendNext uint32) []tcpSAC
 		if length < 2 || length > len(options)-offset {
 			break
 		}
-		if kind == 5 && length >= 10 && (length-2)%8 == 0 {
+		if kind == TCPHeaderOptionSACK && length >= 10 && (length-2)%8 == 0 {
 			for blockOffset := offset + 2; blockOffset < offset+length; blockOffset += 8 {
 				left := binary.BigEndian.Uint32(options[blockOffset : blockOffset+4])
 				right := binary.BigEndian.Uint32(options[blockOffset+4 : blockOffset+8])
 				leftDistance, rightDistance := left-acknowledged, right-acknowledged
 				if leftDistance < rightDistance && rightDistance <= window {
-					blocks = append(blocks, tcpSACKBlock{left: left, right: right})
+					blocks = append(blocks, TCPSACKBlock{LeftEdge: left, RightEdge: right})
 				}
 			}
 		}
 		offset += length
 	}
-	sort.Slice(blocks, func(left, right int) bool { return blocks[left].left-acknowledged < blocks[right].left-acknowledged })
+	sort.Slice(blocks, func(left, right int) bool {
+		return blocks[left].LeftEdge-acknowledged < blocks[right].LeftEdge-acknowledged
+	})
 	merged := blocks[:0]
 	for _, block := range blocks {
-		if len(merged) == 0 || tcpSequenceLess(merged[len(merged)-1].right, block.left) {
+		if len(merged) == 0 || tcpSequenceLess(merged[len(merged)-1].RightEdge, block.LeftEdge) {
 			merged = append(merged, block)
 			continue
 		}
-		if tcpSequenceGreater(block.right, merged[len(merged)-1].right) {
-			merged[len(merged)-1].right = block.right
+		if tcpSequenceGreater(block.RightEdge, merged[len(merged)-1].RightEdge) {
+			merged[len(merged)-1].RightEdge = block.RightEdge
 		}
 	}
 	return merged
@@ -7613,20 +7818,20 @@ func parseTCPSACKOptions(options []byte, acknowledged, sendNext uint32) []tcpSAC
 // ranges, and returns the newest delivery information used by RACK. epoch must
 // be the owning stack's timestamp epoch so compact host-queue stamps reconstruct
 // to the transmission times compared by RACK.
-func applyTCPSACK(outstanding []sentTCPSegment, blocks []tcpSACKBlock, epoch time.Time) ([]sentTCPSegment, uint32, bool, bool, tcpRACKSample, []sentTCPSegment) {
+func applyTCPSACK(outstanding []sentTCPSegment, blocks []TCPSACKBlock, epoch time.Time) ([]sentTCPSegment, uint32, bool, bool, tcpRACKSample, []sentTCPSegment) {
 	var highest uint32
 	var newInformation bool
 	var latest tcpRACKSample
 	var newlySACKed []sentTCPSegment
 	for blockIndex, block := range blocks {
-		if blockIndex == 0 || tcpSequenceGreater(block.right, highest) {
-			highest = block.right
+		if blockIndex == 0 || tcpSequenceGreater(block.RightEdge, highest) {
+			highest = block.RightEdge
 		}
-		outstanding = splitTCPSegmentAt(outstanding, block.left)
-		outstanding = splitTCPSegmentAt(outstanding, block.right)
+		outstanding = splitTCPSegmentAt(outstanding, block.LeftEdge)
+		outstanding = splitTCPSegmentAt(outstanding, block.RightEdge)
 		for index := range outstanding {
 			segment := &outstanding[index]
-			if tcpSequenceGreaterEqual(segment.sequence, block.left) && tcpSequenceGreaterEqual(block.right, segment.end) {
+			if tcpSequenceGreaterEqual(segment.sequence, block.LeftEdge) && tcpSequenceGreaterEqual(block.RightEdge, segment.end) {
 				if !segment.state.has(sentTCPSegmentSACKed) {
 					newInformation = true
 					newlySACKed = append(newlySACKed, *segment)

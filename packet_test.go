@@ -163,6 +163,297 @@ func TestPublicIPPacketCodec(t *testing.T) {
 	}
 }
 
+func TestPublicIPv4HeaderOptions(t *testing.T) {
+	data := []byte{0xaa, 0xbb}
+	options := []IPv4HeaderOption{
+		{Type: IPv4HeaderOptionNOP},
+		{Type: IPv4HeaderOptionRouterAlert, Data: []byte{0, 0}},
+		{Type: 30, Data: data},
+		{Type: 30, Data: []byte{0xcc}},
+		{Type: IPv4HeaderOptionEnd},
+	}
+	packet := IPPacket{
+		Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1"),
+		Protocol: 99, HopLimit: 64, Payload: []byte("structured-ipv4-options"),
+	}
+	if err := packet.SetIPv4HeaderOptions(options); err != nil {
+		t.Fatalf("SetIPv4HeaderOptions: %v", err)
+	}
+	wantOptions := append([]byte(nil), packet.IPv4Options...)
+	data[0] ^= 0xff
+	if !bytes.Equal(packet.IPv4Options, wantOptions) {
+		t.Fatal("SetIPv4HeaderOptions retained caller storage")
+	}
+	parsed, err := packet.IPv4HeaderOptions()
+	if err != nil {
+		t.Fatalf("IPv4HeaderOptions: %v", err)
+	}
+	if len(parsed) != len(options) || parsed[0].Type != IPv4HeaderOptionNOP ||
+		parsed[1].Type != IPv4HeaderOptionRouterAlert || !bytes.Equal(parsed[1].Data, []byte{0, 0}) ||
+		parsed[2].Type != 30 || parsed[3].Type != 30 || parsed[4].Type != IPv4HeaderOptionEnd {
+		t.Fatalf("parsed IPv4 options = %+v", parsed)
+	}
+	sourceRoute := IPv4HeaderOption{Type: IPv4HeaderOptionLooseSourceRoute}
+	if !sourceRoute.Copied() || sourceRoute.Class() != 0 || sourceRoute.Number() != 3 {
+		t.Fatalf("source-route type fields = copied %t class %d number %d", sourceRoute.Copied(), sourceRoute.Class(), sourceRoute.Number())
+	}
+
+	copyPacket := packet
+	if err = copyPacket.SetIPv4HeaderOptions(parsed); err != nil {
+		t.Fatalf("copy parsed IPv4 options: %v", err)
+	}
+	parsed[2].Data[0] ^= 0xff
+	if packet.IPv4Options[7] != 0x55 {
+		t.Fatal("IPv4HeaderOptions Data did not borrow IPv4Options")
+	}
+	if !bytes.Equal(copyPacket.IPv4Options, wantOptions) {
+		t.Fatal("SetIPv4HeaderOptions did not copy parsed Data")
+	}
+	wire, err := copyPacket.AppendBinary(nil)
+	if err != nil {
+		t.Fatalf("encode IPv4 options: %v", err)
+	}
+	decoded, err := ParseIPPacket(wire)
+	if err != nil {
+		t.Fatalf("decode IPv4 options: %v", err)
+	}
+	decodedOptions, err := decoded.IPv4HeaderOptions()
+	if err != nil || len(decodedOptions) != len(options) {
+		t.Fatalf("decoded IPv4 options = %+v, %v", decodedOptions, err)
+	}
+}
+
+func TestPublicIPv4HeaderOptionErrors(t *testing.T) {
+	packet := IPPacket{
+		Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1"),
+		IPv4Options: []byte{IPv4HeaderOptionNOP},
+	}
+	want := append([]byte(nil), packet.IPv4Options...)
+	tests := []struct {
+		name    string
+		options []IPv4HeaderOption
+		wantErr error
+	}{
+		{name: "End data", options: []IPv4HeaderOption{{Type: IPv4HeaderOptionEnd, Data: []byte{1}}}, wantErr: syscall.EINVAL},
+		{name: "NOP data", options: []IPv4HeaderOption{{Type: IPv4HeaderOptionNOP, Data: []byte{1}}}, wantErr: syscall.EINVAL},
+		{name: "after End", options: []IPv4HeaderOption{{Type: IPv4HeaderOptionEnd}, {Type: IPv4HeaderOptionNOP}}, wantErr: syscall.EINVAL},
+		{name: "oversized", options: []IPv4HeaderOption{{Type: 30, Data: make([]byte, 39)}}, wantErr: syscall.EMSGSIZE},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := packet.SetIPv4HeaderOptions(test.options); !errors.Is(err, test.wantErr) {
+				t.Fatalf("SetIPv4HeaderOptions error = %v, want %v", err, test.wantErr)
+			}
+			if !bytes.Equal(packet.IPv4Options, want) {
+				t.Fatal("failed SetIPv4HeaderOptions changed the receiver")
+			}
+		})
+	}
+	for _, raw := range [][]byte{{30}, {30, 1}, make([]byte, 41)} {
+		packet.IPv4Options = raw
+		if _, err := packet.IPv4HeaderOptions(); err == nil {
+			t.Fatalf("IPv4HeaderOptions accepted %x", raw)
+		}
+	}
+	v6 := IPPacket{Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2")}
+	if _, err := v6.IPv4HeaderOptions(); !errors.Is(err, syscall.EAFNOSUPPORT) {
+		t.Fatalf("IPv6 IPv4HeaderOptions error = %v", err)
+	}
+	if err := v6.SetIPv4HeaderOptions(nil); !errors.Is(err, syscall.EAFNOSUPPORT) {
+		t.Fatalf("IPv6 SetIPv4HeaderOptions error = %v", err)
+	}
+}
+
+func TestPublicIPv4HeaderOptionsNormalizeEOLPadding(t *testing.T) {
+	packet := IPPacket{
+		Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1"),
+		Protocol: ProtocolUDP, HopLimit: 64,
+		IPv4Options: []byte{IPv4HeaderOptionEnd, 0xaa, 0xbb, 0xcc}, Payload: make([]byte, udpHeaderSize),
+	}
+	wire, err := packet.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(wire[20:24], []byte{0, 0, 0, 0}) {
+		t.Fatalf("generated IPv4 EOL padding = %x, want zeros", wire[20:24])
+	}
+
+	raw := append([]byte(nil), wire...)
+	copy(raw[21:24], []byte{0xaa, 0xbb, 0xcc})
+	raw[10], raw[11] = 0, 0
+	binary.BigEndian.PutUint16(raw[10:12], checksum(raw[:24]))
+	parsed, err := ParseIPPacket(raw)
+	if err != nil {
+		t.Fatalf("parse nonzero IPv4 EOL padding: %v", err)
+	}
+	if !bytes.Equal(parsed.IPv4Options, raw[20:24]) {
+		t.Fatalf("parsed IPv4 EOL padding = %x, want %x", parsed.IPv4Options, raw[20:24])
+	}
+	options, err := parsed.IPv4HeaderOptions()
+	if err != nil || len(options) != 1 || options[0].Type != IPv4HeaderOptionEnd {
+		t.Fatalf("structured IPv4 EOL = %+v, error=%v", options, err)
+	}
+	reencoded, err := parsed.AppendBinary(nil)
+	if err != nil || !bytes.Equal(reencoded, wire) {
+		t.Fatalf("normalized IPv4 packet: error=%v\n got %x\nwant %x", err, reencoded, wire)
+	}
+	internal, ok := parseIPPacket(raw)
+	if !ok || internal.parameterError {
+		t.Fatalf("runtime parser rejected Linux-compatible EOL padding: %+v, ok=%t", internal, ok)
+	}
+}
+
+func TestPublicIPv6ExtensionHeaders(t *testing.T) {
+	unknownData := []byte{1, 2, 3}
+	hop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	if err := hop.SetOptions([]IPv6ExtensionOption{
+		{Type: IPv6ExtensionOptionRouterAlert, Data: []byte{0, 0}},
+		{Type: 0xe3, Data: unknownData},
+		{Type: IPv6ExtensionOptionPad1},
+	}); err != nil {
+		t.Fatalf("set Hop-by-Hop options: %v", err)
+	}
+	wantHop := append([]byte(nil), hop.Data...)
+	unknownData[0] ^= 0xff
+	if !bytes.Equal(hop.Data, wantHop) {
+		t.Fatal("SetOptions retained caller storage")
+	}
+	options, err := hop.Options()
+	if err != nil {
+		t.Fatalf("parse Hop-by-Hop options: %v", err)
+	}
+	if len(options) < 3 || options[0].Type != IPv6ExtensionOptionRouterAlert || options[1].Type != 0xe3 ||
+		options[1].Action() != 3 || !options[1].MayChangeInTransit() || !bytes.Equal(options[1].Data, []byte{1, 2, 3}) {
+		t.Fatalf("parsed IPv6 options = %+v", options)
+	}
+	hopCopy := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	if err = hopCopy.SetOptions(options); err != nil {
+		t.Fatalf("copy parsed IPv6 options: %v", err)
+	}
+	options[1].Data[0] ^= 0xff
+	if !bytes.Equal(hopCopy.Data, wantHop) {
+		t.Fatal("SetOptions did not copy parsed Data")
+	}
+
+	destination := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderDestination}
+	if err = destination.SetOptions(nil); err != nil {
+		t.Fatal(err)
+	}
+	routing := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderRouting, Data: []byte{0, 0, 0, 0, 0, 0, 0}}
+	fragment := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderFragment, Data: []byte{0, 0, 0, 0x12, 0x34, 0x56, 0x78}}
+	authentication := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderAuthentication, Data: make([]byte, 15)}
+	authentication.Data[0] = 2
+	mobility := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderMobility, Data: []byte{0, 0, 0, 0, 0, 0, 0}}
+	headers := []IPv6ExtensionHeader{hopCopy, routing, fragment, authentication, destination, mobility}
+	payload := []byte("extension-payload")
+	packet := IPPacket{
+		Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"), HopLimit: 64,
+	}
+	if err = packet.SetIPv6ExtensionHeaders(headers, 99, payload); err != nil {
+		t.Fatalf("SetIPv6ExtensionHeaders: %v", err)
+	}
+	wantPayload := append([]byte(nil), packet.Payload...)
+	headers[1].Data[1] ^= 0xff
+	payload[0] ^= 0xff
+	if !bytes.Equal(packet.Payload, wantPayload) {
+		t.Fatal("SetIPv6ExtensionHeaders retained caller storage")
+	}
+	parsedHeaders, protocol, upper, err := packet.IPv6ExtensionHeaders()
+	if err != nil || protocol != 99 || !bytes.Equal(upper, []byte("extension-payload")) || len(parsedHeaders) != len(headers) {
+		t.Fatalf("IPv6ExtensionHeaders = %d headers, protocol %d, payload %x, %v", len(parsedHeaders), protocol, upper, err)
+	}
+	for index := range headers {
+		if parsedHeaders[index].Type != headers[index].Type {
+			t.Fatalf("header %d type = %d, want %d", index, parsedHeaders[index].Type, headers[index].Type)
+		}
+	}
+	if gotProtocol, gotPayload, upperErr := packet.UpperLayer(); upperErr != nil || gotProtocol != 99 || !bytes.Equal(gotPayload, upper) {
+		t.Fatalf("UpperLayer = %d/%x, %v", gotProtocol, gotPayload, upperErr)
+	}
+	wire, err := packet.AppendBinary(nil)
+	if err != nil {
+		t.Fatalf("encode extension chain: %v", err)
+	}
+	decoded, err := ParseIPPacket(wire)
+	if err != nil {
+		t.Fatalf("decode extension chain: %v", err)
+	}
+	decodedHeaders, protocol, upper, err := decoded.IPv6ExtensionHeaders()
+	if err != nil || protocol != 99 || !bytes.Equal(upper, []byte("extension-payload")) || len(decodedHeaders) != len(headers) {
+		t.Fatalf("decoded extension chain = %d/%d/%x, %v", len(decodedHeaders), protocol, upper, err)
+	}
+	noNext := packet
+	trailing := []byte{1, 2, 3}
+	if err = noNext.SetIPv6ExtensionHeaders(nil, ProtocolNoNextHeader, trailing); err != nil {
+		t.Fatal(err)
+	}
+	noHeaders, noProtocol, noPayload, err := noNext.IPv6ExtensionHeaders()
+	if err != nil || len(noHeaders) != 0 || noProtocol != ProtocolNoNextHeader || !bytes.Equal(noPayload, trailing) {
+		t.Fatalf("No Next Header structural result = %+v/%d/%x, %v", noHeaders, noProtocol, noPayload, err)
+	}
+	if _, ignored, err := noNext.UpperLayer(); err != nil || ignored != nil {
+		t.Fatalf("No Next Header upper payload = %x, %v", ignored, err)
+	}
+}
+
+func TestPublicIPv6ExtensionHeaderErrors(t *testing.T) {
+	packet := IPPacket{
+		Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"),
+		Protocol: 99, Payload: []byte{1, 2, 3},
+	}
+	wantProtocol, wantPayload := packet.Protocol, append([]byte(nil), packet.Payload...)
+	fragment := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderFragment, Data: []byte{0, 0, 1, 0, 0, 0, 1}}
+	jumbo := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	if err := jumbo.SetOptions([]IPv6ExtensionOption{{Type: IPv6ExtensionOptionJumboPayload, Data: []byte{0, 1, 0, 0}}}); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		headers  []IPv6ExtensionHeader
+		protocol int
+		payload  []byte
+		wantErr  error
+	}{
+		{name: "extension terminal", protocol: IPv6ExtensionHeaderDestination, wantErr: syscall.EINVAL},
+		{name: "unknown header", headers: []IPv6ExtensionHeader{{Type: 99}}, protocol: ProtocolUDP, wantErr: syscall.EPROTONOSUPPORT},
+		{name: "late Hop-by-Hop", headers: []IPv6ExtensionHeader{{Type: IPv6ExtensionHeaderDestination, Data: make([]byte, 7)}, {Type: IPv6ExtensionHeaderHopByHop, Data: make([]byte, 7)}}, protocol: ProtocolUDP, wantErr: syscall.EINVAL},
+		{name: "malformed Routing", headers: []IPv6ExtensionHeader{{Type: IPv6ExtensionHeaderRouting, Data: make([]byte, 6)}}, protocol: ProtocolUDP, wantErr: syscall.EINVAL},
+		{name: "short Authentication", headers: []IPv6ExtensionHeader{{Type: IPv6ExtensionHeaderAuthentication, Data: make([]byte, 7)}}, protocol: ProtocolUDP, wantErr: syscall.EINVAL},
+		{name: "misaligned Authentication", headers: []IPv6ExtensionHeader{{Type: IPv6ExtensionHeaderAuthentication, Data: append([]byte{1}, make([]byte, 10)...)}}, protocol: ProtocolUDP, wantErr: syscall.EINVAL},
+		{name: "non-atomic Fragment", headers: []IPv6ExtensionHeader{fragment}, protocol: ProtocolUDP, wantErr: syscall.EINVAL},
+		{name: "Jumbo Payload", headers: []IPv6ExtensionHeader{jumbo}, protocol: ProtocolUDP, wantErr: syscall.EINVAL},
+		{name: "oversized", protocol: ProtocolUDP, payload: make([]byte, 65536), wantErr: syscall.EMSGSIZE},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := packet.SetIPv6ExtensionHeaders(test.headers, test.protocol, test.payload); !errors.Is(err, test.wantErr) {
+				t.Fatalf("SetIPv6ExtensionHeaders error = %v, want %v", err, test.wantErr)
+			}
+			if packet.Protocol != wantProtocol || !bytes.Equal(packet.Payload, wantPayload) {
+				t.Fatal("failed SetIPv6ExtensionHeaders changed the receiver")
+			}
+		})
+	}
+	v4 := IPPacket{Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1")}
+	if _, _, _, err := v4.IPv6ExtensionHeaders(); !errors.Is(err, syscall.EAFNOSUPPORT) {
+		t.Fatalf("IPv4 IPv6ExtensionHeaders error = %v", err)
+	}
+	if err := v4.SetIPv6ExtensionHeaders(nil, ProtocolUDP, nil); !errors.Is(err, syscall.EAFNOSUPPORT) {
+		t.Fatalf("IPv4 SetIPv6ExtensionHeaders error = %v", err)
+	}
+	if _, err := (IPv6ExtensionHeader{Type: IPv6ExtensionHeaderRouting, Data: make([]byte, 7)}).Options(); !errors.Is(err, syscall.EPROTONOSUPPORT) {
+		t.Fatalf("Routing Options error = %v", err)
+	}
+	header := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderDestination, Data: []byte{0, 1, 2}}
+	wantData := append([]byte(nil), header.Data...)
+	if err := header.SetOptions([]IPv6ExtensionOption{{Type: IPv6ExtensionOptionPad1, Data: []byte{1}}}); !errors.Is(err, syscall.EINVAL) || !bytes.Equal(header.Data, wantData) {
+		t.Fatalf("invalid Pad1 SetOptions = %x, %v", header.Data, err)
+	}
+	if err := header.SetOptions([]IPv6ExtensionOption{{Type: 30, Data: make([]byte, 256)}}); !errors.Is(err, syscall.EINVAL) || !bytes.Equal(header.Data, wantData) {
+		t.Fatalf("oversized option SetOptions = %x, %v", header.Data, err)
+	}
+}
+
 // TestPublicCodecAppendBinaryOverlappingOptions covers a caller reusing a parsed
 // wire buffer after selecting an option subslice that the shifted payload will
 // overwrite. AppendBinary must read all semantic fields before changing dst.
@@ -481,12 +772,14 @@ func TestPublicIPv6JumboPayloadOptionRejected(t *testing.T) {
 	}
 }
 
-func TestPublicIPv6ExtensionReservedFieldsAreNormalized(t *testing.T) {
+func TestPublicIPv6ExtensionIntegrityFieldsRemainOpaque(t *testing.T) {
 	packet := IPPacket{
 		Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"),
 		Protocol: 0, HopLimit: 64,
 		Payload: []byte{
-			44, 0, 1, 4, 0xaa, 0xbb, 0, 0, // Hop-by-Hop with nonzero PadN data.
+			51, 0, 1, 4, 0xaa, 0xbb, 0xcc, 0xdd, // Hop-by-Hop with nonzero PadN data.
+			135, 2, 0xaa, 0xbb, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, // AH with nonzero Reserved.
+			44, 0, 5, 0xcc, 0, 0, 0, 0, // Mobility with nonzero Reserved.
 			99, 0xff, 0, 6, 0x12, 0x34, 0x56, 0x78, // Atomic Fragment with nonzero reserved fields.
 			1, 2, 3, 4,
 		},
@@ -495,15 +788,20 @@ func TestPublicIPv6ExtensionReservedFieldsAreNormalized(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(wire[44:48], []byte{0, 0, 0, 0}) || wire[49] != 0 || binary.BigEndian.Uint16(wire[50:52]) != 0 {
-		t.Fatalf("generated extension reserved fields were not cleared: %x", wire[40:56])
+	if !bytes.Equal(wire[44:48], []byte{0, 0, 0, 0}) || wire[73] != 0 || binary.BigEndian.Uint16(wire[74:76]) != 0 {
+		t.Fatalf("generated padding and Fragment reserved fields were not cleared: %x", wire[40:80])
+	}
+	if binary.BigEndian.Uint16(wire[50:52]) != 0xaabb || wire[67] != 0xcc {
+		t.Fatalf("integrity-protected extension fields were changed: %x", wire[40:80])
 	}
 
 	// Parsing remains receiver-tolerant and exposes the original wire bytes.
 	raw := append([]byte(nil), wire...)
-	copy(raw[44:46], []byte{0xaa, 0xbb})
-	raw[49] = 0xff
-	binary.BigEndian.PutUint16(raw[50:52], 6)
+	copy(raw[44:48], []byte{0xaa, 0xbb, 0xcc, 0xdd})
+	binary.BigEndian.PutUint16(raw[50:52], 0xddee)
+	raw[67] = 0xee
+	raw[73] = 0xff
+	binary.BigEndian.PutUint16(raw[74:76], 6)
 	parsed, err := ParseIPPacket(raw)
 	if err != nil {
 		t.Fatalf("parse nonzero reserved fields: %v", err)
@@ -511,9 +809,20 @@ func TestPublicIPv6ExtensionReservedFieldsAreNormalized(t *testing.T) {
 	if !bytes.Equal(parsed.Payload, raw[40:]) {
 		t.Fatal("ParseIPPacket did not preserve received extension bytes")
 	}
+	headers, protocol, payload, err := parsed.IPv6ExtensionHeaders()
+	if err != nil || len(headers) != 4 || protocol != 99 || !bytes.Equal(payload, []byte{1, 2, 3, 4}) ||
+		!bytes.Equal(headers[0].Data[3:], []byte{0xaa, 0xbb, 0xcc, 0xdd}) ||
+		binary.BigEndian.Uint16(headers[1].Data[1:3]) != 0xddee || headers[2].Data[2] != 0xee ||
+		headers[3].Data[0] != 0xff || binary.BigEndian.Uint16(headers[3].Data[1:3]) != 6 {
+		t.Fatalf("structured extension fields did not preserve received bytes: headers=%+v protocol=%d payload=%x error=%v", headers, protocol, payload, err)
+	}
+	want := append([]byte(nil), raw...)
+	copy(want[44:48], []byte{0, 0, 0, 0})
+	want[73] = 0
+	binary.BigEndian.PutUint16(want[74:76], 0)
 	reencoded, err := parsed.AppendBinary(nil)
-	if err != nil || !bytes.Equal(reencoded, wire) {
-		t.Fatalf("normalized IPv6 packet: error=%v\n got %x\nwant %x", err, reencoded, wire)
+	if err != nil || !bytes.Equal(reencoded, want) {
+		t.Fatalf("normalized IPv6 packet: error=%v\n got %x\nwant %x", err, reencoded, want)
 	}
 }
 
@@ -607,6 +916,27 @@ func FuzzPublicIPPacketCodec(f *testing.F) {
 		if err != nil {
 			return
 		}
+		structured := packet
+		if packet.Source.Is4() {
+			options, optionsErr := packet.IPv4HeaderOptions()
+			if optionsErr != nil {
+				t.Fatalf("parsed IPv4 options could not be inspected: %v", optionsErr)
+			}
+			if optionsErr = structured.SetIPv4HeaderOptions(options); optionsErr != nil {
+				t.Fatalf("parsed IPv4 options could not be rebuilt: %v", optionsErr)
+			}
+		} else {
+			headers, protocol, payload, headersErr := packet.IPv6ExtensionHeaders()
+			if headersErr != nil {
+				t.Fatalf("parsed IPv6 headers could not be inspected: %v", headersErr)
+			}
+			if headersErr = structured.SetIPv6ExtensionHeaders(headers, protocol, payload); headersErr != nil {
+				t.Fatalf("parsed IPv6 headers could not be rebuilt: %v", headersErr)
+			}
+		}
+		if _, err = structured.AppendBinary(nil); err != nil {
+			t.Fatalf("structured packet could not be encoded: %v", err)
+		}
 		encoded, err := packet.AppendBinary(nil)
 		if err != nil {
 			t.Fatalf("parsed packet could not be encoded: %v", err)
@@ -622,6 +952,78 @@ func FuzzPublicIPPacketCodec(f *testing.F) {
 		inPlace, err := reparsed.AppendBinary(encoded[:0])
 		if err != nil || !bytes.Equal(inPlace, canonical) {
 			t.Fatalf("in-place packet append: error=%v\n got %x\nwant %x", err, inPlace, canonical)
+		}
+	})
+}
+
+func FuzzPublicIPv4HeaderOptions(f *testing.F) {
+	f.Add([]byte{IPv4HeaderOptionNOP, IPv4HeaderOptionRouterAlert, 4, 0, 0, IPv4HeaderOptionEnd, 0, 0})
+	f.Add([]byte{30, 4, 1, 2})
+	f.Fuzz(func(t *testing.T, wire []byte) {
+		packet := IPPacket{
+			Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1"),
+			IPv4Options: wire,
+		}
+		before := append([]byte(nil), wire...)
+		options, err := packet.IPv4HeaderOptions()
+		if !bytes.Equal(wire, before) {
+			t.Fatal("IPv4HeaderOptions modified its input")
+		}
+		if err != nil {
+			return
+		}
+		var rebuilt = packet
+		rebuilt.IPv4Options = nil
+		if err = rebuilt.SetIPv4HeaderOptions(options); err != nil {
+			t.Fatalf("parsed IPv4 options could not be rebuilt: %v", err)
+		}
+		canonical := append([]byte(nil), rebuilt.IPv4Options...)
+		for index := range wire {
+			wire[index] ^= 0xff
+		}
+		if !bytes.Equal(rebuilt.IPv4Options, canonical) {
+			t.Fatal("SetIPv4HeaderOptions retained parsed input")
+		}
+		if _, err = rebuilt.IPv4HeaderOptions(); err != nil {
+			t.Fatalf("rebuilt IPv4 options could not be parsed: %v", err)
+		}
+	})
+}
+
+func FuzzPublicIPv6ExtensionOptions(f *testing.F) {
+	f.Add(true, []byte{0, IPv6ExtensionOptionRouterAlert, 2, 0, 0, IPv6ExtensionOptionPadN, 0})
+	f.Add(false, []byte{0, 0xe3, 3, 1, 2, 3, IPv6ExtensionOptionPad1})
+	f.Fuzz(func(t *testing.T, hopByHop bool, data []byte) {
+		headerType := uint8(IPv6ExtensionHeaderDestination)
+		if hopByHop {
+			headerType = IPv6ExtensionHeaderHopByHop
+		}
+		header := IPv6ExtensionHeader{Type: headerType, Data: data}
+		before := append([]byte(nil), data...)
+		options, err := header.Options()
+		if !bytes.Equal(data, before) {
+			t.Fatal("IPv6 Options modified its input")
+		}
+		if err != nil {
+			return
+		}
+		for _, option := range options {
+			_ = option.Action()
+			_ = option.MayChangeInTransit()
+		}
+		rebuilt := IPv6ExtensionHeader{Type: headerType}
+		if err = rebuilt.SetOptions(options); err != nil {
+			t.Fatalf("parsed IPv6 options could not be rebuilt: %v", err)
+		}
+		canonical := append([]byte(nil), rebuilt.Data...)
+		for index := range data {
+			data[index] ^= 0xff
+		}
+		if !bytes.Equal(rebuilt.Data, canonical) {
+			t.Fatal("SetOptions retained parsed input")
+		}
+		if _, err = rebuilt.Options(); err != nil {
+			t.Fatalf("rebuilt IPv6 options could not be parsed: %v", err)
 		}
 	})
 }
@@ -690,7 +1092,7 @@ func TestIPv4RouterAlertValidation(t *testing.T) {
 		{name: "missing", options: []byte{1, 1, 1, 0}},
 		{name: "nonzero-value", options: []byte{148, 4, 0, 1}},
 		{name: "duplicate", options: []byte{148, 4, 0, 0, 148, 4, 0, 0}},
-		{name: "nonzero-eol-padding", options: []byte{148, 4, 0, 0, 0, 1, 0, 0}},
+		{name: "nonzero-eol-padding", options: []byte{148, 4, 0, 0, 0, 1, 0, 0}, valid: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := ipv4RouterAlert(test.options); got != test.valid {
@@ -854,6 +1256,7 @@ func FuzzIPv4OptionParsing(f *testing.F) {
 	remote := netip.MustParseAddr("198.51.100.171")
 	f.Add([]byte(nil))
 	f.Add([]byte{1, 1, 0, 0})
+	f.Add([]byte{0, 1, 2, 3})
 	f.Add([]byte{148, 4, 0, 0})
 	f.Add([]byte{148, 3, 0, 0})
 	f.Add([]byte{131, 3, 4, 0})
@@ -1021,7 +1424,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	if _, ok := parseIPPacket(validIPv4); !ok {
 		t.Fatal("valid IPv4 options were rejected")
 	}
-	for _, options := range [][]byte{{7, 1, 0, 0}, {0, 1, 0, 0}} {
+	for _, options := range [][]byte{{7, 1, 0, 0}, {30, 1, 0, 0}} {
 		parsed, ok := parseIPPacket(buildTestIPv4Options(remote4, local4, options))
 		if !ok || !parsed.parameterError || parsed.parameterCode != 0 {
 			t.Fatalf("malformed IPv4 options = %+v, %v for %x", parsed, ok, options)

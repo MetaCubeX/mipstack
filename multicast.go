@@ -2543,7 +2543,7 @@ func (s *multicastState) sendIGMPPacket(target netip.Addr, payload []byte, route
 	packet[0], packet[1] = 0x45, 0xc0
 	if routerAlert {
 		packet[0] = 0x46
-		copy(packet[20:24], []byte{148, 4, 0, 0})
+		copy(packet[20:24], []byte{IPv4HeaderOptionRouterAlert, 4, 0, 0})
 	}
 	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
 	binary.BigEndian.PutUint16(packet[4:6], uint16(s.stack.ipv4ID.Add(1)))
@@ -2572,7 +2572,7 @@ func (s *multicastState) sendMLDPacket(target netip.Addr, payload []byte, cancel
 	sourceBytes, targetBytes := source.As16(), target.As16()
 	copy(packet[8:24], sourceBytes[:])
 	copy(packet[24:40], targetBytes[:])
-	copy(packet[40:48], []byte{ProtocolICMPv6, 0, 5, 2, 0, 0, 1, 0})
+	copy(packet[40:48], []byte{ProtocolICMPv6, 0, IPv6ExtensionOptionRouterAlert, 2, 0, 0, IPv6ExtensionOptionPadN, 0})
 	copy(packet[48:], payload)
 	_ = s.stack.writePacketUntil(packet, socketWriteState{closed: cancel})
 }

@@ -1683,10 +1683,10 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	dsack.begin(false, 5000, 16000, 12000, 14000, &controller, rtt)
 	dsack.recordRetransmission(1000, 2000, 300, false)
 	dsack.recordRetransmission(2000, 3000, 301, false)
-	if dsack.observeDSACK(tcpSACKBlock{left: 1000, right: 2000}, 3000, 1000, false) {
+	if dsack.observeDSACK(TCPSACKBlock{LeftEdge: 1000, RightEdge: 2000}, 3000, 1000, false) {
 		t.Fatal("DSACK undo completed before every retransmission was duplicated")
 	}
-	if !dsack.observeDSACK(tcpSACKBlock{left: 2000, right: 3000}, 3000, 1000, false) {
+	if !dsack.observeDSACK(TCPSACKBlock{LeftEdge: 2000, RightEdge: 3000}, 3000, 1000, false) {
 		t.Fatal("DSACK undo did not complete after every retransmission was duplicated")
 	}
 
@@ -1694,7 +1694,7 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	repeated.begin(false, 5000, 16000, 12000, 14000, &controller, rtt)
 	repeated.recordRetransmission(1000, 2000, 300, false)
 	repeated.recordRetransmission(1000, 2000, 301, true)
-	if repeated.observeDSACK(tcpSACKBlock{left: 1000, right: 2000}, 2000, 1000, false) {
+	if repeated.observeDSACK(TCPSACKBlock{LeftEdge: 1000, RightEdge: 2000}, 2000, 1000, false) {
 		t.Fatal("DSACK undid a range retransmitted more than once")
 	}
 	var repacketized tcpRecoveryUndo
@@ -1708,23 +1708,23 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	var emptyScoreboard tcpRecoveryUndo
 	emptyScoreboard.begin(false, 5000, 16000, 12000, 14000, &controller, rtt)
 	emptyScoreboard.recordRetransmission(1000, 2000, 300, false)
-	if emptyScoreboard.observeDSACK(tcpSACKBlock{left: 1000, right: 2000}, 2000, 1000, true) || !emptyScoreboard.dsackDisabled {
+	if emptyScoreboard.observeDSACK(TCPSACKBlock{LeftEdge: 1000, RightEdge: 2000}, 2000, 1000, true) || !emptyScoreboard.dsackDisabled {
 		t.Fatal("RFC 3708 empty-scoreboard exception did not disable undo")
 	}
 
 	var history tcpRetransmissionHistory
 	history.record(1000, 2000)
-	if matched, repeatedRange := history.match(tcpSACKBlock{left: 1000, right: 2000}); !matched || repeatedRange {
+	if matched, repeatedRange := history.match(TCPSACKBlock{LeftEdge: 1000, RightEdge: 2000}); !matched || repeatedRange {
 		t.Fatalf("single retransmission history match = %t, %t", matched, repeatedRange)
 	}
 	history.record(1000, 2000)
-	if matched, repeatedRange := history.match(tcpSACKBlock{left: 1000, right: 2000}); !matched || !repeatedRange {
+	if matched, repeatedRange := history.match(TCPSACKBlock{LeftEdge: 1000, RightEdge: 2000}); !matched || !repeatedRange {
 		t.Fatalf("repeated retransmission history match = %t, %t", matched, repeatedRange)
 	}
 	var overlappingHistory tcpRetransmissionHistory
 	overlappingHistory.record(1000, 2200)
 	overlappingHistory.record(1000, 2000)
-	if matched, repeatedRange := overlappingHistory.match(tcpSACKBlock{left: 1000, right: 2000}); !matched || !repeatedRange {
+	if matched, repeatedRange := overlappingHistory.match(TCPSACKBlock{LeftEdge: 1000, RightEdge: 2000}); !matched || !repeatedRange {
 		t.Fatalf("overlapping retransmission history match = %t, %t", matched, repeatedRange)
 	}
 }
@@ -3140,7 +3140,7 @@ func TestRACKMarksOlderTransmission(t *testing.T) {
 		{sequence: 200, end: 300, hostQueue: testPacketQueueTicketAt(base, base.Add(20*time.Millisecond))},
 	}
 	var latest tcpRACKSample
-	outstanding, _, _, _, latest, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 200, right: 300}}, base)
+	outstanding, _, _, _, latest, _ = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 200, RightEdge: 300}}, base)
 	latest.rtt = 5 * time.Millisecond
 	markRACKLoss(outstanding, latest, base.Add(20*time.Millisecond), 10*time.Millisecond, base)
 	if !outstanding[0].state.has(sentTCPSegmentRACKLost) || outstanding[1].state.has(sentTCPSegmentRACKLost) {
@@ -3223,11 +3223,11 @@ func TestRACKRejectsAmbiguousRetransmissionRTT(t *testing.T) {
 func TestRACKRepeatedSACKIsNotNewDelivery(t *testing.T) {
 	base := time.Unix(100, 0)
 	outstanding := []sentTCPSegment{{sequence: 100, end: 200, timestamp: 10, hostQueue: testPacketQueueTicketAt(base, base)}}
-	outstanding, _, _, newInformation, latest, _ := applyTCPSACK(outstanding, []tcpSACKBlock{{left: 100, right: 200}}, base)
+	outstanding, _, _, newInformation, latest, _ := applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}}, base)
 	if !newInformation || latest.sentAt != base {
 		t.Fatalf("initial SACK = new %t latest %+v", newInformation, latest)
 	}
-	_, _, _, newInformation, latest, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 100, right: 200}}, base)
+	_, _, _, newInformation, latest, _ = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 100, RightEdge: 200}}, base)
 	if newInformation || !latest.sentAt.IsZero() {
 		t.Fatalf("repeated SACK = new %t latest %+v", newInformation, latest)
 	}
@@ -3400,7 +3400,7 @@ func TestTCPDSACKParsing(t *testing.T) {
 	options[0], options[1] = 5, 10
 	binary.BigEndian.PutUint32(options[2:6], 200)
 	binary.BigEndian.PutUint32(options[6:10], 300)
-	if block, ok := parseTCPDSACKOption(options, 300, 500, 200); !ok || block != (tcpSACKBlock{left: 200, right: 300}) {
+	if block, ok := parseTCPDSACKOption(options, 300, 500, 200); !ok || block != (TCPSACKBlock{LeftEdge: 200, RightEdge: 300}) {
 		t.Fatalf("below-ACK DSACK = %#v, %t", block, ok)
 	}
 	if _, ok := parseTCPDSACKOption(options, 300, 500, 50); ok {
@@ -3413,7 +3413,7 @@ func TestTCPDSACKParsing(t *testing.T) {
 	binary.BigEndian.PutUint32(options[6:10], 300)
 	binary.BigEndian.PutUint32(options[10:14], 200)
 	binary.BigEndian.PutUint32(options[14:18], 350)
-	if block, ok := parseTCPDSACKOption(options, 100, 400, 0); !ok || block != (tcpSACKBlock{left: 250, right: 300}) {
+	if block, ok := parseTCPDSACKOption(options, 100, 400, 0); !ok || block != (TCPSACKBlock{LeftEdge: 250, RightEdge: 300}) {
 		t.Fatalf("contained DSACK = %#v, %t", block, ok)
 	}
 }
@@ -3422,7 +3422,7 @@ func TestTCPDSACKParsing(t *testing.T) {
 // block cannot repeatedly inflate duplicate-ACK recovery.
 func TestTCPRepeatedSACKIsNotNewInformation(t *testing.T) {
 	outstanding := []sentTCPSegment{{sequence: 100, end: 200}, {sequence: 200, end: 300, delivery: tcpDeliverySnapshot{deliveredStamp: 1}}}
-	blocks := []tcpSACKBlock{{left: 200, right: 300}}
+	blocks := []TCPSACKBlock{{LeftEdge: 200, RightEdge: 300}}
 	var present, fresh bool
 	var delivered []sentTCPSegment
 	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, blocks, time.Time{})
@@ -3441,7 +3441,7 @@ func TestTCPPartialSACKSplitsScoreboard(t *testing.T) {
 	outstanding := []sentTCPSegment{{sequence: 100, end: 400, flags: TCPFlagACK | TCPFlagPSH, state: sentTCPSegmentTransmitted}}
 	var present, fresh bool
 	var delivered []sentTCPSegment
-	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, []tcpSACKBlock{{left: 200, right: 300}}, time.Time{})
+	outstanding, _, present, fresh, _, delivered = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: 200, RightEdge: 300}}, time.Time{})
 	if !present || !fresh || len(delivered) != 1 || len(outstanding) != 3 {
 		t.Fatalf("partial SACK state = present %t fresh %t delivered %d segments %d", present, fresh, len(delivered), len(outstanding))
 	}
@@ -3465,7 +3465,7 @@ func TestTCPSACKSplitMetadataIsBounded(t *testing.T) {
 	payloadSize := uint32(4 * tcpMaximumSACKSplitRanges)
 	outstanding := []sentTCPSegment{{sequence: 0, end: payloadSize, state: sentTCPSegmentTransmitted}}
 	for offset := uint32(1); offset+1 < payloadSize; offset += 2 {
-		outstanding, _, _, _, _, _ = applyTCPSACK(outstanding, []tcpSACKBlock{{left: offset, right: offset + 1}}, time.Time{})
+		outstanding, _, _, _, _, _ = applyTCPSACK(outstanding, []TCPSACKBlock{{LeftEdge: offset, RightEdge: offset + 1}}, time.Time{})
 	}
 	splitRanges := 0
 	for _, segment := range outstanding {
@@ -3585,7 +3585,7 @@ func TestTCPSequenceWrapAndSACK(t *testing.T) {
 	binary.BigEndian.PutUint32(options[2:6], 0)
 	binary.BigEndian.PutUint32(options[6:10], 0x20)
 	blocks := parseTCPSACKOptions(options, acknowledged, sendNext)
-	if len(blocks) != 1 || blocks[0].left != 0 || blocks[0].right != 0x20 {
+	if len(blocks) != 1 || blocks[0].LeftEdge != 0 || blocks[0].RightEdge != 0x20 {
 		t.Fatalf("wrapped SACK blocks = %#v", blocks)
 	}
 	if !tcpSequenceLess(0xfffffff0, 0x10) || !tcpSequenceGreater(0x10, 0xfffffff0) {
@@ -3602,9 +3602,9 @@ func TestTCPSACKCoalescesAdjacentPieces(t *testing.T) {
 		{sequence: 106, payload: []byte("ef")},
 	}
 	var workspace [34]byte
-	options := tcpSACKOptions(pieces, 103, 4, tcpSACKBlock{}, false, &workspace)
+	options := tcpSACKOptions(pieces, 103, 4, TCPSACKBlock{}, false, &workspace)
 	blocks := parseTCPSACKOptions(options, 90, 120)
-	if len(blocks) != 2 || blocks[0] != (tcpSACKBlock{left: 100, right: 104}) || blocks[1] != (tcpSACKBlock{left: 106, right: 108}) {
+	if len(blocks) != 2 || blocks[0] != (TCPSACKBlock{LeftEdge: 100, RightEdge: 104}) || blocks[1] != (TCPSACKBlock{LeftEdge: 106, RightEdge: 108}) {
 		t.Fatalf("coalesced SACK blocks = %#v", blocks)
 	}
 }
@@ -3617,7 +3617,7 @@ func TestTCPSACKOptionsDoNotAllocate(t *testing.T) {
 	}
 	allocations := testing.AllocsPerRun(100, func() {
 		var workspace [34]byte
-		if options := tcpSACKOptions(pieces, 103, 4, tcpSACKBlock{}, false, &workspace); len(options) != 18 {
+		if options := tcpSACKOptions(pieces, 103, 4, TCPSACKBlock{}, false, &workspace); len(options) != 18 {
 			panic("unexpected SACK option size")
 		}
 	})
@@ -3689,12 +3689,12 @@ func TestTCPSACKPiggybacksOnData(t *testing.T) {
 }
 
 func TestTCPDSACKGeneration(t *testing.T) {
-	if block, ok := tcpDuplicateSACKBlock(90, 20, false, 100, nil); !ok || block != (tcpSACKBlock{left: 90, right: 100}) {
+	if block, ok := tcpDuplicateSACKBlock(90, 20, false, 100, nil); !ok || block != (TCPSACKBlock{LeftEdge: 90, RightEdge: 100}) {
 		t.Fatalf("below-ACK duplicate block = %#v, %t", block, ok)
 	}
 	pieces := []tcpReceivedPiece{{sequence: 120, payload: make([]byte, 20)}}
 	block, ok := tcpDuplicateSACKBlock(125, 20, false, 100, pieces)
-	if !ok || block != (tcpSACKBlock{left: 125, right: 140}) {
+	if !ok || block != (TCPSACKBlock{LeftEdge: 125, RightEdge: 140}) {
 		t.Fatalf("contained duplicate block = %#v, %t", block, ok)
 	}
 	var workspace [34]byte
@@ -4870,6 +4870,132 @@ func TestPublicTCPSegmentCodec(t *testing.T) {
 	}
 }
 
+func TestPublicTCPHeaderOptions(t *testing.T) {
+	var mss, scale, sackPermitted, timestamp, sack TCPHeaderOption
+	mss.SetMaximumSegmentSize(1460)
+	scale.SetWindowScale(255)
+	sackPermitted.SetSACKPermitted()
+	timestamp.SetTimestamp(0x10203040, 0x50607080)
+	wantBlocks := []TCPSACKBlock{{LeftEdge: 0xfffffff0, RightEdge: 0x20}}
+	if err := sack.SetSACKBlocks(wantBlocks); err != nil {
+		t.Fatal(err)
+	}
+	unknownData := []byte{0xaa, 0xbb}
+	options := []TCPHeaderOption{
+		{Kind: TCPHeaderOptionNOP}, mss, scale, sackPermitted, timestamp, sack,
+		{Kind: 30, Data: unknownData}, {Kind: 30, Data: []byte{0xcc, 0xdd}},
+		{Kind: TCPHeaderOptionEnd},
+	}
+	segment := TCPSegment{}
+	if err := segment.SetHeaderOptions(options); err != nil {
+		t.Fatalf("SetHeaderOptions: %v", err)
+	}
+	wantWire := append([]byte(nil), segment.Options...)
+	if len(wantWire) != 39 {
+		t.Fatalf("encoded option length = %d, want 39", len(wantWire))
+	}
+	mss.Data[0] ^= 0xff
+	unknownData[0] ^= 0xff
+	if !bytes.Equal(segment.Options, wantWire) {
+		t.Fatal("SetHeaderOptions retained caller storage")
+	}
+
+	parsed, err := segment.HeaderOptions()
+	if err != nil {
+		t.Fatalf("HeaderOptions: %v", err)
+	}
+	if len(parsed) != len(options) {
+		t.Fatalf("parsed %d options, want %d", len(parsed), len(options))
+	}
+	if value, ok := parsed[1].MaximumSegmentSize(); !ok || value != 1460 {
+		t.Fatalf("MSS = %d, %t", value, ok)
+	}
+	if value, ok := parsed[2].WindowScale(); !ok || value != 255 {
+		t.Fatalf("raw Window Scale = %d, %t", value, ok)
+	}
+	if !parsed[3].IsSACKPermitted() {
+		t.Fatal("SACK-Permitted was not recognized")
+	}
+	if value, echo, ok := parsed[4].Timestamp(); !ok || value != 0x10203040 || echo != 0x50607080 {
+		t.Fatalf("Timestamp = %#x/%#x, %t", value, echo, ok)
+	}
+	blocks, ok := parsed[5].SACKBlocks()
+	if !ok || len(blocks) != 1 || blocks[0] != wantBlocks[0] {
+		t.Fatalf("SACK blocks = %+v, %t", blocks, ok)
+	}
+	if parsed[6].Kind != 30 || parsed[7].Kind != 30 || !bytes.Equal(parsed[6].Data, []byte{0xaa, 0xbb}) || parsed[8].Kind != TCPHeaderOptionEnd {
+		t.Fatalf("unknown, duplicate, or End options changed: %+v", parsed)
+	}
+
+	var copied TCPSegment
+	if err = copied.SetHeaderOptions(parsed); err != nil {
+		t.Fatalf("copy parsed options: %v", err)
+	}
+	parsed[6].Data[0] ^= 0xff
+	if segment.Options[32] != 0x55 {
+		t.Fatal("HeaderOptions Data did not borrow TCPSegment.Options")
+	}
+	if !bytes.Equal(copied.Options, wantWire) {
+		t.Fatal("SetHeaderOptions did not copy parsed Data")
+	}
+}
+
+func TestPublicTCPHeaderOptionErrors(t *testing.T) {
+	segment := TCPSegment{Options: []byte{TCPHeaderOptionNOP}}
+	want := append([]byte(nil), segment.Options...)
+	tests := []struct {
+		name    string
+		options []TCPHeaderOption
+		wantErr error
+	}{
+		{name: "End data", options: []TCPHeaderOption{{Kind: TCPHeaderOptionEnd, Data: []byte{1}}}, wantErr: syscall.EINVAL},
+		{name: "NOP data", options: []TCPHeaderOption{{Kind: TCPHeaderOptionNOP, Data: []byte{1}}}, wantErr: syscall.EINVAL},
+		{name: "after End", options: []TCPHeaderOption{{Kind: TCPHeaderOptionEnd}, {Kind: TCPHeaderOptionNOP}}, wantErr: syscall.EINVAL},
+		{name: "oversized", options: []TCPHeaderOption{{Kind: 30, Data: make([]byte, 39)}}, wantErr: syscall.EMSGSIZE},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := segment.SetHeaderOptions(test.options); !errors.Is(err, test.wantErr) {
+				t.Fatalf("SetHeaderOptions error = %v, want %v", err, test.wantErr)
+			}
+			if !bytes.Equal(segment.Options, want) {
+				t.Fatal("failed SetHeaderOptions changed the receiver")
+			}
+		})
+	}
+	for _, raw := range [][]byte{{30}, {30, 1}, append([]byte{30, 42}, make([]byte, 39)...)} {
+		if _, err := (TCPSegment{Options: raw}).HeaderOptions(); err == nil {
+			t.Fatalf("HeaderOptions accepted %x", raw)
+		}
+	}
+	malformed := []TCPHeaderOption{
+		{Kind: TCPHeaderOptionMSS, Data: []byte{1}},
+		{Kind: TCPHeaderOptionWindowScale, Data: []byte{1, 2}},
+		{Kind: TCPHeaderOptionTimestamp, Data: make([]byte, 7)},
+		{Kind: TCPHeaderOptionSACK, Data: make([]byte, 7)},
+	}
+	if _, ok := malformed[0].MaximumSegmentSize(); ok {
+		t.Fatal("malformed MSS was recognized")
+	}
+	if _, ok := malformed[1].WindowScale(); ok {
+		t.Fatal("malformed Window Scale was recognized")
+	}
+	if _, _, ok := malformed[2].Timestamp(); ok {
+		t.Fatal("malformed Timestamp was recognized")
+	}
+	if _, ok := malformed[3].SACKBlocks(); ok {
+		t.Fatal("malformed SACK was recognized")
+	}
+	original := TCPHeaderOption{Kind: 99, Data: []byte{1}}
+	option := original
+	if err := option.SetSACKBlocks(nil); !errors.Is(err, syscall.EINVAL) || option.Kind != original.Kind || !bytes.Equal(option.Data, original.Data) {
+		t.Fatalf("empty SetSACKBlocks = %+v, %v", option, err)
+	}
+	if err := option.SetSACKBlocks(make([]TCPSACKBlock, 5)); !errors.Is(err, syscall.EINVAL) || option.Kind != original.Kind || !bytes.Equal(option.Data, original.Data) {
+		t.Fatalf("oversized SetSACKBlocks = %+v, %v", option, err)
+	}
+}
+
 func TestPublicTCPSegmentNormalizesReservedFieldsAndEOLPadding(t *testing.T) {
 	segment := TCPSegment{
 		Source: netip.MustParseAddrPort("192.0.2.1:12345"), Destination: netip.MustParseAddrPort("198.51.100.2:443"),
@@ -4982,19 +5108,55 @@ func FuzzTCPOptions(f *testing.F) {
 		_, _, _ = parseTCPTimestamp(options)
 		blocks := parseTCPSACKOptions(options, acknowledged, sendNext)
 		for index, block := range blocks {
-			leftDistance, rightDistance := block.left-acknowledged, block.right-acknowledged
+			leftDistance, rightDistance := block.LeftEdge-acknowledged, block.RightEdge-acknowledged
 			if leftDistance >= rightDistance || rightDistance > window {
-				t.Fatalf("SACK block %d = [%#x,%#x) outside %#x-byte send window", index, block.left, block.right, window)
+				t.Fatalf("SACK block %d = [%#x,%#x) outside %#x-byte send window", index, block.LeftEdge, block.RightEdge, window)
 			}
-			if index != 0 && blocks[index-1].right-acknowledged >= leftDistance {
+			if index != 0 && blocks[index-1].RightEdge-acknowledged >= leftDistance {
 				t.Fatalf("SACK blocks %d and %d are unordered or unmerged", index-1, index)
 			}
 		}
-		if block, ok := parseTCPDSACKOption(options, acknowledged, sendNext, window); ok && !tcpSequenceLess(block.left, block.right) {
-			t.Fatalf("invalid DSACK block [%#x,%#x)", block.left, block.right)
+		if block, ok := parseTCPDSACKOption(options, acknowledged, sendNext, window); ok && !tcpSequenceLess(block.LeftEdge, block.RightEdge) {
+			t.Fatalf("invalid DSACK block [%#x,%#x)", block.LeftEdge, block.RightEdge)
 		}
 		if !bytes.Equal(options, before) {
 			t.Fatal("TCP option parsing modified its input")
+		}
+	})
+}
+
+func FuzzPublicTCPHeaderOptions(f *testing.F) {
+	f.Add([]byte{TCPHeaderOptionNOP, TCPHeaderOptionMSS, 4, 0x05, 0xb4, TCPHeaderOptionEnd, 0, 0})
+	f.Add([]byte{TCPHeaderOptionSACK, 10, 0xff, 0xff, 0xff, 0xf0, 0, 0, 0, 0x20})
+	f.Fuzz(func(t *testing.T, wire []byte) {
+		before := append([]byte(nil), wire...)
+		options, err := (TCPSegment{Options: wire}).HeaderOptions()
+		if !bytes.Equal(wire, before) {
+			t.Fatal("HeaderOptions modified its input")
+		}
+		if err != nil {
+			return
+		}
+		for _, option := range options {
+			_, _ = option.MaximumSegmentSize()
+			_, _ = option.WindowScale()
+			_ = option.IsSACKPermitted()
+			_, _, _ = option.Timestamp()
+			_, _ = option.SACKBlocks()
+		}
+		var rebuilt TCPSegment
+		if err = rebuilt.SetHeaderOptions(options); err != nil {
+			t.Fatalf("parsed options could not be rebuilt: %v", err)
+		}
+		canonical := append([]byte(nil), rebuilt.Options...)
+		for index := range wire {
+			wire[index] ^= 0xff
+		}
+		if !bytes.Equal(rebuilt.Options, canonical) {
+			t.Fatal("SetHeaderOptions retained parsed input")
+		}
+		if _, err = rebuilt.HeaderOptions(); err != nil {
+			t.Fatalf("rebuilt options could not be parsed: %v", err)
 		}
 	})
 }
@@ -5075,20 +5237,20 @@ func FuzzTCPSACKScoreboard(f *testing.F) {
 			if events[offset+3]&1 != 0 && right-left > 1 {
 				left++
 			}
-			block := tcpSACKBlock{left: base + uint32(left), right: base + uint32(right)}
+			block := TCPSACKBlock{LeftEdge: base + uint32(left), RightEdge: base + uint32(right)}
 			var highest uint32
 			var present, fresh bool
 			var newlySACKed []sentTCPSegment
-			outstanding, highest, present, fresh, _, newlySACKed = applyTCPSACK(outstanding, []tcpSACKBlock{block}, epoch)
-			if !present || highest != block.right {
-				t.Fatalf("SACK apply metadata = present %t highest %#x, want true/%#x", present, highest, block.right)
+			outstanding, highest, present, fresh, _, newlySACKed = applyTCPSACK(outstanding, []TCPSACKBlock{block}, epoch)
+			if !present || highest != block.RightEdge {
+				t.Fatalf("SACK apply metadata = present %t highest %#x, want true/%#x", present, highest, block.RightEdge)
 			}
 			if fresh != (len(newlySACKed) != 0) {
 				t.Fatalf("fresh SACK metadata = %t with %d newly SACKed ranges", fresh, len(newlySACKed))
 			}
 			for _, segment := range newlySACKed {
 				if segment.sequence-base < uint32(left) || segment.end-base > uint32(right) || !segment.state.has(sentTCPSegmentTransmitted) {
-					t.Fatalf("newly SACKed range [%#x,%#x) outside block [%#x,%#x)", segment.sequence, segment.end, block.left, block.right)
+					t.Fatalf("newly SACKed range [%#x,%#x) outside block [%#x,%#x)", segment.sequence, segment.end, block.LeftEdge, block.RightEdge)
 				}
 			}
 			check()

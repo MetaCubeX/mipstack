@@ -90,11 +90,21 @@ func TestPublicTCPSegmentCodecInterop(t *testing.T) {
 			}
 			defer listener.Close()
 
+			var maximumSegmentSize, windowScale, sackPermitted, timestamp mipstack.TCPHeaderOption
+			maximumSegmentSize.SetMaximumSegmentSize(1460)
+			windowScale.SetWindowScale(7)
+			sackPermitted.SetSACKPermitted()
+			timestamp.SetTimestamp(0x10203040, 0)
 			segment := mipstack.TCPSegment{
 				Source:         netipAddrPort(family.mipstackAddress, mipstackPort),
 				Destination:    netipAddrPort(family.gvisorAddress, gvisorPort),
 				SequenceNumber: 1000, Flags: mipstack.TCPFlagSYN, WindowSize: 65535,
-				Options: []byte{2, 4, 0x05, 0xb4},
+			}
+			if err := segment.SetHeaderOptions([]mipstack.TCPHeaderOption{
+				maximumSegmentSize, sackPermitted, timestamp,
+				{Kind: mipstack.TCPHeaderOptionNOP}, windowScale,
+			}); err != nil {
+				t.Fatalf("construct public TCP SYN options: %v", err)
 			}
 			tcpWire, err := segment.AppendBinary(nil)
 			if err != nil {
@@ -120,6 +130,26 @@ func TestPublicTCPSegmentCodecInterop(t *testing.T) {
 				parsed, parseErr := parsedPacket.TCPSegment()
 				if parseErr != nil || parsed.Source != segment.Destination || parsed.Destination != segment.Source || parsed.Flags&(mipstack.TCPFlagSYN|mipstack.TCPFlagACK) != mipstack.TCPFlagSYN|mipstack.TCPFlagACK || parsed.Flags&mipstack.TCPFlagRST != 0 || parsed.AcknowledgmentNumber != segment.SequenceNumber+1 {
 					t.Fatalf("parsed gVisor SYN-ACK = %+v, %v", parsed, parseErr)
+				}
+				options, optionsErr := parsed.HeaderOptions()
+				if optionsErr != nil {
+					t.Fatalf("parse gVisor SYN-ACK options: %v", optionsErr)
+				}
+				var foundMSS, foundWindowScale, foundSACK, foundTimestamp bool
+				for _, option := range options {
+					if value, ok := option.MaximumSegmentSize(); ok {
+						foundMSS = value != 0
+					}
+					if value, ok := option.WindowScale(); ok {
+						foundWindowScale = value <= 14
+					}
+					foundSACK = foundSACK || option.IsSACKPermitted()
+					if _, _, ok := option.Timestamp(); ok {
+						foundTimestamp = true
+					}
+				}
+				if !foundMSS || !foundWindowScale || !foundSACK || !foundTimestamp {
+					t.Fatalf("gVisor SYN-ACK options did not negotiate the offered features: %+v", options)
 				}
 			case <-time.After(3 * time.Second):
 				t.Fatal("timed out waiting for gVisor SYN-ACK")
