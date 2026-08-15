@@ -118,6 +118,13 @@ behavior. The historic NS bit remains explicitly available. IPv6 encoding
 similarly clears Fragment Header reserved fields and PadN data without hiding
 the received bytes from a parsed `IPPacket`.
 
+`ICMPMessage.IsEchoRequest` identifies complete IPv4 and IPv6 Echo Requests.
+`EchoReply` creates a zero-copy semantic Echo Reply using a caller-selected
+source address; explicit selection is required because multicast, broadcast,
+and anycast destinations cannot be reused blindly as reply sources. The reply
+shares `Body` with the request, while `MarshalBinary` and `AppendBinary` encode
+the complete message and calculate its address-family checksum.
+
 `IPPacket.UpperLayer` walks IPv6 Hop-by-Hop, Destination Options, Routing, and
 atomic Fragment headers. Stateful fragment reassembly belongs to `Stack`, not
 the standalone codec, while IPv6 jumbograms are not supported. Non-atomic

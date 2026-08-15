@@ -259,6 +259,128 @@ func TestPublicICMPMessageCodec(t *testing.T) {
 	}
 }
 
+func TestPublicICMPMessageEchoReply(t *testing.T) {
+	tests := []struct {
+		name      string
+		request   ICMPMessage
+		source    netip.Addr
+		protocol  int
+		replyType uint8
+	}{
+		{
+			name: "IPv4 mapped",
+			request: ICMPMessage{
+				Source: netip.MustParseAddr("::ffff:192.0.2.1"), Destination: netip.MustParseAddr("::ffff:198.51.100.1"),
+				Type: 8, Body: []byte{0x12, 0x34, 0, 7, 'v', '4'},
+			},
+			source: netip.MustParseAddr("::ffff:198.51.100.2"), protocol: ProtocolICMPv4, replyType: 0,
+		},
+		{
+			name: "IPv6 multicast request",
+			request: ICMPMessage{
+				Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("ff02::1"),
+				Type: 128, Body: []byte{0x56, 0x78, 0, 9, 'v', '6'},
+			},
+			source: netip.MustParseAddr("2001:db8:1::1"), protocol: ProtocolICMPv6, replyType: 129,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requestWire, err := test.request.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("append Echo Request: %v", err)
+			}
+			request, err := (IPPacket{
+				Source: test.request.Source.Unmap(), Destination: test.request.Destination.Unmap(),
+				Protocol: test.protocol, HopLimit: 64, Payload: requestWire,
+			}).ICMPMessage()
+			if err != nil {
+				t.Fatalf("parse Echo Request: %v", err)
+			}
+			reply, err := request.EchoReply(test.source)
+			if err != nil {
+				t.Fatalf("EchoReply: %v", err)
+			}
+			if reply.Source != test.source.Unmap() || reply.Destination != test.request.Source.Unmap() ||
+				reply.Type != test.replyType || reply.Code != 0 || !bytes.Equal(reply.Body, test.request.Body) {
+				t.Fatalf("EchoReply = %+v", reply)
+			}
+			if &reply.Body[0] != &request.Body[0] {
+				t.Fatal("EchoReply copied Body")
+			}
+			if reply.IsEchoRequest() {
+				t.Fatal("Echo Reply classified as a request")
+			}
+
+			backing := &requestWire[0]
+			wire, err := reply.AppendBinary(requestWire[:0])
+			if err != nil {
+				t.Fatalf("append Echo Reply: %v", err)
+			}
+			if &wire[0] != backing {
+				t.Fatal("in-place Echo Reply encoding replaced wire backing")
+			}
+			parsed, err := (IPPacket{
+				Source: reply.Source, Destination: reply.Destination,
+				Protocol: test.protocol, HopLimit: 64, Payload: wire,
+			}).ICMPMessage()
+			if err != nil {
+				t.Fatalf("parse Echo Reply: %v", err)
+			}
+			if parsed.Type != test.replyType || parsed.Code != 0 || !bytes.Equal(parsed.Body, test.request.Body) {
+				t.Fatalf("parsed Echo Reply = %+v", parsed)
+			}
+		})
+	}
+}
+
+func TestPublicICMPMessageEchoReplyErrors(t *testing.T) {
+	v4 := ICMPMessage{
+		Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1"),
+		Type: 8, Body: []byte{0, 1, 0, 2},
+	}
+	v6 := ICMPMessage{
+		Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"),
+		Type: 128, Body: []byte{0, 1, 0, 2},
+	}
+	nonEcho := v4
+	nonEcho.Type = 0
+	nonzeroCode := v4
+	nonzeroCode.Code = 1
+	shortBody := v4
+	shortBody.Body = make([]byte, 3)
+	zonedRequest := v6
+	zonedRequest.Source = zonedRequest.Source.WithZone("test")
+	oversizedBody := v4
+	oversizedBody.Body = make([]byte, 65532)
+	tests := []struct {
+		name    string
+		request ICMPMessage
+		source  netip.Addr
+		want    error
+	}{
+		{name: "non-Echo", request: nonEcho, source: v4.Destination, want: syscall.EINVAL},
+		{name: "nonzero code", request: nonzeroCode, source: v4.Destination, want: syscall.EINVAL},
+		{name: "short body", request: shortBody, source: v4.Destination, want: syscall.EINVAL},
+		{name: "invalid source", request: v4, source: netip.Addr{}, want: syscall.EINVAL},
+		{name: "cross-family source", request: v4, source: v6.Destination, want: syscall.EINVAL},
+		{name: "zoned source", request: v6, source: v6.Destination.WithZone("test"), want: syscall.EINVAL},
+		{name: "zoned request", request: zonedRequest, source: v6.Destination, want: syscall.EINVAL},
+		{name: "oversized body", request: oversizedBody, source: v4.Destination, want: syscall.EMSGSIZE},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reply, err := test.request.EchoReply(test.source)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("EchoReply error = %v, want %v", err, test.want)
+			}
+			if reply.Source.IsValid() || reply.Destination.IsValid() || reply.Body != nil {
+				t.Fatalf("failed EchoReply returned %+v", reply)
+			}
+		})
+	}
+}
+
 func TestPublicICMPMessageCodecErrorsDoNotModifyDestination(t *testing.T) {
 	message := ICMPMessage{Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"), Type: 8, Body: make([]byte, 4)}
 	message.Destination = netip.MustParseAddr("2001:db8::1")

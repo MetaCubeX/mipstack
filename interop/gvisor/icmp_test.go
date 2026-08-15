@@ -39,8 +39,8 @@ func TestICMPEchoInterop(t *testing.T) {
 }
 
 // TestPublicICMPMessageCodecInterop verifies that gVisor accepts an echo
-// request constructed by the public codec and that its native reply is decoded
-// by the same semantic API.
+// request constructed by the public codec, that ICMPMessage.EchoReply matches
+// gVisor's native reply, and that the reply is decoded by the semantic API.
 func TestPublicICMPMessageCodecInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
@@ -65,6 +65,14 @@ func TestPublicICMPMessageCodecInterop(t *testing.T) {
 				Source: family.mipstackAddress, Destination: family.gvisorAddress,
 				Type: messageType, Body: body,
 			}
+			expectedReply, err := message.EchoReply(family.gvisorAddress)
+			if err != nil {
+				t.Fatalf("construct public ICMP echo reply: %v", err)
+			}
+			expectedReplyWire, err := expectedReply.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public ICMP echo reply: %v", err)
+			}
 			icmpWire, err := message.AppendBinary(nil)
 			if err != nil {
 				t.Fatalf("encode public ICMP message: %v", err)
@@ -85,6 +93,16 @@ func TestPublicICMPMessageCodecInterop(t *testing.T) {
 				parsedPacket, parseErr := mipstack.ParseIPPacket(responseWire)
 				if parseErr != nil {
 					t.Fatalf("parse gVisor ICMP packet: %v", parseErr)
+				}
+				actualProtocol, actualReplyWire, upperErr := parsedPacket.UpperLayer()
+				if upperErr != nil {
+					t.Fatalf("locate gVisor ICMP reply: %v", upperErr)
+				}
+				if actualProtocol != protocol {
+					t.Fatalf("gVisor ICMP reply protocol = %d, want %d", actualProtocol, protocol)
+				}
+				if !bytes.Equal(actualReplyWire, expectedReplyWire) {
+					t.Fatalf("public ICMP echo reply = %x, gVisor reply = %x", expectedReplyWire, actualReplyWire)
 				}
 				parsed, parseErr := parsedPacket.ICMPMessage()
 				wantType := uint8(0)

@@ -69,6 +69,34 @@ func (m ICMPMessage) IsEchoRequest() bool {
 	return m.Type == 128
 }
 
+// EchoReply returns the semantic Echo Reply corresponding to m, using source
+// as the reply source address. An explicit source is required because a request
+// destination may be multicast, broadcast, or anycast and source selection
+// requires IP routing state. The source argument must be an unzoned address in
+// m's address family, but its ownership and address classification are not
+// checked. Body aliases m.Body; MarshalBinary or AppendBinary calculates the
+// reply checksum.
+func (m ICMPMessage) EchoReply(source netip.Addr) (ICMPMessage, error) {
+	normalized, _, err := m.wireLayout()
+	if err != nil {
+		return ICMPMessage{}, err
+	}
+	if !normalized.IsEchoRequest() || source.Zone() != "" {
+		return ICMPMessage{}, syscall.EINVAL
+	}
+	source = source.Unmap()
+	if !source.IsValid() || source.Is4() != normalized.Source.Is4() {
+		return ICMPMessage{}, syscall.EINVAL
+	}
+	normalized.Destination = normalized.Source
+	normalized.Source = source
+	normalized.Type = 0
+	if source.Is6() {
+		normalized.Type = 129
+	}
+	return normalized, nil
+}
+
 // MarshalBinary returns the complete ICMP message wire encoding. Source and
 // Destination select the family and contribute to the ICMPv6 pseudo-header
 // checksum but are not themselves encoded. MarshalBinary is semantically
