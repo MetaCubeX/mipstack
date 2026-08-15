@@ -43,15 +43,19 @@ func TestICMPErrorCodeValidation(t *testing.T) {
 		{ProtocolICMPv4, 11, 2, false},
 		{ProtocolICMPv4, 12, 2, true},
 		{ProtocolICMPv4, 12, 3, false},
-		{ProtocolICMPv6, 1, 7, true},
+		{ProtocolICMPv6, 1, ICMPv6DestinationUnreachableCodeSourceRoutingHeader, true},
 		{ProtocolICMPv6, 1, 8, false},
+		{ProtocolICMPv6, 1, ICMPv6DestinationUnreachableCodePRoute, true},
+		{ProtocolICMPv6, 1, 10, false},
 		{ProtocolICMPv6, 2, 0, true},
 		{ProtocolICMPv6, 2, 1, false},
 		{ProtocolICMPv6, 3, 1, true},
 		{ProtocolICMPv6, 3, 2, false},
-		{ProtocolICMPv6, 4, 3, true},
-		{ProtocolICMPv6, 4, 4, true},
-		{ProtocolICMPv6, 4, 5, false},
+		{ProtocolICMPv6, 4, ICMPv6ParameterProblemCodeIncompleteFirstFragment, true},
+		{ProtocolICMPv6, 4, ICMPv6ParameterProblemCodeSRUpperLayerHeader, true},
+		{ProtocolICMPv6, 4, ICMPv6ParameterProblemCodeUnrecognizedNextHeaderAtIntermediateNode, true},
+		{ProtocolICMPv6, 4, ICMPv6ParameterProblemCodeOptionTooBig, true},
+		{ProtocolICMPv6, 4, 11, false},
 		{ProtocolICMPv4, 8, 0, false},
 	} {
 		if got := validICMPErrorCode(test.protocol, test.messageType, test.code); got != test.valid {
@@ -186,6 +190,19 @@ func FuzzICMPErrorQuotes(f *testing.F) {
 			!bytes.Equal(networkError.QuotedPayload, networkError.QuotedPacket[len(networkError.QuotedPacket)-len(networkError.QuotedPayload):]) {
 			t.Fatal("parsed ICMP payload is not a quoted-packet suffix")
 		}
+		if len(networkError.QuotedPacket) <= 65535-8 {
+			constructed, constructErr := publicError.ICMPMessage(destination)
+			if constructErr != nil {
+				t.Fatalf("construct parsed ICMP error: %v", constructErr)
+			}
+			reparsed, parseErr := constructed.ICMPError()
+			if parseErr != nil {
+				t.Fatalf("parse reconstructed ICMP error: %v", parseErr)
+			}
+			if !reflect.DeepEqual(reparsed, publicError) {
+				t.Fatalf("ICMP error reconstruction changed semantics:\n original: %+v\n  rebuilt: %+v", publicError, reparsed)
+			}
+		}
 		cloned := cloneICMPError(networkError)
 		clonedPacket := append([]byte(nil), cloned.QuotedPacket...)
 		clonedPayload := append([]byte(nil), cloned.QuotedPayload...)
@@ -278,6 +295,131 @@ func TestPublicICMPMessageCodec(t *testing.T) {
 	}
 }
 
+func TestPublicICMPMessageEchoFieldsAndConstruction(t *testing.T) {
+	for _, test := range []struct {
+		name                   string
+		source, destination    netip.Addr
+		protocol               int
+		requestType, replyType uint8
+	}{
+		{
+			name: "IPv4 mapped", source: netip.MustParseAddr("::ffff:192.0.2.1"),
+			destination: netip.MustParseAddr("::ffff:198.51.100.1"), protocol: ProtocolICMPv4,
+			requestType: ICMPv4TypeEchoRequest, replyType: ICMPv4TypeEchoReply,
+		},
+		{
+			name: "IPv6", source: netip.MustParseAddr("2001:db8::1"),
+			destination: netip.MustParseAddr("2001:db8::2"), protocol: ProtocolICMPv6,
+			requestType: ICMPv6TypeEchoRequest, replyType: ICMPv6TypeEchoReply,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload := []byte("echo-payload")
+			message := ICMPMessage{
+				Source: test.source, Destination: test.destination,
+				Type: 0xff, Code: 0xff, Body: []byte("replaced"),
+			}
+			if err := message.SetEchoRequest(0x1234, 0x5678, payload); err != nil {
+				t.Fatalf("SetEchoRequest: %v", err)
+			}
+			if message.Source != test.source || message.Destination != test.destination {
+				t.Fatalf("SetEchoRequest changed address context: %s -> %s", message.Source, message.Destination)
+			}
+			payload[0] ^= 0xff
+			identifier, sequence, data, ok := message.Echo()
+			if !ok || identifier != 0x1234 || sequence != 0x5678 || !bytes.Equal(data, []byte("echo-payload")) {
+				t.Fatalf("Echo = %#x/%#x/%q/%t", identifier, sequence, data, ok)
+			}
+			if message.Type != test.requestType || message.Code != ICMPCodeNone || !message.IsEchoRequest() || message.IsEchoReply() {
+				t.Fatalf("constructed Echo Request = %+v", message)
+			}
+			if &data[0] != &message.Body[4] {
+				t.Fatal("Echo copied its payload")
+			}
+
+			wire, err := message.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode constructed Echo Request: %v", err)
+			}
+			parsed, err := (IPPacket{
+				Source: message.Source, Destination: message.Destination,
+				Protocol: test.protocol, HopLimit: 64, Payload: wire,
+			}).ICMPMessage()
+			if err != nil {
+				t.Fatalf("parse constructed Echo Request: %v", err)
+			}
+			identifier, sequence, data, ok = parsed.Echo()
+			if !ok || identifier != 0x1234 || sequence != 0x5678 || !bytes.Equal(data, []byte("echo-payload")) {
+				t.Fatalf("parsed Echo = %#x/%#x/%q/%t", identifier, sequence, data, ok)
+			}
+
+			overlapping := message.Body[1:]
+			wantReplyPayload := append([]byte(nil), overlapping...)
+			if err = message.SetEchoReply(0xabcd, 9, overlapping); err != nil {
+				t.Fatalf("SetEchoReply with overlapping payload: %v", err)
+			}
+			identifier, sequence, data, ok = message.Echo()
+			if !ok || identifier != 0xabcd || sequence != 9 || !bytes.Equal(data, wantReplyPayload) ||
+				message.Type != test.replyType || message.Code != ICMPCodeNone || message.IsEchoRequest() || !message.IsEchoReply() {
+				t.Fatalf("constructed Echo Reply = %+v, fields %#x/%#x/%q/%t", message, identifier, sequence, data, ok)
+			}
+		})
+	}
+}
+
+func TestPublicICMPMessageEchoValidation(t *testing.T) {
+	v4 := ICMPMessage{
+		Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"),
+		Type: ICMPv4TypeEchoRequest, Code: ICMPCodeNone, Body: []byte{0, 1, 0, 2},
+	}
+	invalidMessages := []ICMPMessage{
+		{Source: v4.Source, Destination: v4.Destination, Type: ICMPv4TypeEchoRequest, Code: 1, Body: v4.Body},
+		{Source: v4.Source, Destination: v4.Destination, Type: ICMPv4TypeDestinationUnreachable, Body: v4.Body},
+		{Source: v4.Source, Destination: v4.Destination, Type: ICMPv4TypeEchoRequest, Body: v4.Body[:3]},
+		{Source: v4.Source, Destination: netip.MustParseAddr("2001:db8::1"), Type: ICMPv4TypeEchoRequest, Body: v4.Body},
+		{Source: netip.MustParseAddr("fe80::1").WithZone("zone"), Destination: netip.MustParseAddr("2001:db8::1"), Type: ICMPv6TypeEchoRequest, Body: v4.Body},
+	}
+	for index, message := range invalidMessages {
+		if identifier, sequence, payload, ok := message.Echo(); ok || identifier != 0 || sequence != 0 || payload != nil ||
+			message.IsEchoRequest() || message.IsEchoReply() {
+			t.Fatalf("invalid Echo %d was accepted", index)
+		}
+	}
+
+	for _, test := range []struct {
+		name    string
+		message ICMPMessage
+		payload []byte
+		want    error
+	}{
+		{name: "invalid source", message: ICMPMessage{Destination: v4.Destination}, want: syscall.EINVAL},
+		{name: "invalid destination", message: ICMPMessage{Source: v4.Source}, want: syscall.EINVAL},
+		{name: "cross family", message: ICMPMessage{Source: v4.Source, Destination: netip.MustParseAddr("2001:db8::1")}, want: syscall.EINVAL},
+		{name: "zoned", message: ICMPMessage{Source: netip.MustParseAddr("2001:db8::1").WithZone("zone"), Destination: netip.MustParseAddr("2001:db8::2")}, want: syscall.EINVAL},
+		{name: "oversized", message: v4, payload: make([]byte, 65535-8+1), want: syscall.EMSGSIZE},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message := test.message
+			message.Type, message.Code, message.Body = 0xfe, 0xfd, []byte("unchanged")
+			before := message
+			before.Body = append([]byte(nil), message.Body...)
+			if err := message.SetEchoRequest(1, 2, test.payload); !errors.Is(err, test.want) {
+				t.Fatalf("SetEchoRequest error = %v, want %v", err, test.want)
+			}
+			if !reflect.DeepEqual(message, before) {
+				t.Fatalf("failed SetEchoRequest changed receiver: got %+v, want %+v", message, before)
+			}
+		})
+	}
+	var nilMessage *ICMPMessage
+	if err := nilMessage.SetEchoRequest(1, 2, nil); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("nil SetEchoRequest error = %v", err)
+	}
+	if err := nilMessage.SetEchoReply(1, 2, nil); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("nil SetEchoReply error = %v", err)
+	}
+}
+
 func TestPublicICMPError(t *testing.T) {
 	source4 := netip.MustParseAddr("192.0.2.1")
 	target4 := netip.MustParseAddr("198.51.100.1")
@@ -340,6 +482,150 @@ func TestPublicICMPError(t *testing.T) {
 	if err != nil || noNextError.QuotedProtocol != ProtocolNoNextHeader || noNextError.QuotedPayload != nil ||
 		!bytes.Equal(noNextError.QuotedPacket, quotedNoNext) {
 		t.Fatalf("IPv6 No Next Header quote = %+v, %v", noNextError, err)
+	}
+}
+
+func TestPublicICMPErrorConstruction(t *testing.T) {
+	source4 := netip.MustParseAddr("192.0.2.1")
+	target4 := netip.MustParseAddr("198.51.100.1")
+	reporter4 := netip.MustParseAddr("198.51.100.254")
+	udp := make([]byte, udpHeaderSize+16)
+	binary.BigEndian.PutUint16(udp[:2], 42000)
+	binary.BigEndian.PutUint16(udp[2:4], 53)
+	quote4 := buildIPPacket(source4, target4, ProtocolUDP, udp, 7, true)[:20+udpHeaderSize]
+
+	source6 := netip.MustParseAddr("2001:db8::1")
+	target6 := netip.MustParseAddr("2001:db8:1::1")
+	reporter6 := netip.MustParseAddr("2001:db8:ffff::1")
+	tcp := make([]byte, tcpHeaderSize)
+	binary.BigEndian.PutUint16(tcp[:2], 51000)
+	binary.BigEndian.PutUint16(tcp[2:4], 443)
+	quote6 := buildIPPacket(source6, target6, ProtocolTCP, tcp, 0, true)
+
+	for _, test := range []struct {
+		name                  string
+		reporter, destination netip.Addr
+		messageType, code     uint8
+		mtu, pointer          uint32
+		quote                 []byte
+		protocol              int
+	}{
+		{name: "IPv4 fragmentation needed", reporter: reporter4, destination: source4, messageType: ICMPv4TypeDestinationUnreachable, code: ICMPv4DestinationUnreachableCodeFragmentationNeeded, mtu: 1280, quote: quote4, protocol: ProtocolICMPv4},
+		{name: "IPv4 parameter problem", reporter: reporter4, destination: source4, messageType: ICMPv4TypeParameterProblem, code: ICMPv4ParameterProblemCodePointer, pointer: 17, quote: quote4, protocol: ProtocolICMPv4},
+		{name: "IPv4 host unreachable", reporter: reporter4, destination: source4, messageType: ICMPv4TypeDestinationUnreachable, code: ICMPv4DestinationUnreachableCodeHost, quote: quote4, protocol: ProtocolICMPv4},
+		{name: "IPv6 packet too big", reporter: reporter6, destination: source6, messageType: ICMPv6TypePacketTooBig, code: ICMPCodeNone, mtu: 1280, quote: quote6, protocol: ProtocolICMPv6},
+		{name: "IPv6 parameter problem", reporter: reporter6, destination: source6, messageType: ICMPv6TypeParameterProblem, code: ICMPv6ParameterProblemCodeUnrecognizedNextHeader, pointer: 41, quote: quote6, protocol: ProtocolICMPv6},
+		{name: "IPv6 processing-limit parameter problem", reporter: reporter6, destination: source6, messageType: ICMPv6TypeParameterProblem, code: ICMPv6ParameterProblemCodeOptionTooBig, pointer: 48, quote: quote6, protocol: ProtocolICMPv6},
+		{name: "IPv6 P-Route error", reporter: reporter6, destination: source6, messageType: ICMPv6TypeDestinationUnreachable, code: ICMPv6DestinationUnreachableCodePRoute, quote: quote6, protocol: ProtocolICMPv6},
+		{name: "IPv6 time exceeded", reporter: reporter6, destination: source6, messageType: ICMPv6TypeTimeExceeded, code: ICMPv6TimeExceededCodeHopLimitInTransit, quote: quote6, protocol: ProtocolICMPv6},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			quote := append([]byte(nil), test.quote...)
+			wantQuote := append([]byte(nil), quote...)
+			networkError := ICMPError{
+				Reporter: test.reporter, Type: test.messageType, Code: test.code,
+				MTU: test.mtu, Pointer: test.pointer, QuotedPacket: quote,
+				QuotedSource: netip.IPv6Loopback(), QuotedTarget: netip.IPv6Loopback(),
+				QuotedProtocol: 0xff, QuotedPayload: []byte("ignored"),
+				QuotedSourcePort: 1, QuotedTargetPort: 2,
+			}
+			message, err := networkError.ICMPMessage(test.destination)
+			if err != nil {
+				t.Fatalf("construct ICMP error: %v", err)
+			}
+			if message.Source != test.reporter || message.Destination != test.destination || message.Type != test.messageType ||
+				message.Code != test.code || !bytes.Equal(message.Body[4:], wantQuote) {
+				t.Fatalf("constructed ICMP error = %+v", message)
+			}
+			if &message.Body[4] == &quote[0] {
+				t.Fatal("ICMP error construction retained QuotedPacket")
+			}
+			quote[0] ^= 0xff
+			if !bytes.Equal(message.Body[4:], wantQuote) {
+				t.Fatal("mutating QuotedPacket changed constructed ICMP error")
+			}
+
+			wire, err := message.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode constructed ICMP error: %v", err)
+			}
+			parsedMessage, err := (IPPacket{
+				Source: message.Source, Destination: message.Destination,
+				Protocol: test.protocol, HopLimit: 64, Payload: wire,
+			}).ICMPMessage()
+			if err != nil {
+				t.Fatalf("parse constructed ICMP error: %v", err)
+			}
+			parsedError, err := parsedMessage.ICMPError()
+			if err != nil {
+				t.Fatalf("decode constructed ICMP error: %v", err)
+			}
+			if parsedError.Reporter != test.reporter || parsedError.Type != test.messageType || parsedError.Code != test.code ||
+				parsedError.MTU != test.mtu || parsedError.Pointer != test.pointer || !bytes.Equal(parsedError.QuotedPacket, wantQuote) {
+				t.Fatalf("decoded constructed ICMP error = %+v", parsedError)
+			}
+		})
+	}
+}
+
+func TestPublicICMPErrorConstructionFailures(t *testing.T) {
+	source4 := netip.MustParseAddr("192.0.2.1")
+	target4 := netip.MustParseAddr("198.51.100.1")
+	quote4 := buildIPPacket(source4, target4, ProtocolUDP, make([]byte, udpHeaderSize), 1, true)
+	quote6 := buildIPPacket(
+		netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2"),
+		ProtocolUDP, make([]byte, udpHeaderSize), 0, true,
+	)
+	base := ICMPError{
+		Reporter: netip.MustParseAddr("198.51.100.254"),
+		Type:     ICMPv4TypeDestinationUnreachable, Code: ICMPv4DestinationUnreachableCodeHost,
+		QuotedPacket: quote4,
+	}
+	for _, test := range []struct {
+		name         string
+		networkError ICMPError
+		destination  netip.Addr
+		want         error
+	}{
+		{name: "invalid reporter", networkError: func() ICMPError { value := base; value.Reporter = netip.Addr{}; return value }(), destination: source4, want: syscall.EINVAL},
+		{name: "invalid destination", networkError: base, destination: netip.Addr{}, want: syscall.EINVAL},
+		{name: "zoned reporter", networkError: ICMPError{Reporter: netip.MustParseAddr("fe80::1").WithZone("zone"), Type: ICMPv6TypeDestinationUnreachable, Code: ICMPv6DestinationUnreachableCodeNoRoute, QuotedPacket: quote6}, destination: netip.MustParseAddr("2001:db8::1"), want: syscall.EINVAL},
+		{name: "cross-family destination", networkError: base, destination: netip.MustParseAddr("2001:db8::1"), want: syscall.EINVAL},
+		{name: "invalid code", networkError: func() ICMPError { value := base; value.Code = 16; return value }(), destination: source4, want: syscall.EINVAL},
+		{name: "missing quote", networkError: func() ICMPError { value := base; value.QuotedPacket = nil; return value }(), destination: source4, want: syscall.EINVAL},
+		{name: "cross-family quote", networkError: func() ICMPError { value := base; value.QuotedPacket = quote6; return value }(), destination: source4, want: syscall.EINVAL},
+		{name: "unrelated MTU", networkError: func() ICMPError { value := base; value.MTU = 1; return value }(), destination: source4, want: syscall.EINVAL},
+		{name: "unrelated pointer", networkError: func() ICMPError { value := base; value.Pointer = 1; return value }(), destination: source4, want: syscall.EINVAL},
+		{name: "IPv4 MTU overflow", networkError: func() ICMPError {
+			value := base
+			value.Code = ICMPv4DestinationUnreachableCodeFragmentationNeeded
+			value.MTU = 1 << 16
+			return value
+		}(), destination: source4, want: syscall.EINVAL},
+		{name: "IPv4 pointer overflow", networkError: func() ICMPError {
+			value := base
+			value.Type = ICMPv4TypeParameterProblem
+			value.Code = ICMPv4ParameterProblemCodePointer
+			value.Pointer = 1 << 8
+			return value
+		}(), destination: source4, want: syscall.EINVAL},
+		{name: "oversized quote", networkError: func() ICMPError {
+			value := base
+			value.QuotedPacket = append(append([]byte(nil), quote4...), make([]byte, 65535-8-len(quote4)+1)...)
+			return value
+		}(), destination: source4, want: syscall.EMSGSIZE},
+		{name: "oversized malformed quote", networkError: func() ICMPError {
+			value := base
+			value.QuotedPacket = make([]byte, 65535-8+1)
+			return value
+		}(), destination: source4, want: syscall.EMSGSIZE},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message, err := test.networkError.ICMPMessage(test.destination)
+			if !errors.Is(err, test.want) || !reflect.ValueOf(message).IsZero() {
+				t.Fatalf("ICMPMessage = %+v, %v; want zero value and %v", message, err, test.want)
+			}
+		})
 	}
 }
 
@@ -562,6 +848,58 @@ func FuzzPublicICMPMessageCodec(f *testing.F) {
 		inPlace, err := reparsed.AppendBinary(encoded[:0])
 		if err != nil || !bytes.Equal(inPlace, canonical) {
 			t.Fatalf("in-place ICMP append: error=%v\n got %x\nwant %x", err, inPlace, canonical)
+		}
+	})
+}
+
+func FuzzPublicICMPEchoConstruction(f *testing.F) {
+	f.Add(false, false, uint16(0x1234), uint16(7), []byte("IPv4 Echo"))
+	f.Add(true, true, uint16(0xabcd), uint16(9), []byte("IPv6 Echo"))
+	f.Fuzz(func(t *testing.T, ipv6, reply bool, identifier, sequence uint16, payload []byte) {
+		if len(payload) > 65535-8 {
+			payload = payload[:65535-8]
+		}
+		wantPayload := append([]byte(nil), payload...)
+		message := ICMPMessage{
+			Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"),
+		}
+		protocol := ProtocolICMPv4
+		if ipv6 {
+			message.Source = netip.MustParseAddr("2001:db8::1")
+			message.Destination = netip.MustParseAddr("2001:db8::2")
+			protocol = ProtocolICMPv6
+		}
+		var err error
+		if reply {
+			err = message.SetEchoReply(identifier, sequence, payload)
+		} else {
+			err = message.SetEchoRequest(identifier, sequence, payload)
+		}
+		if err != nil {
+			t.Fatalf("construct Echo: %v", err)
+		}
+		for index := range payload {
+			payload[index] ^= 0xff
+		}
+		gotIdentifier, gotSequence, gotPayload, ok := message.Echo()
+		if !ok || gotIdentifier != identifier || gotSequence != sequence || !bytes.Equal(gotPayload, wantPayload) ||
+			message.IsEchoReply() != reply || message.IsEchoRequest() == reply {
+			t.Fatalf("constructed Echo = %+v, fields %#x/%#x/%x/%t", message, gotIdentifier, gotSequence, gotPayload, ok)
+		}
+		wire, err := message.AppendBinary(nil)
+		if err != nil {
+			t.Fatalf("encode Echo: %v", err)
+		}
+		parsed, err := (IPPacket{
+			Source: message.Source, Destination: message.Destination,
+			Protocol: protocol, HopLimit: 64, Payload: wire,
+		}).ICMPMessage()
+		if err != nil {
+			t.Fatalf("parse Echo: %v", err)
+		}
+		gotIdentifier, gotSequence, gotPayload, ok = parsed.Echo()
+		if !ok || gotIdentifier != identifier || gotSequence != sequence || !bytes.Equal(gotPayload, wantPayload) {
+			t.Fatalf("parsed Echo fields = %#x/%#x/%x/%t", gotIdentifier, gotSequence, gotPayload, ok)
 		}
 	})
 }

@@ -142,16 +142,20 @@ func TestPublicIPHeaderOptionsInterop(t *testing.T) {
 				Protocol: mipstack.ProtocolUDP, HopLimit: 37, TrafficClass: 0x2e, Payload: udpWire,
 			}
 			if family.mipstackAddress.Is4() {
+				routerAlert := mipstack.IPv4HeaderOption{}
+				routerAlert.SetRouterAlert(0)
 				if err = packet.SetIPv4HeaderOptions([]mipstack.IPv4HeaderOption{
 					{Type: mipstack.IPv4HeaderOptionNOP},
-					{Type: mipstack.IPv4HeaderOptionRouterAlert, Data: []byte{0, 0}},
+					routerAlert,
 				}); err != nil {
 					t.Fatalf("construct public IPv4 options: %v", err)
 				}
 			} else {
 				hopByHop := mipstack.IPv6ExtensionHeader{Type: mipstack.IPv6ExtensionHeaderHopByHop}
+				routerAlert := mipstack.IPv6ExtensionOption{}
+				routerAlert.SetRouterAlert(0)
 				if err = hopByHop.SetOptions([]mipstack.IPv6ExtensionOption{
-					{Type: mipstack.IPv6ExtensionOptionRouterAlert, Data: []byte{0, 0}},
+					routerAlert,
 				}); err != nil {
 					t.Fatalf("construct public Hop-by-Hop options: %v", err)
 				}
@@ -170,6 +174,31 @@ func TestPublicIPHeaderOptionsInterop(t *testing.T) {
 			wire, err := packet.AppendBinary(nil)
 			if err != nil {
 				t.Fatalf("encode public option packet: %v", err)
+			}
+			parsedPacket, err := mipstack.ParseIPPacket(wire)
+			if err != nil {
+				t.Fatalf("parse public option packet: %v", err)
+			}
+			if family.mipstackAddress.Is4() {
+				options, parseErr := parsedPacket.IPv4HeaderOptions()
+				if parseErr != nil || len(options) < 2 {
+					t.Fatalf("parse public IPv4 options: %+v, %v", options, parseErr)
+				}
+				if value, ok := options[1].RouterAlert(); !ok || value != 0 {
+					t.Fatalf("public IPv4 Router Alert = %d/%t", value, ok)
+				}
+			} else {
+				headers, _, _, parseErr := parsedPacket.IPv6ExtensionHeaders()
+				if parseErr != nil || len(headers) != 2 {
+					t.Fatalf("parse public IPv6 headers: %+v, %v", headers, parseErr)
+				}
+				options, parseErr := headers[0].Options()
+				if parseErr != nil || len(options) == 0 {
+					t.Fatalf("parse public IPv6 options: %+v, %v", options, parseErr)
+				}
+				if value, ok := options[0].RouterAlert(); !ok || value != 0 {
+					t.Fatalf("public IPv6 Router Alert = %d/%t", value, ok)
+				}
 			}
 			if err = network.deliverToGVisor(wire); err != nil {
 				t.Fatalf("deliver public option packet: %v", err)

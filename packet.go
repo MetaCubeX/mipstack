@@ -9,6 +9,8 @@ import (
 const (
 	// ProtocolICMPv4 is the IPv4 Internet Control Message Protocol number.
 	ProtocolICMPv4 = 1
+	// ProtocolIGMP is the Internet Group Management Protocol number.
+	ProtocolIGMP = 2
 	// ProtocolTCP is the Transmission Control Protocol number.
 	ProtocolTCP = 6
 	// ProtocolUDP is the User Datagram Protocol number.
@@ -226,6 +228,23 @@ func (o IPv4HeaderOption) Class() uint8 { return o.Type >> 5 & 0x03 }
 // Number returns the IPv4 option's five-bit option number.
 func (o IPv4HeaderOption) Number() uint8 { return o.Type & 0x1f }
 
+// RouterAlert returns the complete two-byte Router Alert value when o is a
+// well-formed RFC 2113 option. The standalone codec preserves unassigned
+// values; Stack protocol handling currently recognizes only value zero.
+func (o IPv4HeaderOption) RouterAlert() (uint16, bool) {
+	if o.Type != IPv4HeaderOptionRouterAlert || len(o.Data) != 2 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(o.Data), true
+}
+
+// SetRouterAlert replaces o with a Router Alert option containing value.
+func (o *IPv4HeaderOption) SetRouterAlert(value uint16) {
+	o.Type = IPv4HeaderOptionRouterAlert
+	o.Data = make([]byte, 2)
+	binary.BigEndian.PutUint16(o.Data, value)
+}
+
 // IPv6ExtensionHeaders returns the structurally traversable extension-header
 // chain, the final Next Header value, and the remaining payload. The returned
 // descriptor slice is caller-owned; header Data and payload borrow p.Payload.
@@ -414,6 +433,23 @@ func (o IPv6ExtensionOption) Action() uint8 { return o.Type >> 6 }
 
 // MayChangeInTransit reports the RFC 8200 mutable-data flag.
 func (o IPv6ExtensionOption) MayChangeInTransit() bool { return o.Type&0x20 != 0 }
+
+// RouterAlert returns the complete two-byte Router Alert value when o is a
+// well-formed RFC 2711 option. The standalone codec preserves unassigned
+// values; Stack protocol handling currently recognizes only value zero.
+func (o IPv6ExtensionOption) RouterAlert() (uint16, bool) {
+	if o.Type != IPv6ExtensionOptionRouterAlert || len(o.Data) != 2 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(o.Data), true
+}
+
+// SetRouterAlert replaces o with a Router Alert option containing value.
+func (o *IPv6ExtensionOption) SetRouterAlert(value uint16) {
+	o.Type = IPv6ExtensionOptionRouterAlert
+	o.Data = make([]byte, 2)
+	binary.BigEndian.PutUint16(o.Data, value)
+}
 
 // ParseIPPacket validates packet and returns a zero-copy semantic value. It
 // validates declared lengths, the IPv4 header checksum, option framing, IPv6

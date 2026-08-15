@@ -56,15 +56,17 @@ func TestPublicICMPMessageCodecInterop(t *testing.T) {
 					return false
 				},
 			})
-			messageType, protocol := uint8(8), mipstack.ProtocolICMPv4
+			protocol := mipstack.ProtocolICMPv4
 			if family.mipstackAddress.Is6() {
-				messageType, protocol = 128, mipstack.ProtocolICMPv6
+				protocol = mipstack.ProtocolICMPv6
 			}
-			body := append([]byte{0x12, 0x34, 0, 7}, []byte("public-icmp-codec")...)
 			message := mipstack.ICMPMessage{
 				Source: family.mipstackAddress, Destination: family.gvisorAddress,
-				Type: messageType, Body: body,
 			}
+			if err := message.SetEchoRequest(0x1234, 7, []byte("public-icmp-codec")); err != nil {
+				t.Fatalf("construct public ICMP echo request: %v", err)
+			}
+			body := append([]byte(nil), message.Body...)
 			expectedReply, err := message.EchoReply(family.gvisorAddress)
 			if err != nil {
 				t.Fatalf("construct public ICMP echo reply: %v", err)
@@ -105,11 +107,10 @@ func TestPublicICMPMessageCodecInterop(t *testing.T) {
 					t.Fatalf("public ICMP echo reply = %x, gVisor reply = %x", expectedReplyWire, actualReplyWire)
 				}
 				parsed, parseErr := parsedPacket.ICMPMessage()
-				wantType := uint8(0)
-				if family.mipstackAddress.Is6() {
-					wantType = 129
-				}
-				if parseErr != nil || parsed.Source != family.gvisorAddress || parsed.Destination != family.mipstackAddress || parsed.Type != wantType || parsed.Code != 0 || !bytes.Equal(parsed.Body, body) {
+				identifier, sequence, payload, echo := parsed.Echo()
+				if parseErr != nil || parsed.Source != family.gvisorAddress || parsed.Destination != family.mipstackAddress ||
+					!parsed.IsEchoReply() || identifier != 0x1234 || sequence != 7 || !bytes.Equal(payload, []byte("public-icmp-codec")) ||
+					!echo || !bytes.Equal(parsed.Body, body) {
 					t.Fatalf("parsed gVisor ICMP = %+v, %v", parsed, parseErr)
 				}
 			case <-time.After(3 * time.Second):
@@ -186,6 +187,93 @@ func TestPublicICMPErrorInterop(t *testing.T) {
 				}
 			case <-time.After(3 * time.Second):
 				t.Fatal("timed out waiting for gVisor ICMP error")
+			}
+		})
+	}
+}
+
+// TestPublicICMPErrorConstructionInterop verifies that gVisor accepts v4 and
+// v6 Destination Unreachable messages constructed by the public semantic API.
+func TestPublicICMPErrorConstructionInterop(t *testing.T) {
+	const (
+		gvisorPort   = 44041
+		mipstackPort = 44042
+	)
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			network := newFamilyInteropNetwork(t, family, interopDefaultMTU)
+			var queue waiter.Queue
+			endpoint, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, family.icmpProtocol, &queue)
+			if tcpipErr != nil {
+				t.Fatalf("create gVisor raw ICMP endpoint: %s", tcpipErr.String())
+			}
+			defer endpoint.Close()
+			if tcpipErr = endpoint.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+				t.Fatalf("bind gVisor raw ICMP endpoint: %s", tcpipErr.String())
+			}
+			if tcpipErr = endpoint.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+				t.Fatalf("connect gVisor raw ICMP endpoint: %s", tcpipErr.String())
+			}
+			entry, notifications := registerReadable(&queue)
+			defer queue.EventUnregister(&entry)
+
+			datagram := mipstack.UDPDatagram{
+				Source:      netipAddrPort(family.gvisorAddress, gvisorPort),
+				Destination: netipAddrPort(family.mipstackAddress, mipstackPort),
+				Payload:     []byte("quoted-public-udp"),
+			}
+			udpWire, err := datagram.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode quoted UDP datagram: %v", err)
+			}
+			quotedPacket := mipstack.IPPacket{
+				Source: family.gvisorAddress, Destination: family.mipstackAddress,
+				Protocol: mipstack.ProtocolUDP, HopLimit: 31, Payload: udpWire,
+			}
+			quote, err := quotedPacket.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode quoted IP packet: %v", err)
+			}
+			messageType, code, protocol := uint8(mipstack.ICMPv4TypeDestinationUnreachable), uint8(mipstack.ICMPv4DestinationUnreachableCodePort), mipstack.ProtocolICMPv4
+			if family.mipstackAddress.Is6() {
+				messageType, code, protocol = mipstack.ICMPv6TypeDestinationUnreachable, mipstack.ICMPv6DestinationUnreachableCodePort, mipstack.ProtocolICMPv6
+			}
+			networkError := mipstack.ICMPError{
+				Reporter: family.mipstackAddress, Type: messageType, Code: code, QuotedPacket: quote,
+			}
+			message, err := networkError.ICMPMessage(family.gvisorAddress)
+			if err != nil {
+				t.Fatalf("construct public ICMP error: %v", err)
+			}
+			icmpWire, err := message.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public ICMP error: %v", err)
+			}
+			packet := mipstack.IPPacket{
+				Source: family.mipstackAddress, Destination: family.gvisorAddress,
+				Protocol: protocol, HopLimit: 64, Payload: icmpWire,
+			}
+			wire, err := packet.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode public ICMP error packet: %v", err)
+			}
+			if err = network.deliverToGVisor(wire); err != nil {
+				t.Fatalf("deliver public ICMP error: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			received, _, err := readGVisorEndpoint(ctx, endpoint, notifications, 65535)
+			if err != nil {
+				t.Fatalf("read public ICMP error in gVisor: %v", err)
+			}
+			received, err = stripGVisorRawHeader(family, received)
+			if err != nil {
+				t.Fatalf("strip gVisor raw IP header: %v", err)
+			}
+			if !bytes.Equal(received, icmpWire) || len(received) < 8 || received[0] != messageType || received[1] != code ||
+				!bytes.Equal(received[8:], quote) {
+				t.Fatalf("gVisor received ICMP error = %x, want %x", received, icmpWire)
 			}
 		})
 	}

@@ -1678,7 +1678,7 @@ func (s *Stack) writeNonUnicastPacketsUntil(packets [][]byte, external, loopback
 // isMulticastControlPacket identifies IGMP and MLD messages, which RFC 9776
 // and RFC 3810 exempt from multicast source filtering.
 func isMulticastControlPacket(packet ipPacket) bool {
-	if packet.protocol == 2 && packet.source.Is4() {
+	if packet.protocol == ProtocolIGMP && packet.source.Is4() {
 		return true
 	}
 	if packet.protocol == ProtocolICMPv6 && len(packet.payload) != 0 {
@@ -1702,7 +1702,7 @@ func (s *Stack) multicastStateForQuery(packet ipPacket, current multicastEndpoin
 	var valid bool
 	network := s.network.Load()
 	switch packet.protocol {
-	case 2:
+	case ProtocolIGMP:
 		if packet.payload[0] != igmpMembershipQuery {
 			return nil
 		}
@@ -1738,7 +1738,7 @@ func (s *Stack) multicastStateForQuery(packet ipPacket, current multicastEndpoin
 // handleControl consumes IGMP and MLD host-side control messages. Raw sockets
 // receive their copy before this method runs, matching the kernel IP path.
 func (s *multicastState) handleControl(packet ipPacket, receivedAt time.Time) {
-	if packet.protocol == 2 {
+	if packet.protocol == ProtocolIGMP {
 		s.handleIGMP(packet, receivedAt)
 	} else {
 		s.handleMLD(packet, receivedAt)
@@ -2548,7 +2548,7 @@ func (s *multicastState) sendIGMPPacket(target netip.Addr, payload []byte, route
 	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
 	binary.BigEndian.PutUint16(packet[4:6], uint16(s.stack.ipv4ID.Add(1)))
 	binary.BigEndian.PutUint16(packet[6:8], 0x4000)
-	packet[8], packet[9] = 1, 2
+	packet[8], packet[9] = 1, ProtocolIGMP
 	sourceBytes, targetBytes := source.As4(), target.As4()
 	copy(packet[12:16], sourceBytes[:])
 	copy(packet[16:20], targetBytes[:])

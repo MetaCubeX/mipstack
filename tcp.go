@@ -7394,9 +7394,10 @@ func tcpActiveOpenHardError(err error) bool {
 		return false
 	}
 	if networkError.QuotedSource.Is6() {
-		return networkError.Type == 1 && networkError.Code == 4
+		return networkError.Type == ICMPv6TypeDestinationUnreachable && networkError.Code == ICMPv6DestinationUnreachableCodePort
 	}
-	return networkError.Type == 3 && (networkError.Code == 2 || networkError.Code == 3)
+	return networkError.Type == ICMPv4TypeDestinationUnreachable &&
+		(networkError.Code == ICMPv4DestinationUnreachableCodeProtocol || networkError.Code == ICMPv4DestinationUnreachableCodePort)
 }
 
 // tcpRevertRTOBackoff implements the Linux tcp_ld_RTO_revert behavior from
@@ -7413,9 +7414,10 @@ func tcpRevertRTOBackoff(err error, sendUnacknowledged uint32, retransmissions i
 	}
 	revert := false
 	if networkError.QuotedSource.Is6() {
-		revert = networkError.Type == 1 && networkError.Code == 0
+		revert = networkError.Type == ICMPv6TypeDestinationUnreachable && networkError.Code == ICMPv6DestinationUnreachableCodeNoRoute
 	} else {
-		revert = networkError.Type == 3 && (networkError.Code == 0 || networkError.Code == 1)
+		revert = networkError.Type == ICMPv4TypeDestinationUnreachable &&
+			(networkError.Code == ICMPv4DestinationUnreachableCodeNetwork || networkError.Code == ICMPv4DestinationUnreachableCodeHost)
 	}
 	if !revert || binary.BigEndian.Uint32(networkError.QuotedPayload[4:8]) != sendUnacknowledged {
 		return false

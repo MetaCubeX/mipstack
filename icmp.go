@@ -7,11 +7,131 @@ import (
 	"syscall"
 )
 
+const (
+	// ICMPCodeNone is the zero code used by message types without subcodes.
+	ICMPCodeNone = 0
+
+	// ICMPv4TypeEchoReply is the ICMPv4 Echo Reply type.
+	ICMPv4TypeEchoReply = 0
+	// ICMPv4TypeDestinationUnreachable is the ICMPv4 Destination Unreachable type.
+	ICMPv4TypeDestinationUnreachable = 3
+	// ICMPv4TypeEchoRequest is the ICMPv4 Echo Request type.
+	ICMPv4TypeEchoRequest = 8
+	// ICMPv4TypeTimeExceeded is the ICMPv4 Time Exceeded type.
+	ICMPv4TypeTimeExceeded = 11
+	// ICMPv4TypeParameterProblem is the ICMPv4 Parameter Problem type.
+	ICMPv4TypeParameterProblem = 12
+
+	// ICMPv6TypeDestinationUnreachable is the ICMPv6 Destination Unreachable type.
+	ICMPv6TypeDestinationUnreachable = 1
+	// ICMPv6TypePacketTooBig is the ICMPv6 Packet Too Big type.
+	ICMPv6TypePacketTooBig = 2
+	// ICMPv6TypeTimeExceeded is the ICMPv6 Time Exceeded type.
+	ICMPv6TypeTimeExceeded = 3
+	// ICMPv6TypeParameterProblem is the ICMPv6 Parameter Problem type.
+	ICMPv6TypeParameterProblem = 4
+	// ICMPv6TypeEchoRequest is the ICMPv6 Echo Request type.
+	ICMPv6TypeEchoRequest = 128
+	// ICMPv6TypeEchoReply is the ICMPv6 Echo Reply type.
+	ICMPv6TypeEchoReply = 129
+
+	// ICMPv4DestinationUnreachableCodeNetwork reports an unreachable destination network.
+	ICMPv4DestinationUnreachableCodeNetwork = 0
+	// ICMPv4DestinationUnreachableCodeHost reports an unreachable destination host.
+	ICMPv4DestinationUnreachableCodeHost = 1
+	// ICMPv4DestinationUnreachableCodeProtocol reports an unsupported destination protocol.
+	ICMPv4DestinationUnreachableCodeProtocol = 2
+	// ICMPv4DestinationUnreachableCodePort reports an unreachable destination port.
+	ICMPv4DestinationUnreachableCodePort = 3
+	// ICMPv4DestinationUnreachableCodeFragmentationNeeded reports a packet that requires fragmentation with DF set.
+	ICMPv4DestinationUnreachableCodeFragmentationNeeded = 4
+	// ICMPv4DestinationUnreachableCodeSourceRouteFailed reports a failed source route.
+	ICMPv4DestinationUnreachableCodeSourceRouteFailed = 5
+	// ICMPv4DestinationUnreachableCodeNetworkUnknown reports an unknown destination network.
+	ICMPv4DestinationUnreachableCodeNetworkUnknown = 6
+	// ICMPv4DestinationUnreachableCodeHostUnknown reports an unknown destination host.
+	ICMPv4DestinationUnreachableCodeHostUnknown = 7
+	// ICMPv4DestinationUnreachableCodeSourceHostIsolated reports an isolated source host.
+	ICMPv4DestinationUnreachableCodeSourceHostIsolated = 8
+	// ICMPv4DestinationUnreachableCodeNetworkAdministrativelyProhibited reports a prohibited destination network.
+	ICMPv4DestinationUnreachableCodeNetworkAdministrativelyProhibited = 9
+	// ICMPv4DestinationUnreachableCodeHostAdministrativelyProhibited reports a prohibited destination host.
+	ICMPv4DestinationUnreachableCodeHostAdministrativelyProhibited = 10
+	// ICMPv4DestinationUnreachableCodeNetworkUnreachableForTOS reports a network unreachable for the requested TOS.
+	ICMPv4DestinationUnreachableCodeNetworkUnreachableForTOS = 11
+	// ICMPv4DestinationUnreachableCodeHostUnreachableForTOS reports a host unreachable for the requested TOS.
+	ICMPv4DestinationUnreachableCodeHostUnreachableForTOS = 12
+	// ICMPv4DestinationUnreachableCodeCommunicationAdministrativelyProhibited reports prohibited communication.
+	ICMPv4DestinationUnreachableCodeCommunicationAdministrativelyProhibited = 13
+	// ICMPv4DestinationUnreachableCodeHostPrecedenceViolation reports a host-precedence violation.
+	ICMPv4DestinationUnreachableCodeHostPrecedenceViolation = 14
+	// ICMPv4DestinationUnreachableCodePrecedenceCutoff reports a precedence cutoff.
+	ICMPv4DestinationUnreachableCodePrecedenceCutoff = 15
+
+	// ICMPv4TimeExceededCodeTTLInTransit reports an expired IPv4 TTL in transit.
+	ICMPv4TimeExceededCodeTTLInTransit = 0
+	// ICMPv4TimeExceededCodeFragmentReassembly reports an expired fragment reassembly.
+	ICMPv4TimeExceededCodeFragmentReassembly = 1
+	// ICMPv4ParameterProblemCodePointer reports an error at the supplied pointer.
+	ICMPv4ParameterProblemCodePointer = 0
+	// ICMPv4ParameterProblemCodeMissingOption reports a missing required option.
+	ICMPv4ParameterProblemCodeMissingOption = 1
+	// ICMPv4ParameterProblemCodeBadLength reports an invalid packet length.
+	ICMPv4ParameterProblemCodeBadLength = 2
+
+	// ICMPv6DestinationUnreachableCodeNoRoute reports that no route exists.
+	ICMPv6DestinationUnreachableCodeNoRoute = 0
+	// ICMPv6DestinationUnreachableCodeAdministrativelyProhibited reports prohibited communication.
+	ICMPv6DestinationUnreachableCodeAdministrativelyProhibited = 1
+	// ICMPv6DestinationUnreachableCodeBeyondSourceScope reports a destination beyond the source address scope.
+	ICMPv6DestinationUnreachableCodeBeyondSourceScope = 2
+	// ICMPv6DestinationUnreachableCodeAddress reports an unreachable destination address.
+	ICMPv6DestinationUnreachableCodeAddress = 3
+	// ICMPv6DestinationUnreachableCodePort reports an unreachable destination port.
+	ICMPv6DestinationUnreachableCodePort = 4
+	// ICMPv6DestinationUnreachableCodeSourceAddressPolicy reports a source-address policy failure.
+	ICMPv6DestinationUnreachableCodeSourceAddressPolicy = 5
+	// ICMPv6DestinationUnreachableCodeRejectRoute reports a rejected destination route.
+	ICMPv6DestinationUnreachableCodeRejectRoute = 6
+	// ICMPv6DestinationUnreachableCodeSourceRoutingHeader reports an error in a Source Routing Header.
+	ICMPv6DestinationUnreachableCodeSourceRoutingHeader = 7
+	// ICMPv6DestinationUnreachableCodePRoute reports an error in an RPL P-Route.
+	ICMPv6DestinationUnreachableCodePRoute = 9
+
+	// ICMPv6TimeExceededCodeHopLimitInTransit reports an expired IPv6 Hop Limit in transit.
+	ICMPv6TimeExceededCodeHopLimitInTransit = 0
+	// ICMPv6TimeExceededCodeFragmentReassembly reports an expired fragment reassembly.
+	ICMPv6TimeExceededCodeFragmentReassembly = 1
+	// ICMPv6ParameterProblemCodeErroneousHeaderField reports an erroneous header field.
+	ICMPv6ParameterProblemCodeErroneousHeaderField = 0
+	// ICMPv6ParameterProblemCodeUnrecognizedNextHeader reports an unrecognized Next Header value.
+	ICMPv6ParameterProblemCodeUnrecognizedNextHeader = 1
+	// ICMPv6ParameterProblemCodeUnrecognizedOption reports an unrecognized IPv6 option.
+	ICMPv6ParameterProblemCodeUnrecognizedOption = 2
+	// ICMPv6ParameterProblemCodeIncompleteFirstFragment reports an incomplete first-fragment header chain.
+	ICMPv6ParameterProblemCodeIncompleteFirstFragment = 3
+	// ICMPv6ParameterProblemCodeSRUpperLayerHeader reports an SR upper-layer header error.
+	ICMPv6ParameterProblemCodeSRUpperLayerHeader = 4
+	// ICMPv6ParameterProblemCodeUnrecognizedNextHeaderAtIntermediateNode reports an unrecognized Next Header at an intermediate node.
+	ICMPv6ParameterProblemCodeUnrecognizedNextHeaderAtIntermediateNode = 5
+	// ICMPv6ParameterProblemCodeExtensionHeaderTooBig reports an extension header that exceeds a processing limit.
+	ICMPv6ParameterProblemCodeExtensionHeaderTooBig = 6
+	// ICMPv6ParameterProblemCodeExtensionHeaderChainTooLong reports an extension-header chain that exceeds a size limit.
+	ICMPv6ParameterProblemCodeExtensionHeaderChainTooLong = 7
+	// ICMPv6ParameterProblemCodeTooManyExtensionHeaders reports an extension-header count that exceeds a processing limit.
+	ICMPv6ParameterProblemCodeTooManyExtensionHeaders = 8
+	// ICMPv6ParameterProblemCodeTooManyOptionsInExtensionHeader reports an option count that exceeds a processing limit.
+	ICMPv6ParameterProblemCodeTooManyOptionsInExtensionHeader = 9
+	// ICMPv6ParameterProblemCodeOptionTooBig reports an option that exceeds a processing limit.
+	ICMPv6ParameterProblemCodeOptionTooBig = 10
+)
+
 // ICMPMessage is the semantic representation of one ICMPv4 or ICMPv6
 // message. Source and Destination select the address family and, for ICMPv6,
 // provide the checksum pseudo-header. IPPacket.ICMPMessage borrows Body from
 // the packet; callers must replace or copy it before modifying unowned input.
-// Construction normalizes IPv4-mapped IPv6 addresses to IPv4.
+// Validation and wire encoding treat IPv4-mapped IPv6 addresses as IPv4
+// without changing the receiver's address fields.
 type ICMPMessage struct {
 	// Source is the source IP address.
 	Source netip.Addr
@@ -56,17 +176,93 @@ func (p IPPacket) ICMPMessage() (ICMPMessage, error) {
 // IsEchoRequest reports whether m is a complete family-appropriate Echo
 // Request. The four leading Body bytes hold the echo identifier and sequence.
 func (m ICMPMessage) IsEchoRequest() bool {
-	if len(m.Body) < 4 || m.Code != 0 {
-		return false
+	request, ok := m.echoKind()
+	return ok && request
+}
+
+// IsEchoReply reports whether m is a complete family-appropriate Echo Reply.
+// The four leading Body bytes hold the echo identifier and sequence.
+func (m ICMPMessage) IsEchoReply() bool {
+	request, ok := m.echoKind()
+	return ok && !request
+}
+
+// Echo returns the identifier, sequence, and data of a complete family-
+// appropriate Echo Request or Echo Reply. Payload aliases Body.
+func (m ICMPMessage) Echo() (identifier, sequence uint16, payload []byte, ok bool) {
+	if _, ok = m.echoKind(); !ok {
+		return 0, 0, nil, false
 	}
-	source, destination := m.Source.Unmap(), m.Destination.Unmap()
-	if !source.IsValid() || !destination.IsValid() || source.Is4() != destination.Is4() {
-		return false
+	return binary.BigEndian.Uint16(m.Body[:2]), binary.BigEndian.Uint16(m.Body[2:4]), m.Body[4:], true
+}
+
+// SetEchoRequest replaces Type, Code, and Body with an Echo Request containing
+// identifier, sequence, and a copy of payload. Source and Destination must
+// already select one valid address family. It leaves m unchanged on failure.
+func (m *ICMPMessage) SetEchoRequest(identifier, sequence uint16, payload []byte) error {
+	return m.setEcho(true, identifier, sequence, payload)
+}
+
+// SetEchoReply replaces Type, Code, and Body with an Echo Reply containing
+// identifier, sequence, and a copy of payload. Source and Destination must
+// already select one valid address family. It leaves m unchanged on failure.
+func (m *ICMPMessage) SetEchoReply(identifier, sequence uint16, payload []byte) error {
+	return m.setEcho(false, identifier, sequence, payload)
+}
+
+// echoKind validates the common Echo envelope and reports whether it is a
+// request. A false request with ok set is an Echo Reply.
+func (m ICMPMessage) echoKind() (request, ok bool) {
+	_, _, protocol, valid := normalizeICMPAddresses(m.Source, m.Destination)
+	if !valid || len(m.Body) < 4 || m.Code != ICMPCodeNone {
+		return false, false
 	}
-	if source.Is4() {
-		return m.Type == 8
+	if protocol == ProtocolICMPv4 {
+		switch m.Type {
+		case ICMPv4TypeEchoRequest:
+			return true, true
+		case ICMPv4TypeEchoReply:
+			return false, true
+		}
+	} else {
+		switch m.Type {
+		case ICMPv6TypeEchoRequest:
+			return true, true
+		case ICMPv6TypeEchoReply:
+			return false, true
+		}
 	}
-	return m.Type == 128
+	return false, false
+}
+
+// setEcho implements the two ownership-identical Echo construction methods.
+func (m *ICMPMessage) setEcho(request bool, identifier, sequence uint16, payload []byte) error {
+	if m == nil {
+		return syscall.EINVAL
+	}
+	_, _, protocol, valid := normalizeICMPAddresses(m.Source, m.Destination)
+	if !valid {
+		return syscall.EINVAL
+	}
+	if len(payload) > 65535-8 {
+		return syscall.EMSGSIZE
+	}
+	body := make([]byte, 4+len(payload))
+	binary.BigEndian.PutUint16(body[:2], identifier)
+	binary.BigEndian.PutUint16(body[2:4], sequence)
+	copy(body[4:], payload)
+	messageType := uint8(ICMPv4TypeEchoReply)
+	if request {
+		messageType = ICMPv4TypeEchoRequest
+	}
+	if protocol == ProtocolICMPv6 {
+		messageType = ICMPv6TypeEchoReply
+		if request {
+			messageType = ICMPv6TypeEchoRequest
+		}
+	}
+	m.Type, m.Code, m.Body = messageType, ICMPCodeNone, body
+	return nil
 }
 
 // EchoReply returns the semantic Echo Reply corresponding to m, using source
@@ -90,9 +286,9 @@ func (m ICMPMessage) EchoReply(source netip.Addr) (ICMPMessage, error) {
 	}
 	normalized.Destination = normalized.Source
 	normalized.Source = source
-	normalized.Type = 0
+	normalized.Type = ICMPv4TypeEchoReply
 	if source.Is6() {
-		normalized.Type = 129
+		normalized.Type = ICMPv6TypeEchoReply
 	}
 	return normalized, nil
 }
@@ -101,13 +297,9 @@ func (m ICMPMessage) EchoReply(source netip.Addr) (ICMPMessage, error) {
 // type and code. It classifies the message without parsing its quoted packet;
 // ICMPError performs complete quote validation.
 func (m ICMPMessage) IsError() bool {
-	source, destination := m.Source.Unmap(), m.Destination.Unmap()
-	if !source.IsValid() || !destination.IsValid() || source.Is4() != destination.Is4() {
+	_, _, protocol, valid := normalizeICMPAddresses(m.Source, m.Destination)
+	if !valid {
 		return false
-	}
-	protocol := byte(ProtocolICMPv4)
-	if source.Is6() {
-		protocol = ProtocolICMPv6
 	}
 	return validICMPErrorCode(protocol, m.Type, m.Code)
 }
@@ -158,13 +350,11 @@ func (m ICMPMessage) AppendBinary(dst []byte) ([]byte, error) {
 // wireLayout validates m, normalizes its addresses, and returns its exact
 // message length.
 func (m ICMPMessage) wireLayout() (ICMPMessage, int, error) {
-	if m.Source.Zone() != "" || m.Destination.Zone() != "" {
+	source, destination, _, valid := normalizeICMPAddresses(m.Source, m.Destination)
+	if !valid {
 		return ICMPMessage{}, 0, syscall.EINVAL
 	}
-	m.Source, m.Destination = m.Source.Unmap(), m.Destination.Unmap()
-	if !m.Source.IsValid() || !m.Destination.IsValid() || m.Source.Is4() != m.Destination.Is4() {
-		return ICMPMessage{}, 0, syscall.EINVAL
-	}
+	m.Source, m.Destination = source, destination
 	if len(m.Body) < 4 {
 		return ICMPMessage{}, 0, syscall.EINVAL
 	}
@@ -193,25 +383,97 @@ type ICMPError struct {
 	Type byte
 	// Code retains the wire subtype within Type.
 	Code byte
-	// MTU is present for fragmentation-needed and packet-too-big errors.
+	// MTU is present for fragmentation-needed and packet-too-big errors. It is
+	// also consumed by ICMPError.ICMPMessage when the error type defines that
+	// field.
 	MTU uint32
-	// Pointer is present for IPv4 or IPv6 Parameter Problem errors.
+	// Pointer is present for IPv4 or IPv6 Parameter Problem errors. It is also
+	// consumed by ICMPError.ICMPMessage when the error type defines that field.
 	Pointer uint32
-	// QuotedSource is the source of the failed original packet.
+	// QuotedSource is the source of the failed original packet. It is derived
+	// from QuotedPacket and ignored by ICMPError.ICMPMessage.
 	QuotedSource netip.Addr
-	// QuotedTarget is the destination of the failed original packet.
+	// QuotedTarget is the destination of the failed original packet. It is
+	// derived from QuotedPacket and ignored by ICMPError.ICMPMessage.
 	QuotedTarget netip.Addr
 	// QuotedProtocol is the final protocol identified in the available quote.
+	// It is derived from QuotedPacket and ignored by ICMPError.ICMPMessage.
 	QuotedProtocol byte
 	// QuotedPacket contains the available original IP packet, including its IP
-	// header. QuotedPayload aliases its upper-layer suffix when both are present.
+	// header. ICMPError.ICMPMessage copies it into the constructed error.
+	// QuotedPayload aliases its upper-layer suffix when both are present.
 	QuotedPacket []byte
-	// QuotedPayload contains the available original transport header bytes.
+	// QuotedPayload contains the available original transport header bytes. It
+	// is derived from QuotedPacket and ignored by ICMPError.ICMPMessage.
 	QuotedPayload []byte
-	// QuotedSourcePort is the original TCP or UDP source port when present.
+	// QuotedSourcePort is the original TCP or UDP source port when present. It is
+	// derived from QuotedPacket and ignored by ICMPError.ICMPMessage.
 	QuotedSourcePort uint16
 	// QuotedTargetPort is the original TCP or UDP destination port when present.
+	// It is derived from QuotedPacket and ignored by ICMPError.ICMPMessage.
 	QuotedTargetPort uint16
+}
+
+// ICMPMessage constructs the semantic ICMP error represented by e for
+// destination. Reporter and destination select the address family; Type, Code,
+// MTU, Pointer, and QuotedPacket provide the wire fields. It validates the
+// possibly truncated quote, copies QuotedPacket, and ignores the fields derived
+// from that quote. Routing, source ownership, rate limits, quote truncation,
+// and recursive-error suppression remain Stack transmission policy.
+func (e ICMPError) ICMPMessage(destination netip.Addr) (ICMPMessage, error) {
+	reporter, destination, protocol, valid := normalizeICMPAddresses(e.Reporter, destination)
+	if !valid || !validICMPErrorCode(protocol, e.Type, e.Code) {
+		return ICMPMessage{}, syscall.EINVAL
+	}
+	if len(e.QuotedPacket) > 65535-8 {
+		return ICMPMessage{}, syscall.EMSGSIZE
+	}
+	quotedSource, quotedTarget, _, _, quoted := quotedIPPayload(e.QuotedPacket)
+	if !quoted || protocol == ProtocolICMPv4 && (!quotedSource.Is4() || !quotedTarget.Is4()) ||
+		protocol == ProtocolICMPv6 && (!quotedSource.Is6() || !quotedTarget.Is6()) {
+		return ICMPMessage{}, syscall.EINVAL
+	}
+	mtuField := protocol == ProtocolICMPv4 && e.Type == ICMPv4TypeDestinationUnreachable && e.Code == ICMPv4DestinationUnreachableCodeFragmentationNeeded ||
+		protocol == ProtocolICMPv6 && e.Type == ICMPv6TypePacketTooBig
+	pointerField := protocol == ProtocolICMPv4 && e.Type == ICMPv4TypeParameterProblem ||
+		protocol == ProtocolICMPv6 && e.Type == ICMPv6TypeParameterProblem
+	if !mtuField && e.MTU != 0 || !pointerField && e.Pointer != 0 ||
+		protocol == ProtocolICMPv4 && mtuField && e.MTU > 1<<16-1 ||
+		protocol == ProtocolICMPv4 && pointerField && e.Pointer > 1<<8-1 {
+		return ICMPMessage{}, syscall.EINVAL
+	}
+	body := make([]byte, 4+len(e.QuotedPacket))
+	if mtuField {
+		if protocol == ProtocolICMPv4 {
+			binary.BigEndian.PutUint16(body[2:4], uint16(e.MTU))
+		} else {
+			binary.BigEndian.PutUint32(body, e.MTU)
+		}
+	} else if pointerField {
+		if protocol == ProtocolICMPv4 {
+			body[0] = byte(e.Pointer)
+		} else {
+			binary.BigEndian.PutUint32(body, e.Pointer)
+		}
+	}
+	copy(body[4:], e.QuotedPacket)
+	return ICMPMessage{Source: reporter, Destination: destination, Type: e.Type, Code: e.Code, Body: body}, nil
+}
+
+// normalizeICMPAddresses validates and normalizes the address-family context
+// shared by the public ICMP codecs.
+func normalizeICMPAddresses(source, destination netip.Addr) (netip.Addr, netip.Addr, byte, bool) {
+	if source.Zone() != "" || destination.Zone() != "" {
+		return netip.Addr{}, netip.Addr{}, 0, false
+	}
+	source, destination = source.Unmap(), destination.Unmap()
+	if !source.IsValid() || !destination.IsValid() || source.Is4() != destination.Is4() {
+		return netip.Addr{}, netip.Addr{}, 0, false
+	}
+	if source.Is4() {
+		return source, destination, ProtocolICMPv4, true
+	}
+	return source, destination, ProtocolICMPv6, true
 }
 
 // icmpForwarderIPPacket is one caller-owned, normalized header-included ICMP
@@ -359,14 +621,14 @@ func (e ICMPError) Error() string {
 // isICMPEchoRequest reports whether payload is one complete Echo Request for
 // the supplied ICMP address family.
 func isICMPEchoRequest(protocol byte, payload []byte) bool {
-	if len(payload) < 8 || payload[1] != 0 {
+	if len(payload) < 8 || payload[1] != ICMPCodeNone {
 		return false
 	}
 	switch protocol {
 	case ProtocolICMPv4:
-		return payload[0] == 8
+		return payload[0] == ICMPv4TypeEchoRequest
 	case ProtocolICMPv6:
-		return payload[0] == 128
+		return payload[0] == ICMPv6TypeEchoRequest
 	default:
 		return false
 	}
@@ -379,9 +641,9 @@ func makeICMPEchoReply(protocol byte, request []byte) ([]byte, bool) {
 	if !isICMPEchoRequest(protocol, request) {
 		return nil, false
 	}
-	replyType := byte(0)
+	replyType := byte(ICMPv4TypeEchoReply)
 	if protocol == ProtocolICMPv6 {
-		replyType = 129
+		replyType = ICMPv6TypeEchoReply
 	}
 	reply := append([]byte(nil), request...)
 	reply[0], reply[2], reply[3] = replyType, 0, 0
@@ -572,7 +834,7 @@ func (s *Stack) sendAdministrativeUnreachable(packet ipPacket) error {
 			quoteLength = header + 8
 		}
 		icmp := make([]byte, 8+quoteLength)
-		icmp[0], icmp[1] = 3, 13
+		icmp[0], icmp[1] = ICMPv4TypeDestinationUnreachable, ICMPv4DestinationUnreachableCodeCommunicationAdministrativelyProhibited
 		copy(icmp[8:], packet.original[:quoteLength])
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
 		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
@@ -582,7 +844,7 @@ func (s *Stack) sendAdministrativeUnreachable(packet ipPacket) error {
 		quoteLength = maximumQuote
 	}
 	icmp := make([]byte, 8+quoteLength)
-	icmp[0], icmp[1] = 1, 1
+	icmp[0], icmp[1] = ICMPv6TypeDestinationUnreachable, ICMPv6DestinationUnreachableCodeAdministrativelyProhibited
 	copy(icmp[8:], packet.original[:quoteLength])
 	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
 	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, icmp, false)
@@ -607,7 +869,7 @@ func (s *Stack) sendFragmentReassemblyTimeout(set *fragmentSet) error {
 			quoteLength = headerSize + 8
 		}
 		icmp := make([]byte, 8+quoteLength)
-		icmp[0], icmp[1] = 11, 1
+		icmp[0], icmp[1] = ICMPv4TypeTimeExceeded, ICMPv4TimeExceededCodeFragmentReassembly
 		copy(icmp[8:], set.firstPacket[:quoteLength])
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
 		return s.writeIPPayload(set.target, set.source, ProtocolICMPv4, icmp, false)
@@ -617,7 +879,7 @@ func (s *Stack) sendFragmentReassemblyTimeout(set *fragmentSet) error {
 		quoteLength = maximumQuote
 	}
 	icmp := make([]byte, 8+quoteLength)
-	icmp[0], icmp[1] = 3, 1
+	icmp[0], icmp[1] = ICMPv6TypeTimeExceeded, ICMPv6TimeExceededCodeFragmentReassembly
 	copy(icmp[8:], set.firstPacket[:quoteLength])
 	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(set.target, set.source, ProtocolICMPv6, icmp))
 	return s.writeIPPayload(set.target, set.source, ProtocolICMPv6, icmp, false)
@@ -635,7 +897,7 @@ func packetInvokesICMPError(packet []byte) bool {
 	}
 	if protocol == ProtocolICMPv4 {
 		switch payload[0] {
-		case 3, 4, 5, 11, 12:
+		case ICMPv4TypeDestinationUnreachable, 4, 5, ICMPv4TypeTimeExceeded, ICMPv4TypeParameterProblem:
 			return true
 		}
 	}
@@ -676,20 +938,20 @@ func parseICMPErrorFields(reporter netip.Addr, protocol, messageType, code byte,
 		result.QuotedTargetPort = binary.BigEndian.Uint16(payload[2:4])
 	}
 	if protocol == ProtocolICMPv4 {
-		if messageType == 3 && code == 4 {
+		if messageType == ICMPv4TypeDestinationUnreachable && code == ICMPv4DestinationUnreachableCodeFragmentationNeeded {
 			result.MTU = uint32(binary.BigEndian.Uint16(body[2:4]))
 			if result.MTU == 0 {
 				result.MTU = legacyIPv4PathMTU(quote)
 			}
 		}
-		if messageType == 12 {
+		if messageType == ICMPv4TypeParameterProblem {
 			result.Pointer = uint32(body[0])
 		}
 	} else {
-		if messageType == 2 {
+		if messageType == ICMPv6TypePacketTooBig {
 			result.MTU = binary.BigEndian.Uint32(body[:4])
 		}
-		if messageType == 4 {
+		if messageType == ICMPv6TypeParameterProblem {
 			result.Pointer = binary.BigEndian.Uint32(body[:4])
 		}
 	}
@@ -716,31 +978,34 @@ func cloneICMPError(networkError ICMPError) ICMPError {
 	return networkError
 }
 
-// validICMPErrorCode rejects unassigned type/code combinations before they
-// can affect a socket or the path-MTU cache.
+// validICMPErrorCode rejects unsupported or unassigned type/code combinations
+// before they can affect a socket or the path-MTU cache.
 func validICMPErrorCode(protocol, messageType, code byte) bool {
 	switch protocol {
 	case ProtocolICMPv4:
 		switch messageType {
-		case 3:
-			return code <= 15
-		case 11:
-			return code <= 1
-		case 12:
-			return code <= 2
+		case ICMPv4TypeDestinationUnreachable:
+			return code <= ICMPv4DestinationUnreachableCodePrecedenceCutoff
+		case ICMPv4TypeTimeExceeded:
+			return code <= ICMPv4TimeExceededCodeFragmentReassembly
+		case ICMPv4TypeParameterProblem:
+			return code <= ICMPv4ParameterProblemCodeBadLength
 		}
 	case ProtocolICMPv6:
 		switch messageType {
-		case 1:
-			return code <= 7
-		case 2:
-			return code == 0
-		case 3:
-			return code <= 1
-		case 4:
-			// RFC 7112 assigns code 3 for an incomplete first-fragment header
-			// chain; RFC 8754 assigns code 4 for an SR upper-layer error.
-			return code <= 4
+		case ICMPv6TypeDestinationUnreachable:
+			// RFC 8883 code 8 requires an RFC 4884 extension object that
+			// ICMPError does not yet model. RFC 9914 code 9 retains the
+			// ordinary Destination Unreachable body and is fully representable.
+			return code <= ICMPv6DestinationUnreachableCodeSourceRoutingHeader || code == ICMPv6DestinationUnreachableCodePRoute
+		case ICMPv6TypePacketTooBig:
+			return code == ICMPCodeNone
+		case ICMPv6TypeTimeExceeded:
+			return code <= ICMPv6TimeExceededCodeFragmentReassembly
+		case ICMPv6TypeParameterProblem:
+			// RFC 7112 assigns code 3, RFC 8754 assigns code 4, and RFC
+			// 8883 assigns the processing-limit errors from code 5 through 10.
+			return code <= ICMPv6ParameterProblemCodeOptionTooBig
 		}
 	}
 	return false
@@ -840,7 +1105,7 @@ func (s *Stack) sendPortUnreachable(packet ipPacket) error {
 		}
 		quote := packet.original[:quoteLength]
 		icmp := make([]byte, 8+len(quote))
-		icmp[0], icmp[1] = 3, 3
+		icmp[0], icmp[1] = ICMPv4TypeDestinationUnreachable, ICMPv4DestinationUnreachableCodePort
 		copy(icmp[8:], quote)
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
 		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
@@ -851,7 +1116,7 @@ func (s *Stack) sendPortUnreachable(packet ipPacket) error {
 	}
 	quote := packet.original[:quoteLength]
 	icmp := make([]byte, 8+len(quote))
-	icmp[0], icmp[1] = 1, 4
+	icmp[0], icmp[1] = ICMPv6TypeDestinationUnreachable, ICMPv6DestinationUnreachableCodePort
 	copy(icmp[8:], quote)
 	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
 	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, icmp, false)
@@ -877,7 +1142,7 @@ func (s *Stack) sendProtocolUnreachable(packet ipPacket) error {
 			quoteLength = header + 8
 		}
 		icmp := make([]byte, 8+quoteLength)
-		icmp[0], icmp[1] = 3, 2
+		icmp[0], icmp[1] = ICMPv4TypeDestinationUnreachable, ICMPv4DestinationUnreachableCodeProtocol
 		copy(icmp[8:], packet.original[:quoteLength])
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
 		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
@@ -888,7 +1153,7 @@ func (s *Stack) sendProtocolUnreachable(packet ipPacket) error {
 		quoteLength = maximumQuote
 	}
 	icmp := make([]byte, 8+quoteLength)
-	icmp[0], icmp[1] = 4, 1
+	icmp[0], icmp[1] = ICMPv6TypeParameterProblem, ICMPv6ParameterProblemCodeUnrecognizedNextHeader
 	binary.BigEndian.PutUint32(icmp[4:8], uint32(packet.protocolOffset))
 	copy(icmp[8:], packet.original[:quoteLength])
 	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
@@ -914,7 +1179,7 @@ func (s *Stack) sendParameterProblem(packet ipPacket) error {
 			quoteLength = header + 8
 		}
 		icmp := make([]byte, 8+quoteLength)
-		icmp[0], icmp[1], icmp[4] = 12, packet.parameterCode, byte(packet.parameterAt)
+		icmp[0], icmp[1], icmp[4] = ICMPv4TypeParameterProblem, packet.parameterCode, byte(packet.parameterAt)
 		copy(icmp[8:], packet.original[:quoteLength])
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
 		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
@@ -928,7 +1193,7 @@ func (s *Stack) sendParameterProblem(packet ipPacket) error {
 		quoteLength = maximumQuote
 	}
 	icmp := make([]byte, 8+quoteLength)
-	icmp[0], icmp[1] = 4, packet.parameterCode
+	icmp[0], icmp[1] = ICMPv6TypeParameterProblem, packet.parameterCode
 	binary.BigEndian.PutUint32(icmp[4:8], packet.parameterAt)
 	copy(icmp[8:], packet.original[:quoteLength])
 	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))

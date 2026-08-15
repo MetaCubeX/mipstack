@@ -124,19 +124,32 @@ bytes after End remain available in `IPPacket.IPv4Options`, while structured
 option traversal stops at End and packet encoding writes canonical zero
 padding.
 
-`ICMPMessage.IsEchoRequest` identifies complete IPv4 and IPv6 Echo Requests.
-`EchoReply` creates a zero-copy semantic Echo Reply using a caller-selected
-source address; explicit selection is required because multicast, broadcast,
-and anycast destinations cannot be reused blindly as reply sources. The reply
-shares `Body` with the request, while `MarshalBinary` and `AppendBinary` encode
-the complete message and calculate its address-family checksum.
+`ICMPMessage.IsEchoRequest` and `IsEchoReply` identify complete IPv4 and IPv6
+Echo messages, while `Echo` returns their identifier, sequence, and a borrowed
+payload view. `SetEchoRequest` and `SetEchoReply` build either direction with
+an independently owned payload. `EchoReply` creates a zero-copy semantic reply
+from an existing request using a caller-selected source address; explicit
+selection is required because multicast, broadcast, and anycast destinations
+cannot be reused blindly as reply sources. The zero-copy reply shares `Body`
+with the request, while `MarshalBinary` and `AppendBinary` encode the complete
+message and calculate its address-family checksum.
 `ICMPMessage.IsError` classifies supported family-specific error type/code
 pairs, while `ICMPMessage.ICMPError` validates the available quoted structure
 and returns its addresses, protocol, TCP or UDP ports, path MTU, and parameter
 pointer. Quoted packet and payload slices borrow `ICMPMessage.Body`; socket
 delivery takes an independent copy when it must retain them. For IPv6 No Next
 Header, `QuotedPacket` retains ignored trailing bytes while `QuotedPayload` is
-empty, matching `IPPacket.UpperLayer`.
+empty, matching `IPPacket.UpperLayer`. `ICMPError.ICMPMessage` performs the
+reverse construction from a validated, possibly truncated quoted packet and
+copies that quote; route selection, rate limiting, recursive-error suppression,
+and quote truncation remain transmission policy rather than codec behavior.
+The exported untyped ICMP type and code constants cover every error subtype the
+stack accepts as well as Echo Request and Reply. This includes the RFC 8883
+IPv6 Parameter Problem processing-limit codes and RFC 9914 P-Route errors.
+RFC 8883's Destination Unreachable "Headers too long" code remains excluded
+because its required RFC 4884 extension object is not represented by
+`ICMPError`; accepting it as an ordinary quoted error would lose its pointer
+and misidentify extension bytes as part of the quoted packet.
 
 TCP options are available in wire order through `TCPSegment.HeaderOptions` and
 `SetHeaderOptions`. `TCPHeaderOption` preserves unknown and repeated kinds and
@@ -145,7 +158,12 @@ SACK-Permitted, SACK blocks, and Timestamps. `TCPSACKBlock` uses the original
 wrapping 32-bit sequence edges without applying connection-specific window
 policy. IPv4 options use the corresponding `IPv4HeaderOptions` and
 `SetIPv4HeaderOptions` methods; `IPv4HeaderOption` also exposes the copied,
-class, and number fields of its complete option type.
+class, and number fields of its complete option type. IPv4 and IPv6 option
+descriptors both provide typed `RouterAlert` and `SetRouterAlert` methods; the
+standalone codec preserves the complete 16-bit value, while stack IGMP and MLD
+handling recognizes the protocol-defined value zero. `ProtocolIGMP` exposes
+the corresponding IP protocol number alongside the existing protocol
+constants.
 
 `IPPacket.IPv6ExtensionHeaders` and `SetIPv6ExtensionHeaders` expose and build
 the linked extension-header sequence without making callers write Next Header

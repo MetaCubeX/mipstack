@@ -2247,7 +2247,7 @@ func validInboundFragmentSource(state *networkState, source, destination netip.A
 		return true
 	}
 	source = source.Unmap()
-	return protocol == 2 && source.Is4() && source.IsUnspecified()
+	return protocol == ProtocolIGMP && source.Is4() && source.IsUnspecified()
 }
 
 // validInboundPacketSource applies the RFC 9776 section 4.2.14 exception for
@@ -2258,7 +2258,7 @@ func validInboundPacketSource(state *networkState, packet ipPacket) bool {
 		return true
 	}
 	source := packet.source.Unmap()
-	if packet.protocol != 2 || !source.Is4() || !source.IsUnspecified() || len(packet.payload) == 0 {
+	if packet.protocol != ProtocolIGMP || !source.Is4() || !source.IsUnspecified() || len(packet.payload) == 0 {
 		return false
 	}
 	switch packet.payload[0] {

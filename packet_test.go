@@ -5,6 +5,7 @@ import (
 	"encoding"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/netip"
 	"syscall"
 	"testing"
@@ -220,6 +221,95 @@ func TestPublicIPv4HeaderOptions(t *testing.T) {
 	decodedOptions, err := decoded.IPv4HeaderOptions()
 	if err != nil || len(decodedOptions) != len(options) {
 		t.Fatalf("decoded IPv4 options = %+v, %v", decodedOptions, err)
+	}
+}
+
+func TestPublicRouterAlertOptions(t *testing.T) {
+	for _, value := range []uint16{0, 1, 0xffff} {
+		t.Run(fmt.Sprintf("value-%d", value), func(t *testing.T) {
+			ipv4Option := IPv4HeaderOption{Type: IPv4HeaderOptionNOP, Data: []byte{1, 2, 3}}
+			ipv4Option.SetRouterAlert(value)
+			if got, ok := ipv4Option.RouterAlert(); !ok || got != value {
+				t.Fatalf("IPv4 Router Alert = %d/%t, want %d/true", got, ok, value)
+			}
+			ipv4Packet := IPPacket{
+				Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1"),
+				Protocol: 99, HopLimit: 64, Payload: []byte("router-alert-v4"),
+			}
+			if err := ipv4Packet.SetIPv4HeaderOptions([]IPv4HeaderOption{{Type: IPv4HeaderOptionNOP}, ipv4Option}); err != nil {
+				t.Fatalf("set IPv4 Router Alert: %v", err)
+			}
+			wire, err := ipv4Packet.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode IPv4 Router Alert: %v", err)
+			}
+			parsedPacket, err := ParseIPPacket(wire)
+			if err != nil {
+				t.Fatalf("parse IPv4 Router Alert: %v", err)
+			}
+			options, err := parsedPacket.IPv4HeaderOptions()
+			if err != nil || len(options) < 2 {
+				t.Fatalf("parse IPv4 Router Alert options: %+v, %v", options, err)
+			}
+			if got, ok := options[1].RouterAlert(); !ok || got != value {
+				t.Fatalf("parsed IPv4 Router Alert = %d/%t, want %d/true", got, ok, value)
+			}
+
+			ipv6Option := IPv6ExtensionOption{Type: IPv6ExtensionOptionPad1, Data: []byte{1, 2, 3}}
+			ipv6Option.SetRouterAlert(value)
+			if got, ok := ipv6Option.RouterAlert(); !ok || got != value {
+				t.Fatalf("IPv6 Router Alert = %d/%t, want %d/true", got, ok, value)
+			}
+			hopByHop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+			if err = hopByHop.SetOptions([]IPv6ExtensionOption{ipv6Option}); err != nil {
+				t.Fatalf("set IPv6 Router Alert: %v", err)
+			}
+			ipv6Packet := IPPacket{
+				Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"), HopLimit: 64,
+			}
+			if err = ipv6Packet.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{hopByHop}, 99, []byte("router-alert-v6")); err != nil {
+				t.Fatalf("set IPv6 Router Alert header: %v", err)
+			}
+			wire, err = ipv6Packet.AppendBinary(nil)
+			if err != nil {
+				t.Fatalf("encode IPv6 Router Alert: %v", err)
+			}
+			parsedPacket, err = ParseIPPacket(wire)
+			if err != nil {
+				t.Fatalf("parse IPv6 Router Alert: %v", err)
+			}
+			headers, _, _, err := parsedPacket.IPv6ExtensionHeaders()
+			if err != nil || len(headers) != 1 {
+				t.Fatalf("parse IPv6 Router Alert headers: %+v, %v", headers, err)
+			}
+			options6, err := headers[0].Options()
+			if err != nil || len(options6) < 1 {
+				t.Fatalf("parse IPv6 Router Alert options: %+v, %v", options6, err)
+			}
+			if got, ok := options6[0].RouterAlert(); !ok || got != value {
+				t.Fatalf("parsed IPv6 Router Alert = %d/%t, want %d/true", got, ok, value)
+			}
+		})
+	}
+	for index, option := range []IPv4HeaderOption{
+		{},
+		{Type: IPv4HeaderOptionRouterAlert},
+		{Type: IPv4HeaderOptionRouterAlert, Data: []byte{0}},
+		{Type: IPv4HeaderOptionRouterAlert, Data: []byte{0, 0, 0}},
+	} {
+		if value, ok := option.RouterAlert(); ok || value != 0 {
+			t.Fatalf("malformed IPv4 Router Alert %d was accepted", index)
+		}
+	}
+	for index, option := range []IPv6ExtensionOption{
+		{},
+		{Type: IPv6ExtensionOptionRouterAlert},
+		{Type: IPv6ExtensionOptionRouterAlert, Data: []byte{0}},
+		{Type: IPv6ExtensionOptionRouterAlert, Data: []byte{0, 0, 0}},
+	} {
+		if value, ok := option.RouterAlert(); ok || value != 0 {
+			t.Fatalf("malformed IPv6 Router Alert %d was accepted", index)
+		}
 	}
 }
 

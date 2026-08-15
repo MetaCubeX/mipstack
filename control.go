@@ -476,29 +476,29 @@ func socketErrorControlForRead(err error) ([]byte, error) {
 func linuxICMPErrno(networkError ICMPError) uint32 {
 	if networkError.Reporter.Is4() {
 		switch networkError.Type {
-		case 3:
+		case ICMPv4TypeDestinationUnreachable:
 			values := [...]uint32{101, 113, 92, 111, 90, 95, 101, 112, 64, 101, 113, 101, 113, 113, 113, 113}
 			if int(networkError.Code) < len(values) {
 				return values[networkError.Code]
 			}
-		case 11:
+		case ICMPv4TypeTimeExceeded:
 			return 113
-		case 12:
+		case ICMPv4TypeParameterProblem:
 			return 71
 		}
 		return 71
 	}
 	switch networkError.Type {
-	case 1:
+	case ICMPv6TypeDestinationUnreachable:
 		values := [...]uint32{101, 13, 113, 113, 111, 13, 13}
 		if int(networkError.Code) < len(values) {
 			return values[networkError.Code]
 		}
-	case 2:
+	case ICMPv6TypePacketTooBig:
 		return 90
-	case 3:
+	case ICMPv6TypeTimeExceeded:
 		return 113
-	case 4:
+	case ICMPv6TypeParameterProblem:
 		return 71
 	}
 	return 71
