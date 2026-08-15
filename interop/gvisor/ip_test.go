@@ -365,17 +365,13 @@ func TestPublicIPv6FragmentHeaderChainBoundaryInterop(t *testing.T) {
 }
 
 // readGVisorPublicFragments reconstructs one gVisor-generated UDP packet using
-// only the public mipstack fragment view.
+// the public mipstack reassembly API.
 func readGVisorPublicFragments(t *testing.T, captured <-chan []byte, family interopFamily, timeout time.Duration) mipstack.IPPacket {
 	t.Helper()
-	storage := make([]byte, 65535)
-	covered := make([]bool, len(storage))
-	coveredSize, totalSize := 0, -1
-	var template mipstack.IPPacket
-	var protocol int
+	var reassembly mipstack.IPPacketReassembly
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	for totalSize < 0 || coveredSize != totalSize {
+	for {
 		select {
 		case wire := <-captured:
 			packet, err := mipstack.ParseIPPacket(wire)
@@ -383,33 +379,19 @@ func readGVisorPublicFragments(t *testing.T, captured <-chan []byte, family inte
 				continue
 			}
 			view, fragmented := packet.Fragment()
-			if !fragmented || view.Offset < 0 || view.Offset+len(view.Payload) > len(storage) {
+			if !fragmented || view.IsAtomic() {
 				t.Fatalf("gVisor emitted invalid fragment: packet=%+v view=%+v valid=%t error=%v", packet, view, fragmented, err)
 			}
-			if coveredSize == 0 {
-				template, protocol = packet, view.Protocol
-			} else if view.Protocol != protocol {
-				t.Fatalf("gVisor fragment protocol changed from %d to %d", protocol, view.Protocol)
+			result, complete, addErr := reassembly.Add(packet)
+			if addErr != nil {
+				t.Fatalf("reassemble gVisor fragment at %d: %v", view.Offset, addErr)
 			}
-			for offset := view.Offset; offset < view.Offset+len(view.Payload); offset++ {
-				if covered[offset] {
-					t.Fatalf("gVisor emitted overlapping fragment byte %d", offset)
-				}
-				covered[offset] = true
-				coveredSize++
-			}
-			copy(storage[view.Offset:], view.Payload)
-			if !view.MoreFragments {
-				totalSize = view.Offset + len(view.Payload)
+			if complete {
+				return result
 			}
 		case <-timer.C:
-			t.Fatalf("timed out after %d/%d gVisor fragment bytes", coveredSize, totalSize)
+			t.Fatal("timed out while reassembling gVisor fragments")
 		}
-	}
-	return mipstack.IPPacket{
-		Source: template.Source, Destination: template.Destination,
-		Protocol: protocol, HopLimit: template.HopLimit, TrafficClass: template.TrafficClass,
-		Payload: append([]byte(nil), storage[:totalSize]...),
 	}
 }
 

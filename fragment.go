@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net/netip"
+	"sort"
 	"syscall"
 	"time"
 )
@@ -190,20 +191,24 @@ type fragmentPiece struct {
 	data   []byte
 }
 
-// fragmentSet retains one bounded, incomplete datagram.
-type fragmentSet struct {
+// IPPacketReassembly incrementally reassembles one fragmented IP packet. The
+// zero value is ready for use. Add copies every retained byte, so callers may
+// reuse the input packet's backing storage after Add returns.
+//
+// An IPPacketReassembly must not be copied after its first use. Its methods are
+// not safe for concurrent use; callers processing one datagram concurrently
+// must serialize Add and Reset calls.
+type IPPacketReassembly struct {
+	initialized bool
 	pieces      []fragmentPiece
 	total       int
 	bytes       int
-	created     time.Time
-	updated     time.Time
 	protocol    byte
 	source      netip.Addr
 	target      netip.Addr
 	identifier  uint32
 	v6          bool
 	ecnMask     byte
-	options     ipPacketOptions
 	maximum     int
 	maxSize     int
 	maxDFSize   int
@@ -212,26 +217,334 @@ type fragmentSet struct {
 	firstPacket []byte
 }
 
-// parsedFragment is one validated fragment extracted from its IP envelope.
+// fragmentSet adds Stack-owned lifecycle and accounting to one packet
+// reassembly. Timeout, eviction, admission, and ICMP policy intentionally stay
+// outside IPPacketReassembly.
+type fragmentSet struct {
+	IPPacketReassembly
+	created        time.Time
+	updated        time.Time
+	accountedBytes int
+}
+
+// ipPacketReassemblyFragment is the validated protocol state consumed by one
+// packet reassembly, independent of Stack admission and timeout policy.
+type ipPacketReassemblyFragment struct {
+	source     netip.Addr
+	target     netip.Addr
+	protocol   byte
+	offset     int
+	more       bool
+	payload    []byte
+	identifier uint32
+	v6         bool
+	ecn        byte
+	maximum    int
+	packetSize int
+	df         bool
+	header     []byte
+	nextHeader int
+	original   []byte
+	owned      bool
+}
+
+// reassemblyKey applies the protocol-specific datagram identity rules. IPv4
+// includes Protocol in its key; IPv6 deliberately does not include the
+// Fragment header's Next Header value.
+func (f ipPacketReassemblyFragment) reassemblyKey(loopback bool) fragmentKey {
+	key := fragmentKey{
+		source: f.source, target: f.target, identification: f.identifier,
+		v6: f.v6, loopback: loopback,
+	}
+	if !f.v6 {
+		key.protocol = f.protocol
+	}
+	return key
+}
+
+// parsedFragment adds Stack-specific routing and diagnostic metadata to one
+// fragment parsed directly from an inbound wire packet.
 type parsedFragment struct {
-	key           fragmentKey
-	protocol      byte
-	offset        int
-	more          bool
-	payload       []byte
-	identifier    uint32
-	ecn           byte
-	options       ipPacketOptions
-	maximum       int
-	packetSize    int
-	df            bool
-	header        []byte
-	nextHeader    int
-	original      []byte
+	ipPacketReassemblyFragment
 	truncated     bool
 	parameter     bool
 	parameterCode byte
 	parameterAt   uint32
+}
+
+// Add adds one non-atomic IPv4 or IPv6 fragment. When complete is false and
+// err is nil, the receiver remains incomplete; the input was either retained
+// or recognized as a duplicate. A completed packet owns its IPv4Options and
+// Payload storage, and the receiver is reset for reuse before Add returns.
+//
+// An unfragmented packet, an IPv6 atomic fragment, an invalid standalone
+// packet, or a fragment belonging to a different packet reports
+// syscall.EINVAL without changing an existing reassembly. Other standalone
+// validation errors are returned without changing it. A range already fully
+// covered by retained fragments is a duplicate: its payload, ECN, and header
+// metadata are ignored, but a duplicate final fragment may establish the
+// packet's final length. A duplicate never completes reassembly by itself.
+// Once a valid fragment is associated with the current packet, a conflicting
+// length, ECN value, or partial overlap invalidates and resets the entire
+// in-progress reassembly.
+func (r *IPPacketReassembly) Add(fragment IPPacket) (packet IPPacket, complete bool, err error) {
+	parsed, err := publicReassemblyFragment(fragment)
+	if err != nil {
+		return IPPacket{}, false, err
+	}
+	wire, pending, _, err := r.addFragment(parsed, 0)
+	if err != nil {
+		return IPPacket{}, false, err
+	}
+	if pending {
+		return IPPacket{}, false, nil
+	}
+	packet, err = ParseIPPacket(wire)
+	if err != nil {
+		return IPPacket{}, false, err
+	}
+	return packet, true, nil
+}
+
+// Reset discards an incomplete packet and releases all retained storage.
+// Reset is idempotent.
+func (r *IPPacketReassembly) Reset() {
+	*r = IPPacketReassembly{}
+}
+
+// publicReassemblyFragment validates a semantic packet and converts it to the
+// representation shared with Stack's raw-wire ingress. Only an offset-zero
+// fragment needs a complete owned wire image: later fragments contribute no
+// header fields to the reassembled packet.
+func publicReassemblyFragment(packet IPPacket) (ipPacketReassemblyFragment, error) {
+	packet, headerSize, totalSize, err := packet.wireLayout()
+	if err != nil {
+		return ipPacketReassemblyFragment{}, err
+	}
+	view, fragmented := packet.Fragment()
+	if !fragmented || view.IsAtomic() {
+		return ipPacketReassemblyFragment{}, syscall.EINVAL
+	}
+	if packet.Source.Is4() {
+		fragment := ipPacketReassemblyFragment{
+			source: packet.Source, target: packet.Destination,
+			protocol: byte(packet.Protocol), offset: view.Offset, more: view.MoreFragments,
+			payload: view.Payload, identifier: view.Identification, ecn: byte(packet.TrafficClass) & 3,
+			maximum: fragmentMaximumDatagram - headerSize, packetSize: totalSize, df: packet.DontFragment,
+			nextHeader: 9,
+		}
+		if view.Offset == 0 {
+			wire := make([]byte, totalSize)
+			marshalPublicIPPacket(wire, packet, headerSize)
+			fragment.payload = wire[headerSize:]
+			fragment.header = wire[:headerSize]
+			fragment.original = wire
+			fragment.owned = true
+		}
+		return fragment, nil
+	}
+	fragmentOffset, previous, valid := locateIPv6FragmentHeader(byte(packet.Protocol), packet.Payload)
+	if !valid || fragmentOffset+8 > len(packet.Payload) {
+		return ipPacketReassemblyFragment{}, syscall.EINVAL
+	}
+	if view.Offset == 0 && view.MoreFragments && !ipv6FirstFragmentHeaderComplete(byte(view.Protocol), view.Payload) {
+		return ipPacketReassemblyFragment{}, syscall.EINVAL
+	}
+	maximum := fragmentMaximumDatagram
+	if view.Offset == 0 {
+		maximum -= fragmentOffset
+	}
+	fragment := ipPacketReassemblyFragment{
+		source: packet.Source, target: packet.Destination, v6: true,
+		protocol: byte(view.Protocol), offset: view.Offset, more: view.MoreFragments,
+		payload: packet.Payload[fragmentOffset+8:], identifier: view.Identification,
+		ecn:     byte(packet.TrafficClass) & 3,
+		maximum: maximum, packetSize: totalSize,
+	}
+	if view.Offset == 0 {
+		wire := make([]byte, totalSize)
+		marshalPublicIPPacket(wire, packet, headerSize)
+		wireOffset := 40 + fragmentOffset
+		fragment.original = wire
+		fragment.header = wire[:wireOffset]
+		fragment.payload = wire[wireOffset+8:]
+		fragment.nextHeader = 6
+		if previous >= 0 {
+			fragment.nextHeader = 40 + previous
+		}
+		fragment.owned = true
+	}
+	return fragment, nil
+}
+
+// locateIPv6FragmentHeader returns the Fragment header's payload-relative
+// offset and the preceding extension header's payload-relative offset. A
+// previous value of -1 identifies the base header's Next Header field.
+func locateIPv6FragmentHeader(first byte, payload []byte) (fragmentOffset, previous int, ok bool) {
+	next, offset, previous := first, 0, -1
+	for offset <= len(payload) && isTraversableIPv6ExtensionHeader(next) {
+		length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
+		if !valid {
+			return 0, 0, false
+		}
+		if next == IPv6ExtensionHeaderFragment {
+			return offset, previous, true
+		}
+		previous = offset
+		next, offset = payload[offset], offset+length
+	}
+	return 0, 0, false
+}
+
+// addFragment contains the single-datagram state machine shared by the public
+// API and Stack. maximumPieces is a Stack table policy; zero accepts every
+// fragment range representable by a non-jumbogram packet. added reports a new
+// retained range rather than a duplicate.
+func (r *IPPacketReassembly) addFragment(fragment ipPacketReassemblyFragment, maximumPieces int) (_ []byte, pending, added bool, err error) {
+	if !r.initialized {
+		*r = IPPacketReassembly{
+			initialized: true, total: -1, protocol: fragment.protocol,
+			source: fragment.source, target: fragment.target,
+			identifier: fragment.identifier, v6: fragment.v6,
+			ecnMask: 1 << fragment.ecn,
+			maximum: fragmentMaximumDatagram,
+		}
+		if fragment.v6 || fragment.offset == 0 {
+			r.maximum = fragment.maximum
+		} else {
+			r.maximum -= 20
+		}
+	} else if r.v6 != fragment.v6 || r.source != fragment.source || r.target != fragment.target ||
+		r.identifier != fragment.identifier || !r.v6 && r.protocol != fragment.protocol {
+		return nil, false, false, syscall.EINVAL
+	}
+	if !fragment.v6 && fragment.more && len(fragment.payload)%8 != 0 {
+		trimmed := len(fragment.payload) &^ 7
+		discarded := len(fragment.payload) - trimmed
+		fragment.payload = fragment.payload[:trimmed]
+		fragment.original = fragment.original[:len(fragment.original)-discarded]
+		fragment.packetSize -= discarded
+	}
+	end := fragment.offset + len(fragment.payload)
+	if len(fragment.payload) == 0 || end > r.maximum || r.total > r.maximum || r.total >= 0 && end > r.total {
+		r.Reset()
+		return nil, false, false, syscall.EINVAL
+	}
+	duplicate, overlaps := fragmentRangeState(r.pieces, fragment.offset, end)
+	if overlaps && !duplicate {
+		r.Reset()
+		return nil, false, false, syscall.EINVAL
+	}
+	if !fragment.more && r.total >= 0 && r.total != end {
+		r.Reset()
+		return nil, false, false, syscall.EINVAL
+	}
+	if !fragment.more {
+		r.total = end
+		for _, existing := range r.pieces {
+			if existing.offset+len(existing.data) > r.total {
+				r.Reset()
+				return nil, false, false, syscall.EINVAL
+			}
+		}
+	}
+	if duplicate {
+		return nil, true, false, nil
+	}
+	if fragment.offset == 0 {
+		r.protocol = fragment.protocol
+		r.nextHeader = fragment.nextHeader
+		r.maximum = fragment.maximum
+		if r.total > r.maximum {
+			r.Reset()
+			return nil, false, false, syscall.EINVAL
+		}
+		for _, existing := range r.pieces {
+			if existing.offset+len(existing.data) > r.maximum {
+				r.Reset()
+				return nil, false, false, syscall.EINVAL
+			}
+		}
+	}
+	if maximumPieces > 0 && len(r.pieces) >= maximumPieces {
+		r.Reset()
+		return nil, false, false, ErrResourceLimit
+	}
+	candidateECN := r.ecnMask | 1<<fragment.ecn
+	if candidateECN&1 != 0 && candidateECN != 1 {
+		r.Reset()
+		return nil, false, false, syscall.EINVAL
+	}
+	r.ecnMask = candidateECN
+	retainedBytes := len(fragment.payload)
+	if fragment.offset == 0 {
+		if len(fragment.original) == 0 || len(fragment.header) < 20 || len(fragment.header) > len(fragment.original) ||
+			len(fragment.payload) > len(fragment.original)-len(fragment.header) {
+			r.Reset()
+			return nil, false, false, syscall.EINVAL
+		}
+		retainedBytes = len(fragment.original)
+	}
+	var data []byte
+	if fragment.offset == 0 {
+		if fragment.owned {
+			r.firstPacket = fragment.original
+		} else {
+			r.firstPacket = append([]byte(nil), fragment.original...)
+		}
+		r.header = r.firstPacket[:len(fragment.header)]
+		payloadOffset := len(r.firstPacket) - len(fragment.payload)
+		data = r.firstPacket[payloadOffset:]
+	} else {
+		data = append([]byte(nil), fragment.payload...)
+	}
+	piece := fragmentPiece{offset: fragment.offset, data: data}
+	insertAt := sort.Search(len(r.pieces), func(index int) bool {
+		return r.pieces[index].offset > fragment.offset
+	})
+	r.pieces = append(r.pieces, fragmentPiece{})
+	copy(r.pieces[insertAt+1:], r.pieces[insertAt:])
+	r.pieces[insertAt] = piece
+	r.bytes += retainedBytes
+	if fragment.packetSize > r.maxSize {
+		r.maxSize = fragment.packetSize
+	}
+	if fragment.df && fragment.packetSize > r.maxDFSize {
+		r.maxDFSize = fragment.packetSize
+	}
+	if !r.complete() {
+		return nil, true, true, nil
+	}
+	wire := r.finishWire()
+	r.Reset()
+	if wire == nil {
+		return nil, false, true, syscall.EINVAL
+	}
+	return wire, false, true, nil
+}
+
+// complete uses the non-overlapping-range invariant: retained payload bytes
+// can equal the final length only when they cover the complete [0,total)
+// interval. bytes includes the offset-zero packet header and, for IPv6, the
+// Fragment header removed during reassembly.
+func (r *IPPacketReassembly) complete() bool {
+	overhead := len(r.header)
+	if r.v6 && overhead != 0 {
+		overhead += 8
+	}
+	return r.total >= 0 && r.bytes-overhead == r.total
+}
+
+// finishWire constructs one complete packet without retaining caller storage.
+func (r *IPPacketReassembly) finishWire() []byte {
+	ecn, valid := fragmentECN(r.ecnMask)
+	if !valid {
+		return nil
+	}
+	dontFragment := !r.v6 && r.maxDFSize != 0 && r.maxDFSize == r.maxSize
+	packet := buildReassembledPacket(r, dontFragment)
+	setPacketECN(packet, ecn)
+	return packet
 }
 
 // runFragmentCleaner releases incomplete sets even when no later fragments
@@ -271,11 +584,11 @@ func (s *Stack) runFragmentCleaner() {
 func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time, loopback bool) (_ []byte, pending bool) {
 	fragment, ok := parseFragment(packet)
 	network := s.network.Load()
-	if !ok || fragment.truncated || fragment.parameter || !s.acceptsInboundDestination(network, fragment.key.target, loopback) ||
-		!validInboundFragmentSource(network, fragment.key.source, fragment.key.target, fragment.protocol) {
+	if !ok || fragment.truncated || fragment.parameter || !s.acceptsInboundDestination(network, fragment.target, loopback) ||
+		!validInboundFragmentSource(network, fragment.source, fragment.target, fragment.protocol) {
 		return nil, false
 	}
-	fragment.key.loopback = loopback
+	key := fragment.reassemblyKey(loopback)
 	s.fragmentMu.Lock()
 	select {
 	case <-s.closeCh:
@@ -288,75 +601,26 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time, loopback bo
 		s.fragmentMu.Unlock()
 		s.sendFragmentTimeouts(expired)
 	}()
-	set := s.fragments[fragment.key]
+	set := s.fragments[key]
 	if set == nil {
 		for len(s.fragments) >= fragmentMaximumSets {
 			s.evictOldestFragmentExceptLocked(nil)
 		}
-		set = &fragmentSet{
-			total: -1, created: now, updated: now, protocol: fragment.protocol,
-			source: fragment.key.source, target: fragment.key.target,
-			identifier: fragment.identifier, v6: fragment.key.v6, ecnMask: 1 << fragment.ecn, options: fragment.options,
-			maximum: fragmentMaximumDatagram,
-		}
-		if fragment.key.v6 || fragment.offset == 0 {
-			set.maximum = fragment.maximum
-		} else {
-			set.maximum -= 20
-		}
-		s.fragments[fragment.key] = set
+		set = &fragmentSet{created: now, updated: now}
+		s.fragments[key] = set
 		select {
 		case s.fragmentWake <- struct{}{}:
 		default:
 		}
-	} else {
-		// RFC 8200 permits the Next Header fields of IPv6 fragments to
-		// differ and requires reassembly to use the value from offset zero.
-		// IPv4 includes Protocol in the reassembly key, so a mismatch there
-		// still identifies a different datagram.
-		if !set.v6 && set.protocol != fragment.protocol {
-			s.removeFragmentLocked(fragment.key, set)
-			return nil, false
+	}
+	packet, pending, added, err := set.addFragment(fragment.ipPacketReassemblyFragment, fragmentMaximumPieces)
+	s.fragmentBytes += set.bytes - set.accountedBytes
+	set.accountedBytes = set.bytes
+	if err != nil {
+		if !set.initialized {
+			s.removeFragmentLocked(key, set)
 		}
-	}
-	if !fragment.key.v6 && fragment.more && len(fragment.payload)%8 != 0 {
-		trimmed := len(fragment.payload) &^ 7
-		discarded := len(fragment.payload) - trimmed
-		fragment.payload = fragment.payload[:trimmed]
-		fragment.original = fragment.original[:len(fragment.original)-discarded]
-		fragment.packetSize -= discarded
-	}
-	end := fragment.offset + len(fragment.payload)
-	if len(fragment.payload) == 0 || end > set.maximum || set.total > set.maximum ||
-		set.total >= 0 && end > set.total {
-		s.removeFragmentLocked(fragment.key, set)
 		return nil, false
-	}
-	duplicate := fragmentRangeCovered(set.pieces, fragment.offset, end)
-	for _, existing := range set.pieces {
-		existingEnd := existing.offset + len(existing.data)
-		if fragment.offset < existingEnd && existing.offset < end {
-			if !duplicate {
-				// RFC 5722 requires dropping the complete datagram on a
-				// partial overlap. Linux applies the same policy to IPv4.
-				s.removeFragmentLocked(fragment.key, set)
-				return nil, false
-			}
-			break
-		}
-	}
-	if !fragment.more {
-		if set.total >= 0 && set.total != end {
-			s.removeFragmentLocked(fragment.key, set)
-			return nil, false
-		}
-		set.total = end
-		for _, existing := range set.pieces {
-			if existing.offset+len(existing.data) > set.total {
-				s.removeFragmentLocked(fragment.key, set)
-				return nil, false
-			}
-		}
 	}
 	if now.Before(set.created) {
 		// Concurrent Write calls can acquire fragmentMu out of arrival order.
@@ -368,157 +632,57 @@ func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time, loopback bo
 		default:
 		}
 	}
-	if duplicate {
-		// Linux's shared IPv4/IPv6 fragment queue treats a completely
-		// covered range as a duplicate. Ignore its ECN and header metadata,
-		// but retain a newly learned final size so a duplicate last fragment
-		// can complete an otherwise contiguous queue.
-		if set.total < 0 {
-			return nil, true
-		}
-		next := 0
-		for _, piece := range set.pieces {
-			if piece.offset != next {
-				return nil, true
-			}
-			next += len(piece.data)
-		}
-		if next != set.total {
-			return nil, true
-		}
-		return s.finishFragmentReassembly(fragment.key, set)
+	if added && now.After(set.updated) {
+		set.updated = now
 	}
-	if fragment.offset == 0 {
-		// Reassembly metadata follows the fragment containing the original
-		// upper-layer header, regardless of arrival order.
-		set.protocol = fragment.protocol
-		set.options = fragment.options
-		set.nextHeader = fragment.nextHeader
-		set.maximum = fragment.maximum
-		if set.total > set.maximum {
-			s.removeFragmentLocked(fragment.key, set)
-			return nil, false
-		}
-		for _, existing := range set.pieces {
-			if existing.offset+len(existing.data) > set.maximum {
-				s.removeFragmentLocked(fragment.key, set)
-				return nil, false
-			}
-		}
-	}
-	if len(set.pieces) >= fragmentMaximumPieces {
-		s.removeFragmentLocked(fragment.key, set)
-		return nil, false
-	}
-	candidateECN := set.ecnMask | 1<<fragment.ecn
-	if candidateECN&1 != 0 && candidateECN != 1 {
-		s.removeFragmentLocked(fragment.key, set)
-		return nil, false
-	}
-	set.ecnMask = candidateECN
-	retainedBytes := len(fragment.payload)
-	if fragment.offset == 0 {
-		// firstPacket is needed for a possible reassembly-timeout error. Keep
-		// the piece as a slice of that copy instead of retaining a second copy
-		// of the same payload, and charge the complete allocation to the bound.
-		retainedBytes = len(fragment.original)
-	}
-	for retainedBytes > fragmentMaximumBytes-s.fragmentBytes && len(s.fragments) > 1 {
+	for pending && s.fragmentBytes > fragmentMaximumBytes && len(s.fragments) > 1 {
 		if !s.evictOldestFragmentExceptLocked(set) {
 			break
 		}
 	}
-	if retainedBytes > fragmentMaximumBytes-s.fragmentBytes {
-		s.removeFragmentLocked(fragment.key, set)
+	if pending && s.fragmentBytes > fragmentMaximumBytes {
+		s.removeFragmentLocked(key, set)
+		set.Reset()
 		return nil, false
 	}
-	var data []byte
-	if fragment.offset == 0 {
-		set.firstPacket = append([]byte(nil), fragment.original...)
-		set.header = set.firstPacket[:len(fragment.header)]
-		payloadOffset := len(set.firstPacket) - len(fragment.payload)
-		data = set.firstPacket[payloadOffset:]
-	} else {
-		data = append([]byte(nil), fragment.payload...)
-	}
-	piece := fragmentPiece{offset: fragment.offset, data: data}
-	insertAt := len(set.pieces)
-	for index, existing := range set.pieces {
-		if fragment.offset < existing.offset {
-			insertAt = index
-			break
-		}
-	}
-	set.pieces = append(set.pieces, fragmentPiece{})
-	copy(set.pieces[insertAt+1:], set.pieces[insertAt:])
-	set.pieces[insertAt] = piece
-	set.bytes += retainedBytes
-	if now.After(set.updated) {
-		set.updated = now
-	}
-	if fragment.packetSize > set.maxSize {
-		set.maxSize = fragment.packetSize
-	}
-	if fragment.df && fragment.packetSize > set.maxDFSize {
-		set.maxDFSize = fragment.packetSize
-	}
-	s.fragmentBytes += retainedBytes
-	if set.total < 0 {
+	if pending {
 		return nil, true
 	}
-	next := 0
-	for _, piece := range set.pieces {
-		if piece.offset != next {
-			return nil, true
-		}
-		next += len(piece.data)
-	}
-	if next != set.total {
-		return nil, true
-	}
-	return s.finishFragmentReassembly(fragment.key, set)
+	s.removeFragmentLocked(key, set)
+	return packet, false
 }
 
-// fragmentRangeCovered reports whether sorted, non-overlapping pieces cover
-// every byte in [start,end).
-func fragmentRangeCovered(pieces []fragmentPiece, start, end int) bool {
+// fragmentRangeState reports whether sorted, non-overlapping pieces completely
+// cover [start,end) and whether any piece intersects that range.
+func fragmentRangeState(pieces []fragmentPiece, start, end int) (covered, overlaps bool) {
 	if start >= end {
-		return false
+		return false, false
+	}
+	first := sort.Search(len(pieces), func(index int) bool {
+		return pieces[index].offset+len(pieces[index].data) > start
+	})
+	if first == len(pieces) || pieces[first].offset >= end {
+		return false, false
 	}
 	cursor := start
-	for _, piece := range pieces {
-		pieceEnd := piece.offset + len(piece.data)
-		if pieceEnd <= cursor {
-			continue
+	for _, piece := range pieces[first:] {
+		if piece.offset >= end {
+			break
 		}
 		if piece.offset > cursor {
-			return false
+			return false, true
 		}
-		cursor = pieceEnd
+		cursor = piece.offset + len(piece.data)
 		if cursor >= end {
-			return true
+			return true, true
 		}
 	}
-	return false
-}
-
-// finishFragmentReassembly builds and removes one contiguous fragment set.
-func (s *Stack) finishFragmentReassembly(key fragmentKey, set *fragmentSet) ([]byte, bool) {
-	s.removeFragmentLocked(key, set)
-	ecn, valid := fragmentECN(set.ecnMask)
-	if !valid {
-		return nil, false
-	}
-	set.options.trafficClass = set.options.trafficClass&^3 | ecn
-	dontFragment := !set.v6 && set.maxDFSize != 0 && set.maxDFSize == set.maxSize
-	packet := buildReassembledPacket(set, dontFragment)
-	setPacketECN(packet, ecn)
-	return packet, false
+	return false, true
 }
 
 // buildReassembledPacket removes fragmentation state while preserving the
 // complete offset-zero IPv4 header or IPv6 Per-Fragment header chain.
-func buildReassembledPacket(set *fragmentSet, dontFragment bool) []byte {
+func buildReassembledPacket(set *IPPacketReassembly, dontFragment bool) []byte {
 	if !set.v6 {
 		if len(set.header) < 20 || len(set.header)+set.total > 65535 {
 			return nil
@@ -574,26 +738,26 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 		target := netip.AddrFrom4([4]byte(packet[16:20]))
 		identifier := uint32(binary.BigEndian.Uint16(packet[4:6]))
 		protocol := packet[9]
-		key := fragmentKey{source: source, target: target, identification: identifier, protocol: protocol}
 		if optionAt, malformed := malformedIPv4Option(packet[20:headerSize]); malformed {
 			return parsedFragment{
-				key: key, protocol: protocol, offset: int(field&0x1fff) * 8,
-				identifier: identifier, original: packet[:totalSize], parameter: true, parameterAt: uint32(20 + optionAt),
+				ipPacketReassemblyFragment: ipPacketReassemblyFragment{
+					source: source, target: target, protocol: protocol, offset: int(field&0x1fff) * 8,
+					identifier: identifier, original: packet[:totalSize],
+				},
+				parameter: true, parameterAt: uint32(20 + optionAt),
 			}, true
 		}
 		if !validateIPv4Options(packet[20:headerSize]) {
 			return parsedFragment{}, false
 		}
 		return parsedFragment{
-			key:      key,
-			protocol: protocol,
-			offset:   int(field&0x1fff) * 8, more: field&0x2000 != 0,
-			payload: packet[headerSize:totalSize], identifier: identifier, ecn: packet[1] & 3,
-			options:    ipPacketOptions{hopLimit: packet[8], trafficClass: packet[1]},
-			maximum:    fragmentMaximumDatagram - headerSize,
-			packetSize: totalSize, df: field&0x4000 != 0,
-			header: packet[:headerSize], nextHeader: 9,
-			original: packet[:totalSize],
+			ipPacketReassemblyFragment: ipPacketReassemblyFragment{
+				source: source, target: target, protocol: protocol,
+				offset: int(field&0x1fff) * 8, more: field&0x2000 != 0,
+				payload: packet[headerSize:totalSize], identifier: identifier, ecn: packet[1] & 3,
+				maximum: fragmentMaximumDatagram - headerSize, packetSize: totalSize, df: field&0x4000 != 0,
+				header: packet[:headerSize], nextHeader: 9, original: packet[:totalSize],
+			},
 		}, true
 	}
 	if packet[0]>>4 != 6 || len(packet) < 48 {
@@ -605,7 +769,6 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 	}
 	source := netip.AddrFrom16([16]byte(packet[8:24]))
 	target := netip.AddrFrom16([16]byte(packet[24:40]))
-	flowLabel := uint32(packet[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(packet[2:4]))
 	next, nextHeader, offset := packet[6], 6, 40
 	seenHop := false
 	for offset <= end {
@@ -613,8 +776,8 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 		case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination:
 			if next == IPv6ExtensionHeaderHopByHop && (offset != 40 || seenHop) {
 				return parsedFragment{
-					key: fragmentKey{source: source, target: target, v6: true}, original: packet[:end],
-					parameter: true, parameterCode: 1, parameterAt: uint32(nextHeader),
+					ipPacketReassemblyFragment: ipPacketReassemblyFragment{source: source, target: target, v6: true, original: packet[:end]},
+					parameter:                  true, parameterCode: 1, parameterAt: uint32(nextHeader),
 				}, true
 			}
 			if end-offset < 8 {
@@ -628,8 +791,8 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 			if !valid {
 				if action >= 2 && (action == 2 || !target.IsMulticast()) {
 					return parsedFragment{
-						key: fragmentKey{source: source, target: target, v6: true}, original: packet[:end],
-						parameter: true, parameterCode: 2, parameterAt: uint32(offset + optionOffset),
+						ipPacketReassemblyFragment: ipPacketReassemblyFragment{source: source, target: target, v6: true, original: packet[:end]},
+						parameter:                  true, parameterCode: 2, parameterAt: uint32(offset + optionOffset),
 					}, true
 				}
 				return parsedFragment{}, false
@@ -648,8 +811,8 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 			}
 			if packet[offset+3] != 0 {
 				return parsedFragment{
-					key: fragmentKey{source: source, target: target, v6: true}, original: packet[:end],
-					parameter: true, parameterCode: 0, parameterAt: uint32(offset + 2),
+					ipPacketReassemblyFragment: ipPacketReassemblyFragment{source: source, target: target, v6: true, original: packet[:end]},
+					parameter:                  true, parameterCode: 0, parameterAt: uint32(offset + 2),
 				}, true
 			}
 			next, nextHeader, offset = packet[offset], offset, offset+length
@@ -669,7 +832,14 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 			fragmentOffset := int(field & 0xfff8)
 			more := field&1 != 0
 			payload := packet[offset+8 : end]
-			maximum := fragmentMaximumDatagram - (offset - 40)
+			// Only the offset-zero fragment supplies the Per-Fragment headers
+			// retained by reassembly. RFC 8200 permits those headers to differ
+			// in later fragments, so their local length cannot narrow the
+			// structurally valid fragmentable-data range.
+			maximum := fragmentMaximumDatagram
+			if fragmentOffset == 0 {
+				maximum -= offset - 40
+			}
 			parameter := more && len(payload)%8 != 0
 			parameterAt := uint32(4)
 			if fragmentOffset > maximum-len(payload) {
@@ -677,14 +847,13 @@ func parseFragment(packet []byte) (parsedFragment, bool) {
 				parameterAt = uint32(offset + 2)
 			}
 			return parsedFragment{
-				key:      fragmentKey{source: source, target: target, identification: identifier, v6: true},
-				protocol: protocol,
-				offset:   fragmentOffset, more: more,
-				payload: payload, identifier: identifier, ecn: packet[1] >> 4 & 3,
-				options: ipPacketOptions{hopLimit: packet[7], trafficClass: (packet[0]&0x0f)<<4 | packet[1]>>4, flowLabel: flowLabel},
-				header:  packet[:offset], nextHeader: nextHeader,
-				maximum:   maximum,
-				original:  packet[:end],
+				ipPacketReassemblyFragment: ipPacketReassemblyFragment{
+					source: source, target: target, protocol: protocol,
+					offset: fragmentOffset, more: more, payload: payload,
+					identifier: identifier, v6: true, ecn: packet[1] >> 4 & 3,
+					header: packet[:offset], nextHeader: nextHeader,
+					maximum: maximum, original: packet[:end],
+				},
 				truncated: fragmentOffset == 0 && more && !ipv6FirstFragmentHeaderComplete(protocol, payload),
 				parameter: parameter, parameterAt: parameterAt,
 			}, true
@@ -858,7 +1027,8 @@ func (s *Stack) removeFragmentLocked(key fragmentKey, set *fragmentSet) {
 		return
 	}
 	delete(s.fragments, key)
-	s.fragmentBytes -= set.bytes
+	s.fragmentBytes -= set.accountedBytes
+	set.accountedBytes = 0
 }
 
 // discardFragment removes any incomplete datagram matching key.

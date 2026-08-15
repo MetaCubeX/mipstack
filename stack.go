@@ -3149,19 +3149,18 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 	parsed, ok := parseIPPacket(packet)
 	if !ok {
 		network := s.network.Load()
-		if fragment, valid := parseFragment(packet); valid && s.acceptsInboundDestination(network, fragment.key.target, loopback) &&
-			validInboundFragmentSource(network, fragment.key.source, fragment.key.target, fragment.protocol) {
+		if fragment, valid := parseFragment(packet); valid && s.acceptsInboundDestination(network, fragment.target, loopback) &&
+			validInboundFragmentSource(network, fragment.source, fragment.target, fragment.protocol) {
 			if fragment.truncated || fragment.parameter {
-				fragment.key.loopback = loopback
-				s.discardFragment(fragment.key)
+				s.discardFragment(fragment.reassemblyKey(loopback))
 				s.stats.inboundDroppedPackets.Add(1)
-				destination := s.classifyInboundDestination(s.network.Load(), fragment.key.target, loopback)
+				destination := s.classifyInboundDestination(s.network.Load(), fragment.target, loopback)
 				code, at := byte(3), uint32(0)
 				if fragment.parameter && !fragment.truncated {
 					code, at = fragment.parameterCode, fragment.parameterAt
 				}
 				_ = s.sendInboundParameterProblem(ipPacket{
-					source: fragment.key.source, target: fragment.key.target, original: fragment.original,
+					source: fragment.source, target: fragment.target, original: fragment.original,
 					parameterError: true, parameterCode: code, parameterAt: at,
 				}, destination)
 				return nil

@@ -214,22 +214,38 @@ IGMP, ESP, DCCP, SCTP, UDP-Lite, and nested IPv4 or IPv6. An unknown raw
 protocol remains fragmentable because its header boundary cannot be inferred
 from its protocol number alone.
 
+`IPPacketReassembly` incrementally reconstructs one non-atomic fragmented
+packet. Its zero value is ready for use, and `Add` copies every retained byte so
+the caller may immediately reuse storage borrowed by the input `IPPacket`.
+Fragments may arrive out of order. A range already fully covered by retained
+fragments is treated as a duplicate without comparing its payload bytes or
+using its ECN and header metadata. Following Linux, a duplicate final fragment
+may establish the packet's final length, but the duplicate itself never
+completes reassembly. A partial overlap or other associated conflict
+invalidates the entire in-progress reassembly. Invalid standalone input and a
+fragment belonging to a different packet leave existing state unchanged. A
+successful result owns all option and payload storage, contains no non-atomic
+fragmentation state, and resets the receiver for reuse. `Reset` explicitly
+abandons an incomplete packet. The type deliberately has no clock, goroutine,
+global capacity policy, or `Close`: callers multiplexing many datagrams remain
+responsible for their identity table, lifetime, and aggregate resource limits.
+`Stack` supplies that surrounding policy for live network traffic.
+
 `IPPacket.UpperLayer` structurally walks IPv6 Hop-by-Hop, Destination Options,
 Routing, atomic Fragment, Authentication, and Mobility headers. ESP and
 unknown values terminate traversal, while No Next Header returns no upper-layer
 payload even if preserved trailing bytes are available through the structural
 extension API. Structural AH or Mobility traversal does not authenticate or
 otherwise implement those protocols; AH framing still requires its complete
-fixed fields and IPv6's eight-octet alignment. Stateful fragment reassembly
-belongs to `Stack`, not the standalone codec, while IPv6 jumbograms are not
+fixed fields and IPv6's eight-octet alignment. IPv6 jumbograms are not
 supported. Non-atomic fragments remain structurally parseable and round-trip
 encodable, but `UpperLayer` and the TCP, UDP, and ICMP decoders reject them
-until a reassembler supplies a complete packet. Every Jumbo Payload option is
-rejected. A decoder that must validate an address-dependent pseudo-header
-(TCP, checksummed UDP, or ICMPv6) rejects an active IPv4 source route, active
-IPv6 Routing Header, or Mobile IPv6 Home Address option because it lacks the
-corresponding routing state. ICMPv4 and checksum-disabled IPv4 UDP remain
-decodable.
+until `IPPacketReassembly` or `Stack` supplies a complete packet. Every Jumbo
+Payload option is rejected. A decoder that must validate an address-dependent
+pseudo-header (TCP, checksummed UDP, or ICMPv6) rejects an active IPv4 source
+route, active IPv6 Routing Header, or Mobile IPv6 Home Address option because
+it lacks the corresponding routing state. ICMPv4 and checksum-disabled IPv4
+UDP remain decodable.
 
 Protocol numbers, TCP flags, TCP and IP option kinds, and IPv6 extension-header
 identifiers are exposed as untyped constants so callers can use them directly

@@ -886,11 +886,11 @@ func TestFragmentedMulticastOutputReachesLinkAndLoopback(t *testing.T) {
 	for {
 		wire := readOutboundPacket(t, sender)
 		fragment, valid := parseFragment(wire)
-		if !valid || fragment.key.source != source || fragment.key.target != group || fragment.protocol != ProtocolUDP {
+		if !valid || fragment.source != source || fragment.target != group || fragment.protocol != ProtocolUDP {
 			t.Fatalf("invalid outbound multicast fragment: %x", wire)
 		}
-		if fragment.options.hopLimit != 5 || len(wire) > 300 {
-			t.Fatalf("multicast fragment hop/size = %d/%d", fragment.options.hopLimit, len(wire))
+		if wire[8] != 5 || len(wire) > 300 {
+			t.Fatalf("multicast fragment hop/size = %d/%d", wire[8], len(wire))
 		}
 		fragments++
 		if _, err = receiver.Write([][]byte{wire}, 0); err != nil {
