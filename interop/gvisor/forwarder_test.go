@@ -1010,8 +1010,9 @@ func makeInteropICMPPacket(family interopFamily, source, target netip.Addr, mess
 	return packet
 }
 
-// TestICMPForwarderInterop verifies checksum-valid fragmented Echo traffic and
-// both callback-scoped and detached ReplyEcho output against gVisor.
+// TestICMPForwarderInterop verifies checksum-valid fragmented Echo traffic,
+// semantic forwarder message conversions, and both callback-scoped and
+// detached ReplyEcho output against gVisor.
 func TestICMPForwarderInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
@@ -1029,21 +1030,26 @@ func TestICMPForwarderInterop(t *testing.T) {
 					defer cancel()
 
 					type echoResult struct {
-						message   mipstack.ICMPForwarderMessage
-						responder *mipstack.ICMPForwarderResponder
-						err       error
+						message, converted mipstack.ICMPForwarderMessage
+						responder          *mipstack.ICMPForwarderResponder
+						err                error
 					}
 					results := make(chan echoResult, 2)
 					forwarder, err := mipstack.NewICMPForwarder(network.mipstack, mipstack.ICMPForwarderOptions{}, func(request *mipstack.ICMPForwarderRequest) {
 						message := request.Message()
+						semantic, conversionErr := message.ICMPMessage()
+						result := echoResult{message: message, err: conversionErr}
+						if result.err == nil {
+							result.err = result.converted.SetICMPMessage(semantic)
+						}
 						message.Payload = append([]byte(nil), message.Payload...)
-						result := echoResult{message: message}
-						if detached {
+						result.message = message
+						if result.err == nil && detached {
 							result.err = request.ReplyEcho()
 							if result.err == nil {
 								result.responder, result.err = request.Detach()
 							}
-						} else {
+						} else if result.err == nil {
 							result.err = request.ReplyEcho()
 						}
 						results <- result
@@ -1092,6 +1098,11 @@ func TestICMPForwarderInterop(t *testing.T) {
 						}
 						if result.message.Source != family.gvisorAddress || result.message.Destination != family.forwardAddress || !result.message.IsEchoRequest() || !bytes.Equal(result.message.Payload, request) {
 							t.Fatalf("forwarded ICMP message = %+v", result.message)
+						}
+						if result.converted.Source != result.message.Source || result.converted.Destination != result.message.Destination ||
+							result.converted.Type != result.message.Type || result.converted.Code != result.message.Code ||
+							!bytes.Equal(result.converted.Payload, result.message.Payload) {
+							t.Fatalf("converted ICMP message = %+v, want %+v", result.converted, result.message)
 						}
 						if detached {
 							if err = result.responder.ReplyEcho(); err != nil {

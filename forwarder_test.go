@@ -4338,6 +4338,115 @@ func TestICMPForwarderMessageIsEchoRequest(t *testing.T) {
 	}
 }
 
+func TestICMPForwarderMessageConversion(t *testing.T) {
+	tests := []struct {
+		name    string
+		message ICMPMessage
+	}{
+		{
+			name: "IPv4 mapped",
+			message: ICMPMessage{
+				Source: netip.MustParseAddr("::ffff:192.0.2.90"), Destination: netip.MustParseAddr("::ffff:198.51.100.90"),
+				Type: 8, Body: []byte{0x12, 0x34, 0, 1, 'p', 'i', 'n', 'g'},
+			},
+		},
+		{
+			name: "IPv6",
+			message: ICMPMessage{
+				Source: netip.MustParseAddr("2001:db8::90"), Destination: netip.MustParseAddr("2001:db8:1::90"),
+				Type: 128, Body: []byte{0x56, 0x78, 0, 2, 'p', 'i', 'n', 'g'},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			message := test.message
+			forwarded := ICMPForwarderMessage{Payload: make([]byte, 1, 64)}
+			backing := &forwarded.Payload[0]
+			if err := forwarded.SetICMPMessage(message); err != nil {
+				t.Fatalf("SetICMPMessage: %v", err)
+			}
+			if &forwarded.Payload[0] != backing {
+				t.Fatal("SetICMPMessage did not reuse sufficient Payload capacity")
+			}
+			if forwarded.Source != message.Source.Unmap() || forwarded.Destination != message.Destination.Unmap() ||
+				forwarded.Type != message.Type || forwarded.Code != message.Code {
+				t.Fatalf("forwarder metadata = %+v, want %+v", forwarded, message)
+			}
+
+			decoded, err := forwarded.ICMPMessage()
+			if err != nil {
+				t.Fatalf("ICMPMessage: %v", err)
+			}
+			if decoded.Source != message.Source.Unmap() || decoded.Destination != message.Destination.Unmap() ||
+				decoded.Type != message.Type || decoded.Code != message.Code || !bytes.Equal(decoded.Body, message.Body) {
+				t.Fatalf("decoded message = %+v, want %+v", decoded, message)
+			}
+			if &decoded.Body[0] != &forwarded.Payload[4] {
+				t.Fatal("decoded Body does not alias the forwarder Payload")
+			}
+
+			decoded.Body[len(decoded.Body)-1] ^= 0xff
+			wantBody := append([]byte(nil), decoded.Body...)
+			if _, err = forwarded.ICMPMessage(); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("modified wire checksum error = %v", err)
+			}
+			if err = forwarded.SetICMPMessage(decoded); err != nil {
+				t.Fatalf("in-place SetICMPMessage: %v", err)
+			}
+			if &forwarded.Payload[0] != backing {
+				t.Fatal("in-place SetICMPMessage replaced Payload backing")
+			}
+			if reparsed, parseErr := forwarded.ICMPMessage(); parseErr != nil || !bytes.Equal(reparsed.Body, wantBody) {
+				t.Fatalf("reparse after in-place update: message=%+v error=%v", reparsed, parseErr)
+			}
+		})
+	}
+}
+
+func TestICMPForwarderMessageConversionErrors(t *testing.T) {
+	valid := ICMPMessage{
+		Source: netip.MustParseAddr("192.0.2.90"), Destination: netip.MustParseAddr("198.51.100.90"),
+		Type: 8, Body: []byte{0, 1, 0, 2},
+	}
+	forwarded := ICMPForwarderMessage{Payload: make([]byte, 0, 16)}
+	if err := forwarded.SetICMPMessage(valid); err != nil {
+		t.Fatal(err)
+	}
+
+	invalid := valid
+	invalid.Destination = netip.MustParseAddr("2001:db8::1")
+	wantPayload := append([]byte(nil), forwarded.Payload...)
+	wantSource, wantDestination := forwarded.Source, forwarded.Destination
+	wantType, wantCode := forwarded.Type, forwarded.Code
+	if err := forwarded.SetICMPMessage(invalid); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("cross-family SetICMPMessage error = %v", err)
+	}
+	if forwarded.Source != wantSource || forwarded.Destination != wantDestination || forwarded.Type != wantType ||
+		forwarded.Code != wantCode || !bytes.Equal(forwarded.Payload, wantPayload) {
+		t.Fatal("failed SetICMPMessage modified its receiver")
+	}
+	if err := (*ICMPForwarderMessage)(nil).SetICMPMessage(valid); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("nil SetICMPMessage error = %v", err)
+	}
+
+	missing := ICMPForwarderMessage{Source: valid.Source, Destination: valid.Destination, Type: valid.Type}
+	if _, err := missing.ICMPMessage(); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("missing Payload ICMPMessage error = %v", err)
+	}
+	mismatch := forwarded
+	mismatch.Type++
+	if _, err := mismatch.ICMPMessage(); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("metadata mismatch ICMPMessage error = %v", err)
+	}
+	corrupt := forwarded
+	corrupt.Payload = append([]byte(nil), forwarded.Payload...)
+	corrupt.Payload[len(corrupt.Payload)-1] ^= 0xff
+	if _, err := corrupt.ICMPMessage(); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("checksum mismatch ICMPMessage error = %v", err)
+	}
+}
+
 func TestICMPReplyEchoLifecycleAndSnapshotValidation(t *testing.T) {
 	nonEcho := []byte{0, 0, 0, 0, 0, 1, 0, 2}
 	request := &ICMPForwarderRequest{packet: ipPacket{protocol: ProtocolICMPv4, payload: nonEcho}}

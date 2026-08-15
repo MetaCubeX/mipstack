@@ -475,6 +475,46 @@ type ICMPForwarderMessage struct {
 	Payload []byte
 }
 
+// ICMPMessage validates and decodes the current wire message. Body aliases
+// Payload[4:] and inherits Payload's ownership and lifetime. It reports
+// syscall.EINVAL when the message is incomplete, its checksum is invalid, or
+// Type and Code no longer agree with Payload.
+func (m ICMPForwarderMessage) ICMPMessage() (ICMPMessage, error) {
+	if len(m.Payload) < 2 || m.Type != m.Payload[0] || m.Code != m.Payload[1] {
+		return ICMPMessage{}, syscall.EINVAL
+	}
+	protocol := ProtocolICMPv4
+	if m.Source.Unmap().Is6() {
+		protocol = ProtocolICMPv6
+	}
+	return (IPPacket{
+		Source: m.Source, Destination: m.Destination,
+		Protocol: protocol, Payload: m.Payload,
+	}).ICMPMessage()
+}
+
+// SetICMPMessage replaces m with the complete wire encoding of message. It
+// validates message before changing m, normalizes IPv4-mapped addresses, and
+// reuses the current Payload capacity when possible. Message.Body may alias
+// Payload; a successful call does not retain any other input storage. On
+// failure m is unchanged.
+func (m *ICMPForwarderMessage) SetICMPMessage(message ICMPMessage) error {
+	if m == nil {
+		return syscall.EINVAL
+	}
+	normalized, totalSize, err := message.wireLayout()
+	if err != nil {
+		return err
+	}
+	payload := extendForAppend(m.Payload[:0], totalSize)
+	marshalPublicICMPMessage(payload, normalized)
+	*m = ICMPForwarderMessage{
+		Source: normalized.Source, Destination: normalized.Destination,
+		Type: normalized.Type, Code: normalized.Code, Payload: payload,
+	}
+	return nil
+}
+
 // IsEchoRequest reports whether the message is a complete IPv4 or IPv6 Echo
 // Request whose Type and Code fields agree with Payload. Source and Destination
 // must identify the same address family.

@@ -341,6 +341,11 @@ In both forms `Message().Payload` aliases the ICMP region. Detached `Source`,
 `Destination`, `Type`, and `Code` remain the original metadata; changing the
 corresponding payload bytes makes `IsEchoRequest` false but changing IP header
 bytes does not reclassify that metadata.
+`ICMPForwarderMessage.ICMPMessage` validates the current wire snapshot and
+returns a zero-copy semantic view whose `Body` aliases `Payload[4:]`.
+`SetICMPMessage` performs the reverse conversion, recalculates the checksum,
+and reuses existing `Payload` capacity when possible; validation failure leaves
+the forwarder message unchanged.
 
 `ReplyIPPacket` is a restricted header-included ICMP reply, not arbitrary raw
 packet injection. Its destination must be the triggering packet's source; its
