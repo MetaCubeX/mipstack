@@ -1489,6 +1489,84 @@ func TestFairPacketQueueUsesByteCredit(t *testing.T) {
 	}
 }
 
+func TestStackReadFairQueueBoundsLateUDPFlowService(t *testing.T) {
+	const (
+		mtu              = 1400
+		bulkFlows        = 4
+		packetsPerFlow   = 48
+		initialBurstMTUs = 10
+	)
+	source := netip.MustParseAddr("192.0.2.7")
+	target := netip.MustParseAddr("198.51.100.7")
+	bulkPayload := make([]byte, mtu-20)
+	bulkPacket := buildIPPacket(source, target, ProtocolTCP, bulkPayload, 0, true)
+	latencyPacket := testOutputUDPPacket(source, target, 16000, 53, 64)
+
+	for _, test := range []struct {
+		name             string
+		fair             bool
+		wantInFirstBatch bool
+	}{{name: "fifo"}, {name: "drr", fair: true, wantInFirstBatch: true}} {
+		t.Run(test.name, func(t *testing.T) {
+			stack, err := New(Config{
+				LocalAddresses: []netip.Prefix{netip.PrefixFrom(source, 32)},
+				MTU:            mtu,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !test.fair {
+				stack.outbound.initFIFO(outboundPacketQueue, stack.timestampEpoch)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stack.Close() })
+
+			// Four bulk flows consume at most 40 packets of initial DRR credit
+			// before the late flow is served. FIFO leaves it behind all 192.
+			for flow := 0; flow < bulkFlows; flow++ {
+				for packet := 0; packet < packetsPerFlow; packet++ {
+					slot, ok := stack.outbound.tryReserve()
+					if !ok {
+						t.Fatal("output queue has no free slot")
+					}
+					if _, published := stack.outbound.enqueueReservedTCP(slot, bulkPacket, false, uint64(flow+1), false); !published {
+						t.Fatal("failed to publish TCP test packet")
+					}
+				}
+			}
+			enqueueTestOutputPacket(t, &stack.outbound, latencyPacket)
+
+			buffers := make([][]byte, deviceBatchSize)
+			for index := range buffers {
+				buffers[index] = make([]byte, mtu)
+			}
+			sizes := make([]int, len(buffers))
+			count, err := stack.Read(buffers, sizes, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count != deviceBatchSize {
+				t.Fatalf("first Read batch contains %d packets, want %d", count, deviceBatchSize)
+			}
+			latencyRank := -1
+			for index := 0; index < count; index++ {
+				if bytes.Equal(buffers[index][:sizes[index]], latencyPacket) {
+					latencyRank = index
+					break
+				}
+			}
+			if got := latencyRank >= 0; got != test.wantInFirstBatch {
+				t.Fatalf("late UDP flow present in first Read batch = %t at rank %d, want %t", got, latencyRank, test.wantInFirstBatch)
+			}
+			if test.fair && latencyRank > bulkFlows*initialBurstMTUs {
+				t.Fatalf("late UDP flow service rank = %d, want <= %d", latencyRank, bulkFlows*initialBurstMTUs)
+			}
+		})
+	}
+}
+
 func TestOutputPacketFlowHashSeparatesTransportTuples(t *testing.T) {
 	secret := [16]byte{3}
 	for _, addresses := range [][2]netip.Addr{

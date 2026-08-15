@@ -672,11 +672,26 @@ func TestUDPForwarderReplyInterop(t *testing.T) {
 						}
 					}
 					buffer := make([]byte, 65535)
-					for index, response := range result.responses {
+					// UDP preserves datagram boundaries, not delivery order. Large replies
+					// have independent fragment identities and may finish reassembly in
+					// either order even though both writes completed successfully.
+					seen := make([]bool, len(result.responses))
+					for received := range result.responses {
 						read, readErr := client.Read(buffer)
-						if readErr != nil || !bytes.Equal(buffer[:read], response) {
-							t.Fatalf("read gVisor UDP reply %d: n=%d, error=%v", index, read, readErr)
+						if readErr != nil {
+							t.Fatalf("read gVisor UDP reply %d: n=%d, error=%v", received, read, readErr)
 						}
+						matched := -1
+						for index, response := range result.responses {
+							if !seen[index] && bytes.Equal(buffer[:read], response) {
+								matched = index
+								break
+							}
+						}
+						if matched < 0 {
+							t.Fatalf("read unexpected or duplicate gVisor UDP reply %d: n=%d", received, read)
+						}
+						seen[matched] = true
 					}
 					if info := forwarder.Info(); info.Requests != 1 || info.Replies != uint64(len(result.responses)) || info.Pending != 0 {
 						t.Fatalf("UDP reply forwarder info = %+v", info)
