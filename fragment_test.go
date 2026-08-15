@@ -264,6 +264,12 @@ func TestIPv6FirstFragmentHeaderCompleteness(t *testing.T) {
 	tcp[12] = 5 << 4
 	invalidTCPSize := append([]byte(nil), tcp...)
 	invalidTCPSize[12] = 4 << 4
+	dccpOptions := make([]byte, 20)
+	dccpOptions[4] = 5
+	dccpLongSequence := make([]byte, 16)
+	dccpLongSequence[4], dccpLongSequence[8] = 4, 1
+	innerIPv4 := make([]byte, 24)
+	innerIPv4[0] = 0x46
 	for _, test := range []struct {
 		name    string
 		next    byte
@@ -285,12 +291,24 @@ func TestIPv6FirstFragmentHeaderCompleteness(t *testing.T) {
 		{name: "TCP invalid data offset is complete", next: ProtocolTCP, payload: invalidTCPSize, want: true},
 		{name: "UDP", next: ProtocolUDP, payload: udp, want: true},
 		{name: "UDP short", next: ProtocolUDP, payload: udp[:udpHeaderSize-1]},
+		{name: "IGMP", next: ProtocolIGMP, payload: make([]byte, 8), want: true},
+		{name: "IGMP short", next: ProtocolIGMP, payload: make([]byte, 7)},
 		{name: "ESP", next: 50, payload: make([]byte, 8), want: true},
 		{name: "ESP short", next: 50, payload: make([]byte, 7)},
 		{name: "DCCP", next: 33, payload: make([]byte, 12), want: true},
 		{name: "DCCP short", next: 33, payload: make([]byte, 11)},
+		{name: "DCCP options", next: 33, payload: dccpOptions, want: true},
+		{name: "DCCP truncated options", next: 33, payload: dccpOptions[:19]},
+		{name: "DCCP long sequence", next: 33, payload: dccpLongSequence, want: true},
+		{name: "DCCP truncated long sequence", next: 33, payload: dccpLongSequence[:15]},
 		{name: "SCTP", next: 132, payload: make([]byte, 12), want: true},
 		{name: "SCTP short", next: 132, payload: make([]byte, 11)},
+		{name: "UDP-Lite", next: 136, payload: make([]byte, 8), want: true},
+		{name: "UDP-Lite short", next: 136, payload: make([]byte, 7)},
+		{name: "nested IPv4", next: 4, payload: innerIPv4, want: true},
+		{name: "nested IPv4 options short", next: 4, payload: innerIPv4[:23]},
+		{name: "nested IPv6", next: 41, payload: make([]byte, 40), want: true},
+		{name: "nested IPv6 short", next: 41, payload: make([]byte, 39)},
 		{name: "no next header", next: 59, want: true},
 		{name: "unknown raw protocol", next: 99, want: true},
 	} {

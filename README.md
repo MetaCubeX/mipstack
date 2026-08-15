@@ -90,10 +90,12 @@ package are left to embedding adapters so MIPS remains standard-library-only.
 ## Packet codec
 
 `ParseIPPacket` exposes a validated, zero-copy `IPPacket` view of one complete
-IPv4 or IPv6 packet. Its `TCPSegment`, `UDPDatagram`, and `ICMPMessage` methods
+wire IPv4 or IPv6 packet, including a single fragment. It does not perform
+stateful reassembly. Its `TCPSegment`, `UDPDatagram`, and `ICMPMessage` methods
 validate the final upper-layer protocol and checksum and return the matching
-semantic value. Parsed option and payload slices borrow the input packet;
-callers must copy or replace a slice before changing input they do not own.
+semantic value only for an unfragmented or reassembled packet. Parsed option
+and payload slices borrow the input packet; callers must copy or replace a
+slice before changing input they do not own.
 
 The same four values construct wire data through `MarshalBinary` and
 `AppendBinary`. They implement `encoding.BinaryMarshaler` on every supported Go
@@ -177,6 +179,41 @@ Mobility headers remain opaque: their reserved fields are integrity-protected,
 so callers constructing either header must provide canonical fields together
 with a matching ICV or checksum.
 
+`IPPacket.Fragment` returns a borrowed `IPPacketFragmentView` with byte-based
+offset, common 32-bit identification, More Fragments state, the fragment's Next
+Header value, and its raw fragmentable payload. IPv4 exposes the header fields
+directly on `IPPacket`; `IPv6ExtensionHeader.Fragment` and `SetFragment` provide
+typed access to the eight-byte IPv6 header while preserving the structural
+API's rule that `Data` excludes Next Header. An IPv6 atomic Fragment remains
+visible through this view and `IsAtomic`, but may still be traversed by
+`UpperLayer`. For a non-atomic IPv6 fragment, `IPv6ExtensionHeaders` returns the
+Fragment header as its final descriptor, its Next Header value as `protocol`,
+and the remaining fragment bytes without interpreting them as another complete
+extension header. A packet contains at most one structurally visible Fragment
+header. Standalone validation bounds the fragmentable-data end independently
+of the current fragment's header length; only stateful reassembly can apply the
+header retained from the offset-zero fragment, because RFC 8200 permits those
+headers to differ between fragments.
+
+`IPPacket.MarshalFragments` performs stateless source fragmentation against an
+explicit L3 MTU and returns an all-or-nothing set of owned wire packets. A
+fitting input is identical to `MarshalBinary`. IPv4 uses the packet's existing
+Identification, honors DF, preserves copied options using Linux-compatible NOP
+replacement, and supports RFC 791 refragmentation by accumulating the original
+offset and MF state. IPv6 inserts the Fragment header after the RFC 8200
+Per-Fragment headers, uses the caller-supplied identification, and replaces an
+existing atomic header rather than nesting one. For a newly fragmented
+datagram, the caller must provide an IPv4 Identification suitable for the
+source/destination/protocol tuple or an IPv6 identification suitable for the
+source and final destination, including the applicable non-reuse requirement.
+It refuses to refragment a non-atomic IPv6 fragment. The first IPv6 fragment
+contains every traversable extension header and the complete known upper-layer
+header as required by RFC 7112; an MTU too small for that chain returns
+`syscall.EMSGSIZE`. Known-size upper-layer headers comprise TCP, UDP, ICMP,
+IGMP, ESP, DCCP, SCTP, UDP-Lite, and nested IPv4 or IPv6. An unknown raw
+protocol remains fragmentable because its header boundary cannot be inferred
+from its protocol number alone.
+
 `IPPacket.UpperLayer` structurally walks IPv6 Hop-by-Hop, Destination Options,
 Routing, atomic Fragment, Authentication, and Mobility headers. ESP and
 unknown values terminate traversal, while No Next Header returns no upper-layer
@@ -185,7 +222,9 @@ extension API. Structural AH or Mobility traversal does not authenticate or
 otherwise implement those protocols; AH framing still requires its complete
 fixed fields and IPv6's eight-octet alignment. Stateful fragment reassembly
 belongs to `Stack`, not the standalone codec, while IPv6 jumbograms are not
-supported. Non-atomic fragments and every Jumbo Payload option are therefore
+supported. Non-atomic fragments remain structurally parseable and round-trip
+encodable, but `UpperLayer` and the TCP, UDP, and ICMP decoders reject them
+until a reassembler supplies a complete packet. Every Jumbo Payload option is
 rejected. A decoder that must validate an address-dependent pseudo-header
 (TCP, checksummed UDP, or ICMPv6) rejects an active IPv4 source route, active
 IPv6 Routing Header, or Mobile IPv6 Home Address option because it lacks the
@@ -422,7 +461,7 @@ the outer IPv4 and ICMP checksum, and preserves other supported header fields.
 A fitting IPv6 atomic Fragment header is retained with reserved fields cleared.
 If the packet must be fragmented, an existing atomic header is replaced rather
 than nested, and the Fragment header is inserted after the RFC 8200
-unfragmentable chain.
+Per-Fragment header chain.
 IPv4 DF reports `syscall.EMSGSIZE`; otherwise source fragmentation preserves
 copied IPv4 options. ICMPv6 errors larger than the 1280-byte minimum IPv6 MTU
 are rejected as required by RFC 4443, while informational messages may be

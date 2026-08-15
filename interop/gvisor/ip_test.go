@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"syscall"
 	"testing"
 	"time"
 
@@ -108,6 +109,328 @@ func TestPublicIPPacketCodecInterop(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPublicIPFragmentCodecInterop verifies public stateless fragmentation
+// against gVisor's native source fragmentation and reassembly in both address
+// families across the complete interop MTU matrix.
+func TestPublicIPFragmentCodecInterop(t *testing.T) {
+	const (
+		mipstackPort = 44101
+		gvisorPort   = 44102
+	)
+	for _, family := range interopFamilies {
+		family := family
+		for _, mtu := range interopMTUsForFamily(family) {
+			mtu := mtu
+			t.Run(family.name+"/"+interopMTUName(mtu), func(t *testing.T) {
+				captured := make(chan []byte, 1024)
+				network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: mtu,
+					gvisorToMipstack: func(packet []byte) bool {
+						captured <- append([]byte(nil), packet...)
+						return false
+					},
+				})
+				peer := newGVisorUDPSocket(t, network, family.networkProtocol, gvisorFullAddress(family.gvisorAddress, gvisorPort), func(tcpip.Endpoint) {})
+				defer peer.Close()
+				if err := peer.SetDeadline(time.Now().Add(8 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+
+				request := patternedPayload(fragmentedInteropPayloadSize(mtu, 4096), 0xa7)
+				udpWire, err := (mipstack.UDPDatagram{
+					Source:      netipAddrPort(family.mipstackAddress, mipstackPort),
+					Destination: netipAddrPort(family.gvisorAddress, gvisorPort), Payload: request,
+				}).MarshalBinary()
+				if err != nil {
+					t.Fatal(err)
+				}
+				packet := mipstack.IPPacket{
+					Source: family.mipstackAddress, Destination: family.gvisorAddress,
+					Protocol: mipstack.ProtocolUDP, HopLimit: 41, TrafficClass: 0x2e, Payload: udpWire,
+				}
+				if family.mipstackAddress.Is4() {
+					packet.Identification = 0x5317
+					if err = packet.SetIPv4HeaderOptions([]mipstack.IPv4HeaderOption{
+						{Type: mipstack.IPv4HeaderOptionNOP},
+						{Type: mipstack.IPv4HeaderOptionRouterAlert, Data: []byte{0, 0}},
+					}); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					hop := mipstack.IPv6ExtensionHeader{Type: mipstack.IPv6ExtensionHeaderHopByHop}
+					atomic := mipstack.IPv6ExtensionHeader{}
+					destination := mipstack.IPv6ExtensionHeader{Type: mipstack.IPv6ExtensionHeaderDestination}
+					if err = hop.SetOptions(nil); err != nil {
+						t.Fatal(err)
+					}
+					if err = atomic.SetFragment(0, false, 0x10203040); err != nil {
+						t.Fatal(err)
+					}
+					if err = destination.SetOptions(nil); err != nil {
+						t.Fatal(err)
+					}
+					if err = packet.SetIPv6ExtensionHeaders([]mipstack.IPv6ExtensionHeader{hop, atomic, destination}, mipstack.ProtocolUDP, udpWire); err != nil {
+						t.Fatal(err)
+					}
+				}
+				fragments, err := packet.MarshalFragments(int(mtu), 0x89abcdef)
+				if err != nil || len(fragments) < 2 {
+					t.Fatalf("mipstack MarshalFragments = %d packets, %v", len(fragments), err)
+				}
+				for index, wire := range fragments {
+					if len(wire) > int(mtu) {
+						t.Fatalf("mipstack fragment %d length = %d, MTU %d", index, len(wire), mtu)
+					}
+					parsed, parseErr := mipstack.ParseIPPacket(wire)
+					if parseErr != nil {
+						t.Fatalf("parse mipstack fragment %d: %v", index, parseErr)
+					}
+					view, fragmented := parsed.Fragment()
+					if !fragmented || view.Protocol != mipstack.ProtocolUDP && family.mipstackAddress.Is4() {
+						t.Fatalf("mipstack fragment %d view = %+v, valid %t", index, view, fragmented)
+					}
+					if family.mipstackAddress.Is4() {
+						options, optionsErr := parsed.IPv4HeaderOptions()
+						if optionsErr != nil || !containsIPv4RouterAlert(options) {
+							t.Fatalf("mipstack fragment %d copied options = %+v, %v", index, options, optionsErr)
+						}
+					} else if view.Protocol != mipstack.IPv6ExtensionHeaderDestination {
+						t.Fatalf("mipstack IPv6 fragment %d Next Header = %d, want Destination Options", index, view.Protocol)
+					}
+					if err = network.deliverToGVisor(wire); err != nil {
+						t.Fatalf("deliver mipstack fragment %d: %v", index, err)
+					}
+				}
+				storage := make([]byte, len(request)+64)
+				read, source, err := peer.ReadFrom(storage)
+				if err != nil || !bytes.Equal(storage[:read], request) || source.String() != netipAddrPort(family.mipstackAddress, mipstackPort).String() {
+					t.Fatalf("gVisor reassembly = n=%d source=%v error=%v", read, source, err)
+				}
+
+				response := patternedPayload(fragmentedInteropPayloadSize(mtu, 4096)+17, 0xb7)
+				written, err := peer.WriteTo(response, net.UDPAddrFromAddrPort(netipAddrPort(family.mipstackAddress, mipstackPort)))
+				if err != nil || written != len(response) {
+					t.Fatalf("gVisor fragmented write = %d, %v", written, err)
+				}
+				reassembled := readGVisorPublicFragments(t, captured, family, 8*time.Second)
+				datagram, err := reassembled.UDPDatagram()
+				if err != nil || datagram.Source != netipAddrPort(family.gvisorAddress, gvisorPort) ||
+					datagram.Destination != netipAddrPort(family.mipstackAddress, mipstackPort) || !bytes.Equal(datagram.Payload, response) {
+					t.Fatalf("mipstack decoded gVisor fragments = %+v, %v", datagram, err)
+				}
+			})
+		}
+	}
+}
+
+// TestPublicIPv4RefragmentInterop verifies RFC 791 refragmentation, including
+// accumulated offsets, inherited MF, and copied options, through gVisor's
+// native UDP reassembler.
+func TestPublicIPv4RefragmentInterop(t *testing.T) {
+	const (
+		mtu           = 576
+		mipstackPort  = 44201
+		gvisorPort    = 44202
+		originalSplit = 1600
+	)
+	family := interopFamilies[0]
+	network := newFamilyInteropNetwork(t, family, mtu)
+	peer := newGVisorUDPSocket(t, network, family.networkProtocol, gvisorFullAddress(family.gvisorAddress, gvisorPort), func(tcpip.Endpoint) {})
+	defer peer.Close()
+	if err := peer.SetReadDeadline(time.Now().Add(8 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	payload := patternedPayload(3203, 0xc7)
+	udpWire, err := (mipstack.UDPDatagram{
+		Source:      netipAddrPort(family.mipstackAddress, mipstackPort),
+		Destination: netipAddrPort(family.gvisorAddress, gvisorPort), Payload: payload,
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := mipstack.IPPacket{
+		Source: family.mipstackAddress, Destination: family.gvisorAddress,
+		Protocol: mipstack.ProtocolUDP, HopLimit: 37, Identification: 0x7421,
+		MoreFragments: true, Payload: udpWire[:originalSplit],
+	}
+	if err = first.SetIPv4HeaderOptions([]mipstack.IPv4HeaderOption{
+		{Type: mipstack.IPv4HeaderOptionRouterAlert, Data: []byte{0, 0}},
+		{Type: mipstack.IPv4HeaderOptionTimestamp, Data: []byte{5, 0}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.MoreFragments = false
+	second.FragmentOffset = originalSplit
+	second.Payload = udpWire[originalSplit:]
+	if err = second.SetIPv4HeaderOptions([]mipstack.IPv4HeaderOption{
+		{Type: mipstack.IPv4HeaderOptionRouterAlert, Data: []byte{0, 0}},
+		{Type: mipstack.IPv4HeaderOptionNOP}, {Type: mipstack.IPv4HeaderOptionNOP},
+		{Type: mipstack.IPv4HeaderOptionNOP}, {Type: mipstack.IPv4HeaderOptionNOP},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var fragments [][]byte
+	for _, original := range []mipstack.IPPacket{first, second} {
+		part, fragmentErr := original.MarshalFragments(mtu, 0)
+		if fragmentErr != nil || len(part) < 2 {
+			t.Fatalf("refragment offset %d = %d packets, %v", original.FragmentOffset, len(part), fragmentErr)
+		}
+		fragments = append(fragments, part...)
+	}
+	for index, wire := range fragments {
+		parsed, parseErr := mipstack.ParseIPPacket(wire)
+		if parseErr != nil {
+			t.Fatalf("parse refragment %d: %v", index, parseErr)
+		}
+		view, fragmented := parsed.Fragment()
+		options, optionsErr := parsed.IPv4HeaderOptions()
+		if !fragmented || optionsErr != nil || !containsIPv4RouterAlert(options) {
+			t.Fatalf("refragment %d = %+v, options %+v, errors %t/%v", index, view, options, fragmented, optionsErr)
+		}
+		if view.Offset == 0 {
+			if !containsIPv4Timestamp(options) {
+				t.Fatal("offset-zero refragment lost its non-copied Timestamp option")
+			}
+		} else if containsIPv4Timestamp(options) {
+			t.Fatalf("refragment at offset %d retained non-copied Timestamp", view.Offset)
+		}
+		if err = network.deliverToGVisor(wire); err != nil {
+			t.Fatalf("deliver refragment %d: %v", index, err)
+		}
+	}
+	storage := make([]byte, len(payload)+64)
+	read, source, err := peer.ReadFrom(storage)
+	if err != nil || !bytes.Equal(storage[:read], payload) || source.String() != netipAddrPort(family.mipstackAddress, mipstackPort).String() {
+		t.Fatalf("gVisor refragment reassembly = n=%d source=%v error=%v", read, source, err)
+	}
+}
+
+// TestPublicIPv6FragmentHeaderChainBoundaryInterop verifies the RFC 7112
+// boundary where the complete extension and UDP header chain exactly fills
+// the first fragment, while a chain eight bytes larger is unsendable.
+func TestPublicIPv6FragmentHeaderChainBoundaryInterop(t *testing.T) {
+	const (
+		mtu           = 1280
+		mipstackPort  = 44301
+		gvisorPort    = 44302
+		headerDataLen = 1223 // Next Header plus Data forms a 1224-byte header.
+	)
+	family := interopFamilies[1]
+	network := newFamilyInteropNetwork(t, family, mtu)
+	peer := newGVisorUDPSocket(t, network, family.networkProtocol, gvisorFullAddress(family.gvisorAddress, gvisorPort), func(tcpip.Endpoint) {})
+	defer peer.Close()
+	if err := peer.SetReadDeadline(time.Now().Add(8 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	payload := patternedPayload(2003, 0xd7)
+	udpWire, err := (mipstack.UDPDatagram{
+		Source:      netipAddrPort(family.mipstackAddress, mipstackPort),
+		Destination: netipAddrPort(family.gvisorAddress, gvisorPort), Payload: payload,
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := mipstack.IPv6ExtensionHeader{Type: mipstack.IPv6ExtensionHeaderDestination, Data: make([]byte, headerDataLen)}
+	destination.Data[0] = byte((headerDataLen+1)/8 - 1)
+	packet := mipstack.IPPacket{Source: family.mipstackAddress, Destination: family.gvisorAddress, HopLimit: 43}
+	if err = packet.SetIPv6ExtensionHeaders([]mipstack.IPv6ExtensionHeader{destination}, mipstack.ProtocolUDP, udpWire); err != nil {
+		t.Fatal(err)
+	}
+	fragments, err := packet.MarshalFragments(mtu, 0x31415926)
+	if err != nil || len(fragments) < 2 || len(fragments[0]) != mtu {
+		t.Fatalf("exact RFC 7112 boundary = %d packets, first %d bytes, %v", len(fragments), len(fragments[0]), err)
+	}
+	for index, wire := range fragments {
+		if err = network.deliverToGVisor(wire); err != nil {
+			t.Fatalf("deliver boundary fragment %d: %v", index, err)
+		}
+	}
+	storage := make([]byte, len(payload)+64)
+	read, source, err := peer.ReadFrom(storage)
+	if err != nil || !bytes.Equal(storage[:read], payload) || source.String() != netipAddrPort(family.mipstackAddress, mipstackPort).String() {
+		t.Fatalf("gVisor boundary reassembly = n=%d source=%v error=%v", read, source, err)
+	}
+
+	tooLarge := mipstack.IPv6ExtensionHeader{Type: mipstack.IPv6ExtensionHeaderDestination, Data: make([]byte, headerDataLen+8)}
+	tooLarge.Data[0] = byte((len(tooLarge.Data)+1)/8 - 1)
+	if err = packet.SetIPv6ExtensionHeaders([]mipstack.IPv6ExtensionHeader{tooLarge}, mipstack.ProtocolUDP, udpWire); err != nil {
+		t.Fatal(err)
+	}
+	if fragments, err = packet.MarshalFragments(mtu, 1); !errors.Is(err, syscall.EMSGSIZE) || fragments != nil {
+		t.Fatalf("oversized RFC 7112 chain = %d packets, %v", len(fragments), err)
+	}
+}
+
+// readGVisorPublicFragments reconstructs one gVisor-generated UDP packet using
+// only the public mipstack fragment view.
+func readGVisorPublicFragments(t *testing.T, captured <-chan []byte, family interopFamily, timeout time.Duration) mipstack.IPPacket {
+	t.Helper()
+	storage := make([]byte, 65535)
+	covered := make([]bool, len(storage))
+	coveredSize, totalSize := 0, -1
+	var template mipstack.IPPacket
+	var protocol int
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for totalSize < 0 || coveredSize != totalSize {
+		select {
+		case wire := <-captured:
+			packet, err := mipstack.ParseIPPacket(wire)
+			if err != nil || packet.Source != family.gvisorAddress || packet.Destination != family.mipstackAddress {
+				continue
+			}
+			view, fragmented := packet.Fragment()
+			if !fragmented || view.Offset < 0 || view.Offset+len(view.Payload) > len(storage) {
+				t.Fatalf("gVisor emitted invalid fragment: packet=%+v view=%+v valid=%t error=%v", packet, view, fragmented, err)
+			}
+			if coveredSize == 0 {
+				template, protocol = packet, view.Protocol
+			} else if view.Protocol != protocol {
+				t.Fatalf("gVisor fragment protocol changed from %d to %d", protocol, view.Protocol)
+			}
+			for offset := view.Offset; offset < view.Offset+len(view.Payload); offset++ {
+				if covered[offset] {
+					t.Fatalf("gVisor emitted overlapping fragment byte %d", offset)
+				}
+				covered[offset] = true
+				coveredSize++
+			}
+			copy(storage[view.Offset:], view.Payload)
+			if !view.MoreFragments {
+				totalSize = view.Offset + len(view.Payload)
+			}
+		case <-timer.C:
+			t.Fatalf("timed out after %d/%d gVisor fragment bytes", coveredSize, totalSize)
+		}
+	}
+	return mipstack.IPPacket{
+		Source: template.Source, Destination: template.Destination,
+		Protocol: protocol, HopLimit: template.HopLimit, TrafficClass: template.TrafficClass,
+		Payload: append([]byte(nil), storage[:totalSize]...),
+	}
+}
+
+// containsIPv4RouterAlert reports whether options carries Router Alert zero.
+func containsIPv4RouterAlert(options []mipstack.IPv4HeaderOption) bool {
+	for _, option := range options {
+		if value, ok := option.RouterAlert(); ok && value == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// containsIPv4Timestamp reports whether options carries a Timestamp option.
+func containsIPv4Timestamp(options []mipstack.IPv4HeaderOption) bool {
+	for _, option := range options {
+		if option.Type == mipstack.IPv4HeaderOptionTimestamp {
+			return true
+		}
+	}
+	return false
 }
 
 // TestPublicIPHeaderOptionsInterop verifies that gVisor accepts IPv4 options

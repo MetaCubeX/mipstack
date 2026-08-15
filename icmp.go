@@ -482,7 +482,7 @@ type icmpForwarderIPPacket struct {
 	packet       []byte
 	parsed       ipPacket
 	ipv4DF       bool
-	ipv6Fragment ipv6ForwarderFragmentPoint
+	ipv6Fragment ipv6FragmentPoint
 }
 
 // validateICMPForwarderReplyPayload applies the ICMP message and address-family

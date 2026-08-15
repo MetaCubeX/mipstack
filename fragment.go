@@ -8,9 +8,9 @@ import (
 	"time"
 )
 
-// ipv6ForwarderFragmentPoint identifies where a source Fragment header must be
-// inserted and which preceding Next Header byte names the fragmentable part.
-type ipv6ForwarderFragmentPoint struct {
+// ipv6FragmentPoint identifies where a source Fragment header must be inserted
+// and which preceding Next Header byte names the fragmentable part.
+type ipv6FragmentPoint struct {
 	previous       int
 	insertion      int
 	next           byte
@@ -19,69 +19,84 @@ type ipv6ForwarderFragmentPoint struct {
 }
 
 // inspectIPv6ForwarderFragmentPoint validates the extension chain relevant to
-// source fragmentation. RFC 8200 places Hop-by-Hop and Routing headers before
-// the Fragment header; a Destination Options header before Routing remains
-// unfragmentable, while a final Destination Options header is fragmentable.
+// source fragmentation. RFC 8200 places Hop-by-Hop and Routing headers in the
+// Per-Fragment headers; a Destination Options header before Routing remains in
+// that part, while a final Destination Options header is fragmentable.
 // Existing non-atomic fragments and multiple Fragment headers are rejected.
 // One atomic Fragment header is recorded independently from the canonical
 // insertion point so refragmentation can remove it even when the caller used
 // a non-recommended but receiver-valid extension-header order.
-func inspectIPv6ForwarderFragmentPoint(packet []byte) (ipv6ForwarderFragmentPoint, bool) {
+func inspectIPv6ForwarderFragmentPoint(packet []byte) (ipv6FragmentPoint, bool) {
+	return inspectIPv6FragmentPoint(packet, true)
+}
+
+// inspectIPv6FragmentPoint locates the RFC 8200 boundary between the
+// Per-Fragment headers and fragmentable data. Forwarder replies additionally
+// reject active Routing headers because their base addresses are not sufficient
+// to construct a safe response; the standalone packet codec has no such policy.
+func inspectIPv6FragmentPoint(packet []byte, rejectActiveRouting bool) (ipv6FragmentPoint, bool) {
 	if len(packet) < 40 {
-		return ipv6ForwarderFragmentPoint{}, false
+		return ipv6FragmentPoint{}, false
 	}
 	end := len(packet)
 	next, previous, offset := packet[6], 6, 40
-	point := ipv6ForwarderFragmentPoint{
+	point := ipv6FragmentPoint{
 		previous: 6, insertion: 40, next: next,
 		atomicOffset: -1, atomicPrevious: -1,
 	}
-	seenHop := false
+	seenHop, fragmentableStarted := false, false
 	for offset <= end {
 		switch next {
 		case IPv6ExtensionHeaderHopByHop:
 			if offset != 40 || seenHop || end-offset < 8 {
-				return ipv6ForwarderFragmentPoint{}, false
+				return ipv6FragmentPoint{}, false
 			}
 			length := (int(packet[offset+1]) + 1) * 8
 			if length > end-offset {
-				return ipv6ForwarderFragmentPoint{}, false
+				return ipv6FragmentPoint{}, false
 			}
 			seenHop = true
 			next, previous, offset = packet[offset], offset, offset+length
 			point.previous, point.insertion, point.next = previous, offset, next
 		case IPv6ExtensionHeaderRouting:
-			if end-offset < 8 {
-				return ipv6ForwarderFragmentPoint{}, false
+			if fragmentableStarted || end-offset < 8 {
+				return ipv6FragmentPoint{}, false
 			}
 			length := (int(packet[offset+1]) + 1) * 8
-			if length > end-offset || packet[offset+3] != 0 {
-				return ipv6ForwarderFragmentPoint{}, false
+			if length > end-offset || rejectActiveRouting && packet[offset+3] != 0 {
+				return ipv6FragmentPoint{}, false
 			}
 			next, previous, offset = packet[offset], offset, offset+length
 			point.previous, point.insertion, point.next = previous, offset, next
 		case IPv6ExtensionHeaderDestination:
 			if end-offset < 8 {
-				return ipv6ForwarderFragmentPoint{}, false
+				return ipv6FragmentPoint{}, false
 			}
 			length := (int(packet[offset+1]) + 1) * 8
 			if length > end-offset {
-				return ipv6ForwarderFragmentPoint{}, false
+				return ipv6FragmentPoint{}, false
 			}
 			next, previous, offset = packet[offset], offset, offset+length
 			// A pre-routing Destination Options header belongs to the
-			// unfragmentable part only if a Routing header actually follows.
+			// Per-Fragment headers only if a Routing header actually follows.
 			// Never move point here: a later Routing header moves it past both
 			// headers, while an upper-layer header leaves this header in the
 			// fragmentable part. Continuing the scan also finds a Fragment header
 			// that appears after final-destination options.
+		case IPv6ExtensionHeaderAuthentication, IPv6ExtensionHeaderMobility:
+			length, valid := ipv6ExtensionHeaderLength(next, packet[offset:])
+			if !valid {
+				return ipv6FragmentPoint{}, false
+			}
+			fragmentableStarted = true
+			next, previous, offset = packet[offset], offset, offset+length
 		case IPv6ExtensionHeaderFragment:
 			if end-offset < 8 || point.atomicOffset >= 0 {
-				return ipv6ForwarderFragmentPoint{}, false
+				return ipv6FragmentPoint{}, false
 			}
 			field := binary.BigEndian.Uint16(packet[offset+2 : offset+4])
 			if field&0xfff9 != 0 {
-				return ipv6ForwarderFragmentPoint{}, false
+				return ipv6FragmentPoint{}, false
 			}
 			point.atomicOffset, point.atomicPrevious = offset, previous
 			next, previous, offset = packet[offset], offset, offset+8
@@ -89,7 +104,7 @@ func inspectIPv6ForwarderFragmentPoint(packet []byte) (ipv6ForwarderFragmentPoin
 			return point, true
 		}
 	}
-	return ipv6ForwarderFragmentPoint{}, false
+	return ipv6FragmentPoint{}, false
 }
 
 const (
@@ -502,7 +517,7 @@ func (s *Stack) finishFragmentReassembly(key fragmentKey, set *fragmentSet) ([]b
 }
 
 // buildReassembledPacket removes fragmentation state while preserving the
-// complete offset-zero IPv4 header or IPv6 unfragmentable header chain.
+// complete offset-zero IPv4 header or IPv6 Per-Fragment header chain.
 func buildReassembledPacket(set *fragmentSet, dontFragment bool) []byte {
 	if !set.v6 {
 		if len(set.header) < 20 || len(set.header)+set.total > 65535 {
@@ -696,22 +711,59 @@ func ipv6FirstFragmentHeaderComplete(next byte, payload []byte) bool {
 			next, offset = payload[offset], offset+length
 		case IPv6ExtensionHeaderFragment:
 			return false
-		case ProtocolTCP:
-			if len(payload)-offset < tcpHeaderSize {
-				return false
-			}
-			headerSize := int(payload[offset+12]>>4) * 4
-			return headerSize < tcpHeaderSize || headerSize <= len(payload)-offset
-		case ProtocolUDP, ProtocolICMPv4, ProtocolICMPv6, ProtocolESP:
-			return len(payload)-offset >= 8
-		case 33, 132:
-			return len(payload)-offset >= 12
-		case ProtocolNoNextHeader:
-			return true
 		default:
-			return true
+			_, complete := ipv6FirstFragmentUpperLayerLength(next, payload[offset:])
+			return complete
 		}
 	}
+}
+
+// ipv6FirstFragmentUpperLayerLength returns the complete known upper-layer
+// header size required by RFC 7112. Unknown protocols remain admissible because
+// their header boundary cannot be inferred from a protocol number alone.
+func ipv6FirstFragmentUpperLayerLength(protocol byte, payload []byte) (int, bool) {
+	required := 0
+	switch protocol {
+	case ProtocolNoNextHeader:
+		return 0, true
+	case ProtocolTCP:
+		if len(payload) < tcpHeaderSize {
+			return 0, false
+		}
+		required = int(payload[12]>>4) * 4
+		if required < tcpHeaderSize {
+			required = tcpHeaderSize
+		}
+	case ProtocolIGMP, ProtocolUDP, ProtocolICMPv4, ProtocolICMPv6, ProtocolESP, 136: // UDP-Lite.
+		required = 8
+	case 4: // IPv4 encapsulation terminates the IPv6 header chain.
+		if len(payload) < 20 {
+			return 0, false
+		}
+		required = int(payload[0]&0x0f) * 4
+		if required < 20 {
+			required = 20
+		}
+	case 33: // DCCP Data Offset covers its type-specific header and options.
+		if len(payload) < 12 {
+			return 0, false
+		}
+		required = int(payload[4]) * 4
+		minimum := 12
+		if payload[8]&1 != 0 {
+			minimum = 16
+		}
+		if required < minimum {
+			required = minimum
+		}
+	case 41: // A nested IPv6 base header is an upper-layer header for RFC 7112.
+		required = 40
+	case 132: // SCTP has a twelve-byte common header.
+		required = 12
+	default:
+		return 0, true
+	}
+	return required, required <= len(payload)
 }
 
 // fragmentECN applies the RFC 3168 section 5.3 table used by Linux to the OR
@@ -1040,6 +1092,159 @@ func copyIPPayloadParts(destination []byte, offset int, first, second []byte) {
 	}
 }
 
+// marshalPublicIPv4Fragments fragments or refragments one validated IPPacket.
+// The original offset and M flag are part of the fragmentable range, while
+// Linux-style NOP replacement retains the received option-area alignment.
+func marshalPublicIPv4Fragments(packet IPPacket, mtu int) ([][]byte, error) {
+	headerSize := 20 + (len(packet.IPv4Options)+3)&^3
+	maximum := (mtu - headerSize) &^ 7
+	if maximum < 8 || len(packet.Payload) == 0 {
+		return nil, syscall.EMSGSIZE
+	}
+	laterOptions := laterIPv4FragmentOptions(packet.IPv4Options)
+	fragments := make([][]byte, 0, (len(packet.Payload)+maximum-1)/maximum)
+	for offset := 0; offset < len(packet.Payload); {
+		size := len(packet.Payload) - offset
+		if size > mtu-headerSize {
+			size = maximum
+		}
+		if size <= 0 {
+			return nil, syscall.EMSGSIZE
+		}
+		more := packet.MoreFragments || offset+size < len(packet.Payload)
+		options := laterOptions
+		if packet.FragmentOffset+offset == 0 {
+			options = packet.IPv4Options
+		}
+		fragment := packet
+		fragment.DontFragment = false
+		fragment.MoreFragments = more
+		fragment.FragmentOffset = packet.FragmentOffset + offset
+		fragment.IPv4Options = options
+		fragment.Payload = packet.Payload[offset : offset+size]
+		fragmentHeaderSize := 20 + (len(options)+3)&^3
+		wire := make([]byte, fragmentHeaderSize+size)
+		marshalPublicIPPacket(wire, fragment, fragmentHeaderSize)
+		fragments = append(fragments, wire)
+		offset += size
+	}
+	return fragments, nil
+}
+
+// marshalPublicIPv6Fragments inserts one Fragment header at the RFC 8200
+// boundary in a validated packet. An existing atomic header is removed before
+// rediscovering that boundary so the result never nests Fragment headers.
+func marshalPublicIPv6Fragments(packet IPPacket, totalSize, mtu int, identification uint32) ([][]byte, error) {
+	if !isTraversableIPv6ExtensionHeader(byte(packet.Protocol)) {
+		return marshalPublicIPv6PayloadFragments(packet, mtu, identification)
+	}
+	wire := make([]byte, totalSize)
+	marshalPublicIPPacket(wire, packet, 40)
+	point, valid := inspectIPv6FragmentPoint(wire, false)
+	if !valid {
+		return nil, syscall.EINVAL
+	}
+	if point.atomicOffset >= 0 {
+		wire[point.atomicPrevious] = wire[point.atomicOffset]
+		copy(wire[point.atomicOffset:], wire[point.atomicOffset+8:])
+		wire = wire[:len(wire)-8]
+		binary.BigEndian.PutUint16(wire[4:6], uint16(len(wire)-40))
+		point, valid = inspectIPv6FragmentPoint(wire, false)
+		if !valid || point.atomicOffset >= 0 {
+			return nil, syscall.EINVAL
+		}
+	}
+	capacity := mtu - point.insertion - 8
+	maximum := capacity &^ 7
+	fragmentable := wire[point.insertion:]
+	if maximum < 8 || len(fragmentable) == 0 {
+		return nil, syscall.EMSGSIZE
+	}
+	firstHeaderEnd, valid := ipv6FirstFragmentHeaderEnd(wire, point)
+	if !valid || firstHeaderEnd-point.insertion > maximum {
+		return nil, syscall.EMSGSIZE
+	}
+	fragments := make([][]byte, 0, (len(fragmentable)+maximum-1)/maximum)
+	for offset := 0; offset < len(fragmentable); {
+		size := len(fragmentable) - offset
+		if size > capacity {
+			size = maximum
+		}
+		if size <= 0 {
+			return nil, syscall.EMSGSIZE
+		}
+		fragment := make([]byte, point.insertion+8+size)
+		copy(fragment, wire[:point.insertion])
+		fragment[point.previous] = IPv6ExtensionHeaderFragment
+		header := fragment[point.insertion : point.insertion+8]
+		header[0] = point.next
+		field := uint16(offset)
+		if offset+size < len(fragmentable) {
+			field |= 1
+		}
+		binary.BigEndian.PutUint16(header[2:4], field)
+		binary.BigEndian.PutUint32(header[4:8], identification)
+		copy(fragment[point.insertion+8:], fragmentable[offset:offset+size])
+		binary.BigEndian.PutUint16(fragment[4:6], uint16(len(fragment)-40))
+		fragments = append(fragments, fragment)
+		offset += size
+	}
+	return fragments, nil
+}
+
+// marshalPublicIPv6PayloadFragments avoids materializing an unfragmented copy
+// when the base header points directly at an upper-layer payload.
+func marshalPublicIPv6PayloadFragments(packet IPPacket, mtu int, identification uint32) ([][]byte, error) {
+	capacity := mtu - 48
+	maximum := capacity &^ 7
+	if maximum < 8 || len(packet.Payload) == 0 {
+		return nil, syscall.EMSGSIZE
+	}
+	required, complete := ipv6FirstFragmentUpperLayerLength(byte(packet.Protocol), packet.Payload)
+	if !complete || required > maximum {
+		return nil, syscall.EMSGSIZE
+	}
+	fragments := make([][]byte, 0, (len(packet.Payload)+maximum-1)/maximum)
+	for offset := 0; offset < len(packet.Payload); {
+		size := len(packet.Payload) - offset
+		if size > capacity {
+			size = maximum
+		}
+		fragment := make([]byte, 48+size)
+		marshalPublicIPv6BaseHeader(fragment, packet, IPv6ExtensionHeaderFragment, 8+size)
+		header := fragment[40:48]
+		header[0] = byte(packet.Protocol)
+		field := uint16(offset)
+		if offset+size < len(packet.Payload) {
+			field |= 1
+		}
+		binary.BigEndian.PutUint16(header[2:4], field)
+		binary.BigEndian.PutUint32(header[4:8], identification)
+		copy(fragment[48:], packet.Payload[offset:offset+size])
+		fragments = append(fragments, fragment)
+		offset += size
+	}
+	return fragments, nil
+}
+
+// ipv6FirstFragmentHeaderEnd returns the end of every extension header and of
+// the known upper-layer header required in the first fragment by RFC 7112.
+func ipv6FirstFragmentHeaderEnd(packet []byte, point ipv6FragmentPoint) (int, bool) {
+	next, offset := point.next, point.insertion
+	for isTraversableIPv6ExtensionHeader(next) {
+		if next == IPv6ExtensionHeaderFragment {
+			return 0, false
+		}
+		length, valid := ipv6ExtensionHeaderLength(next, packet[offset:])
+		if !valid {
+			return 0, false
+		}
+		next, offset = packet[offset], offset+length
+	}
+	required, complete := ipv6FirstFragmentUpperLayerLength(next, packet[offset:])
+	return offset + required, complete
+}
+
 // buildIPv4FragmentsWithOptions preserves raw output fields on every fragment.
 func buildIPv4FragmentsWithOptions(source, target netip.Addr, protocol byte, payload []byte, mtu int, identification uint16, options ipPacketOptions) [][]byte {
 	maximum := (mtu - 20) &^ 7
@@ -1231,9 +1436,9 @@ func fragmentICMPForwarderIPv4(packet []byte, mtu int, identification uint16) []
 }
 
 // fragmentICMPForwarderIPv6 inserts or reuses one Fragment header after the
-// RFC 8200 unfragmentable extension chain. The upper-layer bytes and checksum
-// remain unchanged across the complete fragment sequence.
-func fragmentICMPForwarderIPv6(packet []byte, point ipv6ForwarderFragmentPoint, transportOffset, mtu int, identification uint32) [][]byte {
+// RFC 8200 Per-Fragment header chain. The upper-layer bytes and checksum remain
+// unchanged across the complete fragment sequence.
+func fragmentICMPForwarderIPv6(packet []byte, point ipv6FragmentPoint, transportOffset, mtu int, identification uint32) [][]byte {
 	prefix := packet[:point.insertion]
 	fragmentable := packet[point.insertion:]
 	maximum := (mtu - len(prefix) - 8) &^ 7

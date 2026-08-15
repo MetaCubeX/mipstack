@@ -65,12 +65,14 @@ const (
 	ipv6MaximumFlowLabel = 1<<20 - 1
 )
 
-// IPPacket is the semantic representation of one complete, unfragmented IPv4
-// or IPv6 packet. For IPv6, Protocol is the base header's immediate Next
-// Header value and Payload includes any extension headers. ParseIPPacket
-// borrows IPv4Options and Payload from its input; callers must replace or copy
-// those slices before modifying data they do not own. Construction normalizes
-// IPv4-mapped IPv6 addresses to IPv4.
+// IPPacket is the semantic representation of one complete wire IPv4 or IPv6
+// packet. A value may therefore be an IPv4 fragment or contain an IPv6
+// Fragment header; it does not imply that the original datagram is complete.
+// For IPv6, Protocol is the base header's immediate Next Header value and
+// Payload includes any extension headers. ParseIPPacket borrows IPv4Options
+// and Payload from its input; callers must replace or copy those slices before
+// modifying data they do not own. Construction normalizes IPv4-mapped IPv6
+// addresses to IPv4.
 type IPPacket struct {
 	// Source is the packet's source address.
 	Source netip.Addr
@@ -88,12 +90,41 @@ type IPPacket struct {
 	Identification uint16
 	// DontFragment is the IPv4 Don't Fragment flag and must be false for IPv6.
 	DontFragment bool
+	// MoreFragments is the IPv4 More Fragments flag and must be false for IPv6.
+	MoreFragments bool
+	// FragmentOffset is the IPv4 fragment offset in bytes and must be zero for
+	// IPv6. A nonzero value must be aligned to eight bytes.
+	FragmentOffset int
 	// IPv4Options contains the exact IPv4 option area, including received padding.
 	// Construction also accepts an unpadded option sequence; encoding adds final
 	// alignment and normalizes every byte after End to zero.
 	IPv4Options []byte
 	// Payload is the complete IP payload. It includes IPv6 extension headers.
 	Payload []byte
+}
+
+// IPPacketFragmentView describes the fragment carried by one IPPacket.
+// Payload borrows the packet's payload storage. For IPv6, Protocol is the
+// Fragment header's Next Header value and Payload begins immediately after
+// that header. The scalar fields are snapshots and do not mutate the packet.
+type IPPacketFragmentView struct {
+	// Protocol identifies the fragmentable payload's first header.
+	Protocol int
+	// Identification is the IPv4 or IPv6 fragment identification value.
+	Identification uint32
+	// Offset is the fragment's byte offset in the original fragmentable part.
+	Offset int
+	// MoreFragments reports whether another fragment follows this one.
+	MoreFragments bool
+	// Payload is the fragmentable data carried by this packet.
+	Payload []byte
+}
+
+// IsAtomic reports whether the view describes an IPv6 atomic fragment. A view
+// returned for IPv4 is always non-atomic because an unfragmented IPv4 packet
+// has no fragment header to expose.
+func (f IPPacketFragmentView) IsAtomic() bool {
+	return f.Offset == 0 && !f.MoreFragments
 }
 
 // IPv4HeaderOption is one IPv4 header option in semantic wire order. Data
@@ -250,16 +281,19 @@ func (o *IPv4HeaderOption) SetRouterAlert(value uint16) {
 // descriptor slice is caller-owned; header Data and payload borrow p.Payload.
 // ESP, No Next Header, and unknown values terminate traversal. Bytes following
 // No Next Header are returned as payload for lossless structural reconstruction
-// even though UpperLayer intentionally ignores them.
+// even though UpperLayer intentionally ignores them. A non-atomic Fragment is
+// the final descriptor: protocol is its Next Header and payload is its raw
+// fragmentable data, which is not traversed as a complete extension chain.
 func (p IPPacket) IPv6ExtensionHeaders() (headers []IPv6ExtensionHeader, protocol int, payload []byte, err error) {
 	if !p.Source.Is6() || p.Source.Is4In6() || !p.Destination.Is6() || p.Destination.Is4In6() {
 		return nil, 0, nil, syscall.EAFNOSUPPORT
 	}
-	if p.Protocol < 0 || p.Protocol > 255 || len(p.IPv4Options) != 0 {
+	if p.Protocol < 0 || p.Protocol > 255 || p.Identification != 0 || p.DontFragment || p.MoreFragments ||
+		p.FragmentOffset != 0 || len(p.IPv4Options) != 0 {
 		return nil, 0, nil, syscall.EINVAL
 	}
 	next, offset := byte(p.Protocol), 0
-	seenHop := false
+	seenHop, seenFragment := false, false
 	for offset <= len(p.Payload) {
 		if !isTraversableIPv6ExtensionHeader(next) {
 			return headers, int(next), p.Payload[offset:], nil
@@ -278,12 +312,24 @@ func (p IPPacket) IPv6ExtensionHeaders() (headers []IPv6ExtensionHeader, protoco
 				return nil, 0, nil, syscall.EINVAL
 			}
 		}
-		if next == IPv6ExtensionHeaderFragment && binary.BigEndian.Uint16(header[2:4])&0xfff9 != 0 {
-			return nil, 0, nil, syscall.EINVAL
-		}
-		headers = append(headers, IPv6ExtensionHeader{Type: next, Data: header[1:]})
+		descriptor := IPv6ExtensionHeader{Type: next, Data: header[1:]}
+		headers = append(headers, descriptor)
 		if next == IPv6ExtensionHeaderHopByHop {
 			seenHop = true
+		}
+		if next == IPv6ExtensionHeaderFragment {
+			if seenFragment {
+				return nil, 0, nil, syscall.EINVAL
+			}
+			seenFragment = true
+			fragmentOffset, more, _, valid := descriptor.Fragment()
+			fragmentPayload := p.Payload[offset+length:]
+			if !valid || !validFragmentPayload(fragmentOffset, more, len(fragmentPayload), 65535) {
+				return nil, 0, nil, syscall.EINVAL
+			}
+			if fragmentOffset != 0 || more {
+				return headers, int(header[0]), fragmentPayload, nil
+			}
 		}
 		next, offset = header[0], offset+length
 	}
@@ -294,7 +340,9 @@ func (p IPPacket) IPv6ExtensionHeaders() (headers []IPv6ExtensionHeader, protoco
 // extension chain and final upper-layer payload. It generates every Next
 // Header link, copies all caller storage, and leaves p unchanged on failure.
 // Each header Data excludes its Next Header byte and must otherwise contain a
-// complete header-specific wire representation.
+// complete header-specific wire representation. A non-atomic Fragment must be
+// the final descriptor; only in that case may protocol itself identify a
+// traversable extension header whose bytes begin in payload.
 func (p *IPPacket) SetIPv6ExtensionHeaders(headers []IPv6ExtensionHeader, protocol int, payload []byte) error {
 	if p == nil {
 		return syscall.EINVAL
@@ -302,14 +350,14 @@ func (p *IPPacket) SetIPv6ExtensionHeaders(headers []IPv6ExtensionHeader, protoc
 	if !p.Source.Is6() || p.Source.Is4In6() || !p.Destination.Is6() || p.Destination.Is4In6() {
 		return syscall.EAFNOSUPPORT
 	}
-	if protocol < 0 || protocol > 255 || isTraversableIPv6ExtensionHeader(byte(protocol)) {
+	if protocol < 0 || protocol > 255 {
 		return syscall.EINVAL
 	}
 	if len(payload) > 65535 {
 		return syscall.EMSGSIZE
 	}
 	total := len(payload)
-	seenHop := false
+	seenHop, seenFragment, nonAtomicFragment := false, false, false
 	for index, header := range headers {
 		if !isTraversableIPv6ExtensionHeader(header.Type) {
 			return syscall.EPROTONOSUPPORT
@@ -330,13 +378,29 @@ func (p *IPPacket) SetIPv6ExtensionHeaders(headers []IPv6ExtensionHeader, protoc
 				return syscall.EINVAL
 			}
 		}
-		if header.Type == IPv6ExtensionHeaderFragment && binary.BigEndian.Uint16(header.Data[1:3])&0xfff9 != 0 {
-			return syscall.EINVAL
+		if header.Type == IPv6ExtensionHeaderFragment {
+			if seenFragment {
+				return syscall.EINVAL
+			}
+			seenFragment = true
+			fragmentOffset, more, _, valid := header.Fragment()
+			if !valid {
+				return syscall.EINVAL
+			}
+			nonAtomicFragment = fragmentOffset != 0 || more
+			if nonAtomicFragment {
+				if index != len(headers)-1 || !validFragmentPayload(fragmentOffset, more, len(payload), 65535) {
+					return syscall.EINVAL
+				}
+			}
 		}
 		total += length
 		if total > 65535 {
 			return syscall.EMSGSIZE
 		}
+	}
+	if isTraversableIPv6ExtensionHeader(byte(protocol)) && !nonAtomicFragment {
+		return syscall.EINVAL
 	}
 	encoded := make([]byte, 0, total)
 	for index, header := range headers {
@@ -354,6 +418,75 @@ func (p *IPPacket) SetIPv6ExtensionHeaders(headers []IPv6ExtensionHeader, protoc
 		p.Protocol = int(headers[0].Type)
 	}
 	p.Payload = encoded
+	return nil
+}
+
+// Fragment returns the fragment metadata carried by p. For a valid packet it
+// returns false only when an IPv4 packet is unfragmented or an IPv6 packet has
+// no Fragment header. The returned payload borrows p.Payload.
+func (p IPPacket) Fragment() (IPPacketFragmentView, bool) {
+	source, destination := p.Source.Unmap(), p.Destination.Unmap()
+	if source.Is4() && destination.Is4() {
+		if !p.MoreFragments && p.FragmentOffset == 0 {
+			return IPPacketFragmentView{}, false
+		}
+		return IPPacketFragmentView{
+			Protocol: p.Protocol, Identification: uint32(p.Identification),
+			Offset: p.FragmentOffset, MoreFragments: p.MoreFragments, Payload: p.Payload,
+		}, true
+	}
+	if !p.Source.Is6() || p.Source.Is4In6() || !p.Destination.Is6() || p.Destination.Is4In6() ||
+		p.Protocol < 0 || p.Protocol > 255 {
+		return IPPacketFragmentView{}, false
+	}
+	next, offset := byte(p.Protocol), 0
+	for offset <= len(p.Payload) && isTraversableIPv6ExtensionHeader(next) {
+		length, valid := ipv6ExtensionHeaderLength(next, p.Payload[offset:])
+		if !valid {
+			return IPPacketFragmentView{}, false
+		}
+		header := p.Payload[offset : offset+length]
+		if next == IPv6ExtensionHeaderFragment {
+			fragmentOffset, more, identification, valid := (IPv6ExtensionHeader{Type: next, Data: header[1:]}).Fragment()
+			if !valid {
+				return IPPacketFragmentView{}, false
+			}
+			return IPPacketFragmentView{
+				Protocol: int(header[0]), Identification: identification,
+				Offset: fragmentOffset, MoreFragments: more, Payload: p.Payload[offset+length:],
+			}, true
+		}
+		next, offset = header[0], offset+length
+	}
+	return IPPacketFragmentView{}, false
+}
+
+// Fragment decodes an IPv6 Fragment header. Offset is returned in bytes.
+// Reserved fields are ignored as required for reception by RFC 8200. The
+// method returns false when h is not an exactly sized Fragment header.
+func (h IPv6ExtensionHeader) Fragment() (offset int, moreFragments bool, identification uint32, ok bool) {
+	if h.Type != IPv6ExtensionHeaderFragment || len(h.Data) != 7 {
+		return 0, false, 0, false
+	}
+	field := binary.BigEndian.Uint16(h.Data[1:3])
+	return int(field & 0xfff8), field&1 != 0, binary.BigEndian.Uint32(h.Data[3:7]), true
+}
+
+// SetFragment replaces h with an IPv6 Fragment header. Offset is measured in
+// bytes and must be in 0..65528 and aligned to eight bytes. Reserved fields
+// are encoded as zero. The method leaves h unchanged on failure.
+func (h *IPv6ExtensionHeader) SetFragment(offset int, moreFragments bool, identification uint32) error {
+	if h == nil || offset < 0 || offset > 65528 || offset&7 != 0 {
+		return syscall.EINVAL
+	}
+	data := make([]byte, 7)
+	field := uint16(offset)
+	if moreFragments {
+		field |= 1
+	}
+	binary.BigEndian.PutUint16(data[1:3], field)
+	binary.BigEndian.PutUint32(data[3:7], identification)
+	h.Type, h.Data = IPv6ExtensionHeaderFragment, data
 	return nil
 }
 
@@ -453,8 +586,8 @@ func (o *IPv6ExtensionOption) SetRouterAlert(value uint16) {
 
 // ParseIPPacket validates packet and returns a zero-copy semantic value. It
 // validates declared lengths, the IPv4 header checksum, option framing, IPv6
-// extension framing, and extension placement. Stateful fragment reassembly is
-// outside this codec, so non-atomic fragments are rejected. Bytes beyond the
+// extension framing, fragment fields, and extension placement. It accepts one
+// complete wire fragment but performs no stateful reassembly. Bytes beyond the
 // declared IP length are ignored as link-layer padding.
 func ParseIPPacket(packet []byte) (IPPacket, error) {
 	if len(packet) == 0 {
@@ -468,7 +601,11 @@ func ParseIPPacket(packet []byte) (IPPacket, error) {
 		headerSize := int(packet[0]&0x0f) * 4
 		totalSize := int(binary.BigEndian.Uint16(packet[2:4]))
 		fragment := binary.BigEndian.Uint16(packet[6:8])
-		if headerSize < 20 || totalSize < headerSize || totalSize > len(packet) || fragment&0x8000 != 0 || fragment&0x3fff != 0 || checksum(packet[:headerSize]) != 0 {
+		fragmentOffset := int(fragment&0x1fff) * 8
+		moreFragments := fragment&0x2000 != 0
+		if headerSize < 20 || totalSize < headerSize || totalSize > len(packet) || fragment&0x8000 != 0 ||
+			fragment&0x3fff != 0 && !validFragmentPayload(fragmentOffset, moreFragments, totalSize-headerSize, 65535-20) ||
+			checksum(packet[:headerSize]) != 0 {
 			return IPPacket{}, syscall.EINVAL
 		}
 		options := packet[20:headerSize]
@@ -479,6 +616,7 @@ func ParseIPPacket(packet []byte) (IPPacket, error) {
 			Source: netip.AddrFrom4([4]byte(packet[12:16])), Destination: netip.AddrFrom4([4]byte(packet[16:20])),
 			Protocol: int(packet[9]), HopLimit: int(packet[8]), TrafficClass: int(packet[1]),
 			Identification: binary.BigEndian.Uint16(packet[4:6]), DontFragment: fragment&0x4000 != 0,
+			MoreFragments: moreFragments, FragmentOffset: fragmentOffset,
 			IPv4Options: options, Payload: packet[headerSize:totalSize],
 		}, nil
 	case 6:
@@ -501,8 +639,8 @@ func ParseIPPacket(packet []byte) (IPPacket, error) {
 			FlowLabel:    uint32(packet[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(packet[2:4])),
 			Payload:      packet[40:end],
 		}
-		if _, _, _, err := result.upperLayer(); err != nil {
-			return IPPacket{}, err
+		if _, _, _, _, valid := walkIPv6UpperLayer(byte(result.Protocol), result.Payload); !valid {
+			return IPPacket{}, syscall.EINVAL
 		}
 		return result, nil
 	default:
@@ -513,7 +651,8 @@ func ParseIPPacket(packet []byte) (IPPacket, error) {
 // UpperLayer returns the final IPv4 protocol or IPv6 Next Header value and
 // the corresponding upper-layer bytes. The returned slice aliases Payload.
 // For IPv6 it walks supported extension headers without applying Stack routing
-// or option-admission policy.
+// or option-admission policy. It rejects a non-atomic fragment because that
+// packet does not contain a complete upper-layer unit.
 func (p IPPacket) UpperLayer() (protocol int, payload []byte, err error) {
 	protocol, payload, _, err = p.upperLayer()
 	return
@@ -532,16 +671,16 @@ func (p IPPacket) upperLayer() (protocol int, payload []byte, pseudoHeaderSafe b
 		return 0, nil, false, syscall.EINVAL
 	}
 	if source.Is4() {
-		if len(p.IPv4Options) > 40 || !validIPv4OptionsForCodec(p.IPv4Options) {
+		if p.MoreFragments || p.FragmentOffset != 0 || len(p.IPv4Options) > 40 || !validIPv4OptionsForCodec(p.IPv4Options) {
 			return 0, nil, false, syscall.EINVAL
 		}
 		return p.Protocol, p.Payload, !hasActiveIPv4SourceRoute(p.IPv4Options), nil
 	}
-	if len(p.IPv4Options) != 0 {
+	if p.Identification != 0 || p.DontFragment || p.MoreFragments || p.FragmentOffset != 0 || len(p.IPv4Options) != 0 {
 		return 0, nil, false, syscall.EINVAL
 	}
-	next, upper, pseudoHeaderUnsafe, ok := walkIPv6UpperLayer(byte(p.Protocol), p.Payload)
-	if !ok {
+	next, upper, pseudoHeaderUnsafe, nonAtomicFragment, ok := walkIPv6UpperLayer(byte(p.Protocol), p.Payload)
+	if !ok || nonAtomicFragment {
 		return 0, nil, false, syscall.EINVAL
 	}
 	return int(next), upper, !pseudoHeaderUnsafe, nil
@@ -582,6 +721,44 @@ func (p IPPacket) AppendBinary(dst []byte) ([]byte, error) {
 	return dst, nil
 }
 
+// MarshalFragments returns one or more owned wire packets whose complete L3
+// length is no larger than mtu. A fitting packet produces the same encoding as
+// MarshalBinary. IPv4 uses the packet's Identification, honors DontFragment,
+// and may refragment an existing fragment while preserving its original offset
+// and More Fragments state. IPv6 uses ipv6Identification only when
+// fragmentation is required, replaces an atomic Fragment header, and refuses
+// to refragment a non-atomic fragment. For a newly fragmented datagram, the
+// caller is responsible for satisfying the Identification non-reuse requirement
+// for the IPv4 source, destination, and protocol tuple or the IPv6 source and
+// final-destination pair. IPv6 returns syscall.EMSGSIZE if mtu cannot carry the
+// complete known header chain in the first fragment as required by RFC 7112.
+// The IPv6 identification argument is ignored for IPv4 and fitting packets. No
+// partial result is returned on failure.
+func (p IPPacket) MarshalFragments(mtu int, ipv6Identification uint32) ([][]byte, error) {
+	normalized, headerSize, totalSize, err := p.wireLayout()
+	if err != nil {
+		return nil, err
+	}
+	if mtu <= 0 {
+		return nil, syscall.EMSGSIZE
+	}
+	if totalSize <= mtu {
+		packet := make([]byte, totalSize)
+		marshalPublicIPPacket(packet, normalized, headerSize)
+		return [][]byte{packet}, nil
+	}
+	if normalized.Source.Is4() {
+		if normalized.DontFragment {
+			return nil, syscall.EMSGSIZE
+		}
+		return marshalPublicIPv4Fragments(normalized, mtu)
+	}
+	if fragment, ok := normalized.Fragment(); ok && !fragment.IsAtomic() {
+		return nil, syscall.EMSGSIZE
+	}
+	return marshalPublicIPv6Fragments(normalized, totalSize, mtu, ipv6Identification)
+}
+
 // extendForAppend exposes reusable capacity without clearing bytes that a
 // zero-copy parsed value may still borrow from the same backing array.
 func extendForAppend(dst []byte, size int) []byte {
@@ -611,18 +788,40 @@ func (p IPPacket) wireLayout() (IPPacket, int, int, error) {
 		if len(p.Payload) > 65535-headerSize {
 			return IPPacket{}, 0, 0, syscall.EMSGSIZE
 		}
+		// A non-initial fragment cannot reveal the header size retained from
+		// fragment zero. Validate the largest possible IPv4 data range here;
+		// reassembly applies the actual first-header length.
+		if !validFragmentPayload(p.FragmentOffset, p.MoreFragments, len(p.Payload), 65535-20) {
+			return IPPacket{}, 0, 0, syscall.EINVAL
+		}
 		return p, headerSize, headerSize + len(p.Payload), nil
 	}
-	if p.FlowLabel > ipv6MaximumFlowLabel || p.Identification != 0 || p.DontFragment || len(p.IPv4Options) != 0 {
+	if p.FlowLabel > ipv6MaximumFlowLabel || p.Identification != 0 || p.DontFragment || p.MoreFragments ||
+		p.FragmentOffset != 0 || len(p.IPv4Options) != 0 {
 		return IPPacket{}, 0, 0, syscall.EINVAL
 	}
 	if len(p.Payload) > 65535 {
 		return IPPacket{}, 0, 0, syscall.EMSGSIZE
 	}
-	if _, _, _, err := p.upperLayer(); err != nil {
-		return IPPacket{}, 0, 0, err
+	if _, _, _, _, valid := walkIPv6UpperLayer(byte(p.Protocol), p.Payload); !valid {
+		return IPPacket{}, 0, 0, syscall.EINVAL
 	}
 	return p, 40, 40 + len(p.Payload), nil
+}
+
+// validFragmentPayload validates the common offset, M flag, and reconstructed
+// fragmentable-part bounds shared by IPv4 and IPv6 Fragment headers.
+func validFragmentPayload(offset int, more bool, payloadSize, maximum int) bool {
+	if offset < 0 || offset > 65528 || offset&7 != 0 || payloadSize < 0 || maximum < 0 {
+		return false
+	}
+	if (offset != 0 || more) && payloadSize == 0 {
+		return false
+	}
+	if more && payloadSize&7 != 0 {
+		return false
+	}
+	return payloadSize <= maximum && offset <= maximum-payloadSize
 }
 
 // marshalPublicIPPacket writes one already validated public packet. Payload is
@@ -641,9 +840,12 @@ func marshalPublicIPPacket(dst []byte, p IPPacket, headerSize int) {
 		dst[0], dst[1], dst[8], dst[9] = 0x40|byte(headerSize/4), byte(p.TrafficClass), byte(p.HopLimit), byte(p.Protocol)
 		binary.BigEndian.PutUint16(dst[2:4], uint16(len(dst)))
 		binary.BigEndian.PutUint16(dst[4:6], p.Identification)
-		fragment := uint16(0)
+		fragment := uint16(p.FragmentOffset / 8)
 		if p.DontFragment {
-			fragment = 0x4000
+			fragment |= 0x4000
+		}
+		if p.MoreFragments {
+			fragment |= 0x2000
 		}
 		binary.BigEndian.PutUint16(dst[6:8], fragment)
 		source, destination := p.Source.As4(), p.Destination.As4()
@@ -655,11 +857,16 @@ func marshalPublicIPPacket(dst []byte, p IPPacket, headerSize int) {
 	}
 	copy(dst[headerSize:], p.Payload)
 	normalizeIPv6ExtensionFields(byte(p.Protocol), dst[headerSize:])
+	marshalPublicIPv6BaseHeader(dst, p, byte(p.Protocol), len(dst)-40)
+}
+
+// marshalPublicIPv6BaseHeader writes the fixed header of a validated packet.
+func marshalPublicIPv6BaseHeader(dst []byte, p IPPacket, protocol byte, payloadSize int) {
 	dst[0] = 0x60 | byte(p.TrafficClass)>>4
 	dst[1] = byte(p.TrafficClass)<<4 | byte(p.FlowLabel>>16)
 	binary.BigEndian.PutUint16(dst[2:4], uint16(p.FlowLabel))
-	binary.BigEndian.PutUint16(dst[4:6], uint16(len(dst)-40))
-	dst[6], dst[7] = byte(p.Protocol), byte(p.HopLimit)
+	binary.BigEndian.PutUint16(dst[4:6], uint16(payloadSize))
+	dst[6], dst[7] = protocol, byte(p.HopLimit)
 	source, destination := p.Source.As16(), p.Destination.As16()
 	copy(dst[8:24], source[:])
 	copy(dst[24:40], destination[:])
@@ -705,6 +912,9 @@ func normalizeIPv6ExtensionFields(first byte, payload []byte) {
 			field := binary.BigEndian.Uint16(payload[offset+2 : offset+4])
 			binary.BigEndian.PutUint16(payload[offset+2:offset+4], field&^0x0006)
 			offset += 8
+			if field&0xfff9 != 0 {
+				return
+			}
 		default:
 			return
 		}
@@ -1035,40 +1245,48 @@ func (p ipPacket) hasRouterAlert() bool {
 // walkIPv6UpperLayer validates supported extension-header framing and returns
 // the final upper-layer view. Unknown option action bits are codec data, not
 // host admission policy, and therefore do not make the public packet invalid.
-func walkIPv6UpperLayer(first byte, payload []byte) (protocol byte, upper []byte, pseudoHeaderUnsafe, ok bool) {
+func walkIPv6UpperLayer(first byte, payload []byte) (protocol byte, upper []byte, pseudoHeaderUnsafe, nonAtomicFragment, ok bool) {
 	next, offset := first, 0
-	seenHop := false
+	seenHop, seenFragment := false, false
 	for offset <= len(payload) {
 		if next == ProtocolNoNextHeader {
 			// RFC 8200 requires receivers to ignore bytes following No Next
 			// Header. IPPacket.Payload still preserves them for round trips.
-			return next, nil, pseudoHeaderUnsafe, true
+			return next, nil, pseudoHeaderUnsafe, false, true
 		}
 		if !isTraversableIPv6ExtensionHeader(next) {
-			return next, payload[offset:], pseudoHeaderUnsafe, true
+			return next, payload[offset:], pseudoHeaderUnsafe, false, true
 		}
 		if next == IPv6ExtensionHeaderHopByHop && (offset != 0 || seenHop) {
-			return 0, nil, false, false
+			return 0, nil, false, false, false
 		}
 		length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
 		if !valid {
-			return 0, nil, false, false
+			return 0, nil, false, false, false
 		}
 		header := payload[offset : offset+length]
 		switch next {
 		case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination:
 			validOptions, homeAddress, jumboPayload := inspectIPv6OptionsForCodec(header)
 			if !validOptions || jumboPayload {
-				return 0, nil, false, false
+				return 0, nil, false, false, false
 			}
 			pseudoHeaderUnsafe = pseudoHeaderUnsafe || homeAddress
 		case IPv6ExtensionHeaderRouting:
 			pseudoHeaderUnsafe = pseudoHeaderUnsafe || header[3] != 0
 		case IPv6ExtensionHeaderFragment:
-			// Only atomic fragments contain a complete upper-layer unit. The
-			// two reserved fields are ignored as RFC 8200 requires.
-			if binary.BigEndian.Uint16(header[2:4])&0xfff9 != 0 {
-				return 0, nil, false, false
+			if seenFragment {
+				return 0, nil, false, false, false
+			}
+			seenFragment = true
+			field := binary.BigEndian.Uint16(header[2:4])
+			fragmentOffset, more := int(field&0xfff8), field&1 != 0
+			fragmentPayload := payload[offset+length:]
+			if !validFragmentPayload(fragmentOffset, more, len(fragmentPayload), 65535) {
+				return 0, nil, false, false, false
+			}
+			if fragmentOffset != 0 || more {
+				return header[0], fragmentPayload, pseudoHeaderUnsafe, true, true
 			}
 		}
 		if next == IPv6ExtensionHeaderHopByHop {
@@ -1076,7 +1294,7 @@ func walkIPv6UpperLayer(first byte, payload []byte) (protocol byte, upper []byte
 		}
 		next, offset = header[0], offset+length
 	}
-	return 0, nil, false, false
+	return 0, nil, false, false, false
 }
 
 // isTraversableIPv6ExtensionHeader reports headers whose length and following

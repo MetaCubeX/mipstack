@@ -544,6 +544,475 @@ func TestPublicIPv6ExtensionHeaderErrors(t *testing.T) {
 	}
 }
 
+func TestPublicIPv6FragmentHeader(t *testing.T) {
+	header := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderRouting, Data: []byte{1, 2, 3}}
+	if err := header.SetFragment(24, true, 0x12345678); err != nil {
+		t.Fatalf("SetFragment: %v", err)
+	}
+	offset, more, identification, ok := header.Fragment()
+	if !ok || offset != 24 || !more || identification != 0x12345678 || header.Type != IPv6ExtensionHeaderFragment ||
+		len(header.Data) != 7 || header.Data[0] != 0 || header.Data[2]&6 != 0 {
+		t.Fatalf("Fragment = offset %d, more %t, identification %#x, valid %t, header %+v", offset, more, identification, ok, header)
+	}
+	header.Data[0] = 0xff
+	header.Data[2] |= 6
+	offset, more, identification, ok = header.Fragment()
+	if !ok || offset != 24 || !more || identification != 0x12345678 {
+		t.Fatalf("Fragment with reserved fields = offset %d, more %t, identification %#x, valid %t", offset, more, identification, ok)
+	}
+	wantType, wantData := header.Type, append([]byte(nil), header.Data...)
+	for _, invalid := range []int{-8, 1, 65536} {
+		if err := header.SetFragment(invalid, false, 1); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("SetFragment(%d) error = %v", invalid, err)
+		}
+		if header.Type != wantType || !bytes.Equal(header.Data, wantData) {
+			t.Fatalf("failed SetFragment(%d) changed receiver", invalid)
+		}
+	}
+	if _, _, _, ok = (IPv6ExtensionHeader{Type: IPv6ExtensionHeaderRouting, Data: make([]byte, 7)}).Fragment(); ok {
+		t.Fatal("Routing header decoded as Fragment")
+	}
+	if _, _, _, ok = (IPv6ExtensionHeader{Type: IPv6ExtensionHeaderFragment, Data: make([]byte, 6)}).Fragment(); ok {
+		t.Fatal("short Fragment header decoded")
+	}
+}
+
+func TestPublicIPPacketFragmentCodec(t *testing.T) {
+	ipv4 := IPPacket{
+		Source: netip.MustParseAddr("192.0.2.11"), Destination: netip.MustParseAddr("198.51.100.11"),
+		Protocol: 99, HopLimit: 47, Identification: 0x1234, DontFragment: true,
+		MoreFragments: true, FragmentOffset: 24, Payload: []byte("fragment-payload"),
+	}
+	for _, packet := range []IPPacket{ipv4} {
+		wire, err := packet.MarshalBinary()
+		if err != nil {
+			t.Fatalf("marshal IPv4 fragment: %v", err)
+		}
+		parsed, err := ParseIPPacket(wire)
+		if err != nil {
+			t.Fatalf("parse IPv4 fragment: %v", err)
+		}
+		view, fragmented := parsed.Fragment()
+		if !fragmented || view.Protocol != packet.Protocol || view.Identification != uint32(packet.Identification) ||
+			view.Offset != packet.FragmentOffset || view.MoreFragments != packet.MoreFragments || !bytes.Equal(view.Payload, packet.Payload) || view.IsAtomic() {
+			t.Fatalf("IPv4 fragment view = %+v, fragmented %t", view, fragmented)
+		}
+		if _, _, err = parsed.UpperLayer(); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("IPv4 fragment UpperLayer error = %v", err)
+		}
+		roundTrip, err := parsed.MarshalBinary()
+		if err != nil || !bytes.Equal(roundTrip, wire) {
+			t.Fatalf("IPv4 fragment round trip: %v\n got %x\nwant %x", err, roundTrip, wire)
+		}
+	}
+
+	hop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	if err := hop.SetOptions(nil); err != nil {
+		t.Fatal(err)
+	}
+	fragment := IPv6ExtensionHeader{}
+	if err := fragment.SetFragment(16, true, 0x89abcdef); err != nil {
+		t.Fatal(err)
+	}
+	rawFragmentPayload := make([]byte, 16)
+	for index := range rawFragmentPayload {
+		rawFragmentPayload[index] = byte(index + 1)
+	}
+	ipv6 := IPPacket{
+		Source: netip.MustParseAddr("2001:db8::11"), Destination: netip.MustParseAddr("2001:db8::12"), HopLimit: 31,
+	}
+	if err := ipv6.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{hop, fragment}, IPv6ExtensionHeaderDestination, rawFragmentPayload); err != nil {
+		t.Fatalf("construct IPv6 fragment: %v", err)
+	}
+	wire, err := ipv6.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal IPv6 fragment: %v", err)
+	}
+	parsed, err := ParseIPPacket(wire)
+	if err != nil {
+		t.Fatalf("parse IPv6 fragment: %v", err)
+	}
+	headers, protocol, payload, err := parsed.IPv6ExtensionHeaders()
+	if err != nil || len(headers) != 2 || protocol != IPv6ExtensionHeaderDestination || !bytes.Equal(payload, rawFragmentPayload) {
+		t.Fatalf("IPv6 fragment extension view = %+v/%d/%x, %v", headers, protocol, payload, err)
+	}
+	view, fragmented := parsed.Fragment()
+	if !fragmented || view.Protocol != IPv6ExtensionHeaderDestination || view.Identification != 0x89abcdef ||
+		view.Offset != 16 || !view.MoreFragments || !bytes.Equal(view.Payload, rawFragmentPayload) || view.IsAtomic() {
+		t.Fatalf("IPv6 fragment view = %+v, fragmented %t", view, fragmented)
+	}
+	if _, _, err = parsed.UpperLayer(); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("IPv6 fragment UpperLayer error = %v", err)
+	}
+	roundTrip, err := parsed.MarshalBinary()
+	if err != nil || !bytes.Equal(roundTrip, wire) {
+		t.Fatalf("IPv6 fragment round trip: %v\n got %x\nwant %x", err, roundTrip, wire)
+	}
+
+	atomic := IPv6ExtensionHeader{}
+	if err = atomic.SetFragment(0, false, 7); err != nil {
+		t.Fatal(err)
+	}
+	destination := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderDestination}
+	if err = destination.SetOptions(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = ipv6.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{atomic, destination}, 99, []byte("atomic-upper")); err != nil {
+		t.Fatalf("construct atomic fragment: %v", err)
+	}
+	view, fragmented = ipv6.Fragment()
+	if !fragmented || !view.IsAtomic() || view.Protocol != IPv6ExtensionHeaderDestination || view.Identification != 7 {
+		t.Fatalf("atomic fragment view = %+v, fragmented %t", view, fragmented)
+	}
+	if protocol, payload, err = ipv6.UpperLayer(); err != nil || protocol != 99 || !bytes.Equal(payload, []byte("atomic-upper")) {
+		t.Fatalf("atomic UpperLayer = %d/%x, %v", protocol, payload, err)
+	}
+}
+
+func TestPublicIPPacketFragmentErrors(t *testing.T) {
+	v4 := IPPacket{
+		Source: netip.MustParseAddr("192.0.2.21"), Destination: netip.MustParseAddr("198.51.100.21"),
+		Protocol: 99, HopLimit: 64, Identification: 1, Payload: make([]byte, 16),
+	}
+	for _, mutate := range []func(*IPPacket){
+		func(packet *IPPacket) { packet.FragmentOffset = 1 },
+		func(packet *IPPacket) { packet.FragmentOffset = 65536 },
+		func(packet *IPPacket) { packet.MoreFragments, packet.Payload = true, packet.Payload[:15] },
+		func(packet *IPPacket) { packet.FragmentOffset, packet.Payload = 8, nil },
+	} {
+		packet := v4
+		mutate(&packet)
+		if _, err := packet.MarshalBinary(); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("invalid IPv4 fragment %+v error = %v", packet, err)
+		}
+	}
+
+	invalidV4 := buildIPPacket(v4.Source, v4.Destination, byte(v4.Protocol), make([]byte, 15), v4.Identification, false)
+	binary.BigEndian.PutUint16(invalidV4[6:8], 0x2000)
+	invalidV4[10], invalidV4[11] = 0, 0
+	binary.BigEndian.PutUint16(invalidV4[10:12], checksum(invalidV4[:20]))
+	if _, err := ParseIPPacket(invalidV4); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("misaligned IPv4 non-final fragment error = %v", err)
+	}
+
+	source6 := netip.MustParseAddr("2001:db8::21")
+	target6 := netip.MustParseAddr("2001:db8::22")
+	fragmentBytes := make([]byte, 8+15)
+	fragmentBytes[0] = 99
+	fragmentBytes[3] = 1
+	if _, err := ParseIPPacket(buildIPPacket(source6, target6, IPv6ExtensionHeaderFragment, fragmentBytes, 0, false)); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("misaligned IPv6 non-final fragment error = %v", err)
+	}
+	atomicChain := make([]byte, 16)
+	atomicChain[0], atomicChain[8] = IPv6ExtensionHeaderFragment, 99
+	if _, err := ParseIPPacket(buildIPPacket(source6, target6, IPv6ExtensionHeaderFragment, atomicChain, 0, false)); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("multiple IPv6 Fragment headers error = %v", err)
+	}
+
+	packet6 := IPPacket{Source: source6, Destination: target6, HopLimit: 64}
+	first, second := IPv6ExtensionHeader{}, IPv6ExtensionHeader{}
+	_ = first.SetFragment(0, false, 1)
+	_ = second.SetFragment(0, false, 2)
+	if err := packet6.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{first, second}, 99, nil); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("multiple SetIPv6ExtensionHeaders fragments error = %v", err)
+	}
+}
+
+func TestPublicIPFragmentMaximumOffsets(t *testing.T) {
+	ipv4 := IPPacket{
+		Source: netip.MustParseAddr("192.0.2.23"), Destination: netip.MustParseAddr("198.51.100.23"),
+		Protocol: 99, Identification: 7, FragmentOffset: 65512, Payload: make([]byte, 3),
+	}
+	wire, err := ipv4.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal maximum IPv4 fragment: %v", err)
+	}
+	parsed, err := ParseIPPacket(wire)
+	view, fragmented := parsed.Fragment()
+	if err != nil || !fragmented || view.Offset != 65512 || len(view.Payload) != 3 {
+		t.Fatalf("maximum IPv4 fragment = %+v, valid %t, error %v", view, fragmented, err)
+	}
+	ipv4.Payload = make([]byte, 4)
+	if _, err = ipv4.MarshalBinary(); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("oversized reassembled IPv4 fragment error = %v", err)
+	}
+	// A non-initial fragment does not reveal the IHL retained from fragment
+	// zero. Its own option area must not reduce the structurally valid data
+	// range; the reassembler validates the actual first-fragment IHL.
+	ipv4.Payload = make([]byte, 3)
+	ipv4.IPv4Options = make([]byte, 40)
+	wire, err = ipv4.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal maximum IPv4 fragment with options: %v", err)
+	}
+	if _, err = ParseIPPacket(wire); err != nil {
+		t.Fatalf("parse maximum IPv4 fragment with options: %v", err)
+	}
+
+	header := IPv6ExtensionHeader{}
+	if err = header.SetFragment(65528, false, 0x89abcdef); err != nil {
+		t.Fatalf("construct maximum IPv6 Fragment header: %v", err)
+	}
+	ipv6 := IPPacket{
+		Source: netip.MustParseAddr("2001:db8::23"), Destination: netip.MustParseAddr("2001:db8::24"), HopLimit: 64,
+	}
+	if err = ipv6.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{header}, 99, make([]byte, 7)); err != nil {
+		t.Fatalf("construct maximum IPv6 fragment: %v", err)
+	}
+	wire, err = ipv6.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal maximum IPv6 fragment: %v", err)
+	}
+	parsed, err = ParseIPPacket(wire)
+	view, fragmented = parsed.Fragment()
+	if err != nil || !fragmented || view.Offset != 65528 || len(view.Payload) != 7 {
+		t.Fatalf("maximum IPv6 fragment = %+v, valid %t, error %v", view, fragmented, err)
+	}
+	if err = ipv6.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{header}, 99, make([]byte, 8)); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("oversized reassembled IPv6 fragment error = %v", err)
+	}
+	// RFC 8200 permits Per-Fragment headers to differ between fragments. A
+	// non-initial fragment's own prefix therefore does not reduce the maximum
+	// fragmentable-part end; the offset-zero prefix controls reassembly size.
+	hop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	if err = hop.SetOptions(nil); err != nil {
+		t.Fatalf("construct Hop-by-Hop header: %v", err)
+	}
+	if err = ipv6.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{hop, header}, 99, make([]byte, 7)); err != nil {
+		t.Fatalf("construct maximum IPv6 fragment with prefix: %v", err)
+	}
+	wire, err = ipv6.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal maximum IPv6 fragment with prefix: %v", err)
+	}
+	if _, err = ParseIPPacket(wire); err != nil {
+		t.Fatalf("parse maximum IPv6 fragment with prefix: %v", err)
+	}
+}
+
+func TestPublicIPv4MarshalFragments(t *testing.T) {
+	payload := make([]byte, 2503)
+	for index := range payload {
+		payload[index] = byte(index*29 + 7)
+	}
+	packet := IPPacket{
+		Source: netip.MustParseAddr("192.0.2.31"), Destination: netip.MustParseAddr("198.51.100.31"),
+		Protocol: 99, HopLimit: 49, TrafficClass: 0x2e, Identification: 0x4567, Payload: payload,
+	}
+	if err := packet.SetIPv4HeaderOptions([]IPv4HeaderOption{
+		{Type: 0x9e, Data: []byte{1, 2}}, {Type: 0x1e, Data: []byte{3, 4}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fragments, err := packet.MarshalFragments(400, 0xdeadbeef)
+	if err != nil || len(fragments) < 2 {
+		t.Fatalf("MarshalFragments = %d packets, %v", len(fragments), err)
+	}
+	reassembled := make([]byte, len(payload))
+	covered := 0
+	for index, wire := range fragments {
+		if len(wire) > 400 {
+			t.Fatalf("fragment %d size = %d", index, len(wire))
+		}
+		parsed, parseErr := ParseIPPacket(wire)
+		if parseErr != nil {
+			t.Fatalf("parse fragment %d: %v", index, parseErr)
+		}
+		view, ok := parsed.Fragment()
+		if !ok || view.Identification != uint32(packet.Identification) || view.Offset != covered || view.MoreFragments != (index+1 < len(fragments)) {
+			t.Fatalf("fragment %d view = %+v, valid %t", index, view, ok)
+		}
+		copy(reassembled[view.Offset:], view.Payload)
+		covered += len(view.Payload)
+		if view.Offset == 0 {
+			if !bytes.Equal(parsed.IPv4Options, packet.IPv4Options) {
+				t.Fatalf("first fragment options = %x, want %x", parsed.IPv4Options, packet.IPv4Options)
+			}
+		} else if !bytes.Equal(parsed.IPv4Options, []byte{0x9e, 4, 1, 2, 1, 1, 1, 1}) {
+			t.Fatalf("later fragment options = %x", parsed.IPv4Options)
+		}
+	}
+	if covered != len(payload) || !bytes.Equal(reassembled, payload) {
+		t.Fatal("IPv4 fragment payload did not reconstruct")
+	}
+
+	refragment := packet
+	refragment.FragmentOffset = 800
+	refragment.MoreFragments = true
+	refragment.Payload = payload[:800]
+	fragments, err = refragment.MarshalFragments(220, 0)
+	if err != nil || len(fragments) < 2 {
+		t.Fatalf("IPv4 refragment = %d packets, %v", len(fragments), err)
+	}
+	covered = 0
+	for index, wire := range fragments {
+		parsed, parseErr := ParseIPPacket(wire)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		view, ok := parsed.Fragment()
+		if !ok || view.Offset != 800+covered || !view.MoreFragments || !bytes.Equal(parsed.IPv4Options, []byte{0x9e, 4, 1, 2, 1, 1, 1, 1}) {
+			t.Fatalf("refragment %d = %+v, options %x", index, view, parsed.IPv4Options)
+		}
+		covered += len(view.Payload)
+	}
+	if covered != len(refragment.Payload) {
+		t.Fatalf("refragment coverage = %d, want %d", covered, len(refragment.Payload))
+	}
+
+	df := packet
+	df.DontFragment = true
+	if fragments, err = df.MarshalFragments(400, 0); !errors.Is(err, syscall.EMSGSIZE) || fragments != nil {
+		t.Fatalf("DF MarshalFragments = %d packets, %v", len(fragments), err)
+	}
+	fitting := packet
+	fitting.Payload = fitting.Payload[:32]
+	want, err := fitting.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragments, err = fitting.MarshalFragments(len(want), 0)
+	if err != nil || len(fragments) != 1 || !bytes.Equal(fragments[0], want) {
+		t.Fatalf("fitting MarshalFragments = %d packets, %v", len(fragments), err)
+	}
+	fitting.Payload[0] ^= 0xff
+	if bytes.Equal(fragments[0][len(fragments[0])-len(fitting.Payload):], fitting.Payload) {
+		t.Fatal("fitting MarshalFragments retained payload storage")
+	}
+}
+
+func TestPublicIPv6MarshalFragments(t *testing.T) {
+	source := netip.MustParseAddr("2001:db8::31")
+	target := netip.MustParseAddr("2001:db8::32")
+	udpPayload := make([]byte, 3003)
+	for index := range udpPayload {
+		udpPayload[index] = byte(index*31 + 11)
+	}
+	udpWire, err := (UDPDatagram{
+		Source: netip.AddrPortFrom(source, 31001), Destination: netip.AddrPortFrom(target, 31002), Payload: udpPayload,
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	destination := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderDestination}
+	if err = hop.SetOptions(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = destination.SetOptions(nil); err != nil {
+		t.Fatal(err)
+	}
+	routing := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderRouting, Data: make([]byte, 7)}
+	packet := IPPacket{Source: source, Destination: target, HopLimit: 39, TrafficClass: 0x2e, FlowLabel: 0x12345}
+	if err = packet.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{hop, routing, destination}, ProtocolUDP, udpWire); err != nil {
+		t.Fatal(err)
+	}
+	fragments, err := packet.MarshalFragments(1280, 0x76543210)
+	if err != nil || len(fragments) < 2 {
+		t.Fatalf("IPv6 MarshalFragments = %d packets, %v", len(fragments), err)
+	}
+	fragmentable := packet.Payload[16:]
+	reassembled := make([]byte, len(fragmentable))
+	covered := 0
+	for index, wire := range fragments {
+		if len(wire) > 1280 {
+			t.Fatalf("IPv6 fragment %d size = %d", index, len(wire))
+		}
+		parsed, parseErr := ParseIPPacket(wire)
+		if parseErr != nil {
+			t.Fatalf("parse IPv6 fragment %d: %v", index, parseErr)
+		}
+		headers, protocol, raw, headersErr := parsed.IPv6ExtensionHeaders()
+		view, ok := parsed.Fragment()
+		if headersErr != nil || len(headers) != 3 || headers[0].Type != IPv6ExtensionHeaderHopByHop ||
+			headers[1].Type != IPv6ExtensionHeaderRouting || headers[2].Type != IPv6ExtensionHeaderFragment ||
+			protocol != IPv6ExtensionHeaderDestination || !ok || view.Identification != 0x76543210 ||
+			view.Offset != covered || view.MoreFragments != (index+1 < len(fragments)) || !bytes.Equal(raw, view.Payload) {
+			t.Fatalf("IPv6 fragment %d = headers %+v protocol %d view %+v, errors %v/%t", index, headers, protocol, view, headersErr, ok)
+		}
+		copy(reassembled[view.Offset:], view.Payload)
+		covered += len(view.Payload)
+	}
+	if covered != len(fragmentable) || !bytes.Equal(reassembled, fragmentable) {
+		t.Fatal("IPv6 fragmentable part did not reconstruct")
+	}
+
+	atomic := IPv6ExtensionHeader{}
+	if err = atomic.SetFragment(0, false, 1); err != nil {
+		t.Fatal(err)
+	}
+	authentication := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderAuthentication, Data: make([]byte, 15)}
+	authentication.Data[0] = 2
+	atomicPacket := IPPacket{Source: source, Destination: target, HopLimit: 64}
+	if err = atomicPacket.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{hop, authentication, atomic, destination}, ProtocolUDP, udpWire); err != nil {
+		t.Fatal(err)
+	}
+	fragments, err = atomicPacket.MarshalFragments(1280, 0xaabbccdd)
+	if err != nil || len(fragments) < 2 {
+		t.Fatalf("atomic MarshalFragments = %d packets, %v", len(fragments), err)
+	}
+	atomicFragmentable := make([]byte, len(authentication.Data)+1+len(destination.Data)+1+len(udpWire))
+	atomicCovered := 0
+	for index, wire := range fragments {
+		parsed, parseErr := ParseIPPacket(wire)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		view, ok := parsed.Fragment()
+		if !ok || view.Identification != 0xaabbccdd || view.Protocol != IPv6ExtensionHeaderAuthentication || view.Offset != atomicCovered {
+			t.Fatalf("atomic replacement fragment %d = %+v, valid %t", index, view, ok)
+		}
+		copy(atomicFragmentable[view.Offset:], view.Payload)
+		atomicCovered += len(view.Payload)
+	}
+	if atomicCovered != len(atomicFragmentable) {
+		t.Fatalf("atomic replacement coverage = %d, want %d", atomicCovered, len(atomicFragmentable))
+	}
+	reconstructedAtomic := IPPacket{
+		Source: source, Destination: target, Protocol: IPv6ExtensionHeaderAuthentication, HopLimit: 64, Payload: atomicFragmentable,
+	}
+	atomicHeaders, atomicProtocol, atomicUpper, atomicErr := reconstructedAtomic.IPv6ExtensionHeaders()
+	if atomicErr != nil || len(atomicHeaders) != 2 || atomicHeaders[0].Type != IPv6ExtensionHeaderAuthentication ||
+		atomicHeaders[1].Type != IPv6ExtensionHeaderDestination || atomicProtocol != ProtocolUDP || !bytes.Equal(atomicUpper, udpWire) {
+		t.Fatalf("reconstructed atomic replacement = %+v/%d/%x, %v", atomicHeaders, atomicProtocol, atomicUpper, atomicErr)
+	}
+
+	nonAtomic := IPv6ExtensionHeader{}
+	if err = nonAtomic.SetFragment(0, true, 3); err != nil {
+		t.Fatal(err)
+	}
+	nonAtomicPacket := IPPacket{Source: source, Destination: target, HopLimit: 64}
+	if err = nonAtomicPacket.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{nonAtomic}, ProtocolUDP, make([]byte, 1280)); err != nil {
+		t.Fatal(err)
+	}
+	if fragments, err = nonAtomicPacket.MarshalFragments(1000, 4); !errors.Is(err, syscall.EMSGSIZE) || fragments != nil {
+		t.Fatalf("non-atomic refragment = %d packets, %v", len(fragments), err)
+	}
+
+	tcpHeader := make([]byte, 256)
+	tcpHeader[12] = 15 << 4
+	tcpPacket := IPPacket{
+		Source: source, Destination: target, Protocol: ProtocolTCP, HopLimit: 64,
+		TrafficClass: 0xab, FlowLabel: 0xabcde, Payload: tcpHeader,
+	}
+	if fragments, err = tcpPacket.MarshalFragments(104, 5); !errors.Is(err, syscall.EMSGSIZE) || fragments != nil {
+		t.Fatalf("RFC 7112 short first fragment = %d packets, %v", len(fragments), err)
+	}
+	fragments, err = tcpPacket.MarshalFragments(112, 5)
+	if err != nil || len(fragments) < 2 {
+		t.Fatalf("RFC 7112 exact first fragment = %d packets, %v", len(fragments), err)
+	}
+	firstPacket, err := ParseIPPacket(fragments[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstView, ok := firstPacket.Fragment()
+	if !ok || len(firstView.Payload) < 60 || !firstView.MoreFragments || firstPacket.Source != source || firstPacket.Destination != target ||
+		firstPacket.HopLimit != tcpPacket.HopLimit || firstPacket.TrafficClass != tcpPacket.TrafficClass || firstPacket.FlowLabel != tcpPacket.FlowLabel {
+		t.Fatalf("RFC 7112 first fragment view = %+v, valid %t", firstView, ok)
+	}
+}
+
 // TestPublicCodecAppendBinaryOverlappingOptions covers a caller reusing a parsed
 // wire buffer after selecting an option subslice that the shifted payload will
 // overwrite. AppendBinary must read all semantic fields before changing dst.
@@ -988,8 +1457,18 @@ func TestPublicChecksumAPI(t *testing.T) {
 func FuzzPublicIPPacketCodec(f *testing.F) {
 	seeds := []IPPacket{
 		{Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"), Protocol: 99, HopLimit: 64, Payload: []byte("v4")},
+		{Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"), Protocol: 99, HopLimit: 64, Identification: 7, MoreFragments: true, FragmentOffset: 16, Payload: make([]byte, 16)},
 		{Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"), Protocol: 99, HopLimit: 64, Payload: []byte("v6")},
 	}
+	fragment := IPv6ExtensionHeader{}
+	if err := fragment.SetFragment(24, true, 0x12345678); err != nil {
+		f.Fatal(err)
+	}
+	ipv6Fragment := IPPacket{Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"), HopLimit: 64}
+	if err := ipv6Fragment.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{fragment}, IPv6ExtensionHeaderDestination, make([]byte, 16)); err != nil {
+		f.Fatal(err)
+	}
+	seeds = append(seeds, ipv6Fragment)
 	for _, seed := range seeds {
 		wire, err := seed.AppendBinary(nil)
 		if err != nil {
@@ -1042,6 +1521,57 @@ func FuzzPublicIPPacketCodec(f *testing.F) {
 		inPlace, err := reparsed.AppendBinary(encoded[:0])
 		if err != nil || !bytes.Equal(inPlace, canonical) {
 			t.Fatalf("in-place packet append: error=%v\n got %x\nwant %x", err, inPlace, canonical)
+		}
+	})
+}
+
+func FuzzPublicIPPacketMarshalFragments(f *testing.F) {
+	for _, seed := range []IPPacket{
+		{
+			Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1"),
+			Protocol: 99, HopLimit: 64, Identification: 1, Payload: make([]byte, 4096),
+		},
+		{
+			Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"),
+			Protocol: 99, HopLimit: 64, Payload: make([]byte, 4096),
+		},
+	} {
+		wire, err := seed.MarshalBinary()
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(wire, uint16(1500), uint32(7))
+	}
+	f.Fuzz(func(t *testing.T, wire []byte, rawMTU uint16, identification uint32) {
+		if len(wire) > 8192 {
+			return
+		}
+		packet, err := ParseIPPacket(wire)
+		if err != nil {
+			return
+		}
+		minimumMTU := 576
+		if packet.Source.Is6() {
+			minimumMTU = 1280
+		}
+		mtu := minimumMTU + int(rawMTU)%((9000-minimumMTU)+1)
+		fragments, fragmentErr := packet.MarshalFragments(mtu, identification)
+		if fragmentErr != nil {
+			if len(fragments) != 0 {
+				t.Fatal("failed fragmentation returned partial output")
+			}
+			return
+		}
+		if len(fragments) == 0 {
+			t.Fatal("successful fragmentation returned no packets")
+		}
+		for index, fragment := range fragments {
+			if len(fragment) > mtu {
+				t.Fatalf("fragment %d length = %d, MTU %d", index, len(fragment), mtu)
+			}
+			if _, parseErr := ParseIPPacket(fragment); parseErr != nil {
+				t.Fatalf("fragment %d cannot be parsed: %v", index, parseErr)
+			}
 		}
 	})
 }
@@ -1821,6 +2351,34 @@ func BenchmarkParseIPPacket(b *testing.B) {
 			b.SetBytes(int64(len(test.packet)))
 			for index := 0; index < b.N; index++ {
 				if _, err := ParseIPPacket(test.packet); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkIPPacketMarshalFragments(b *testing.B) {
+	payload := make([]byte, 16*1024)
+	for _, packet := range []IPPacket{
+		{
+			Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1"),
+			Protocol: 99, HopLimit: 64, Identification: 1, Payload: payload,
+		},
+		{
+			Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8:1::1"),
+			Protocol: 99, HopLimit: 64, Payload: payload,
+		},
+	} {
+		name := "IPv4"
+		if packet.Source.Is6() {
+			name = "IPv6"
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			for index := 0; index < b.N; index++ {
+				if _, err := packet.MarshalFragments(1500, uint32(index)); err != nil {
 					b.Fatal(err)
 				}
 			}
