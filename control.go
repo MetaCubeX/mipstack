@@ -57,14 +57,14 @@ const (
 	SocketErrorOriginTXTime
 )
 
-// SocketErrorControlMessage is the structured form of one Linux
-// sock_extended_err ancillary record returned by MessageFlagErrorQueue reads.
+// SocketErrorControlMessage represents the structured fields of one Linux
+// sock_extended_err ancillary record used by MessageFlagErrorQueue reads.
 type SocketErrorControlMessage struct {
 	// Errno is the Linux errno number associated with the failed operation.
 	Errno uint32
 	// Origin identifies the subsystem that generated the error.
 	Origin SocketErrorOrigin
-	// Type and Code retain the ICMP or ICMPv6 classification.
+	// Type is the ICMP or ICMPv6 classification.
 	Type uint8
 	// Code is the ICMP or ICMPv6 subtype associated with Type.
 	Code uint8
@@ -73,13 +73,54 @@ type SocketErrorControlMessage struct {
 	Info uint32
 	// Data is the protocol-specific sock_extended_err data field.
 	Data uint32
-	// Offender is the router or destination that reported the failure.
+	// Offender is the router or destination that reported the failure. It must
+	// be a valid, unzoned IPv4 or IPv6 address when marshaling. An IPv4-mapped
+	// IPv6 address retains its IPv6 representation.
 	Offender netip.Addr
+}
+
+// MarshalBinary returns one complete, aligned Linux 64-bit little-endian
+// ancillary record. It is semantically identical to AppendBinary(nil).
+func (message SocketErrorControlMessage) MarshalBinary() ([]byte, error) {
+	return message.AppendBinary(nil)
+}
+
+// AppendBinary appends one complete, aligned Linux 64-bit little-endian
+// ancillary record to dst. Offender selects IP_RECVERR or IPV6_RECVERR;
+// IPv4-mapped addresses retain their IPv6 sockaddr representation. Reserved
+// fields and sockaddr fields not represented by SocketErrorControlMessage are
+// encoded as zero.
+// Numeric fields, including unrecognized Origin, Type, and Code values, are
+// encoded unchanged without applying ICMP policy.
+// On validation failure it returns the original dst unchanged.
+func (message SocketErrorControlMessage) AppendBinary(dst []byte) ([]byte, error) {
+	if !message.Offender.IsValid() || message.Offender.Zone() != "" {
+		return dst, errors.New("mipstack: invalid socket-error control-message offender")
+	}
+	offender := message.Offender
+	var data [44]byte
+	binary.LittleEndian.PutUint32(data[:4], message.Errno)
+	data[4], data[5], data[6] = byte(message.Origin), message.Type, message.Code
+	binary.LittleEndian.PutUint32(data[8:12], message.Info)
+	binary.LittleEndian.PutUint32(data[12:16], message.Data)
+	level, kind, size := uint32(linuxLevelIP), uint32(linuxIPReceiveError), 32
+	if offender.Is4() {
+		binary.LittleEndian.PutUint16(data[16:18], 2)
+		address := offender.As4()
+		copy(data[20:24], address[:])
+	} else {
+		level, kind, size = linuxLevelIPv6, linuxIPv6ReceiveError, 44
+		binary.LittleEndian.PutUint16(data[16:18], 10)
+		address := offender.As16()
+		copy(data[24:40], address[:])
+	}
+	return appendLinuxControl(dst, level, kind, data[:size]), nil
 }
 
 // Parse replaces message with the one error record found in control. Other
 // well-formed ancillary records are ignored so packet metadata may coexist in
-// the same OOB buffer.
+// the same OOB buffer. Records with an AF_UNSPEC offender are rejected because
+// SocketErrorControlMessage does not carry the cmsg address family separately.
 func (message *SocketErrorControlMessage) Parse(control []byte) error {
 	if message == nil {
 		return errors.New("mipstack: nil socket-error control-message receiver")
@@ -445,31 +486,21 @@ func socketErrorControlForRead(err error) ([]byte, error) {
 	if !errors.As(err, &networkError) || !networkError.Reporter.IsValid() {
 		return nil, errors.New("mipstack: asynchronous error has no ICMP metadata")
 	}
-	v6 := networkError.Reporter.Is6()
-	size := 32
-	level, kind := uint32(linuxLevelIP), uint32(linuxIPReceiveError)
+	reporter := networkError.Reporter
+	networkError.Reporter = reporter.Unmap()
 	origin := SocketErrorOriginICMP
-	if v6 {
-		size, level, kind, origin = 44, linuxLevelIPv6, linuxIPv6ReceiveError, SocketErrorOriginICMP6
+	if networkError.Reporter.Is6() {
+		origin = SocketErrorOriginICMP6
 	}
-	data := make([]byte, size)
-	binary.LittleEndian.PutUint32(data[:4], linuxICMPErrno(networkError))
-	data[4], data[5], data[6] = byte(origin), networkError.Type, networkError.Code
 	info := networkError.MTU
 	if info == 0 {
 		info = networkError.Pointer
 	}
-	binary.LittleEndian.PutUint32(data[8:12], info)
-	if v6 {
-		binary.LittleEndian.PutUint16(data[16:18], 10)
-		address := networkError.Reporter.As16()
-		copy(data[24:40], address[:])
-	} else {
-		binary.LittleEndian.PutUint16(data[16:18], 2)
-		address := networkError.Reporter.As4()
-		copy(data[20:24], address[:])
-	}
-	return appendLinuxControl(nil, level, kind, data), nil
+	return (SocketErrorControlMessage{
+		Errno: linuxICMPErrno(networkError), Origin: origin,
+		Type: networkError.Type, Code: networkError.Code, Info: info,
+		Offender: reporter,
+	}).MarshalBinary()
 }
 
 // linuxICMPErrno applies the errno mappings used by Linux ICMP error handlers.

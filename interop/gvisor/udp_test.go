@@ -713,6 +713,17 @@ func TestUDPClosedPortInterop(t *testing.T) {
 			if socketError.Errno != 111 || socketError.Origin != wantOrigin || socketError.Type != wantType || socketError.Code != wantCode || socketError.Offender != family.gvisorAddress {
 				t.Fatalf("mipstack UDP MSG_ERRQUEUE control = %+v", socketError)
 			}
+			canonicalControl, err := socketError.MarshalBinary()
+			if err != nil {
+				t.Fatalf("re-encode mipstack UDP MSG_ERRQUEUE control: %v", err)
+			}
+			if !bytes.Equal(canonicalControl, message[0].OOB[:message[0].NN]) {
+				t.Fatalf("re-encoded mipstack UDP MSG_ERRQUEUE control = %x, want %x", canonicalControl, message[0].OOB[:message[0].NN])
+			}
+			var roundTripError mipstack.SocketErrorControlMessage
+			if err = roundTripError.Parse(canonicalControl); err != nil || roundTripError != socketError {
+				t.Fatalf("reparse mipstack UDP MSG_ERRQUEUE control = %+v, %v, want %+v", roundTripError, err, socketError)
+			}
 		})
 	}
 }

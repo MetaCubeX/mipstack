@@ -701,13 +701,26 @@ UDP and IP `ReadBatch`/`WriteBatch` also accept Linux-compatible message flags.
 errors and successful `MessageFlagErrorQueue` reads are consumed like Linux. A
 `MessageFlagErrorQueue` read never blocks and returns the quoted failed payload,
 the original destination in `Addr`, and a Linux `sock_extended_err` record in
-`OOB`; `SocketErrorControlMessage.Parse` provides its structured form.
+`OOB`.
 `MessageFlagDontWait` makes packet-queue reads and writes return `EAGAIN`
 instead of waiting. `MessageFlagTruncated` requests the complete payload length
 and, along with `MessageFlagControlTruncated`, also reports output truncation.
 Nonblocking fragmented output reserves the complete fragment set before
 publishing it, so a failed send cannot leave a partial datagram on the link or
 loopback path.
+
+`SocketErrorControlMessage.Parse` finds one Linux `sock_extended_err` record in
+a possibly compound OOB buffer. `MarshalBinary` and `AppendBinary` encode the
+structured value as one canonical, complete, aligned record; with sufficient
+destination capacity, `AppendBinary` can append it to other ancillary data
+without allocating. The offender address selects `IP_RECVERR` or
+`IPV6_RECVERR`; IPv4-mapped addresses retain their IPv6 sockaddr representation,
+matching Linux IPv6 socket error queues.
+Fields not represented by `SocketErrorControlMessage`, including reserved
+bytes and sockaddr port, flow-info, and scope fields, are written as zero.
+An offender must be a valid, unzoned address; `Parse` rejects Linux
+`AF_UNSPEC` offenders because the structured value does not otherwise retain
+the cmsg address family needed for an unambiguous re-encoding.
 
 An ordinary `IPConn` exchanges upper-layer protocol payloads. With
 `IPHeaderIncludedOnWrite`, IPv4 writes follow Linux `IP_HDRINCL`: the stack
