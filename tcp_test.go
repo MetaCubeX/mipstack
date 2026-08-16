@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // TestTCPListenerAcceptAndClose verifies passive open, bidirectional stream
@@ -156,7 +157,6 @@ func TestStackCloseEventuallyReleasesTCPBuffers(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection := newTCPConn(stack, "tcp4", tcpKey{local: local, remote: remote}, 1400, tcpSocketOptionSet{})
-	connection.connected = make(chan error, 1)
 	payload := make([]byte, 1<<20)
 	connection.mu.Lock()
 	connection.readBuffer.append(payload)
@@ -168,7 +168,7 @@ func TestStackCloseEventuallyReleasesTCPBuffers(t *testing.T) {
 	connection.deliverError(errors.New("retained network error"))
 	stack.tcp[connection.key] = connection
 	stack.stats.activeTCPConnections.Add(1)
-	go connection.run(1)
+	go connection.run(1, make(chan error, 1))
 	if err = stack.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestStackCloseEventuallyReleasesTCPBuffers(t *testing.T) {
 	connection.mu.Lock()
 	released := connection.readBuffer.size == 0 && connection.readBuffer.chunks == nil &&
 		connection.sendBuffer.size == 0 && connection.sendBuffer.chunks == nil && connection.sendBuffer.spare == nil &&
-		connection.networkError == nil && connection.readDeadline.timer == nil && connection.writeDeadline.timer == nil
+		connection.pending == nil && connection.readDeadline.timer == nil && connection.writeDeadline.timer == nil
 	connection.mu.Unlock()
 	if !released || connection.inbound.retainedBytes() != 0 {
 		t.Fatal("terminated TCP connection retained payload-bearing buffers")
@@ -268,6 +268,21 @@ func TestTCPConnectionInfo(t *testing.T) {
 		info.KeepAliveConfig.Idle <= 0 || info.KeepAliveConfig.Interval <= 0 || info.KeepAliveConfig.Count <= 0 ||
 		info.BytesSent < uint64(len(payload)) {
 		t.Fatalf("incomplete live TCP diagnostics: %+v", info)
+	}
+	const concurrentInfoCalls = 64
+	infos := make(chan TCPConnInfo, concurrentInfoCalls)
+	for index := 0; index < concurrentInfoCalls; index++ {
+		go func() { infos <- clientConnection.Info() }()
+	}
+	for index := 0; index < concurrentInfoCalls; index++ {
+		select {
+		case concurrent := <-infos:
+			if concurrent.State != TCPStateEstablished || concurrent.LocalAddress != info.LocalAddress || concurrent.RemoteAddress != info.RemoteAddress {
+				t.Fatalf("concurrent TCP diagnostics = %+v", concurrent)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent TCP diagnostics blocked")
+		}
 	}
 	if err = clientConnection.SetLinger(0); err != nil {
 		t.Fatal(err)
@@ -1650,8 +1665,11 @@ func TestTCPProvenLossAccountingUsesTransmissionGenerations(t *testing.T) {
 func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlCUBIC)
 	rtt := rttEstimator{initialized: true, srtt: 100 * time.Millisecond, variation: 20 * time.Millisecond, rto: time.Second}
-	var eifel tcpRecoveryUndo
+	eifel := tcpRecoveryUndo{spuriousUndos: 2}
 	eifel.begin(true, 4000, 12000, 8000, 10000, &controller, rtt)
+	if eifel.spuriousUndos != 2 {
+		t.Fatalf("recovery restart discarded %d prior spurious undos", eifel.spuriousUndos)
+	}
 	eifel.recordRetransmission(1000, 2000, 200, false)
 	if eifel.detectEifel(199, false, false, 4000) {
 		t.Fatal("Eifel accepted an all-data ACK without prior DSACK evidence")
@@ -3060,11 +3078,46 @@ func TestTCPCloseWithUnreadDataIsAbortive(t *testing.T) {
 	default:
 		t.Fatal("Close with unread data did not request an abortive reset")
 	}
-	if !connection.resetAfterAbort() {
+	if !connection.takeAbortReset() {
 		t.Fatal("unread-data close suppressed the reset")
+	}
+	if connection.takeAbortReset() {
+		t.Fatal("unread-data close published the reset more than once")
 	}
 	if connection.sendBuffer.size != 0 {
 		t.Fatalf("abortive close retained %d send bytes", connection.sendBuffer.size)
+	}
+}
+
+func TestTCPConnectionMemoryLayout(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		return
+	}
+	for _, test := range []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"TCPConn", unsafe.Sizeof(TCPConn{}), 752},
+		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1528},
+		{"tcpEstablishedLivenessState", unsafe.Sizeof(tcpEstablishedLivenessState{}), 72},
+		{"tcpEstablishedPathMTUState", unsafe.Sizeof(tcpEstablishedPathMTUState{}), 120},
+		{"tcpRecoveryUndo", unsafe.Sizeof(tcpRecoveryUndo{}), 176},
+		{"tcpCongestionController", unsafe.Sizeof(tcpCongestionController{}), 472},
+	} {
+		if test.got != test.want {
+			t.Errorf("%s size = %d, want %d; reassess per-connection allocation classes", test.name, test.got, test.want)
+		}
+	}
+
+	var state tcpEstablishedState
+	liveness := state.ensureLivenessState()
+	if state.pathMTUState != nil || state.ensureLivenessState() != liveness {
+		t.Fatal("liveness state initialized or retained an unrelated path state")
+	}
+	pathState := state.ensurePathMTUState()
+	if state.ensurePathMTUState() != pathState || state.livenessState != liveness {
+		t.Fatal("path state initialization replaced an independent liveness state")
 	}
 }
 
@@ -3103,6 +3156,42 @@ func TestTCPSendBufferChunkOwnership(t *testing.T) {
 	if &reusable.chunks[0].storage[0] != firstStorage {
 		t.Fatal("acknowledged storage was not reused")
 	}
+}
+
+func TestTCPSendBufferAdaptiveChunkRetention(t *testing.T) {
+	var buffer tcpSendBuffer
+	buffer.append([]byte{1})
+	if capacity := cap(buffer.chunks[0].storage); capacity != tcpSendChunkInitial {
+		t.Fatalf("initial small send chunk capacity = %d, want %d", capacity, tcpSendChunkInitial)
+	}
+	buffer.append(make([]byte, tcpSendChunkInitial))
+	if capacity := cap(buffer.chunks[1].storage); capacity != tcpSendChunkMinimum {
+		t.Fatalf("later small send chunk capacity = %d, want %d", capacity, tcpSendChunkMinimum)
+	}
+
+	var moderate tcpSendBuffer
+	payload := make([]byte, 8*1024)
+	moderate.append(payload)
+	moderate.acknowledge(len(payload))
+	if moderate.spare != nil || moderate.reusableState != tcpSendReusableReleased {
+		t.Fatalf("one-shot moderate chunk retained: spare=%d state=%d", cap(moderate.spare), moderate.reusableState)
+	}
+	moderate.append(payload)
+	moderate.acknowledge(len(payload))
+	if cap(moderate.spare) != len(payload) || moderate.reusableState != tcpSendReusableConfirmed {
+		t.Fatalf("repeated moderate chunk not retained: spare=%d state=%d", cap(moderate.spare), moderate.reusableState)
+	}
+
+	var live tcpSendBuffer
+	live.append(make([]byte, tcpSendChunkInitial))
+	live.append([]byte{1})
+	live.acknowledge(tcpSendChunkInitial)
+	live.append(make([]byte, tcpSendChunkMinimum))
+	if capacity := cap(live.chunks[1].storage); capacity < tcpSendChunkMinimum {
+		t.Fatalf("small first-chunk spare reused in live queue: capacity=%d", capacity)
+	}
+	var view tcpPayloadView
+	live.view(0, tcpSendChunkMaximum, &view)
 }
 
 func TestTCPCloseWithoutUnreadDataRemainsGraceful(t *testing.T) {
@@ -3276,8 +3365,8 @@ func TestRACKReorderingWindowUsesMinimumRTT(t *testing.T) {
 		t.Fatalf("DSACK-expanded RACK window = %v, want 4ms", window)
 	}
 	var estimator rttEstimator
-	estimator.observe(20 * time.Millisecond)
-	estimator.observe(4 * time.Millisecond)
+	estimator.observeAt(20*time.Millisecond, 1)
+	estimator.observeAt(4*time.Millisecond, 2)
 	if estimator.minimum != 4*time.Millisecond {
 		t.Fatalf("minimum RTT = %v, want 4ms", estimator.minimum)
 	}
@@ -3945,6 +4034,82 @@ func TestTCPInboundQueueRetainsOnlySmallBacking(t *testing.T) {
 	if queue.segments != nil || queue.head != 0 {
 		t.Fatalf("large drained inbound queue retained len %d cap %d head %d", len(queue.segments), cap(queue.segments), queue.head)
 	}
+	if !queue.enqueue(tcpSegment{}) || cap(queue.segments) != tcpMetadataQueueRetain {
+		t.Fatalf("burst-aware inbound queue restarted with capacity %d, want %d", cap(queue.segments), tcpMetadataQueueRetain)
+	}
+	if _, ok := queue.dequeue(); !ok {
+		t.Fatal("burst-aware inbound queue lost a segment")
+	}
+}
+
+func TestTCPNetworkErrorQueueIsLazyBoundedAndOrdered(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	if connection.pending != nil {
+		t.Fatal("new TCP connection allocated a network-error queue")
+	}
+	errorsByIndex := make([]error, tcpMaximumPendingNetworkErrors+2)
+	for index := range errorsByIndex {
+		errorsByIndex[index] = errors.New(strconv.Itoa(index))
+		connection.deliverError(errorsByIndex[index])
+	}
+	if got := len(connection.pending.networkErrors); got != tcpMaximumPendingNetworkErrors {
+		t.Fatalf("queued network errors = %d, want %d", got, tcpMaximumPendingNetworkErrors)
+	}
+	for index := 0; index < tcpMaximumPendingNetworkErrors; index++ {
+		got, ok := connection.takeNetworkError()
+		if !ok || got != errorsByIndex[index] {
+			t.Fatalf("network error %d = %v, %v", index, got, ok)
+		}
+	}
+	if got, ok := connection.takeNetworkError(); ok || got != nil {
+		t.Fatalf("empty network-error queue returned %v, %v", got, ok)
+	}
+}
+
+func TestTCPReadNotificationIsLazyAndCannotMissWake(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	if connection.readNotify != nil {
+		t.Fatal("new TCP connection allocated a read notification")
+	}
+	connection.mu.Lock()
+	connection.readBuffer.append([]byte{1})
+	connection.notifyReadLocked()
+	connection.mu.Unlock()
+	var immediate [1]byte
+	if n, err := connection.Read(immediate[:]); n != 1 || err != nil || immediate[0] != 1 {
+		t.Fatalf("immediate Read = %d, %v, %v", n, err, immediate)
+	}
+	if connection.readNotify != nil {
+		t.Fatal("buffered Read allocated a notification")
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		var value [1]byte
+		_, err := connection.Read(value[:])
+		if err == nil && value[0] != 2 {
+			err = errors.New("blocked Read returned the wrong byte")
+		}
+		result <- err
+	}()
+	waitFor(t, time.Second, func() bool {
+		connection.mu.Lock()
+		initialized := connection.readNotify != nil
+		connection.mu.Unlock()
+		return initialized
+	})
+	connection.mu.Lock()
+	connection.readBuffer.append([]byte{2})
+	connection.notifyReadLocked()
+	connection.mu.Unlock()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked Read missed its notification")
+	}
 }
 
 func TestTCPInboundQueueCompactsConsumedPrefixBeforeGrowing(t *testing.T) {
@@ -3981,21 +4146,87 @@ func TestTCPInboundQueueCompactsConsumedPrefixBeforeGrowing(t *testing.T) {
 	}
 }
 
+func BenchmarkTCPInboundQueueSingleSegment(b *testing.B) {
+	queue := newTCPSegmentQueue()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		for index := 0; index < tcpMetadataQueueInitial; index++ {
+			if !queue.enqueue(tcpSegment{sequence: uint32(index)}) {
+				b.Fatal("single-segment inbound queue rejected a segment")
+			}
+		}
+		for index := 0; index < tcpMetadataQueueInitial; index++ {
+			if _, ok := queue.dequeue(); !ok {
+				b.Fatal("single-segment inbound queue lost a segment")
+			}
+		}
+	}
+}
+
+func BenchmarkTCPInboundQueueColdBurst(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		queue := newTCPSegmentQueue()
+		for index := 0; index < tcpMetadataQueueRetain; index++ {
+			if !queue.enqueue(tcpSegment{sequence: uint32(index)}) {
+				b.Fatal("cold inbound queue rejected a segment")
+			}
+		}
+		for index := 0; index < tcpMetadataQueueRetain; index++ {
+			if _, ok := queue.dequeue(); !ok {
+				b.Fatal("cold inbound queue lost a segment")
+			}
+		}
+	}
+}
+
 func BenchmarkTCPInboundQueueSmallBurst(b *testing.B) {
 	queue := newTCPSegmentQueue()
+	for index := 0; index < tcpMetadataQueueRetain; index++ {
+		if !queue.enqueue(tcpSegment{sequence: uint32(index)}) {
+			b.Fatal("warm-up inbound queue rejected a segment")
+		}
+	}
+	for index := 0; index < tcpMetadataQueueRetain; index++ {
+		if _, ok := queue.dequeue(); !ok {
+			b.Fatal("warm-up inbound queue lost a segment")
+		}
+	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for iteration := 0; iteration < b.N; iteration++ {
 		for index := 0; index < tcpMetadataQueueRetain; index++ {
 			if !queue.enqueue(tcpSegment{sequence: uint32(index)}) {
-				b.Fatal("small inbound queue rejected a segment")
+				b.Fatal("inbound queue rejected a segment")
 			}
 		}
 		for index := 0; index < tcpMetadataQueueRetain; index++ {
 			if _, ok := queue.dequeue(); !ok {
-				b.Fatal("small inbound queue lost a segment")
+				b.Fatal("inbound queue lost a segment")
 			}
 		}
+	}
+}
+
+func BenchmarkTCPSendBufferReuse(b *testing.B) {
+	for _, size := range []int{1, 8 * 1024, 32 * 1024} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			payload := make([]byte, size)
+			var buffer tcpSendBuffer
+			for iteration := 0; iteration < 2; iteration++ {
+				buffer.append(payload)
+				buffer.acknowledge(len(payload))
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				buffer.append(payload)
+				buffer.acknowledge(len(payload))
+			}
+		})
 	}
 }
 
@@ -4095,12 +4326,12 @@ func TestTCPSegmentTimestampOptionsUseFixedWorkspace(t *testing.T) {
 }
 
 func TestTCPActorWakeCoalescesStateChanges(t *testing.T) {
-	connection := &TCPConn{actorWake: make(chan struct{}, 1)}
+	connection := &TCPConn{inbound: newTCPSegmentQueue()}
 	connection.wakeActor(tcpActorWakeSend)
 	connection.wakeActor(tcpActorWakeWindow)
 	connection.wakeActor(tcpActorWakeOptions | tcpActorWakePathMTU)
 	select {
-	case <-connection.actorWake:
+	case <-connection.inbound.notify:
 	default:
 		t.Fatal("actor wake was not published")
 	}
@@ -4109,15 +4340,32 @@ func TestTCPActorWakeCoalescesStateChanges(t *testing.T) {
 		t.Fatalf("actor wake flags = %#x, want %#x", got, want)
 	}
 	select {
-	case <-connection.actorWake:
+	case <-connection.inbound.notify:
 		t.Fatal("coalesced actor wake published more than one token")
 	default:
 	}
 	connection.wakeActor(tcpActorWakeSend)
 	select {
-	case <-connection.actorWake:
+	case <-connection.inbound.notify:
 	default:
 		t.Fatal("actor wake did not rearm after consumption")
+	}
+
+	connection.takeActorWake()
+	if !connection.inbound.enqueue(tcpSegment{sequence: 1}) {
+		t.Fatal("packet wake was not queued")
+	}
+	connection.wakeActor(tcpActorWakeInfo)
+	select {
+	case <-connection.inbound.notify:
+	default:
+		t.Fatal("shared packet and state wake was not published")
+	}
+	if got := connection.takeActorWake(); got != tcpActorWakeInfo {
+		t.Fatalf("coalesced packet wake flags = %#x, want %#x", got, tcpActorWakeInfo)
+	}
+	if segment, ok := connection.inbound.dequeue(); !ok || segment.sequence != 1 {
+		t.Fatalf("coalesced packet wake lost segment: %+v, %v", segment, ok)
 	}
 }
 
@@ -4750,7 +4998,7 @@ func TestTCPReservedHeaderBitsAreIgnored(t *testing.T) {
 
 func TestRTTSampleIsSaturatedBeforeArithmetic(t *testing.T) {
 	estimator := rttEstimator{}
-	estimator.observe(time.Duration(1<<63 - 1))
+	estimator.observeAt(time.Duration(1<<63-1), 1)
 	if estimator.srtt != tcpMaximumRTO || estimator.rto != tcpMaximumRTO || estimator.minimum != tcpMaximumRTO {
 		t.Fatalf("saturated RTT estimator = srtt %v rto %v minimum %v", estimator.srtt, estimator.rto, estimator.minimum)
 	}
@@ -4793,23 +5041,23 @@ func TestTCPRFC6069RTOBackoffRevert(t *testing.T) {
 
 func TestTCPMinimumRTTAdaptsToLongerPath(t *testing.T) {
 	var filter tcpMinimumRTTFilter
-	start := time.Unix(1, 0)
+	start := monotonicStamp(1)
 	if minimum := filter.observe(start, 10*time.Millisecond); minimum != 10*time.Millisecond {
 		t.Fatalf("initial minimum RTT = %v", minimum)
 	}
 	// Populate Linux's quarter- and half-window backup samples while the
 	// original path minimum remains valid.
-	if minimum := filter.observe(start.Add(tcpMinimumRTTWindow/4+time.Second), 20*time.Millisecond); minimum != 10*time.Millisecond {
+	if minimum := filter.observe(start+monotonicStamp(tcpMinimumRTTWindow/4+time.Second), 20*time.Millisecond); minimum != 10*time.Millisecond {
 		t.Fatalf("quarter-window minimum RTT = %v", minimum)
 	}
-	if minimum := filter.observe(start.Add(tcpMinimumRTTWindow/2+time.Second), 30*time.Millisecond); minimum != 10*time.Millisecond {
+	if minimum := filter.observe(start+monotonicStamp(tcpMinimumRTTWindow/2+time.Second), 30*time.Millisecond); minimum != 10*time.Millisecond {
 		t.Fatalf("half-window minimum RTT = %v", minimum)
 	}
-	if minimum := filter.observe(start.Add(tcpMinimumRTTWindow+time.Second), 40*time.Millisecond); minimum != 20*time.Millisecond {
+	if minimum := filter.observe(start+monotonicStamp(tcpMinimumRTTWindow+time.Second), 40*time.Millisecond); minimum != 20*time.Millisecond {
 		t.Fatalf("expired path minimum RTT = %v, want 20ms", minimum)
 	}
 	// A genuinely lower sample immediately replaces every stale candidate.
-	if minimum := filter.observe(start.Add(tcpMinimumRTTWindow+2*time.Second), 5*time.Millisecond); minimum != 5*time.Millisecond {
+	if minimum := filter.observe(start+monotonicStamp(tcpMinimumRTTWindow+2*time.Second), 5*time.Millisecond); minimum != 5*time.Millisecond {
 		t.Fatalf("new lower minimum RTT = %v, want 5ms", minimum)
 	}
 }

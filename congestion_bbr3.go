@@ -133,78 +133,74 @@ func bbr3DecodePacketState(value uint64) bbr3PacketSnapshot {
 // retransmission selection, and delivery-rate sampling; this type owns only
 // BBRv3's path model, congestion window, and pacing policy.
 type bbr3CongestionControl struct {
-	mode       bbrMode
-	probePhase bbr3ProbePhase
-	ackPhase   bbr3ACKPhase
-
-	bandwidthHigh   [2]float64
-	bandwidthLow    float64
-	inflightLow     uint32
-	inflightHigh    uint32
-	latestBandwidth float64
-	latestInflight  uint32
-
-	roundCount           uint32
-	nextRoundDelivered   uint32
+	// Narrow controller state is grouped ahead of wider model values. Unlike
+	// a lazy recovery snapshot, this layout also reduces memory after loss and
+	// leaves hot ACK processing free of pointer indirection.
+	mode                 bbrMode
+	probePhase           bbr3ProbePhase
+	ackPhase             bbr3ACKPhase
 	roundStart           bool
-	fullBandwidth        float64
 	fullRounds           uint8
 	fullBandwidthNow     bool
 	fullBandwidthReached bool
-
-	lossRoundDelivered uint32
-	lossRoundStart     bool
-	lossInRound        bool
-	lossEventsInRound  uint8
-
-	minimumRTT      time.Duration
-	minimumRTTStamp time.Time
-	probeRTTMinimum time.Duration
-	probeRTTStamp   time.Time
-	probeDone       time.Time
-	probeRound      bool
-	priorWindow     uint32
-
-	probeStarted         time.Time
-	probeWait            time.Duration
-	roundsSinceProbe     uint32
-	probeUpCount         uint32
-	probeUpACKed         uint64
+	lossRoundStart       bool
+	lossInRound          bool
+	lossEventsInRound    uint8
+	probeRound           bool
 	probeUpRounds        uint8
 	probeSamples         bool
 	stoppedRiskyProbe    bool
 	previousProbeTooHigh bool
-	initialWindowMSS     uint32
-
-	delivered              uint64
-	lost                   uint64
-	applicationLimited     bool
-	schedulerLimited       bool
-	schedulerLimitedEvents uint64
-	requestAppLimited      bool
-
-	ackEpochStamp    time.Time
-	ackEpochBytes    uint64
-	extraACKed       [2]uint32
-	extraACKedIndex  uint8
-	extraACKedRounds uint8
-
-	pacingRate           float64
-	maximumPacingRate    uint64
-	nextSend             time.Time
-	pacingWakeDeadline   time.Time
-	pacingBurstRemaining int
+	applicationLimited   bool
+	schedulerLimited     bool
+	requestAppLimited    bool
+	extraACKedIndex      uint8
+	extraACKedRounds     uint8
 	idleRestart          bool
 	hasSeenRTT           bool
-	probeRandom          uint64
+	recovery             bool
+	lossRecovery         bool
+	packetConservation   bool
+	undoBounds           bool
 
-	recovery           bool
-	lossRecovery       bool
-	packetConservation bool
-	undoBounds         bool
-	undoBandwidthLow   float64
+	inflightLow        uint32
+	inflightHigh       uint32
+	latestInflight     uint32
+	roundCount         uint32
+	nextRoundDelivered uint32
+	lossRoundDelivered uint32
+	priorWindow        uint32
+	roundsSinceProbe   uint32
+	probeUpCount       uint32
+	initialWindowMSS   uint32
+	extraACKed         [2]uint32
 	undoInflightLow    uint32
 	undoInflightHigh   uint32
+
+	bandwidthHigh          [2]float64
+	bandwidthLow           float64
+	latestBandwidth        float64
+	fullBandwidth          float64
+	minimumRTT             time.Duration
+	minimumRTTStamp        time.Time
+	probeRTTMinimum        time.Duration
+	probeRTTStamp          time.Time
+	probeDone              time.Time
+	probeStarted           time.Time
+	probeWait              time.Duration
+	probeUpACKed           uint64
+	delivered              uint64
+	lost                   uint64
+	schedulerLimitedEvents uint64
+	ackEpochStamp          time.Time
+	ackEpochBytes          uint64
+	pacingRate             float64
+	maximumPacingRate      uint64
+	nextSend               time.Time
+	pacingWakeDeadline     time.Time
+	pacingBurstRemaining   int
+	probeRandom            uint64
+	undoBandwidthLow       float64
 }
 
 // newBBR3CongestionControl constructs one independent BBRv3 controller.

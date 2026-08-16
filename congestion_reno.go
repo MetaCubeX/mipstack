@@ -1,10 +1,19 @@
 package mipstack
 
+import "math"
+
+// renoRecoveryCheckpointValid occupies the sign bit that a nonnegative Reno
+// growth credit never uses.
+const renoRecoveryCheckpointValid = uint64(1) << 63
+
 // renoCongestionControl retains Reno's fractional byte-counted ACK credit.
 type renoCongestionControl struct {
-	credit           float64
-	recoveryCredit   float64
-	recoverySnapshot bool
+	credit float64
+	// recoveryCheckpoint stores the nonnegative credit's IEEE-754 bits and
+	// uses the otherwise-clear sign bit as the validity flag. Keeping the
+	// checkpoint inline avoids a second allocation after ordinary loss while
+	// retaining the controller in the 16-byte allocation class.
+	recoveryCheckpoint uint64
 }
 
 // newRenoCongestionControl constructs one independent Reno controller.
@@ -34,17 +43,16 @@ func (r *renoCongestionControl) HandleCongestionEvent(event *CongestionEvent) {
 	case CongestionEventRecovery:
 		switch event.Recovery.Stage {
 		case CongestionRecoveryCheckpoint:
-			r.recoveryCredit = r.credit
-			r.recoverySnapshot = true
+			r.recoveryCheckpoint = math.Float64bits(r.credit) | renoRecoveryCheckpointValid
 		case CongestionRecoveryUndo:
-			if r.recoverySnapshot {
-				r.credit = r.recoveryCredit
+			if r.recoveryCheckpoint&renoRecoveryCheckpointValid != 0 {
+				r.credit = math.Float64frombits(r.recoveryCheckpoint &^ renoRecoveryCheckpointValid)
 			}
-			r.recoverySnapshot = false
+			r.recoveryCheckpoint = 0
 		}
 	case CongestionEventMTUChanged:
 		r.credit = 0
-		r.recoverySnapshot = false
+		r.recoveryCheckpoint = 0
 	}
 }
 

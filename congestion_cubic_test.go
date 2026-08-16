@@ -49,6 +49,13 @@ func TestCUBICFastConvergenceComparesAdjustedMaximum(t *testing.T) {
 	}
 }
 
+func TestCUBICRecoveryCheckpointDoesNotAllocate(t *testing.T) {
+	cubic := newCUBICCongestionControl()
+	if allocations := testing.AllocsPerRun(1000, cubic.saveRecoveryCheckpoint); allocations != 0 {
+		t.Fatalf("CUBIC recovery checkpoint allocations = %v, want 0", allocations)
+	}
+}
+
 func TestCUBICRenoFriendlyAlpha(t *testing.T) {
 	const mss = 1000
 	controller := newTCPCongestionController(CongestionControlCUBIC)

@@ -34,6 +34,23 @@ func TestRenoCongestionAvoidanceRetainsFractionalCredit(t *testing.T) {
 	}
 }
 
+func TestRenoRecoveryCheckpointRetainsZeroCredit(t *testing.T) {
+	reno := newRenoCongestionControl()
+	checkpoint := CongestionEvent{Type: CongestionEventRecovery, Recovery: CongestionRecovery{Stage: CongestionRecoveryCheckpoint}}
+	undo := CongestionEvent{Type: CongestionEventRecovery, Recovery: CongestionRecovery{Stage: CongestionRecoveryUndo}}
+	reno.HandleCongestionEvent(&checkpoint)
+	reno.credit = 0.75
+	reno.HandleCongestionEvent(&undo)
+	if reno.credit != 0 || reno.recoveryCheckpoint != 0 {
+		t.Fatalf("Reno zero-credit undo = credit %v checkpoint %#x", reno.credit, reno.recoveryCheckpoint)
+	}
+	reno.credit = 0.25
+	reno.HandleCongestionEvent(&undo)
+	if reno.credit != 0.25 {
+		t.Fatalf("repeated Reno undo restored a stale checkpoint: credit %v", reno.credit)
+	}
+}
+
 func TestRenoDoesNotGrowWhenApplicationLimited(t *testing.T) {
 	const mss = 1000
 	controller := newTCPCongestionController(CongestionControlReno)

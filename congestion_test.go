@@ -15,7 +15,29 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
+
+func TestBuiltInCongestionControllerLayouts(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("64-bit layout assertion")
+	}
+	tests := []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"Reno", unsafe.Sizeof(renoCongestionControl{}), 16},
+		{"CUBIC", unsafe.Sizeof(cubicCongestionControl{}), 256},
+		{"BBR", unsafe.Sizeof(bbrCongestionControl{}), 360},
+		{"BBRv3", unsafe.Sizeof(bbr3CongestionControl{}), 400},
+	}
+	for _, test := range tests {
+		if test.got != test.want {
+			t.Errorf("%s controller size = %d, want %d; reassess the lossy-connection allocation class", test.name, test.got, test.want)
+		}
+	}
+}
 
 type testPacedCongestionControl struct {
 	dataEvents  int

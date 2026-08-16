@@ -19,7 +19,10 @@ type cubicCongestionControl struct {
 	k                  float64
 	credit             float64
 	afterTimeout       bool
-	recovery           cubicRecoveryCheckpoint
+	// recovery stays inline because established Internet flows normally enter
+	// recovery eventually; this avoids a second object and lowers post-loss
+	// memory even though a connection that never recovers carries the reserve.
+	recovery cubicRecoveryCheckpoint
 }
 
 // cubicRecoveryCheckpoint is the private CUBIC state restored after Eifel or

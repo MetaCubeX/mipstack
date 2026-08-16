@@ -211,59 +211,57 @@ func (f *bbrBandwidthFilter) update(window, round uint32, rate float64) float64 
 // retains Linux's delivery sampler, packet-timed rounds, max filters, ACK
 // aggregation compensation, policer detection, gain cycle, and ProbeRTT.
 type bbrCongestionControl struct {
-	mode bbrMode
-
-	bandwidthFilter      bbrBandwidthFilter
-	bandwidth            float64
-	roundCount           uint32
-	nextRoundDelivered   uint32
+	// Bounded counters and flags are grouped ahead of wider model values so
+	// every BBR connection, including a policed or recovering one, stays in a
+	// smaller allocation class without adding indirection to ACK processing.
+	mode                 bbrMode
 	roundStart           bool
-	fullBandwidth        float64
-	fullRounds           int
+	fullRounds           uint8
 	fullBandwidthReached bool
-
-	minimumRTT      time.Duration
-	minimumRTTStamp time.Time
-	cycleIndex      int
-	cycleStamp      tcpDeliveryTimestamp
-	cycleRandom     uint64
-	probeDone       time.Time
-	probeRound      bool
-	priorWindow     uint32
-
-	delivered              uint64
-	deliveredStamp         tcpDeliveryTimestamp
-	totalLost              uint64
-	applicationLimited     bool
-	schedulerLimited       bool
-	schedulerLimitedEvents uint64
-	requestAppLimited      bool
-
-	ackEpochStamp    time.Time
-	ackEpochBytes    uint64
-	extraACKed       [2]uint32
-	extraACKedIndex  int
-	extraACKedRounds int
-
-	longTermSampling      bool
-	longTermUseBandwidth  bool
-	longTermBandwidth     float64
-	longTermLastDelivered uint64
-	longTermLastLost      uint64
-	longTermLastStamp     time.Time
-	longTermRounds        int
-
-	pacingRate           float64
-	maximumPacingRate    uint64
-	nextSend             time.Time
-	pacingWakeDeadline   time.Time
-	pacingBurstRemaining int
+	probeRound           bool
+	applicationLimited   bool
+	schedulerLimited     bool
+	requestAppLimited    bool
+	extraACKedIndex      uint8
+	extraACKedRounds     uint8
+	longTermSampling     bool
+	longTermUseBandwidth bool
+	longTermRounds       uint8
 	idleRestart          bool
 	hasSeenRTT           bool
+	recovery             bool
+	lossRecovery         bool
+	packetConservation   bool
 
-	recovery           bool
-	lossRecovery       bool
-	packetConservation bool
+	roundCount         uint32
+	nextRoundDelivered uint32
+	cycleStamp         tcpDeliveryTimestamp
+	priorWindow        uint32
+	deliveredStamp     tcpDeliveryTimestamp
+	extraACKed         [2]uint32
+
+	bandwidthFilter        bbrBandwidthFilter
+	bandwidth              float64
+	minimumRTT             time.Duration
+	minimumRTTStamp        time.Time
+	cycleIndex             int
+	fullBandwidth          float64
+	cycleRandom            uint64
+	probeDone              time.Time
+	delivered              uint64
+	totalLost              uint64
+	schedulerLimitedEvents uint64
+	ackEpochStamp          time.Time
+	ackEpochBytes          uint64
+	longTermBandwidth      float64
+	longTermLastDelivered  uint64
+	longTermLastLost       uint64
+	longTermLastStamp      time.Time
+	pacingRate             float64
+	maximumPacingRate      uint64
+	nextSend               time.Time
+	pacingWakeDeadline     time.Time
+	pacingBurstRemaining   int
 }
 
 // newBBRCongestionControl constructs one independent BBR controller. Linux
