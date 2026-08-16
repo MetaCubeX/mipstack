@@ -20,12 +20,13 @@ type SocketOption interface {
 	apply(socketOptionSet, socketOptionUse) (socketOptionSet, error)
 }
 
-// socketOptionsNamespace groups socket-option constructors without adding one
-// exported package identifier per option. Its numeric value has no meaning.
-type socketOptionsNamespace uint8
+// SocketOptionFactory constructs socket options used when creating sockets.
+// Its value carries no state; use SocketOptions rather than constructing one.
+type SocketOptionFactory uint8
 
-// SocketOptions constructs creation-time socket policies. The constructors
-// have the following operation scopes:
+// SocketOptions constructs creation-time socket policies. See the methods on
+// [SocketOptionFactory] for each constructor's detailed contract. The
+// constructors have the following operation scopes:
 //
 //   - ReadBuffer, TrafficClass, and FlowLabel are valid for every creation
 //     method on ListenConfig and Dialer, TCPForwarderRequest.Accept, and
@@ -50,7 +51,7 @@ type socketOptionsNamespace uint8
 // removes an applicable earlier override of the same kind and otherwise has no
 // effect. Using an explicit setting outside its scope reports
 // syscall.ENOPROTOOPT before an endpoint is created.
-const SocketOptions socketOptionsNamespace = 0
+const SocketOptions SocketOptionFactory = 0
 
 // socketOptionBoolOverride records whether a boolean policy is inherited or
 // explicitly disabled or enabled.
@@ -187,14 +188,14 @@ type multicastLoopbackSocketOption socketOptionBoolOverride
 // It is valid for every creation method on ListenConfig and Dialer, for
 // TCPForwarderRequest.Accept, and for UDPForwarderRequest.Accept and
 // UDPForwarderRequest.Listen.
-func (socketOptionsNamespace) ReadBuffer(bytes int) SocketOption {
+func (SocketOptionFactory) ReadBuffer(bytes int) SocketOption {
 	return readBufferSocketOption{value: bytes, set: true}
 }
 
 // UnsetReadBuffer restores inheritance from the current Stack configuration,
 // overriding an earlier ReadBuffer option in the same list. The unset marker
 // is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetReadBuffer() SocketOption {
+func (SocketOptionFactory) UnsetReadBuffer() SocketOption {
 	return readBufferSocketOption{}
 }
 
@@ -221,14 +222,14 @@ func (option readBufferSocketOption) apply(set socketOptionSet, use socketOption
 // It is valid for every creation method on ListenConfig and Dialer, for
 // TCPForwarderRequest.Accept, and for UDPForwarderRequest.Accept and
 // UDPForwarderRequest.Listen.
-func (socketOptionsNamespace) TrafficClass(value int) SocketOption {
+func (SocketOptionFactory) TrafficClass(value int) SocketOption {
 	return trafficClassSocketOption{value: value, set: true}
 }
 
 // UnsetTrafficClass restores inheritance from the current Stack
 // configuration, overriding an earlier TrafficClass option in the same list.
 // The unset marker is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetTrafficClass() SocketOption {
+func (SocketOptionFactory) UnsetTrafficClass() SocketOption {
 	return trafficClassSocketOption{}
 }
 
@@ -256,14 +257,14 @@ func (option trafficClassSocketOption) apply(set socketOptionSet, use socketOpti
 // It is valid for every creation method on ListenConfig and Dialer, for
 // TCPForwarderRequest.Accept, and for UDPForwarderRequest.Accept and
 // UDPForwarderRequest.Listen.
-func (socketOptionsNamespace) FlowLabel(label uint32) SocketOption {
+func (SocketOptionFactory) FlowLabel(label uint32) SocketOption {
 	return flowLabelSocketOption{value: label, set: true}
 }
 
 // UnsetFlowLabel restores inheritance, including automatic flow-label
 // selection when the Stack default is zero. The unset marker is valid for
 // every socket creation operation.
-func (socketOptionsNamespace) UnsetFlowLabel() SocketOption {
+func (SocketOptionFactory) UnsetFlowLabel() SocketOption {
 	return flowLabelSocketOption{}
 }
 
@@ -290,13 +291,13 @@ func (option flowLabelSocketOption) apply(set socketOptionSet, use socketOptionU
 //
 // It is valid for ListenConfig.ListenTCP, Dialer.DialTCP, and
 // TCPForwarderRequest.Accept.
-func (socketOptionsNamespace) WriteBuffer(bytes int) SocketOption {
+func (SocketOptionFactory) WriteBuffer(bytes int) SocketOption {
 	return writeBufferSocketOption{value: bytes, set: true}
 }
 
 // UnsetWriteBuffer restores TCP send-buffer inheritance and auto-tuning. It
 // is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetWriteBuffer() SocketOption {
+func (SocketOptionFactory) UnsetWriteBuffer() SocketOption {
 	return writeBufferSocketOption{}
 }
 
@@ -320,13 +321,13 @@ func (option writeBufferSocketOption) apply(set socketOptionSet, use socketOptio
 // KeepAlive controls keepalive probing on newly created TCP connections. It is
 // valid for ListenConfig.ListenTCP, Dialer.DialTCP, and
 // TCPForwarderRequest.Accept.
-func (socketOptionsNamespace) KeepAlive(enabled bool) SocketOption {
+func (SocketOptionFactory) KeepAlive(enabled bool) SocketOption {
 	return keepAliveSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
 // UnsetKeepAlive restores the current Stack TCP keepalive default. It is valid
 // for every socket creation operation.
-func (socketOptionsNamespace) UnsetKeepAlive() SocketOption {
+func (SocketOptionFactory) UnsetKeepAlive() SocketOption {
 	return keepAliveSocketOption(socketOptionBoolOverrideUnset)
 }
 
@@ -351,13 +352,13 @@ func (option keepAliveSocketOption) apply(set socketOptionSet, use socketOptionU
 // count inherited by newly created TCP connections. Every field must be
 // positive. It is valid for ListenConfig.ListenTCP, Dialer.DialTCP, and
 // TCPForwarderRequest.Accept.
-func (socketOptionsNamespace) KeepAliveConfig(config KeepAliveConfig) SocketOption {
+func (SocketOptionFactory) KeepAliveConfig(config KeepAliveConfig) SocketOption {
 	return keepAliveConfigSocketOption{value: config, set: true}
 }
 
 // UnsetKeepAliveConfig restores the current Stack keepalive timing policy. It
 // is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetKeepAliveConfig() SocketOption {
+func (SocketOptionFactory) UnsetKeepAliveConfig() SocketOption {
 	return keepAliveConfigSocketOption{}
 }
 
@@ -381,13 +382,13 @@ func (option keepAliveConfigSocketOption) apply(set socketOptionSet, use socketO
 // NoDelay controls Nagle coalescing on newly created TCP connections. True is
 // the package and net.TCPConn-compatible default. It is valid for
 // ListenConfig.ListenTCP, Dialer.DialTCP, and TCPForwarderRequest.Accept.
-func (socketOptionsNamespace) NoDelay(enabled bool) SocketOption {
+func (SocketOptionFactory) NoDelay(enabled bool) SocketOption {
 	return noDelaySocketOption(newSocketOptionBoolOverride(enabled))
 }
 
 // UnsetNoDelay restores the current Stack TCP Nagle policy. It is valid for
 // every socket creation operation.
-func (socketOptionsNamespace) UnsetNoDelay() SocketOption {
+func (SocketOptionFactory) UnsetNoDelay() SocketOption {
 	return noDelaySocketOption(socketOptionBoolOverrideUnset)
 }
 
@@ -412,13 +413,13 @@ func (option noDelaySocketOption) apply(set socketOptionSet, use socketOptionUse
 // without an acceptable inbound segment. Zero explicitly disables the policy.
 // It is valid for ListenConfig.ListenTCP, Dialer.DialTCP, and
 // TCPForwarderRequest.Accept.
-func (socketOptionsNamespace) IdleTimeout(timeout time.Duration) SocketOption {
+func (SocketOptionFactory) IdleTimeout(timeout time.Duration) SocketOption {
 	return idleTimeoutSocketOption{value: timeout, set: true}
 }
 
 // UnsetIdleTimeout restores the current Stack receive-idle policy. It is valid
 // for every socket creation operation.
-func (socketOptionsNamespace) UnsetIdleTimeout() SocketOption {
+func (SocketOptionFactory) UnsetIdleTimeout() SocketOption {
 	return idleTimeoutSocketOption{}
 }
 
@@ -443,13 +444,13 @@ func (option idleTimeoutSocketOption) apply(set socketOptionSet, use socketOptio
 // remain unacknowledged or unsent behind a zero window. Zero explicitly
 // disables this custom bound. It is valid for ListenConfig.ListenTCP,
 // Dialer.DialTCP, and TCPForwarderRequest.Accept.
-func (socketOptionsNamespace) UserTimeout(timeout time.Duration) SocketOption {
+func (SocketOptionFactory) UserTimeout(timeout time.Duration) SocketOption {
 	return userTimeoutSocketOption{value: timeout, set: true}
 }
 
 // UnsetUserTimeout restores the current Stack TCP user-timeout policy. It is
 // valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetUserTimeout() SocketOption {
+func (SocketOptionFactory) UnsetUserTimeout() SocketOption {
 	return userTimeoutSocketOption{}
 }
 
@@ -474,14 +475,14 @@ func (option userTimeoutSocketOption) apply(set socketOptionSet, use socketOptio
 // connections. It overrides CongestionControlFactory when it appears later in
 // the same option list. It is valid for ListenConfig.ListenTCP,
 // Dialer.DialTCP, and TCPForwarderRequest.Accept.
-func (socketOptionsNamespace) CongestionControl(algorithm CongestionControl) SocketOption {
+func (SocketOptionFactory) CongestionControl(algorithm CongestionControl) SocketOption {
 	return congestionControlSocketOption{name: algorithm, set: true}
 }
 
 // UnsetCongestionControl restores the current Stack congestion-control
 // policy, overriding either congestion-control option form used earlier. The
 // unset marker is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetCongestionControl() SocketOption {
+func (SocketOptionFactory) UnsetCongestionControl() SocketOption {
 	return congestionControlSocketOption{}
 }
 
@@ -506,7 +507,7 @@ func (option congestionControlSocketOption) apply(set socketOptionSet, use socke
 // created TCP connections. It overrides CongestionControl when it appears
 // later in the same option list. It is valid for ListenConfig.ListenTCP,
 // Dialer.DialTCP, and TCPForwarderRequest.Accept.
-func (socketOptionsNamespace) CongestionControlFactory(factory *CongestionControlFactory) SocketOption {
+func (SocketOptionFactory) CongestionControlFactory(factory *CongestionControlFactory) SocketOption {
 	return congestionControlFactorySocketOption{value: factory, set: true}
 }
 
@@ -530,13 +531,13 @@ func (option congestionControlFactorySocketOption) apply(set socketOptionSet, us
 // MaximumPacingRate caps newly created TCP connections to bytesPerSecond.
 // Zero explicitly removes the cap. It is valid for ListenConfig.ListenTCP,
 // Dialer.DialTCP, and TCPForwarderRequest.Accept.
-func (socketOptionsNamespace) MaximumPacingRate(bytesPerSecond uint64) SocketOption {
+func (SocketOptionFactory) MaximumPacingRate(bytesPerSecond uint64) SocketOption {
 	return maximumPacingRateSocketOption{value: bytesPerSecond, set: true}
 }
 
 // UnsetMaximumPacingRate restores the current Stack pacing-rate policy. It is
 // valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetMaximumPacingRate() SocketOption {
+func (SocketOptionFactory) UnsetMaximumPacingRate() SocketOption {
 	return maximumPacingRateSocketOption{}
 }
 
@@ -558,13 +559,13 @@ func (option maximumPacingRateSocketOption) apply(set socketOptionSet, use socke
 // Accept. Zero creates an unbuffered accept handoff; the value cannot be
 // negative. The policy belongs to the listener and is not inherited by a
 // connection. It is valid only for ListenConfig.ListenTCP.
-func (socketOptionsNamespace) AcceptQueue(capacity int) SocketOption {
+func (SocketOptionFactory) AcceptQueue(capacity int) SocketOption {
 	return acceptQueueSocketOption{value: capacity, set: true}
 }
 
 // UnsetAcceptQueue restores the current Stack completed-handshake limit. It is
 // valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetAcceptQueue() SocketOption {
+func (SocketOptionFactory) UnsetAcceptQueue() SocketOption {
 	return acceptQueueSocketOption{}
 }
 
@@ -588,13 +589,13 @@ func (option acceptQueueSocketOption) apply(set socketOptionSet, use socketOptio
 // SYNBacklog sets the number of stateful TCP handshakes owned by a listener
 // before it falls back to SYN cookies. Zero selects cookies immediately; the
 // value cannot be negative. It is valid only for ListenConfig.ListenTCP.
-func (socketOptionsNamespace) SYNBacklog(capacity int) SocketOption {
+func (SocketOptionFactory) SYNBacklog(capacity int) SocketOption {
 	return synBacklogSocketOption{value: capacity, set: true}
 }
 
 // UnsetSYNBacklog restores the current Stack stateful-handshake limit. It is
 // valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetSYNBacklog() SocketOption {
+func (SocketOptionFactory) UnsetSYNBacklog() SocketOption {
 	return synBacklogSocketOption{}
 }
 
@@ -620,13 +621,13 @@ func (option synBacklogSocketOption) apply(set socketOptionSet, use socketOption
 // reads after queued payloads. It is valid for the UDP and IP creation methods
 // on ListenConfig and Dialer, and for UDPForwarderRequest.Accept and
 // UDPForwarderRequest.Listen.
-func (socketOptionsNamespace) ReceiveErrors(enabled bool) SocketOption {
+func (SocketOptionFactory) ReceiveErrors(enabled bool) SocketOption {
 	return receiveErrorsSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
 // UnsetReceiveErrors restores the current Stack asynchronous-error policy. It
 // is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetReceiveErrors() SocketOption {
+func (SocketOptionFactory) UnsetReceiveErrors() SocketOption {
 	return receiveErrorsSocketOption(socketOptionBoolOverrideUnset)
 }
 
@@ -651,13 +652,13 @@ func (option receiveErrorsSocketOption) apply(set socketOptionSet, use socketOpt
 // by newly created UDP and IP sockets. It is valid for the UDP and IP creation
 // methods on ListenConfig and Dialer, and for UDPForwarderRequest.Accept and
 // UDPForwarderRequest.Listen.
-func (socketOptionsNamespace) PathMTUDiscovery(mode PathMTUDiscovery) SocketOption {
+func (SocketOptionFactory) PathMTUDiscovery(mode PathMTUDiscovery) SocketOption {
 	return pathMTUDiscoverySocketOption{value: mode, set: true}
 }
 
 // UnsetPathMTUDiscovery restores the current Stack PMTU-discovery policy. It
 // is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetPathMTUDiscovery() SocketOption {
+func (SocketOptionFactory) UnsetPathMTUDiscovery() SocketOption {
 	return pathMTUDiscoverySocketOption{}
 }
 
@@ -683,13 +684,13 @@ func (option pathMTUDiscoverySocketOption) apply(set socketOptionSet, use socket
 // only for an IPv6-only endpoint; IPv4 and dual-stack creation report EINVAL.
 // It is valid for the UDP and IP creation methods on ListenConfig and Dialer,
 // and for UDPForwarderRequest.Accept and UDPForwarderRequest.Listen.
-func (socketOptionsNamespace) HopLimit(hopLimit int) SocketOption {
+func (SocketOptionFactory) HopLimit(hopLimit int) SocketOption {
 	return hopLimitSocketOption{value: hopLimit, set: true}
 }
 
 // UnsetHopLimit restores the current Stack unicast hop-limit policy. It is
 // valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetHopLimit() SocketOption {
+func (SocketOptionFactory) UnsetHopLimit() SocketOption {
 	return hopLimitSocketOption{}
 }
 
@@ -714,13 +715,13 @@ func (option hopLimitSocketOption) apply(set socketOptionSet, use socketOptionUs
 // by newly created UDP and IP sockets. It is valid for the UDP and IP creation
 // methods on ListenConfig and Dialer, and for UDPForwarderRequest.Accept and
 // UDPForwarderRequest.Listen.
-func (socketOptionsNamespace) Broadcast(enabled bool) SocketOption {
+func (SocketOptionFactory) Broadcast(enabled bool) SocketOption {
 	return broadcastSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
 // UnsetBroadcast restores the current Stack broadcast-output policy. It is
 // valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetBroadcast() SocketOption {
+func (SocketOptionFactory) UnsetBroadcast() SocketOption {
 	return broadcastSocketOption(socketOptionBoolOverrideUnset)
 }
 
@@ -746,13 +747,13 @@ func (option broadcastSocketOption) apply(set socketOptionSet, use socketOptionU
 // zero confines output to this host. It is valid for the UDP and IP creation
 // methods on ListenConfig and Dialer, and for UDPForwarderRequest.Accept and
 // UDPForwarderRequest.Listen.
-func (socketOptionsNamespace) MulticastHopLimit(hopLimit int) SocketOption {
+func (SocketOptionFactory) MulticastHopLimit(hopLimit int) SocketOption {
 	return multicastHopLimitSocketOption{value: hopLimit, set: true}
 }
 
 // UnsetMulticastHopLimit restores the current Stack multicast hop limit. It
 // is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetMulticastHopLimit() SocketOption {
+func (SocketOptionFactory) UnsetMulticastHopLimit() SocketOption {
 	return multicastHopLimitSocketOption{}
 }
 
@@ -777,13 +778,13 @@ func (option multicastHopLimitSocketOption) apply(set socketOptionSet, use socke
 // matching local memberships for newly created UDP and IP sockets. It is valid
 // for the UDP and IP creation methods on ListenConfig and Dialer, and for
 // UDPForwarderRequest.Accept and UDPForwarderRequest.Listen.
-func (socketOptionsNamespace) MulticastLoopback(enabled bool) SocketOption {
+func (SocketOptionFactory) MulticastLoopback(enabled bool) SocketOption {
 	return multicastLoopbackSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
 // UnsetMulticastLoopback restores the current Stack multicast-loopback policy.
 // It is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetMulticastLoopback() SocketOption {
+func (SocketOptionFactory) UnsetMulticastLoopback() SocketOption {
 	return multicastLoopbackSocketOption(socketOptionBoolOverrideUnset)
 }
 
@@ -809,14 +810,14 @@ func (option multicastLoopbackSocketOption) apply(set socketOptionSet, use socke
 // an explicit false value disables that behavior. UDP listeners default to an
 // exclusive binding and require every overlapping endpoint to opt in. It is
 // valid only for ListenConfig.ListenTCP and ListenConfig.ListenUDP.
-func (socketOptionsNamespace) ReuseAddress(enabled bool) SocketOption {
+func (SocketOptionFactory) ReuseAddress(enabled bool) SocketOption {
 	return reuseAddressSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
 // UnsetReuseAddress restores the operation-specific SO_REUSEADDR default,
 // overriding earlier ReuseAddress options in the same list. The unset marker
 // is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetReuseAddress() SocketOption {
+func (SocketOptionFactory) UnsetReuseAddress() SocketOption {
 	return reuseAddressSocketOption(socketOptionBoolOverrideUnset)
 }
 
@@ -840,14 +841,14 @@ func (option reuseAddressSocketOption) apply(set socketOptionSet, use socketOpti
 // ReusePort controls Linux SO_REUSEPORT-style flow distribution for TCP and
 // UDP listeners. Every endpoint in an overlapping group must enable it. It is
 // valid only for ListenConfig.ListenTCP and ListenConfig.ListenUDP.
-func (socketOptionsNamespace) ReusePort(enabled bool) SocketOption {
+func (SocketOptionFactory) ReusePort(enabled bool) SocketOption {
 	return reusePortSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
 // UnsetReusePort restores the default disabled SO_REUSEPORT policy,
 // overriding earlier ReusePort options in the same list. The unset marker is
 // valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetReusePort() SocketOption {
+func (SocketOptionFactory) UnsetReusePort() SocketOption {
 	return reusePortSocketOption(socketOptionBoolOverrideUnset)
 }
 
@@ -873,14 +874,14 @@ func (option reusePortSocketOption) apply(set socketOptionSet, use socketOptionU
 // IP_HDRINCL and IPV6_HDRINCL. Use IPConn.SetIPHeaderIncludedOnWrite to change
 // the representation of an existing socket. It is valid only for
 // ListenConfig.ListenIP and Dialer.DialIP.
-func (socketOptionsNamespace) IPHeaderIncludedOnWrite(enabled bool) SocketOption {
+func (SocketOptionFactory) IPHeaderIncludedOnWrite(enabled bool) SocketOption {
 	return ipHeaderIncludedOnWriteSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
 // UnsetIPHeaderIncludedOnWrite restores protocol-payload writes, overriding
 // earlier IPHeaderIncludedOnWrite options in the same list. The unset marker
 // is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetIPHeaderIncludedOnWrite() SocketOption {
+func (SocketOptionFactory) UnsetIPHeaderIncludedOnWrite() SocketOption {
 	return ipHeaderIncludedOnWriteSocketOption(socketOptionBoolOverrideUnset)
 }
 
@@ -906,14 +907,14 @@ func (option ipHeaderIncludedOnWriteSocketOption) apply(set socketOptionSet, use
 // creation-time option because changing the interpretation of queued messages
 // would make concurrent reads ambiguous. It is valid only for
 // ListenConfig.ListenIP and Dialer.DialIP.
-func (socketOptionsNamespace) IPHeaderIncludedOnRead(enabled bool) SocketOption {
+func (SocketOptionFactory) IPHeaderIncludedOnRead(enabled bool) SocketOption {
 	return ipHeaderIncludedOnReadSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
 // UnsetIPHeaderIncludedOnRead restores protocol-payload reads, overriding
 // earlier IPHeaderIncludedOnRead options in the same list. The unset marker is
 // valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetIPHeaderIncludedOnRead() SocketOption {
+func (SocketOptionFactory) UnsetIPHeaderIncludedOnRead() SocketOption {
 	return ipHeaderIncludedOnReadSocketOption(socketOptionBoolOverrideUnset)
 }
 
@@ -938,14 +939,14 @@ func (option ipHeaderIncludedOnReadSocketOption) apply(set socketOptionSet, use 
 // protocol socket. A generic dual-stack ip:icmp socket applies it only to its
 // IPv4 branch. Other protocols report syscall.ENOPROTOOPT and IPv6-only
 // sockets report syscall.EAFNOSUPPORT before the endpoint is created.
-func (socketOptionsNamespace) ICMPv4Filter(filter ICMPv4Filter) SocketOption {
+func (SocketOptionFactory) ICMPv4Filter(filter ICMPv4Filter) SocketOption {
 	return icmpV4FilterSocketOption{value: filter, set: true}
 }
 
 // UnsetICMPv4Filter restores the all-accepting default, overriding an earlier
 // ICMPv4Filter option in the same list. The unset marker is valid for every
 // socket creation operation.
-func (socketOptionsNamespace) UnsetICMPv4Filter() SocketOption {
+func (SocketOptionFactory) UnsetICMPv4Filter() SocketOption {
 	return icmpV4FilterSocketOption{}
 }
 
@@ -967,14 +968,14 @@ func (option icmpV4FilterSocketOption) apply(set socketOptionSet, use socketOpti
 // protocol socket. A generic dual-stack ip:ipv6-icmp socket applies it only to
 // its IPv6 branch. Other protocols report syscall.ENOPROTOOPT and IPv4-only
 // sockets report syscall.EAFNOSUPPORT before the endpoint is created.
-func (socketOptionsNamespace) ICMPv6Filter(filter ICMPv6Filter) SocketOption {
+func (SocketOptionFactory) ICMPv6Filter(filter ICMPv6Filter) SocketOption {
 	return icmpV6FilterSocketOption{value: filter, set: true}
 }
 
 // UnsetICMPv6Filter restores the all-accepting default, overriding an earlier
 // ICMPv6Filter option in the same list. The unset marker is valid for every
 // socket creation operation.
-func (socketOptionsNamespace) UnsetICMPv6Filter() SocketOption {
+func (SocketOptionFactory) UnsetICMPv6Filter() SocketOption {
 	return icmpV6FilterSocketOption{}
 }
 
@@ -998,7 +999,7 @@ func (option icmpV6FilterSocketOption) apply(set socketOptionSet, use socketOpti
 // disabled, offset is ignored. IPv4-only sockets report syscall.EAFNOSUPPORT;
 // ICMPv6 sockets report syscall.EINVAL because their checksum at offset 2 is
 // mandatory and cannot be configured.
-func (socketOptionsNamespace) IPv6Checksum(enabled bool, offset int) SocketOption {
+func (SocketOptionFactory) IPv6Checksum(enabled bool, offset int) SocketOption {
 	return ipv6ChecksumSocketOption{
 		value: ipv6ChecksumPolicy{enabled: enabled, offset: offset},
 		set:   true,
@@ -1009,7 +1010,7 @@ func (socketOptionsNamespace) IPv6Checksum(enabled bool, offset int) SocketOptio
 // IPv6Checksum option in the same list. ICMPv6 restores mandatory processing
 // at offset 2; other protocols restore disabled processing. The unset marker
 // is valid for every socket creation operation.
-func (socketOptionsNamespace) UnsetIPv6Checksum() SocketOption {
+func (SocketOptionFactory) UnsetIPv6Checksum() SocketOption {
 	return ipv6ChecksumSocketOption{}
 }
 
