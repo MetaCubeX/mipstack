@@ -2339,12 +2339,14 @@ func TestICMPProtocolMustMatchIPFamily(t *testing.T) {
 }
 
 func BenchmarkParseIPPacket(b *testing.B) {
+	ipv6ExtensionPacket := testIPv6ExtensionBenchmarkPacket()
 	for _, test := range []struct {
 		name   string
 		packet []byte
 	}{
 		{name: "IPv4", packet: buildTestUDP(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("192.0.2.1"), 50000, 443, make([]byte, 1200))},
 		{name: "IPv6", packet: buildTestUDP(netip.MustParseAddr("2001:db8:1::1"), netip.MustParseAddr("2001:db8::1"), 50000, 443, make([]byte, 1200))},
+		{name: "IPv6-extension", packet: ipv6ExtensionPacket},
 	} {
 		b.Run(test.name, func(b *testing.B) {
 			b.ReportAllocs()
@@ -2387,12 +2389,14 @@ func BenchmarkIPPacketMarshalFragments(b *testing.B) {
 }
 
 func BenchmarkStackPacketParsing(b *testing.B) {
+	ipv6ExtensionPacket := testIPv6ExtensionBenchmarkPacket()
 	for _, test := range []struct {
 		name   string
 		packet []byte
 	}{
 		{name: "IPv4", packet: buildTestUDP(netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("192.0.2.1"), 50000, 443, make([]byte, 1200))},
 		{name: "IPv6", packet: buildTestUDP(netip.MustParseAddr("2001:db8:1::1"), netip.MustParseAddr("2001:db8::1"), 50000, 443, make([]byte, 1200))},
+		{name: "IPv6-extension", packet: ipv6ExtensionPacket},
 	} {
 		b.Run(test.name, func(b *testing.B) {
 			b.ReportAllocs()
@@ -2401,6 +2405,67 @@ func BenchmarkStackPacketParsing(b *testing.B) {
 				if _, ok := parseIPPacket(test.packet); !ok {
 					b.Fatal("valid packet was rejected")
 				}
+			}
+		})
+	}
+}
+
+// testIPv6ExtensionBenchmarkPacket adds one valid Hop-by-Hop header without
+// changing the transport pseudo-header covered by buildTestUDP.
+func testIPv6ExtensionBenchmarkPacket() []byte {
+	packet := buildTestUDP(netip.MustParseAddr("2001:db8:1::1"), netip.MustParseAddr("2001:db8::1"), 50000, 443, make([]byte, 1200))
+	withExtension := make([]byte, len(packet)+8)
+	copy(withExtension[:40], packet[:40])
+	withExtension[6] = IPv6ExtensionHeaderHopByHop
+	binary.BigEndian.PutUint16(withExtension[4:6], uint16(len(withExtension)-40))
+	copy(withExtension[40:48], []byte{ProtocolUDP, 0, IPv6ExtensionOptionPadN, 4, 0, 0, 0, 0})
+	copy(withExtension[48:], packet[40:])
+	return withExtension
+}
+
+func BenchmarkIPPacketFragment(b *testing.B) {
+	fragment6 := make([]byte, 8+1200)
+	fragment6[0] = ProtocolUDP
+	binary.BigEndian.PutUint16(fragment6[2:4], 1)
+	binary.BigEndian.PutUint32(fragment6[4:8], 0x12345678)
+	extensionFragment6 := make([]byte, 8+len(fragment6))
+	copy(extensionFragment6[:8], []byte{IPv6ExtensionHeaderFragment, 0, IPv6ExtensionOptionPadN, 4, 0, 0, 0, 0})
+	copy(extensionFragment6[8:], fragment6)
+	for _, test := range []struct {
+		name   string
+		packet IPPacket
+	}{
+		{
+			name: "IPv4",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1"),
+				Protocol: ProtocolUDP, MoreFragments: true, Payload: make([]byte, 1200),
+			},
+		},
+		{
+			name: "IPv6",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8:1::1"),
+				Protocol: IPv6ExtensionHeaderFragment, Payload: fragment6,
+			},
+		},
+		{
+			name: "IPv6-extension",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8:1::1"),
+				Protocol: IPv6ExtensionHeaderHopByHop, Payload: extensionFragment6,
+			},
+		},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			var view IPPacketFragmentView
+			var ok bool
+			for index := 0; index < b.N; index++ {
+				view, ok = test.packet.Fragment()
+			}
+			if !ok || len(view.Payload) == 0 {
+				b.Fatal("fragment metadata unavailable")
 			}
 		})
 	}

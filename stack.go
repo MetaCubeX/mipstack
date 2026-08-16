@@ -320,7 +320,7 @@ type Stack struct {
 	flowLabelSecret [16]byte
 
 	fragmentMu    sync.Mutex
-	fragments     map[fragmentKey]*fragmentSet
+	fragments     map[fragmentKey]*ipPacketReassemblyEntry
 	fragmentBytes int
 	fragmentWake  chan struct{}
 
@@ -1603,7 +1603,7 @@ func New(config Config) (*Stack, error) {
 	stack := &Stack{
 		tcp: make(map[tcpKey]*TCPConn), udp: make(map[udpKey]*UDPConn),
 		nextPort: [2]automaticPortCursor{ports4, ports6}, pathMTU: make(map[netip.Addr]pathMTUEntry),
-		closeCh: make(chan struct{}), timestampEpoch: timestampEpoch, fragments: make(map[fragmentKey]*fragmentSet), fragmentWake: make(chan struct{}, 1),
+		closeCh: make(chan struct{}), timestampEpoch: timestampEpoch, fragments: make(map[fragmentKey]*ipPacketReassemblyEntry), fragmentWake: make(chan struct{}, 1),
 	}
 	stack.outbound.initFair(outboundPacketQueue, timestampEpoch, state.mtu, outputFlowSecret)
 	stack.loopback.initFIFO(loopbackPacketQueue, timestampEpoch)
@@ -3149,7 +3149,8 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 	parsed, ok := parseIPPacket(packet)
 	if !ok {
 		network := s.network.Load()
-		if fragment, valid := parseFragment(packet); valid && s.acceptsInboundDestination(network, fragment.target, loopback) &&
+		fragment, validFragment := parseFragment(packet)
+		if validFragment && s.acceptsInboundDestination(network, fragment.target, loopback) &&
 			validInboundFragmentSource(network, fragment.source, fragment.target, fragment.protocol) {
 			if fragment.truncated || fragment.parameter {
 				s.discardFragment(fragment.reassemblyKey(loopback))
@@ -3166,10 +3167,12 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 				return nil
 			}
 		}
-		if reassembled, pending := s.reassemblePacketStatus(packet, receivedAt, loopback); reassembled != nil {
-			parsed, ok = parseIPPacket(reassembled)
-		} else if pending {
-			return nil
+		if validFragment {
+			if reassembled, pending := s.reassembleParsedFragmentStatus(fragment, receivedAt, loopback); reassembled != nil {
+				parsed, ok = parseIPPacket(reassembled)
+			} else if pending {
+				return nil
+			}
 		}
 	}
 	network := s.network.Load()

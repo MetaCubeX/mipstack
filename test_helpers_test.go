@@ -44,6 +44,16 @@ func (s *Stack) reassemblePacket(packet []byte, now time.Time) []byte {
 	return result
 }
 
+// reassemblePacketStatus preserves the raw-wire test entry point after packet
+// ingress began passing its already parsed fragment directly to reassembly.
+func (s *Stack) reassemblePacketStatus(packet []byte, now time.Time, loopback bool) (_ []byte, pending bool) {
+	fragment, ok := parseFragment(packet)
+	if !ok {
+		return nil, false
+	}
+	return s.reassembleParsedFragmentStatus(fragment, now, loopback)
+}
+
 // expireFragments advances fragment cleanup synchronously for timeout tests.
 func (s *Stack) expireFragments(now time.Time) {
 	s.fragmentMu.Lock()

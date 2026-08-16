@@ -41,6 +41,20 @@ type UDPDatagram struct {
 	Payload []byte
 }
 
+// udpWireLength validates UDP's fixed header and declared datagram length. It
+// is intentionally small enough to inline in both the public codec and Stack's
+// packet hot path; checksum policy remains with those callers.
+func udpWireLength(udp []byte) (int, bool) {
+	if len(udp) < udpHeaderSize {
+		return 0, false
+	}
+	length := int(binary.BigEndian.Uint16(udp[4:6]))
+	if length < udpHeaderSize || length > len(udp) {
+		return 0, false
+	}
+	return length, true
+}
+
 // UDPDatagram validates and decodes the packet's UDP upper layer. A shorter
 // UDP Length trims IP-layer padding; a length larger than the upper layer is
 // invalid.
@@ -49,26 +63,23 @@ func (p IPPacket) UDPDatagram() (UDPDatagram, error) {
 	if err != nil {
 		return UDPDatagram{}, err
 	}
-	if len(udp) < udpHeaderSize {
-		return UDPDatagram{}, syscall.EINVAL
-	}
-	length := int(binary.BigEndian.Uint16(udp[4:6]))
-	if length < udpHeaderSize || length > len(udp) {
+	source, destination := p.Source.Unmap(), p.Destination.Unmap()
+	length, valid := udpWireLength(udp)
+	if !valid {
 		return UDPDatagram{}, syscall.EINVAL
 	}
 	checksumValue := binary.BigEndian.Uint16(udp[6:8])
-	if p.Source.Unmap().Is6() && checksumValue == 0 {
+	if source.Is6() && checksumValue == 0 {
 		return UDPDatagram{}, syscall.EINVAL
 	}
 	if checksumValue != 0 {
 		if !pseudoHeaderSafe {
 			return UDPDatagram{}, syscall.EPROTONOSUPPORT
 		}
-		if transportChecksum(p.Source, p.Destination, ProtocolUDP, udp[:length]) != 0 {
+		if transportChecksum(source, destination, ProtocolUDP, udp[:length]) != 0 {
 			return UDPDatagram{}, syscall.EINVAL
 		}
 	}
-	source, destination := p.Source.Unmap(), p.Destination.Unmap()
 	return UDPDatagram{
 		Source:           netip.AddrPortFrom(source, binary.BigEndian.Uint16(udp[0:2])),
 		Destination:      netip.AddrPortFrom(destination, binary.BigEndian.Uint16(udp[2:4])),
@@ -122,11 +133,9 @@ func marshalPublicUDPDatagram(dst []byte, d UDPDatagram) {
 	if d.ChecksumDisabled {
 		return
 	}
-	value := transportChecksumParts(d.Source.Addr(), d.Destination.Addr(), ProtocolUDP, len(dst), dst[:udpHeaderSize], dst[udpHeaderSize:])
-	if value == 0 {
-		value = 0xffff
-	}
-	binary.BigEndian.PutUint16(dst[6:8], value)
+	writeUDPChecksumValue(dst[:udpHeaderSize], transportChecksumParts(
+		d.Source.Addr(), d.Destination.Addr(), ProtocolUDP, len(dst), dst[:udpHeaderSize], dst[udpHeaderSize:],
+	))
 }
 
 // udpDatagram is one validated inbound payload and its source endpoint.
@@ -358,12 +367,8 @@ func (reuseAddressUDPSocketBinding) register(stack *Stack, connection *UDPConn) 
 // datagram according to its already classified IP destination.
 func (s *Stack) handleUDP(packet ipPacket, destination inboundDestinationClass) error {
 	udp := packet.payload
-	if len(udp) < udpHeaderSize {
-		s.stats.inboundDroppedPackets.Add(1)
-		return nil
-	}
-	length := int(binary.BigEndian.Uint16(udp[4:6]))
-	if length < udpHeaderSize || length > len(udp) {
+	length, valid := udpWireLength(udp)
+	if !valid {
 		s.stats.inboundDroppedPackets.Add(1)
 		return nil
 	}
@@ -1504,14 +1509,8 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 		return syscall.EMSGSIZE
 	}
 	var udpHeader [udpHeaderSize]byte
-	binary.BigEndian.PutUint16(udpHeader[0:2], sourcePort)
-	binary.BigEndian.PutUint16(udpHeader[2:4], targetPort)
-	binary.BigEndian.PutUint16(udpHeader[4:6], uint16(udpSize))
-	value := transportChecksumParts(source, target, ProtocolUDP, udpSize, udpHeader[:], payload)
-	if value == 0 {
-		value = 0xffff
-	}
-	binary.BigEndian.PutUint16(udpHeader[6:8], value)
+	marshalUDPHeaderFields(udpHeader[:], sourcePort, targetPort, udpSize)
+	writeUDPChecksumValue(udpHeader[:], transportChecksumParts(source, target, ProtocolUDP, udpSize, udpHeader[:], payload))
 	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
 	return c.stack.writeIPFragmentsUntilOptionsForMTU(source, target, ProtocolUDP, udpHeader[:], payload, options, mtu, state)
 }
@@ -1559,20 +1558,13 @@ func (c *UDPConn) writeDatagramBuffersForMTU(source, target netip.Addr, sourcePo
 		return syscall.EMSGSIZE
 	}
 	udp := packet[ipSize:]
-	binary.BigEndian.PutUint16(udp[0:2], sourcePort)
-	binary.BigEndian.PutUint16(udp[2:4], targetPort)
-	binary.BigEndian.PutUint16(udp[4:6], uint16(udpSize))
-	binary.BigEndian.PutUint16(udp[6:8], 0)
+	marshalUDPHeaderFields(udp[:udpHeaderSize], sourcePort, targetPort, udpSize)
 	if copied := copyMessageBuffers(udp[udpHeaderSize:], buffers); copied != payloadSize {
 		queue.releaseBuffer(packet, reusable)
 		queue.releaseReserved(slot)
 		return syscall.EINVAL
 	}
-	checksumValue := transportChecksum(source, target, ProtocolUDP, udp)
-	if checksumValue == 0 {
-		checksumValue = 0xffff
-	}
-	binary.BigEndian.PutUint16(udp[6:8], checksumValue)
+	writeUDPChecksumValue(udp[:udpHeaderSize], transportChecksum(source, target, ProtocolUDP, udp))
 	if !queue.enqueueReservedPacket(slot, packet, reusable) {
 		return ErrClosed
 	}
@@ -1584,11 +1576,16 @@ func (c *UDPConn) writeDatagramBuffersForMTU(source, target netip.Addr, sourcePo
 func marshalUDPDatagram(dst []byte, source, target netip.Addr, sourcePort, targetPort uint16, payload []byte) {
 	marshalUDPHeaderFields(dst[:udpHeaderSize], sourcePort, targetPort, len(dst))
 	copy(dst[udpHeaderSize:], payload)
-	value := transportChecksum(source, target, ProtocolUDP, dst)
+	writeUDPChecksumValue(dst[:udpHeaderSize], transportChecksum(source, target, ProtocolUDP, dst))
+}
+
+// writeUDPChecksumValue applies UDP's zero-checksum wire representation to a
+// checksum calculated over either contiguous or scatter payload storage.
+func writeUDPChecksumValue(header []byte, value uint16) {
 	if value == 0 {
 		value = 0xffff
 	}
-	binary.BigEndian.PutUint16(dst[6:8], value)
+	binary.BigEndian.PutUint16(header[6:8], value)
 }
 
 // marshalUDPHeaderFields writes one UDP header with a cleared checksum.

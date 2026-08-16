@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"reflect"
 	"syscall"
 	"testing"
 	"time"
@@ -529,6 +530,12 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 			t.Fatalf("second IPv4 fragment %d ID = %d, want 102", index, id)
 		}
 	}
+	if err = stack4.writeIPFragmentsUntilOptionsForMTU(local4, remote4, ProtocolUDP, make([]byte, 16), nil, ipPacketOptions{}, 27, socketWriteState{}); !errors.Is(err, syscall.EMSGSIZE) {
+		t.Fatalf("invalid IPv4 fragment MTU = %v, want EMSGSIZE", err)
+	}
+	if got := stack4.ipv4ID.Load(); got != 102 {
+		t.Fatalf("invalid IPv4 fragment MTU consumed Identification: %d", got)
+	}
 	atomic4, err := stack4.ipPayloadPackets(local4, remote4, ProtocolICMPv4, make([]byte, 8), false)
 	if err != nil || len(atomic4) != 1 {
 		t.Fatalf("atomic IPv4 packets = %d, %v", len(atomic4), err)
@@ -561,6 +568,12 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 		if id := binary.BigEndian.Uint32(packet[44:48]); id != 1001 {
 			t.Fatalf("IPv6 fragment %d ID = %d, want 1001", index, id)
 		}
+	}
+	if err = stack6.writeIPFragmentsUntilOptionsForMTU(local6, remote6, ProtocolUDP, make([]byte, 16), nil, ipPacketOptions{}, 55, socketWriteState{}); !errors.Is(err, syscall.EMSGSIZE) {
+		t.Fatalf("invalid IPv6 fragment MTU = %v, want EMSGSIZE", err)
+	}
+	if got := stack6.ipv6FragmentID.Load(); got != 1001 {
+		t.Fatalf("invalid IPv6 fragment MTU consumed Identification: %d", got)
 	}
 }
 
@@ -771,9 +784,9 @@ func TestDuplicateFragmentAtPieceLimitPreservesQueue(t *testing.T) {
 		pieces[index] = fragmentPiece{offset: index * 8, data: make([]byte, 8)}
 	}
 	stack.fragmentMu.Lock()
-	stack.fragments[key] = &fragmentSet{
-		IPPacketReassembly: IPPacketReassembly{
-			initialized: true, pieces: pieces, total: -1, bytes: fragmentMaximumPieces * 8,
+	stack.fragments[key] = &ipPacketReassemblyEntry{
+		state: ipPacketReassemblyState{
+			pieces: pieces, total: -1, bytes: fragmentMaximumPieces * 8,
 			protocol: ProtocolUDP, source: key.source, target: key.target, identifier: key.identification,
 			ecnMask: 1, maximum: fragmentMaximumDatagram - 20,
 		},
@@ -936,16 +949,16 @@ func TestFragmentByteCapacityEvictsOldest(t *testing.T) {
 	_, stack := newTestStack(t, local, remote)
 	now := time.Now()
 	oldKey := fragmentKey{source: remote, target: local, identification: 1, protocol: ProtocolUDP}
-	old := &fragmentSet{
-		IPPacketReassembly: IPPacketReassembly{
-			initialized: true, total: -1, bytes: fragmentMaximumBytes - 1,
+	oldEntry := &ipPacketReassemblyEntry{
+		state: ipPacketReassemblyState{
+			total: -1, bytes: fragmentMaximumBytes - 1,
 			source: remote, target: local, identifier: 1, maximum: fragmentMaximumDatagram - 20,
 		},
 		created: now, updated: now.Add(-time.Second), accountedBytes: fragmentMaximumBytes - 1,
 	}
 	stack.fragmentMu.Lock()
-	stack.fragments[oldKey] = old
-	stack.fragmentBytes = old.bytes
+	stack.fragments[oldKey] = oldEntry
+	stack.fragmentBytes = oldEntry.state.bytes
 	stack.fragmentMu.Unlock()
 	fragments := buildIPv4Fragments(remote, local, ProtocolUDP, make([]byte, 16), 28, 2)
 	if packet := stack.reassemblePacket(fragments[0], now); packet != nil {
@@ -954,11 +967,11 @@ func TestFragmentByteCapacityEvictsOldest(t *testing.T) {
 	newKey := fragmentKey{source: remote, target: local, identification: 2, protocol: ProtocolUDP}
 	stack.fragmentMu.Lock()
 	_, oldPresent := stack.fragments[oldKey]
-	newSet := stack.fragments[newKey]
+	newEntry := stack.fragments[newKey]
 	retained := stack.fragmentBytes
 	stack.fragmentMu.Unlock()
-	if oldPresent || newSet == nil {
-		t.Fatalf("byte-pressure sets: old present=%t new present=%t", oldPresent, newSet != nil)
+	if oldPresent || newEntry == nil {
+		t.Fatalf("byte-pressure sets: old present=%t new present=%t", oldPresent, newEntry != nil)
 	}
 	if retained != len(fragments[0]) {
 		t.Fatalf("retained bytes after byte-pressure eviction = %d, want %d", retained, len(fragments[0]))
@@ -1015,24 +1028,24 @@ func TestFragmentTimesDoNotFollowLockAcquisitionOrder(t *testing.T) {
 		t.Fatal("test fragment did not parse")
 	}
 	stack.fragmentMu.Lock()
-	set := stack.fragments[parsed.reassemblyKey(false)]
+	entry := stack.fragments[parsed.reassemblyKey(false)]
 	stack.fragmentMu.Unlock()
-	if set == nil {
+	if entry == nil {
 		t.Fatal("incomplete fragment set was not retained")
 	}
-	if set.created != base {
-		t.Fatalf("fragment creation time = %v, want %v", set.created, base)
+	if entry.created != base {
+		t.Fatalf("fragment creation time = %v, want %v", entry.created, base)
 	}
-	if set.updated != base.Add(time.Second) {
-		t.Fatalf("fragment update time = %v, want %v", set.updated, base.Add(time.Second))
+	if entry.updated != base.Add(time.Second) {
+		t.Fatalf("fragment update time = %v, want %v", entry.updated, base.Add(time.Second))
 	}
 }
 
 func TestNextFragmentExpiryUsesFirstArrivalAndAddressFamily(t *testing.T) {
 	start := time.Unix(100, 0)
-	stack := &Stack{fragments: map[fragmentKey]*fragmentSet{
+	stack := &Stack{fragments: map[fragmentKey]*ipPacketReassemblyEntry{
 		{identification: 1}:           {created: start.Add(time.Second)},
-		{identification: 2, v6: true}: {IPPacketReassembly: IPPacketReassembly{v6: true}, created: start.Add(-20 * time.Second)},
+		{identification: 2, v6: true}: {state: ipPacketReassemblyState{v6: true}, created: start.Add(-20 * time.Second)},
 	}}
 	stack.fragmentMu.Lock()
 	next, ok := stack.nextFragmentExpiryLocked()
@@ -1181,23 +1194,23 @@ func checkFragmentFuzzResources(t testing.TB, stack *Stack) {
 		t.Fatalf("fragment resources = %d sets, %d bytes", len(stack.fragments), stack.fragmentBytes)
 	}
 	retainedBytes := 0
-	for _, set := range stack.fragments {
-		if len(set.pieces) > fragmentMaximumPieces || set.bytes < 0 {
-			t.Fatalf("fragment set resources = %d pieces, %d bytes", len(set.pieces), set.bytes)
+	for _, entry := range stack.fragments {
+		if len(entry.state.pieces) > fragmentMaximumPieces || entry.state.bytes < 0 {
+			t.Fatalf("fragment set resources = %d pieces, %d bytes", len(entry.state.pieces), entry.state.bytes)
 		}
 		payloadBytes := 0
 		previousEnd := 0
-		for index, piece := range set.pieces {
+		for index, piece := range entry.state.pieces {
 			if len(piece.data) == 0 || piece.offset < 0 || index != 0 && piece.offset < previousEnd {
 				t.Fatalf("invalid retained fragment piece at %d: offset %d length %d after %d", index, piece.offset, len(piece.data), previousEnd)
 			}
 			previousEnd = piece.offset + len(piece.data)
 			payloadBytes += len(piece.data)
 		}
-		if payloadBytes > set.bytes {
-			t.Fatalf("fragment set retained %d payload bytes but accounts for %d", payloadBytes, set.bytes)
+		if payloadBytes > entry.state.bytes {
+			t.Fatalf("fragment set retained %d payload bytes but accounts for %d", payloadBytes, entry.state.bytes)
 		}
-		retainedBytes += set.bytes
+		retainedBytes += entry.state.bytes
 	}
 	if retainedBytes != stack.fragmentBytes {
 		t.Fatalf("fragment byte accounting = %d, want %d", stack.fragmentBytes, retainedBytes)
@@ -1516,7 +1529,7 @@ func TestIPv4FragmentsWithDontFragmentAreAccepted(t *testing.T) {
 	if len(fragments) < 2 {
 		t.Fatalf("fragment count = %d", len(fragments))
 	}
-	stack := &Stack{fragments: make(map[fragmentKey]*fragmentSet), fragmentWake: make(chan struct{}, 1)}
+	stack := &Stack{fragments: make(map[fragmentKey]*ipPacketReassemblyEntry), fragmentWake: make(chan struct{}, 1)}
 	stack.network.Store(&networkState{local: map[netip.Addr]struct{}{target: {}}})
 	var packet []byte
 	for index := range fragments {
@@ -1656,7 +1669,7 @@ func TestIPPacketReassembly(t *testing.T) {
 					t.Fatalf("fragment %d complete = %t", index, complete)
 				}
 			}
-			if reassembly.initialized || reassembly.bytes != 0 || len(reassembly.pieces) != 0 {
+			if reassembly.active || reassembly.state.bytes != 0 || len(reassembly.state.pieces) != 0 {
 				t.Fatal("completed reassembly retained internal state")
 			}
 			if _, fragmented := result.Fragment(); fragmented {
@@ -1693,17 +1706,17 @@ func TestIPPacketReassemblyErrorsAndReset(t *testing.T) {
 	if _, complete, err := reassembly.Add(packet); err != nil || complete {
 		t.Fatalf("initial fragment = complete %t, %v", complete, err)
 	}
-	retained := reassembly.bytes
+	retained := reassembly.state.bytes
 	if _, _, err := reassembly.Add(IPPacket{Source: source, Destination: destination, Protocol: 253, Payload: []byte{1}}); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("unfragmented Add error = %v", err)
 	}
 	different := packet
 	different.Identification++
-	if _, _, err := reassembly.Add(different); !errors.Is(err, syscall.EINVAL) || reassembly.bytes != retained {
-		t.Fatalf("different packet = bytes %d, %v", reassembly.bytes, err)
+	if _, _, err := reassembly.Add(different); !errors.Is(err, syscall.EINVAL) || reassembly.state.bytes != retained {
+		t.Fatalf("different packet = bytes %d, %v", reassembly.state.bytes, err)
 	}
-	if _, complete, err := reassembly.Add(packet); err != nil || complete || reassembly.bytes != retained {
-		t.Fatalf("duplicate = complete %t bytes %d, %v", complete, reassembly.bytes, err)
+	if _, complete, err := reassembly.Add(packet); err != nil || complete || reassembly.state.bytes != retained {
+		t.Fatalf("duplicate = complete %t bytes %d, %v", complete, reassembly.state.bytes, err)
 	}
 	var duplicateReassembly IPPacketReassembly
 	nonInitial := packet
@@ -1713,15 +1726,15 @@ func TestIPPacketReassemblyErrorsAndReset(t *testing.T) {
 	}
 	duplicateFinal := nonInitial
 	duplicateFinal.MoreFragments = false
-	if _, complete, err := duplicateReassembly.Add(duplicateFinal); err != nil || complete || duplicateReassembly.total != nonInitial.FragmentOffset+len(nonInitial.Payload) || duplicateReassembly.bytes != len(nonInitial.Payload) {
-		t.Fatalf("duplicate final = complete %t total %d bytes %d, %v", complete, duplicateReassembly.total, duplicateReassembly.bytes, err)
+	if _, complete, err := duplicateReassembly.Add(duplicateFinal); err != nil || complete || duplicateReassembly.state.total != nonInitial.FragmentOffset+len(nonInitial.Payload) || duplicateReassembly.state.bytes != len(nonInitial.Payload) {
+		t.Fatalf("duplicate final = complete %t total %d bytes %d, %v", complete, duplicateReassembly.state.total, duplicateReassembly.state.bytes, err)
 	}
 	first := packet
 	first.Payload = first.Payload[:8]
 	if _, complete, err := duplicateReassembly.Add(first); err != nil || !complete {
 		t.Fatalf("first fragment = complete %t, %v", complete, err)
 	}
-	if duplicateReassembly.initialized {
+	if duplicateReassembly.active {
 		t.Fatal("completed duplicate test retained reassembly state")
 	}
 	overlap := packet
@@ -1730,7 +1743,7 @@ func TestIPPacketReassemblyErrorsAndReset(t *testing.T) {
 	if _, _, err := reassembly.Add(overlap); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("overlap error = %v", err)
 	}
-	if reassembly.initialized || reassembly.bytes != 0 || len(reassembly.pieces) != 0 {
+	if reassembly.active || reassembly.state.bytes != 0 || len(reassembly.state.pieces) != 0 {
 		t.Fatal("overlap did not reset the complete reassembly")
 	}
 	reassembly.Reset()
@@ -1761,7 +1774,7 @@ func TestIPPacketReassemblyErrorsAndReset(t *testing.T) {
 	if _, complete, err := reassembly.Add(nonInitial6); err != nil || complete {
 		t.Fatalf("IPv6 non-initial fragment = complete %t, %v", complete, err)
 	}
-	retained = reassembly.bytes
+	retained = reassembly.state.bytes
 	truncatedHeader := IPv6ExtensionHeader{}
 	if err := truncatedHeader.SetFragment(0, true, 2); err != nil {
 		t.Fatal(err)
@@ -1770,8 +1783,8 @@ func TestIPPacketReassemblyErrorsAndReset(t *testing.T) {
 	if err := truncated.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{truncatedHeader}, ProtocolTCP, make([]byte, 8)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := reassembly.Add(truncated); !errors.Is(err, syscall.EINVAL) || reassembly.bytes != retained {
-		t.Fatalf("RFC 7112 first fragment = bytes %d, %v", reassembly.bytes, err)
+	if _, _, err := reassembly.Add(truncated); !errors.Is(err, syscall.EINVAL) || reassembly.state.bytes != retained {
+		t.Fatalf("RFC 7112 first fragment = bytes %d, %v", reassembly.state.bytes, err)
 	}
 	reassembly.Reset()
 }
@@ -2059,6 +2072,106 @@ func TestFragmentRangeState(t *testing.T) {
 			covered, overlaps := fragmentRangeState(pieces, test.start, test.end)
 			if covered != test.covered || overlaps != test.overlaps {
 				t.Fatalf("range [%d,%d) = covered %t overlaps %t, want %t/%t", test.start, test.end, covered, overlaps, test.covered, test.overlaps)
+			}
+		})
+	}
+}
+
+func TestFragmentRangeCursor(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		total, capacity  int
+		want             [][3]int
+		wantConstruction bool
+	}{
+		{name: "empty", capacity: 15},
+		{name: "capacity below offset unit", total: 1, capacity: 7},
+		{name: "single final range", total: 15, capacity: 15, wantConstruction: true, want: [][3]int{{0, 15, 0}}},
+		{name: "aligned final range", total: 16, capacity: 15, wantConstruction: true, want: [][3]int{{0, 8, 1}, {8, 8, 0}}},
+		{name: "full final capacity", total: 22, capacity: 15, wantConstruction: true, want: [][3]int{{0, 8, 1}, {8, 14, 0}}},
+		{name: "multiple nonfinal ranges", total: 31, capacity: 15, wantConstruction: true, want: [][3]int{{0, 8, 1}, {8, 8, 1}, {16, 15, 0}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cursor, valid := newFragmentRangeCursor(test.total, test.capacity)
+			if valid != test.wantConstruction {
+				t.Fatalf("newFragmentRangeCursor(%d, %d) valid = %t, want %t", test.total, test.capacity, valid, test.wantConstruction)
+			}
+			var got [][3]int
+			for offset, size, more, ok := cursor.next(); ok; offset, size, more, ok = cursor.next() {
+				if more && size%8 != 0 {
+					t.Fatalf("non-final range [%d,%d) is not eight-byte aligned", offset, offset+size)
+				}
+				if size > test.capacity {
+					t.Fatalf("range size %d exceeds capacity %d", size, test.capacity)
+				}
+				moreValue := 0
+				if more {
+					moreValue = 1
+				}
+				got = append(got, [3]int{offset, size, moreValue})
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("ranges = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestFragmentRangeCursorOutputRoundTrip(t *testing.T) {
+	payload := make([]byte, 31)
+	for index := range payload {
+		payload[index] = byte(index*17 + 3)
+	}
+	for _, test := range []struct {
+		name           string
+		packet         IPPacket
+		mtu            int
+		identification uint32
+		wantSizes      []int
+	}{
+		{
+			name: "IPv4",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("192.0.2.231"), Destination: netip.MustParseAddr("198.51.100.231"),
+				Protocol: 253, HopLimit: 64, Identification: 0x7231, Payload: payload,
+			},
+			mtu: 35, wantSizes: []int{28, 28, 35},
+		},
+		{
+			name: "IPv6",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("2001:db8::231"), Destination: netip.MustParseAddr("2001:db8:1::231"),
+				Protocol: 253, HopLimit: 64, Payload: payload,
+			},
+			mtu: 63, identification: 0x10203231, wantSizes: []int{56, 56, 63},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fragments, err := test.packet.MarshalFragments(test.mtu, test.identification)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var reassembly IPPacketReassembly
+			var result IPPacket
+			for index, wire := range fragments {
+				if index >= len(test.wantSizes) || len(wire) != test.wantSizes[index] {
+					t.Fatalf("fragment %d size = %d, want %v", index, len(wire), test.wantSizes)
+				}
+				fragment, parseErr := ParseIPPacket(wire)
+				if parseErr != nil {
+					t.Fatalf("parse fragment %d: %v", index, parseErr)
+				}
+				var complete bool
+				result, complete, err = reassembly.Add(fragment)
+				if err != nil {
+					t.Fatalf("add fragment %d: %v", index, err)
+				}
+				if complete != (index == len(fragments)-1) {
+					t.Fatalf("fragment %d complete = %t", index, complete)
+				}
+			}
+			if len(fragments) != len(test.wantSizes) || !bytes.Equal(result.Payload, payload) {
+				t.Fatalf("fragment count/payload = %d/%x, want %d/%x", len(fragments), result.Payload, len(test.wantSizes), payload)
 			}
 		})
 	}

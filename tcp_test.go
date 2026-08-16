@@ -3416,6 +3416,11 @@ func TestTCPDSACKParsing(t *testing.T) {
 	if block, ok := parseTCPDSACKOption(options, 100, 400, 0); !ok || block != (TCPSACKBlock{LeftEdge: 250, RightEdge: 300}) {
 		t.Fatalf("contained DSACK = %#v, %t", block, ok)
 	}
+	binary.BigEndian.PutUint32(options[2:6], 301)
+	binary.BigEndian.PutUint32(options[6:10], 300)
+	if block, ok := parseTCPDSACKOption(options, 100, 400, 0); ok {
+		t.Fatalf("reversed contained DSACK = %#v, want rejected", block)
+	}
 }
 
 // TestTCPRepeatedSACKIsNotNewInformation verifies that an unchanged SACK
@@ -4870,6 +4875,27 @@ func TestPublicTCPSegmentCodec(t *testing.T) {
 	}
 }
 
+func TestPublicTCPSegmentCodecIPv4MappedAddresses(t *testing.T) {
+	segment := TCPSegment{
+		Source: netip.MustParseAddrPort("[::ffff:192.0.2.1]:12345"), Destination: netip.MustParseAddrPort("[::ffff:198.51.100.2]:443"),
+		SequenceNumber: 7, Flags: TCPFlagACK, WindowSize: 4096, Payload: []byte("mapped"),
+	}
+	wire, err := segment.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := IPPacket{Source: segment.Source.Addr(), Destination: segment.Destination.Addr(), Protocol: ProtocolTCP, Payload: wire}
+	parsed, err := packet.TCPSegment()
+	if err != nil {
+		t.Fatalf("parse mapped TCP segment: %v", err)
+	}
+	if parsed.Source != netip.AddrPortFrom(segment.Source.Addr().Unmap(), segment.Source.Port()) ||
+		parsed.Destination != netip.AddrPortFrom(segment.Destination.Addr().Unmap(), segment.Destination.Port()) ||
+		!bytes.Equal(parsed.Payload, segment.Payload) {
+		t.Fatalf("parsed mapped TCP segment = %+v", parsed)
+	}
+}
+
 func TestPublicTCPHeaderOptions(t *testing.T) {
 	var mss, scale, sackPermitted, timestamp, sack TCPHeaderOption
 	mss.SetMaximumSegmentSize(1460)
@@ -5906,6 +5932,45 @@ func BenchmarkTCPSetDeadline(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func BenchmarkPublicTCPSegmentCodec(b *testing.B) {
+	segment := TCPSegment{
+		Source: netip.MustParseAddrPort("192.0.2.1:12345"), Destination: netip.MustParseAddrPort("198.51.100.2:443"),
+		SequenceNumber: 100, AcknowledgmentNumber: 200, Flags: TCPFlagACK, WindowSize: 32768,
+		Options: []byte{TCPHeaderOptionNOP, TCPHeaderOptionNOP, TCPHeaderOptionTimestamp, 10, 0, 0, 0, 1, 0, 0, 0, 2},
+		Payload: make([]byte, 1200),
+	}
+	wire, err := segment.MarshalBinary()
+	if err != nil {
+		b.Fatal(err)
+	}
+	packet := IPPacket{Source: segment.Source.Addr(), Destination: segment.Destination.Addr(), Protocol: ProtocolTCP, Payload: wire}
+	b.Run("parse", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(wire)))
+		var parsed TCPSegment
+		var parseErr error
+		for index := 0; index < b.N; index++ {
+			parsed, parseErr = packet.TCPSegment()
+		}
+		if parseErr != nil || len(parsed.Payload) != len(segment.Payload) {
+			b.Fatalf("parse = %v, %v", parsed, parseErr)
+		}
+	})
+	b.Run("append", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(wire)))
+		buffer := make([]byte, 0, len(wire))
+		var encoded []byte
+		var appendErr error
+		for index := 0; index < b.N; index++ {
+			encoded, appendErr = segment.AppendBinary(buffer[:0])
+		}
+		if appendErr != nil || len(encoded) != len(wire) {
+			b.Fatalf("append length = %d, %v", len(encoded), appendErr)
+		}
+	})
 }
 
 // TestTCPImpairedNetworkConditions exercises recovery from individual and

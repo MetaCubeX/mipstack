@@ -583,6 +583,27 @@ func TestPublicUDPDatagramCodec(t *testing.T) {
 	}
 }
 
+func TestPublicUDPDatagramCodecIPv4MappedAddresses(t *testing.T) {
+	datagram := UDPDatagram{
+		Source: netip.MustParseAddrPort("[::ffff:192.0.2.1]:5353"), Destination: netip.MustParseAddrPort("[::ffff:198.51.100.2]:53"),
+		Payload: []byte("mapped"),
+	}
+	wire, err := datagram.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := IPPacket{Source: datagram.Source.Addr(), Destination: datagram.Destination.Addr(), Protocol: ProtocolUDP, Payload: wire}
+	parsed, err := packet.UDPDatagram()
+	if err != nil {
+		t.Fatalf("parse mapped UDP datagram: %v", err)
+	}
+	if parsed.Source != netip.AddrPortFrom(datagram.Source.Addr().Unmap(), datagram.Source.Port()) ||
+		parsed.Destination != netip.AddrPortFrom(datagram.Destination.Addr().Unmap(), datagram.Destination.Port()) ||
+		!bytes.Equal(parsed.Payload, datagram.Payload) {
+		t.Fatalf("parsed mapped UDP datagram = %+v", parsed)
+	}
+}
+
 func TestPublicUDPDatagramCodecErrorsDoNotModifyDestination(t *testing.T) {
 	datagram := UDPDatagram{Source: netip.MustParseAddrPort("[2001:db8::1]:1"), Destination: netip.MustParseAddrPort("[2001:db8::2]:2"), ChecksumDisabled: true}
 	prefix := []byte{3, 4, 5}

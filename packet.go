@@ -139,6 +139,20 @@ type IPv4HeaderOption struct {
 	Data []byte
 }
 
+// ipv4HeaderOptionLength validates one length-bearing option prefix. Callers
+// handle one-byte End and NOP encodings. Zero reports malformed framing.
+func ipv4HeaderOptionLength(option []byte) int {
+	if len(option) < 2 {
+		return 0
+	}
+	length := int(option[1])
+	// The unsigned comparison rejects both lengths below two and overrun.
+	if uint(length-2) > uint(len(option)-2) {
+		return 0
+	}
+	return length
+}
+
 // IPv6ExtensionHeader is one structurally traversable IPv6 extension header.
 // Type is the value naming the header in the preceding Next Header field. Data
 // excludes this header's own Next Header byte but includes every remaining raw
@@ -165,6 +179,28 @@ type IPv6ExtensionOption struct {
 	Data []byte
 }
 
+// ipv6NextHeaderFieldOffset maps a payload-relative preceding-header offset to
+// the corresponding Next Header byte in a complete IPv6 packet.
+func ipv6NextHeaderFieldOffset(previous int) int {
+	if previous < 0 {
+		return 6
+	}
+	return 40 + previous
+}
+
+// ipv6ExtensionOptionLength validates one option within the remaining option
+// area. Callers establish that remaining contains optionType at index zero.
+func ipv6ExtensionOptionLength(optionType byte, remaining []byte) (length int, valid bool) {
+	if optionType == IPv6ExtensionOptionPad1 {
+		return 1, true
+	}
+	if len(remaining) < 2 {
+		return 0, false
+	}
+	length = 2 + int(remaining[1])
+	return length, length <= len(remaining)
+}
+
 // IPv4HeaderOptions parses the exact IPv4 option sequence. The returned slice
 // owns its descriptors, but each Data field borrows IPv4Options. End is
 // returned as the final descriptor; its following received padding is omitted.
@@ -178,19 +214,16 @@ func (p IPPacket) IPv4HeaderOptions() ([]IPv4HeaderOption, error) {
 	var result []IPv4HeaderOption
 	for offset := 0; offset < len(p.IPv4Options); {
 		optionType := p.IPv4Options[offset]
-		switch optionType {
-		case IPv4HeaderOptionEnd:
+		if optionType == IPv4HeaderOptionEnd {
 			return append(result, IPv4HeaderOption{Type: optionType}), nil
-		case IPv4HeaderOptionNOP:
+		}
+		if optionType == IPv4HeaderOptionNOP {
 			result = append(result, IPv4HeaderOption{Type: optionType})
 			offset++
 			continue
 		}
-		if len(p.IPv4Options)-offset < 2 {
-			return nil, syscall.EINVAL
-		}
-		length := int(p.IPv4Options[offset+1])
-		if length < 2 || length > len(p.IPv4Options)-offset {
+		length := ipv4HeaderOptionLength(p.IPv4Options[offset:])
+		if length == 0 {
 			return nil, syscall.EINVAL
 		}
 		result = append(result, IPv4HeaderOption{Type: optionType, Data: p.IPv4Options[offset+2 : offset+length]})
@@ -294,46 +327,46 @@ func (p IPPacket) IPv6ExtensionHeaders() (headers []IPv6ExtensionHeader, protoco
 	}
 	next, offset := byte(p.Protocol), 0
 	seenHop, seenFragment := false, false
-	for offset <= len(p.Payload) {
+	for {
 		if !isTraversableIPv6ExtensionHeader(next) {
 			return headers, int(next), p.Payload[offset:], nil
 		}
 		if next == IPv6ExtensionHeaderHopByHop && (offset != 0 || seenHop) {
 			return nil, 0, nil, syscall.EINVAL
 		}
-		length, valid := ipv6ExtensionHeaderLength(next, p.Payload[offset:])
+		headerType := next
+		length, valid := ipv6ExtensionHeaderLength(headerType, p.Payload[offset:])
 		if !valid {
 			return nil, 0, nil, syscall.EINVAL
 		}
 		header := p.Payload[offset : offset+length]
-		if next == IPv6ExtensionHeaderHopByHop || next == IPv6ExtensionHeaderDestination {
+		next, offset = header[0], offset+length
+		if headerType == IPv6ExtensionHeaderHopByHop || headerType == IPv6ExtensionHeaderDestination {
 			validOptions, _, jumboPayload := inspectIPv6OptionsForCodec(header)
 			if !validOptions || jumboPayload {
 				return nil, 0, nil, syscall.EINVAL
 			}
 		}
-		descriptor := IPv6ExtensionHeader{Type: next, Data: header[1:]}
+		descriptor := IPv6ExtensionHeader{Type: headerType, Data: header[1:]}
 		headers = append(headers, descriptor)
-		if next == IPv6ExtensionHeaderHopByHop {
+		if headerType == IPv6ExtensionHeaderHopByHop {
 			seenHop = true
 		}
-		if next == IPv6ExtensionHeaderFragment {
+		if headerType == IPv6ExtensionHeaderFragment {
 			if seenFragment {
 				return nil, 0, nil, syscall.EINVAL
 			}
 			seenFragment = true
 			fragmentOffset, more, _, valid := descriptor.Fragment()
-			fragmentPayload := p.Payload[offset+length:]
+			fragmentPayload := p.Payload[offset:]
 			if !valid || !validFragmentPayload(fragmentOffset, more, len(fragmentPayload), 65535) {
 				return nil, 0, nil, syscall.EINVAL
 			}
 			if fragmentOffset != 0 || more {
-				return headers, int(header[0]), fragmentPayload, nil
+				return headers, int(next), fragmentPayload, nil
 			}
 		}
-		next, offset = header[0], offset+length
 	}
-	return nil, 0, nil, syscall.EINVAL
 }
 
 // SetIPv6ExtensionHeaders replaces Protocol and Payload with one complete
@@ -440,14 +473,15 @@ func (p IPPacket) Fragment() (IPPacketFragmentView, bool) {
 		return IPPacketFragmentView{}, false
 	}
 	next, offset := byte(p.Protocol), 0
-	for offset <= len(p.Payload) && isTraversableIPv6ExtensionHeader(next) {
-		length, valid := ipv6ExtensionHeaderLength(next, p.Payload[offset:])
+	for isTraversableIPv6ExtensionHeader(next) {
+		headerType := next
+		length, valid := ipv6ExtensionHeaderLength(headerType, p.Payload[offset:])
 		if !valid {
 			return IPPacketFragmentView{}, false
 		}
 		header := p.Payload[offset : offset+length]
-		if next == IPv6ExtensionHeaderFragment {
-			fragmentOffset, more, identification, valid := (IPv6ExtensionHeader{Type: next, Data: header[1:]}).Fragment()
+		if headerType == IPv6ExtensionHeaderFragment {
+			fragmentOffset, more, identification, valid := (IPv6ExtensionHeader{Type: headerType, Data: header[1:]}).Fragment()
 			if !valid {
 				return IPPacketFragmentView{}, false
 			}
@@ -878,40 +912,45 @@ func marshalPublicIPv6BaseHeader(dst []byte, p IPPacket, protocol byte, payloadS
 // fields, and this structural codec lacks the state required to recompute it.
 func normalizeIPv6ExtensionFields(first byte, payload []byte) {
 	next, offset := first, 0
-	for offset <= len(payload) {
+	for {
 		switch next {
 		case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination:
-			length := (int(payload[offset+1]) + 1) * 8
-			for optionOffset := offset + 2; optionOffset < offset+length; {
-				kind := payload[optionOffset]
-				if kind == IPv6ExtensionOptionPad1 {
-					optionOffset++
-					continue
+			length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
+			if !valid {
+				return
+			}
+			header := payload[offset : offset+length]
+			next, offset = header[0], offset+length
+			options := header[2:]
+			for offset := 0; offset < len(options); {
+				optionType := options[offset]
+				length, valid := ipv6ExtensionOptionLength(optionType, options[offset:])
+				if !valid {
+					return
 				}
-				optionLength := int(payload[optionOffset+1])
-				if kind == IPv6ExtensionOptionPadN {
-					for index := optionOffset + 2; index < optionOffset+2+optionLength; index++ {
-						payload[index] = 0
+				if optionType == IPv6ExtensionOptionPadN {
+					for index := offset + 2; index < offset+length; index++ {
+						options[index] = 0
 					}
 				}
-				optionOffset += optionLength + 2
+				offset += length
+			}
+		case IPv6ExtensionHeaderRouting, IPv6ExtensionHeaderAuthentication, IPv6ExtensionHeaderMobility:
+			length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
+			if !valid {
+				return
 			}
 			next, offset = payload[offset], offset+length
-		case IPv6ExtensionHeaderRouting:
-			length := (int(payload[offset+1]) + 1) * 8
-			next, offset = payload[offset], offset+length
-		case IPv6ExtensionHeaderAuthentication:
-			length := (int(payload[offset+1]) + 2) * 4
-			next, offset = payload[offset], offset+length
-		case IPv6ExtensionHeaderMobility:
-			length := (int(payload[offset+1]) + 1) * 8
-			next, offset = payload[offset], offset+length
 		case IPv6ExtensionHeaderFragment:
-			next = payload[offset]
-			payload[offset+1] = 0
-			field := binary.BigEndian.Uint16(payload[offset+2 : offset+4])
-			binary.BigEndian.PutUint16(payload[offset+2:offset+4], field&^0x0006)
-			offset += 8
+			length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
+			if !valid {
+				return
+			}
+			header := payload[offset : offset+length]
+			next, offset = header[0], offset+length
+			header[1] = 0
+			field := binary.BigEndian.Uint16(header[2:4])
+			binary.BigEndian.PutUint16(header[2:4], field&^0x0006)
 			if field&0xfff9 != 0 {
 				return
 			}
@@ -1151,72 +1190,85 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 			return ipPacket{}, false
 		}
 		flowLabel := uint32(packet[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(packet[2:4]))
-		next, nextOffset, offset := packet[6], 6, 40
+		payload := packet[40:end]
+		switch packet[6] {
+		case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination,
+			IPv6ExtensionHeaderRouting, IPv6ExtensionHeaderFragment:
+		default:
+			return ipPacket{
+				source: source, target: target, protocol: packet[6], protocolOffset: 6,
+				ecn: packet[1] >> 4 & 3, hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4, flowLabel: flowLabel,
+				payload: payload, original: packet[:end],
+			}, true
+		}
+		next, offset, previous := packet[6], 0, -1
 		seenHop := false
-		for offset <= end {
+		for {
 			switch next {
 			case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination:
-				if next == IPv6ExtensionHeaderHopByHop && (offset != 40 || seenHop) {
+				headerType, headerOffset := next, offset
+				if next == IPv6ExtensionHeaderHopByHop && (offset != 0 || seenHop) {
 					// RFC 8200 permits Hop-by-Hop only immediately after the
 					// IPv6 header. A later value zero is therefore an
 					// unrecognized Next Header, not another extension header.
 					return ipPacket{
 						source: source, target: target, original: packet[:end], ecn: packet[1] >> 4 & 3,
 						hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4, flowLabel: flowLabel,
-						parameterError: true, parameterCode: 1, parameterAt: uint32(nextOffset),
+						parameterError: true, parameterCode: 1, parameterAt: uint32(ipv6NextHeaderFieldOffset(previous)),
 					}, true
 				}
-				if end-offset < 8 {
+				length, valid := ipv6ExtensionHeaderUnit8Length(payload[offset:])
+				if !valid {
 					return ipPacket{}, false
 				}
-				length := (int(packet[offset+1]) + 1) * 8
-				if length > end-offset {
-					return ipPacket{}, false
-				}
-				valid, action, optionOffset := inspectIPv6Options(packet[offset : offset+length])
+				header := payload[offset : offset+length]
+				next, previous, offset = header[0], offset, offset+length
+				valid, action, optionOffset := inspectIPv6Options(header)
 				if !valid {
 					if action >= 2 && (action == 2 || !target.IsMulticast()) {
 						return ipPacket{
 							source: source, target: target, original: packet[:end], ecn: packet[1] >> 4 & 3,
 							hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4, flowLabel: flowLabel,
-							parameterError: true, parameterCode: 2, parameterAt: uint32(offset + optionOffset),
+							parameterError: true, parameterCode: 2, parameterAt: uint32(40 + headerOffset + optionOffset),
 						}, true
 					}
 					return ipPacket{}, false
 				}
-				if next == IPv6ExtensionHeaderHopByHop {
+				if headerType == IPv6ExtensionHeaderHopByHop {
 					seenHop = true
 				}
-				next, nextOffset, offset = packet[offset], offset, offset+length
 			case IPv6ExtensionHeaderRouting:
-				if end-offset < 8 {
+				headerOffset := offset
+				length, valid := ipv6ExtensionHeaderUnit8Length(payload[offset:])
+				if !valid {
 					return ipPacket{}, false
 				}
-				length := (int(packet[offset+1]) + 1) * 8
-				if length > end-offset {
-					return ipPacket{}, false
-				}
-				if packet[offset+3] != 0 {
+				header := payload[offset : offset+length]
+				next, previous, offset = header[0], offset, offset+length
+				if header[3] != 0 {
 					return ipPacket{
 						source: source, target: target, original: packet[:end], ecn: packet[1] >> 4 & 3,
 						hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4, flowLabel: flowLabel,
-						parameterError: true, parameterCode: 0, parameterAt: uint32(offset + 2),
+						parameterError: true, parameterCode: 0, parameterAt: uint32(40 + headerOffset + 2),
 					}, true
 				}
-				next, nextOffset, offset = packet[offset], offset, offset+length
 			case IPv6ExtensionHeaderFragment:
 				// Non-atomic fragments require bounded reassembly. Atomic
 				// fragments can safely continue as an ordinary packet. RFC
 				// 8200 requires receivers to ignore both reserved fields.
-				if end-offset < 8 || binary.BigEndian.Uint16(packet[offset+2:offset+4])&0xfff9 != 0 {
+				if len(payload)-offset < 8 {
 					return ipPacket{}, false
 				}
-				next, nextOffset, offset = packet[offset], offset, offset+8
+				header := payload[offset : offset+8]
+				next, previous, offset = header[0], offset, offset+8
+				if binary.BigEndian.Uint16(header[2:4])&0xfff9 != 0 {
+					return ipPacket{}, false
+				}
 			default:
 				return ipPacket{
-					source: source, target: target, protocol: next, protocolOffset: nextOffset,
+					source: source, target: target, protocol: next, protocolOffset: ipv6NextHeaderFieldOffset(previous),
 					ecn: packet[1] >> 4 & 3, hopLimit: packet[7], trafficClass: packet[0]&0x0f<<4 | packet[1]>>4, flowLabel: flowLabel,
-					payload: packet[offset:end], original: packet[:end],
+					payload: payload[offset:], original: packet[:end],
 				}, true
 			}
 		}
@@ -1238,17 +1290,17 @@ func (p ipPacket) hasRouterAlert() bool {
 	if !p.source.Is6() || len(p.original) < 48 || p.original[6] != IPv6ExtensionHeaderHopByHop {
 		return false
 	}
-	length := (int(p.original[41]) + 1) * 8
-	return length <= len(p.original)-40 && ipv6RouterAlert(p.original[40:40+length])
+	length, valid := ipv6ExtensionHeaderUnit8Length(p.original[40:])
+	return valid && ipv6RouterAlert(p.original[40:40+length])
 }
 
-// walkIPv6UpperLayer validates supported extension-header framing and returns
-// the final upper-layer view. Unknown option action bits are codec data, not
-// host admission policy, and therefore do not make the public packet invalid.
+// walkIPv6UpperLayer validates an extension chain and returns its final
+// upper-layer view. Unknown option action bits are codec data, not host
+// admission policy, and therefore do not make the public packet invalid.
 func walkIPv6UpperLayer(first byte, payload []byte) (protocol byte, upper []byte, pseudoHeaderUnsafe, nonAtomicFragment, ok bool) {
 	next, offset := first, 0
 	seenHop, seenFragment := false, false
-	for offset <= len(payload) {
+	for {
 		if next == ProtocolNoNextHeader {
 			// RFC 8200 requires receivers to ignore bytes following No Next
 			// Header. IPPacket.Payload still preserves them for round trips.
@@ -1260,12 +1312,13 @@ func walkIPv6UpperLayer(first byte, payload []byte) (protocol byte, upper []byte
 		if next == IPv6ExtensionHeaderHopByHop && (offset != 0 || seenHop) {
 			return 0, nil, false, false, false
 		}
-		length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
+		headerType := next
+		length, valid := ipv6ExtensionHeaderLength(headerType, payload[offset:])
 		if !valid {
 			return 0, nil, false, false, false
 		}
 		header := payload[offset : offset+length]
-		switch next {
+		switch headerType {
 		case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderDestination:
 			validOptions, homeAddress, jumboPayload := inspectIPv6OptionsForCodec(header)
 			if !validOptions || jumboPayload {
@@ -1289,12 +1342,11 @@ func walkIPv6UpperLayer(first byte, payload []byte) (protocol byte, upper []byte
 				return header[0], fragmentPayload, pseudoHeaderUnsafe, true, true
 			}
 		}
-		if next == IPv6ExtensionHeaderHopByHop {
+		if headerType == IPv6ExtensionHeaderHopByHop {
 			seenHop = true
 		}
 		next, offset = header[0], offset+length
 	}
-	return 0, nil, false, false, false
 }
 
 // isTraversableIPv6ExtensionHeader reports headers whose length and following
@@ -1312,39 +1364,71 @@ func isTraversableIPv6ExtensionHeader(headerType byte) bool {
 	}
 }
 
-// ipv6ExtensionHeaderLength validates one header prefix within a remaining
-// packet and returns its complete length, including Next Header.
+// ipv6ExtensionHeaderLength validates one traversable header prefix within a
+// remaining packet and returns its complete length, including Next Header.
+// Callers establish that headerType is traversable before calling it.
 func ipv6ExtensionHeaderLength(headerType byte, header []byte) (int, bool) {
+	if headerType == IPv6ExtensionHeaderFragment {
+		return 8, len(header) >= 8
+	}
 	if len(header) < 2 {
 		return 0, false
 	}
-	length, valid := ipv6ExtensionHeaderDataLength(headerType, header[1:])
-	return length, valid && length <= len(header)
+	length := ipv6ExtensionHeaderLengthField(headerType, header[1])
+	return length, length != 0 && length <= len(header)
+}
+
+// ipv6ExtensionHeaderUnit8Length validates a Hop-by-Hop, Routing,
+// Destination Options, or Mobility header whose length is in eight-byte
+// units excluding the first unit.
+func ipv6ExtensionHeaderUnit8Length(header []byte) (int, bool) {
+	if len(header) < 2 {
+		return 0, false
+	}
+	length := ipv6ExtensionHeaderUnit8LengthField(header[1])
+	return length, length <= len(header)
+}
+
+// ipv6ExtensionHeaderUnit8LengthField decodes the RFC 8200 Hdr Ext Len field.
+func ipv6ExtensionHeaderUnit8LengthField(lengthField byte) int {
+	return (int(lengthField) + 1) * 8
+}
+
+// ipv6AuthenticationHeaderLength decodes and validates the RFC 4302 Payload
+// Len field, including IPv6's required eight-byte alignment.
+func ipv6AuthenticationHeaderLength(lengthField byte) int {
+	if lengthField < 2 || lengthField&1 != 0 {
+		return 0
+	}
+	return (int(lengthField) + 2) * 4
+}
+
+// ipv6ExtensionHeaderLengthField decodes the type-specific length field of a
+// non-Fragment extension header. Zero reports an unsupported or invalid type.
+func ipv6ExtensionHeaderLengthField(headerType, lengthField byte) int {
+	if headerType == IPv6ExtensionHeaderAuthentication {
+		return ipv6AuthenticationHeaderLength(lengthField)
+	}
+	switch headerType {
+	case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting,
+		IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderMobility:
+		return ipv6ExtensionHeaderUnit8LengthField(lengthField)
+	default:
+		return 0
+	}
 }
 
 // ipv6ExtensionHeaderDataLength validates the length field available after a
 // header's Next Header byte and returns the complete header length.
 func ipv6ExtensionHeaderDataLength(headerType byte, data []byte) (int, bool) {
-	switch headerType {
-	case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting,
-		IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderMobility:
-		if len(data) < 1 {
-			return 0, false
-		}
-		return (int(data[0]) + 1) * 8, true
-	case IPv6ExtensionHeaderFragment:
-		return 8, len(data) >= 7
-	case IPv6ExtensionHeaderAuthentication:
-		if len(data) < 1 {
-			return 0, false
-		}
-		length := (int(data[0]) + 2) * 4
-		// RFC 4302 requires the fixed fields through Sequence Number and,
-		// for IPv6, pads the complete AH to an eight-octet boundary.
-		return length, length >= 16 && length%8 == 0
-	default:
+	if len(data) < 1 || !isTraversableIPv6ExtensionHeader(headerType) {
 		return 0, false
 	}
+	length := 8
+	if headerType != IPv6ExtensionHeaderFragment {
+		length = ipv6ExtensionHeaderLengthField(headerType, data[0])
+	}
+	return length, length != 0 && len(data) >= length-1
 }
 
 // parseIPv6ExtensionOptions parses the option bytes following the common
@@ -1353,20 +1437,16 @@ func parseIPv6ExtensionOptions(options []byte) ([]IPv6ExtensionOption, error) {
 	var result []IPv6ExtensionOption
 	for offset := 0; offset < len(options); {
 		optionType := options[offset]
-		if optionType == IPv6ExtensionOptionPad1 {
-			result = append(result, IPv6ExtensionOption{Type: optionType})
-			offset++
-			continue
-		}
-		if len(options)-offset < 2 {
+		length, valid := ipv6ExtensionOptionLength(optionType, options[offset:])
+		if !valid {
 			return nil, syscall.EINVAL
 		}
-		length := int(options[offset+1])
-		if length > len(options)-offset-2 {
-			return nil, syscall.EINVAL
+		option := IPv6ExtensionOption{Type: optionType}
+		if length != 1 {
+			option.Data = options[offset+2 : offset+length]
 		}
-		result = append(result, IPv6ExtensionOption{Type: optionType, Data: options[offset+2 : offset+2+length]})
-		offset += 2 + length
+		result = append(result, option)
+		offset += length
 	}
 	return result, nil
 }
@@ -1383,6 +1463,9 @@ func ipv4OptionsContentLength(options []byte) (int, bool) {
 			offset++
 			continue
 		}
+		// This framing check is inlined through validIPv4OptionsForCodec into
+		// packet parsing. Calling ipv4HeaderOptionLength here crosses the
+		// compiler's inline budget and slows both IPv4 and IPv6 parsing.
 		if len(options)-offset < 2 {
 			return 0, false
 		}
@@ -1415,11 +1498,8 @@ func hasActiveIPv4SourceRoute(options []byte) bool {
 			offset++
 			continue
 		}
-		if len(options)-offset < 2 {
-			return false
-		}
-		length := int(options[offset+1])
-		if length < 2 || length > len(options)-offset {
+		length := ipv4HeaderOptionLength(options[offset:])
+		if length == 0 {
 			return false
 		}
 		if kind == IPv4HeaderOptionLooseSourceRoute || kind == IPv4HeaderOptionStrictSourceRoute {
@@ -1452,10 +1532,13 @@ func inspectIPv6OptionsForCodec(header []byte) (valid, homeAddress, jumboPayload
 // reports options that need state unavailable to the standalone codec.
 func inspectIPv6OptionBytesForCodec(options []byte) (valid, homeAddress, jumboPayload bool) {
 	for offset := 0; offset < len(options); {
-		if options[offset] == IPv6ExtensionOptionPad1 {
+		optionType := options[offset]
+		if optionType == IPv6ExtensionOptionPad1 {
 			offset++
 			continue
 		}
+		// This function sits inside the public IPv6 walker and remains just
+		// within the compiler's inline budget with local framing checks.
 		if len(options)-offset < 2 {
 			return false, false, false
 		}
@@ -1463,8 +1546,8 @@ func inspectIPv6OptionBytesForCodec(options []byte) (valid, homeAddress, jumboPa
 		if length > len(options)-offset {
 			return false, false, false
 		}
-		homeAddress = homeAddress || options[offset] == IPv6ExtensionOptionHomeAddress
-		jumboPayload = jumboPayload || options[offset] == IPv6ExtensionOptionJumboPayload
+		homeAddress = homeAddress || optionType == IPv6ExtensionOptionHomeAddress
+		jumboPayload = jumboPayload || optionType == IPv6ExtensionOptionJumboPayload
 		offset += length
 	}
 	return true, homeAddress, jumboPayload
@@ -1482,11 +1565,8 @@ func ipv4RouterAlert(options []byte) bool {
 			offset++
 			continue
 		}
-		if len(options)-offset < 2 {
-			return false
-		}
-		length := int(options[offset+1])
-		if length < 2 || length > len(options)-offset {
+		length := ipv4HeaderOptionLength(options[offset:])
+		if length == 0 {
 			return false
 		}
 		if kind == IPv4HeaderOptionRouterAlert {
@@ -1503,22 +1583,19 @@ func ipv4RouterAlert(options []byte) bool {
 // ipv6RouterAlert reports a zero-valued RFC 2711 option in one validated
 // Hop-by-Hop header.
 func ipv6RouterAlert(header []byte) bool {
+	if len(header) < 2 {
+		return false
+	}
 	found := false
-	for offset := 2; offset < len(header); {
-		kind := header[offset]
-		if kind == IPv6ExtensionOptionPad1 {
-			offset++
-			continue
-		}
-		if len(header)-offset < 2 {
+	options := header[2:]
+	for offset := 0; offset < len(options); {
+		optionType := options[offset]
+		length, valid := ipv6ExtensionOptionLength(optionType, options[offset:])
+		if !valid {
 			return false
 		}
-		length := int(header[offset+1]) + 2
-		if length > len(header)-offset {
-			return false
-		}
-		if kind == IPv6ExtensionOptionRouterAlert {
-			if found || length != 4 || header[offset+2] != 0 || header[offset+3] != 0 {
+		if optionType == IPv6ExtensionOptionRouterAlert {
+			if found || length != 4 || options[offset+2] != 0 || options[offset+3] != 0 {
 				return false
 			}
 			found = true
@@ -1543,11 +1620,8 @@ func malformedIPv4Option(options []byte) (int, bool) {
 			offset++
 			continue
 		}
-		if len(options)-offset < 2 {
-			return offset, true
-		}
-		length := int(options[offset+1])
-		if length < 2 || length > len(options)-offset {
+		length := ipv4HeaderOptionLength(options[offset:])
+		if length == 0 {
 			return offset, true
 		}
 		switch kind {
@@ -1619,8 +1693,7 @@ func malformedIPv4Option(options []byte) (int, bool) {
 // are rejected because silently ignoring their destination semantics is unsafe.
 func validateIPv4Options(options []byte) bool {
 	for offset := 0; offset < len(options); {
-		kind := options[offset]
-		switch kind {
+		switch options[offset] {
 		case IPv4HeaderOptionEnd:
 			return true
 		case IPv4HeaderOptionNOP:
@@ -1629,6 +1702,8 @@ func validateIPv4Options(options []byte) bool {
 		case IPv4HeaderOptionLooseSourceRoute, IPv4HeaderOptionStrictSourceRoute:
 			return false
 		}
+		// This admission path is inlined into packet ingress. Keeping the
+		// equivalent checks local avoids a sentinel branch on every option.
 		if len(options)-offset < 2 {
 			return false
 		}
@@ -1649,15 +1724,8 @@ func inspectIPv6Options(header []byte) (bool, byte, int) {
 	}
 	for offset := 2; offset < len(header); {
 		kind := header[offset]
-		if kind == IPv6ExtensionOptionPad1 {
-			offset++
-			continue
-		}
-		if len(header)-offset < 2 {
-			return false, 0, offset
-		}
-		length := int(header[offset+1]) + 2
-		if length > len(header)-offset {
+		length, valid := ipv6ExtensionOptionLength(kind, header[offset:])
+		if !valid {
 			return false, 0, offset
 		}
 		if action := kind >> 6; action != 0 {

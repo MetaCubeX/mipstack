@@ -214,6 +214,22 @@ type TCPHeaderOption struct {
 	Data []byte
 }
 
+// tcpHeaderOptionLength validates one length-bearing option prefix. Callers
+// handle one-byte End and NOP. Zero reports malformed framing. Transport actor
+// parsers keep equivalent checks local because a returned sentinel adds a
+// measurable valid-path branch on every SYN or ACK.
+func tcpHeaderOptionLength(option []byte) int {
+	if len(option) < 2 {
+		return 0
+	}
+	length := int(option[1])
+	// The unsigned comparison rejects both lengths below two and overrun.
+	if uint(length-2) > uint(len(option)-2) {
+		return 0
+	}
+	return length
+}
+
 // TCPSACKBlock is one half-open sequence range carried by a TCP SACK option.
 // Edges use TCP's wrapping 32-bit sequence space; interpreting their order
 // requires connection context that the standalone wire codec does not have.
@@ -253,6 +269,16 @@ type TCPSegment struct {
 	Payload []byte
 }
 
+// tcpWireHeaderSize validates TCP's data offset against an already checked
+// segment length. Checksum and option policy remain with each caller.
+func tcpWireHeaderSize(dataOffset byte, segmentSize int) (int, bool) {
+	headerSize := int(dataOffset>>4) * 4
+	if headerSize < tcpHeaderSize || headerSize > segmentSize {
+		return 0, false
+	}
+	return headerSize, true
+}
+
 // HeaderOptions parses the exact TCP option sequence. The returned slice owns
 // its option descriptors, but each Data field borrows Options. End is returned
 // as the final descriptor and bytes after it are ignored as receiver padding.
@@ -273,11 +299,8 @@ func (s TCPSegment) HeaderOptions() ([]TCPHeaderOption, error) {
 			offset++
 			continue
 		}
-		if len(s.Options)-offset < 2 {
-			return nil, syscall.EINVAL
-		}
-		length := int(s.Options[offset+1])
-		if length < 2 || length > len(s.Options)-offset {
+		length := tcpHeaderOptionLength(s.Options[offset:])
+		if length == 0 {
 			return nil, syscall.EINVAL
 		}
 		result = append(result, TCPHeaderOption{Kind: kind, Data: s.Options[offset+2 : offset+length]})
@@ -441,21 +464,25 @@ func (p IPPacket) TCPSegment() (TCPSegment, error) {
 	if len(tcp) < tcpHeaderSize {
 		return TCPSegment{}, syscall.EINVAL
 	}
-	headerSize := int(tcp[12]>>4) * 4
-	if headerSize < tcpHeaderSize || headerSize > len(tcp) {
+	headerSize, valid := tcpWireHeaderSize(tcp[12], len(tcp))
+	if !valid {
 		return TCPSegment{}, syscall.EINVAL
 	}
-	if _, valid := tcpOptionsContentLength(tcp[tcpHeaderSize:headerSize]); !valid || transportChecksum(p.Source, p.Destination, ProtocolTCP, tcp) != 0 {
+	options := tcp[tcpHeaderSize:headerSize]
+	if _, valid = tcpOptionsContentLength(options); !valid {
 		return TCPSegment{}, syscall.EINVAL
 	}
 	source, destination := p.Source.Unmap(), p.Destination.Unmap()
+	if transportChecksum(source, destination, ProtocolTCP, tcp) != 0 {
+		return TCPSegment{}, syscall.EINVAL
+	}
 	return TCPSegment{
 		Source:         netip.AddrPortFrom(source, binary.BigEndian.Uint16(tcp[0:2])),
 		Destination:    netip.AddrPortFrom(destination, binary.BigEndian.Uint16(tcp[2:4])),
 		SequenceNumber: binary.BigEndian.Uint32(tcp[4:8]), AcknowledgmentNumber: binary.BigEndian.Uint32(tcp[8:12]),
 		Flags:      uint16(tcp[13]) | uint16(tcp[12]&1)<<8,
 		WindowSize: binary.BigEndian.Uint16(tcp[14:16]), UrgentPointer: binary.BigEndian.Uint16(tcp[18:20]),
-		Options: tcp[tcpHeaderSize:headerSize], Payload: tcp[headerSize:],
+		Options: options, Payload: tcp[headerSize:],
 	}, nil
 }
 
@@ -513,15 +540,21 @@ func marshalPublicTCPSegment(dst []byte, s TCPSegment, headerSize int) {
 	for index := tcpHeaderSize + len(s.Options); index < headerSize; index++ {
 		dst[index] = 0
 	}
-	binary.BigEndian.PutUint16(dst[0:2], s.Source.Port())
-	binary.BigEndian.PutUint16(dst[2:4], s.Destination.Port())
-	binary.BigEndian.PutUint32(dst[4:8], s.SequenceNumber)
-	binary.BigEndian.PutUint32(dst[8:12], s.AcknowledgmentNumber)
-	dst[12], dst[13] = byte(headerSize/4)<<4|byte(s.Flags>>8)&1, byte(s.Flags)
-	binary.BigEndian.PutUint16(dst[14:16], s.WindowSize)
-	binary.BigEndian.PutUint16(dst[16:18], 0)
-	binary.BigEndian.PutUint16(dst[18:20], s.UrgentPointer)
-	binary.BigEndian.PutUint16(dst[16:18], transportChecksumParts(s.Source.Addr(), s.Destination.Addr(), ProtocolTCP, len(dst), dst[:headerSize], dst[headerSize:]))
+	marshalTCPHeaderFields(dst[:headerSize], s.Source.Port(), s.Destination.Port(), s.SequenceNumber, s.AcknowledgmentNumber, s.Flags, s.WindowSize, s.UrgentPointer)
+	binary.BigEndian.PutUint16(dst[16:18], transportChecksum(s.Source.Addr(), s.Destination.Addr(), ProtocolTCP, dst))
+}
+
+// marshalTCPHeaderFields writes every fixed TCP field and clears the checksum.
+// The caller supplies a complete, four-byte-aligned header including options.
+func marshalTCPHeaderFields(header []byte, sourcePort, destinationPort uint16, sequence, acknowledgement uint32, flags uint16, window, urgent uint16) {
+	binary.BigEndian.PutUint16(header[0:2], sourcePort)
+	binary.BigEndian.PutUint16(header[2:4], destinationPort)
+	binary.BigEndian.PutUint32(header[4:8], sequence)
+	binary.BigEndian.PutUint32(header[8:12], acknowledgement)
+	header[12], header[13] = byte(len(header)/4)<<4|byte(flags>>8)&1, byte(flags)
+	binary.BigEndian.PutUint16(header[14:16], window)
+	binary.BigEndian.PutUint16(header[16:18], 0)
+	binary.BigEndian.PutUint16(header[18:20], urgent)
 }
 
 // tcpOptionsContentLength validates option TLV framing and returns the bytes
@@ -536,6 +569,9 @@ func tcpOptionsContentLength(options []byte) (int, bool) {
 			offset++
 			continue
 		}
+		// This validator is inlined into public TCP parsing and encoding.
+		// Calling tcpHeaderOptionLength here crosses the compiler's inline
+		// budget; semantic option decoding still shares that helper.
 		if len(options)-offset < 2 {
 			return 0, false
 		}
@@ -2878,8 +2914,8 @@ func (s *Stack) handleTCPForDestination(packet ipPacket, receivedAt time.Time, l
 		s.stats.tcpInvalidSegments.Add(1)
 		return nil
 	}
-	headerSize := int(tcp[12]>>4) * 4
-	if headerSize < tcpHeaderSize || headerSize > len(tcp) {
+	headerSize, valid := tcpWireHeaderSize(tcp[12], len(tcp))
+	if !valid {
 		s.stats.inboundDroppedPackets.Add(1)
 		s.stats.tcpInvalidSegments.Add(1)
 		return nil
@@ -3209,17 +3245,11 @@ func buildTCPPacketViewInto(packet []byte, source, target netip.Addr, sourcePort
 		return nil, syscall.EMSGSIZE
 	}
 	tcp := packet[ipSize:]
-	binary.BigEndian.PutUint16(tcp[0:2], sourcePort)
-	binary.BigEndian.PutUint16(tcp[2:4], targetPort)
-	binary.BigEndian.PutUint32(tcp[4:8], sequence)
-	binary.BigEndian.PutUint32(tcp[8:12], acknowledgement)
-	tcp[12], tcp[13] = byte(headerSize/4)<<4, flags
-	binary.BigEndian.PutUint16(tcp[14:16], window)
-	binary.BigEndian.PutUint32(tcp[16:20], 0)
 	for index := tcpHeaderSize; index < headerSize; index++ {
 		tcp[index] = 0
 	}
 	copy(tcp[tcpHeaderSize:headerSize], options)
+	marshalTCPHeaderFields(tcp[:headerSize], sourcePort, targetPort, sequence, acknowledgement, uint16(flags), window, 0)
 	if payload.copyTo(tcp[headerSize:]) != payload.size {
 		return nil, errors.New("mipstack: incomplete TCP payload view")
 	}
@@ -7460,7 +7490,8 @@ func parseTCPOptions(options []byte, fallback, localMaximum int) (int, uint8, bo
 	var timestamp bool
 	var timestampValue uint32
 	for offset := 0; offset < len(options); {
-		switch options[offset] {
+		kind := options[offset]
+		switch kind {
 		case TCPHeaderOptionEnd:
 			return clampMSS(mss, localMaximum), scale, windowScaling, sack, timestamp, timestampValue
 		case TCPHeaderOptionNOP:
@@ -7474,7 +7505,7 @@ func parseTCPOptions(options []byte, fallback, localMaximum int) (int, uint8, bo
 		if length < 2 || length > len(options)-offset {
 			break
 		}
-		switch options[offset] {
+		switch kind {
 		case TCPHeaderOptionMSS:
 			if length == 4 {
 				value := int(binary.BigEndian.Uint16(options[offset+2 : offset+4]))
@@ -7748,7 +7779,10 @@ func parseTCPDSACKOption(options []byte, acknowledged, sendNext, history uint32)
 			left := binary.BigEndian.Uint32(options[offset+2 : offset+6])
 			right := binary.BigEndian.Uint32(options[offset+6 : offset+10])
 			block := TCPSACKBlock{LeftEdge: left, RightEdge: right}
-			if tcpSequenceLess(left, right) && tcpSequenceLessEqual(right, acknowledged) && acknowledged-left <= history {
+			if !tcpSequenceLess(left, right) {
+				return TCPSACKBlock{}, false
+			}
+			if tcpSequenceLessEqual(right, acknowledged) && acknowledged-left <= history {
 				return block, true
 			}
 			if length >= 18 {
@@ -7756,7 +7790,7 @@ func parseTCPDSACKOption(options []byte, acknowledged, sendNext, history uint32)
 				secondRight := binary.BigEndian.Uint32(options[offset+14 : offset+18])
 				secondLength := secondRight - secondLeft
 				if secondLength != 0 && secondLength <= sendNext-acknowledged &&
-					left-secondLeft < secondLength && right-secondLeft <= secondLength && left != right {
+					left-secondLeft < secondLength && right-secondLeft <= secondLength {
 					return block, true
 				}
 			}

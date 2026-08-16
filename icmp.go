@@ -196,6 +196,45 @@ func (m ICMPMessage) Echo() (identifier, sequence uint16, payload []byte, ok boo
 	return binary.BigEndian.Uint16(m.Body[:2]), binary.BigEndian.Uint16(m.Body[2:4]), m.Body[4:], true
 }
 
+// classifyICMPEcho is the family-aware Echo grammar shared by public semantic
+// values, raw Stack input, and Forwarder snapshots.
+func classifyICMPEcho(protocol, messageType, code byte, bodyLength int) (request, ok bool) {
+	if bodyLength < 4 || code != ICMPCodeNone {
+		return false, false
+	}
+	switch protocol {
+	case ProtocolICMPv4:
+		switch messageType {
+		case ICMPv4TypeEchoRequest:
+			return true, true
+		case ICMPv4TypeEchoReply:
+			return false, true
+		}
+	case ProtocolICMPv6:
+		switch messageType {
+		case ICMPv6TypeEchoRequest:
+			return true, true
+		case ICMPv6TypeEchoReply:
+			return false, true
+		}
+	}
+	return false, false
+}
+
+// icmpEchoMessageType returns the request or reply type for one address family.
+func icmpEchoMessageType(ipv6, request bool) byte {
+	if ipv6 {
+		if request {
+			return ICMPv6TypeEchoRequest
+		}
+		return ICMPv6TypeEchoReply
+	}
+	if request {
+		return ICMPv4TypeEchoRequest
+	}
+	return ICMPv4TypeEchoReply
+}
+
 // SetEchoRequest replaces Type, Code, and Body with an Echo Request containing
 // identifier, sequence, and a copy of payload. Source and Destination must
 // already select one valid address family. It leaves m unchanged on failure.
@@ -214,25 +253,10 @@ func (m *ICMPMessage) SetEchoReply(identifier, sequence uint16, payload []byte) 
 // request. A false request with ok set is an Echo Reply.
 func (m ICMPMessage) echoKind() (request, ok bool) {
 	_, _, protocol, valid := normalizeICMPAddresses(m.Source, m.Destination)
-	if !valid || len(m.Body) < 4 || m.Code != ICMPCodeNone {
+	if !valid {
 		return false, false
 	}
-	if protocol == ProtocolICMPv4 {
-		switch m.Type {
-		case ICMPv4TypeEchoRequest:
-			return true, true
-		case ICMPv4TypeEchoReply:
-			return false, true
-		}
-	} else {
-		switch m.Type {
-		case ICMPv6TypeEchoRequest:
-			return true, true
-		case ICMPv6TypeEchoReply:
-			return false, true
-		}
-	}
-	return false, false
+	return classifyICMPEcho(protocol, m.Type, m.Code, len(m.Body))
 }
 
 // setEcho implements the two ownership-identical Echo construction methods.
@@ -251,16 +275,7 @@ func (m *ICMPMessage) setEcho(request bool, identifier, sequence uint16, payload
 	binary.BigEndian.PutUint16(body[:2], identifier)
 	binary.BigEndian.PutUint16(body[2:4], sequence)
 	copy(body[4:], payload)
-	messageType := uint8(ICMPv4TypeEchoReply)
-	if request {
-		messageType = ICMPv4TypeEchoRequest
-	}
-	if protocol == ProtocolICMPv6 {
-		messageType = ICMPv6TypeEchoReply
-		if request {
-			messageType = ICMPv6TypeEchoRequest
-		}
-	}
+	messageType := icmpEchoMessageType(protocol == ProtocolICMPv6, request)
 	m.Type, m.Code, m.Body = messageType, ICMPCodeNone, body
 	return nil
 }
@@ -286,10 +301,7 @@ func (m ICMPMessage) EchoReply(source netip.Addr) (ICMPMessage, error) {
 	}
 	normalized.Destination = normalized.Source
 	normalized.Source = source
-	normalized.Type = ICMPv4TypeEchoReply
-	if source.Is6() {
-		normalized.Type = ICMPv6TypeEchoReply
-	}
+	normalized.Type = icmpEchoMessageType(source.Is6(), false)
 	return normalized, nil
 }
 
@@ -414,6 +426,37 @@ type ICMPError struct {
 	QuotedTargetPort uint16
 }
 
+// icmpErrorFieldKinds identifies the four-byte error-body fields whose wire
+// layout is shared by public construction and Stack-generated control errors.
+func icmpErrorFieldKinds(protocol, messageType, code byte) (mtu, pointer bool) {
+	mtu = protocol == ProtocolICMPv4 && messageType == ICMPv4TypeDestinationUnreachable && code == ICMPv4DestinationUnreachableCodeFragmentationNeeded ||
+		protocol == ProtocolICMPv6 && messageType == ICMPv6TypePacketTooBig
+	pointer = protocol == ProtocolICMPv4 && messageType == ICMPv4TypeParameterProblem ||
+		protocol == ProtocolICMPv6 && messageType == ICMPv6TypeParameterProblem
+	return
+}
+
+// marshalICMPErrorBody writes the four type-specific bytes and quoted packet
+// after validation by the public constructor or selection by Stack policy.
+func marshalICMPErrorBody(body []byte, protocol, messageType, code byte, mtu, pointer uint32, quote []byte) {
+	body[0], body[1], body[2], body[3] = 0, 0, 0, 0
+	mtuField, pointerField := icmpErrorFieldKinds(protocol, messageType, code)
+	if mtuField {
+		if protocol == ProtocolICMPv4 {
+			binary.BigEndian.PutUint16(body[2:4], uint16(mtu))
+		} else {
+			binary.BigEndian.PutUint32(body[:4], mtu)
+		}
+	} else if pointerField {
+		if protocol == ProtocolICMPv4 {
+			body[0] = byte(pointer)
+		} else {
+			binary.BigEndian.PutUint32(body[:4], pointer)
+		}
+	}
+	copy(body[4:], quote)
+}
+
 // ICMPMessage constructs the semantic ICMP error represented by e for
 // destination. Reporter and destination select the address family; Type, Code,
 // MTU, Pointer, and QuotedPacket provide the wire fields. It validates the
@@ -433,30 +476,14 @@ func (e ICMPError) ICMPMessage(destination netip.Addr) (ICMPMessage, error) {
 		protocol == ProtocolICMPv6 && (!quotedSource.Is6() || !quotedTarget.Is6()) {
 		return ICMPMessage{}, syscall.EINVAL
 	}
-	mtuField := protocol == ProtocolICMPv4 && e.Type == ICMPv4TypeDestinationUnreachable && e.Code == ICMPv4DestinationUnreachableCodeFragmentationNeeded ||
-		protocol == ProtocolICMPv6 && e.Type == ICMPv6TypePacketTooBig
-	pointerField := protocol == ProtocolICMPv4 && e.Type == ICMPv4TypeParameterProblem ||
-		protocol == ProtocolICMPv6 && e.Type == ICMPv6TypeParameterProblem
+	mtuField, pointerField := icmpErrorFieldKinds(protocol, e.Type, e.Code)
 	if !mtuField && e.MTU != 0 || !pointerField && e.Pointer != 0 ||
 		protocol == ProtocolICMPv4 && mtuField && e.MTU > 1<<16-1 ||
 		protocol == ProtocolICMPv4 && pointerField && e.Pointer > 1<<8-1 {
 		return ICMPMessage{}, syscall.EINVAL
 	}
 	body := make([]byte, 4+len(e.QuotedPacket))
-	if mtuField {
-		if protocol == ProtocolICMPv4 {
-			binary.BigEndian.PutUint16(body[2:4], uint16(e.MTU))
-		} else {
-			binary.BigEndian.PutUint32(body, e.MTU)
-		}
-	} else if pointerField {
-		if protocol == ProtocolICMPv4 {
-			body[0] = byte(e.Pointer)
-		} else {
-			binary.BigEndian.PutUint32(body, e.Pointer)
-		}
-	}
-	copy(body[4:], e.QuotedPacket)
+	marshalICMPErrorBody(body, protocol, e.Type, e.Code, e.MTU, e.Pointer, e.QuotedPacket)
 	return ICMPMessage{Source: reporter, Destination: destination, Type: e.Type, Code: e.Code, Body: body}, nil
 }
 
@@ -618,33 +645,18 @@ func (e ICMPError) Error() string {
 	return fmt.Sprintf("ICMP error from %s: type=%d code=%d", e.Reporter, e.Type, e.Code)
 }
 
-// isICMPEchoRequest reports whether payload is one complete Echo Request for
-// the supplied ICMP address family.
-func isICMPEchoRequest(protocol byte, payload []byte) bool {
-	if len(payload) < 8 || payload[1] != ICMPCodeNone {
-		return false
-	}
-	switch protocol {
-	case ProtocolICMPv4:
-		return payload[0] == ICMPv4TypeEchoRequest
-	case ProtocolICMPv6:
-		return payload[0] == ICMPv6TypeEchoRequest
-	default:
-		return false
-	}
-}
-
 // makeICMPEchoReply copies one Echo Request into an Echo Reply with a cleared
 // checksum. The caller owns the returned payload and must calculate the
 // address-family checksum before transmission.
 func makeICMPEchoReply(protocol byte, request []byte) ([]byte, bool) {
-	if !isICMPEchoRequest(protocol, request) {
+	if len(request) < 4 {
 		return nil, false
 	}
-	replyType := byte(ICMPv4TypeEchoReply)
-	if protocol == ProtocolICMPv6 {
-		replyType = ICMPv6TypeEchoReply
+	isRequest, ok := classifyICMPEcho(protocol, request[0], request[1], len(request)-4)
+	if !ok || !isRequest {
+		return nil, false
 	}
+	replyType := icmpEchoMessageType(protocol == ProtocolICMPv6, false)
 	reply := append([]byte(nil), request...)
 	reply[0], reply[2], reply[3] = replyType, 0, 0
 	return reply, true
@@ -811,6 +823,38 @@ func (s *Stack) writeOwnedICMPReply(packet ipPacket, reply []byte) error {
 	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, reply, true)
 }
 
+// writeICMPError encodes one Stack-selected error through the same body and
+// checksum primitives as ICMPError.ICMPMessage. Routing, rate limiting,
+// recursive-error suppression, and quotation policy remain with the caller.
+func (s *Stack) writeICMPError(source, target netip.Addr, messageType, code byte, mtu, pointer uint32, quote []byte) error {
+	protocol := byte(ProtocolICMPv4)
+	if source.Is6() {
+		protocol = ProtocolICMPv6
+	}
+	payload := make([]byte, 8+len(quote))
+	body := payload[4:]
+	marshalICMPErrorBody(body, protocol, messageType, code, mtu, pointer, quote)
+	marshalPublicICMPMessage(payload, ICMPMessage{
+		Source: source, Destination: target, Type: messageType, Code: code, Body: body,
+	})
+	return s.writeIPPayload(source, target, protocol, payload, false)
+}
+
+// icmpErrorQuote applies RFC 792's IPv4 header-plus-eight minimum and RFC
+// 4443's IPv6 minimum-MTU ceiling to an already validated original packet.
+func icmpErrorQuote(packet []byte, ipv6 bool) []byte {
+	quoteLength := len(packet)
+	if !ipv6 {
+		headerSize := int(packet[0]&0x0f) * 4
+		if quoteLength > headerSize+8 {
+			quoteLength = headerSize + 8
+		}
+	} else if maximum := ipv6MinimumMTU - 48; quoteLength > maximum {
+		quoteLength = maximum
+	}
+	return packet[:quoteLength]
+}
+
 // sendAdministrativeUnreachable rejects a handler-supplied ICMP request when
 // RFC 792 or RFC 4443 permits an error response.
 func (s *Stack) sendAdministrativeUnreachable(packet ipPacket) error {
@@ -827,62 +871,33 @@ func (s *Stack) sendAdministrativeUnreachable(packet ipPacket) error {
 	if !s.allowControlResponse(controlResponsePortUnreachable) {
 		return nil
 	}
-	quoteLength := len(packet.original)
 	if packet.source.Is4() {
-		header := int(packet.original[0]&0x0f) * 4
-		if quoteLength > header+8 {
-			quoteLength = header + 8
-		}
-		icmp := make([]byte, 8+quoteLength)
-		icmp[0], icmp[1] = ICMPv4TypeDestinationUnreachable, ICMPv4DestinationUnreachableCodeCommunicationAdministrativelyProhibited
-		copy(icmp[8:], packet.original[:quoteLength])
-		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
+		return s.writeICMPError(packet.target, packet.source, ICMPv4TypeDestinationUnreachable,
+			ICMPv4DestinationUnreachableCodeCommunicationAdministrativelyProhibited, 0, 0, icmpErrorQuote(packet.original, false))
 	}
-	maximumQuote := ipv6MinimumMTU - 48
-	if quoteLength > maximumQuote {
-		quoteLength = maximumQuote
-	}
-	icmp := make([]byte, 8+quoteLength)
-	icmp[0], icmp[1] = ICMPv6TypeDestinationUnreachable, ICMPv6DestinationUnreachableCodeAdministrativelyProhibited
-	copy(icmp[8:], packet.original[:quoteLength])
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
-	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, icmp, false)
+	return s.writeICMPError(packet.target, packet.source, ICMPv6TypeDestinationUnreachable,
+		ICMPv6DestinationUnreachableCodeAdministrativelyProhibited, 0, 0, icmpErrorQuote(packet.original, true))
 }
 
 // sendFragmentReassemblyTimeout reports an expired datagram when its first
 // fragment was available. RFC 792 and RFC 4443 prohibit recursively reporting
 // another ICMP error, while RFC 4443 also caps the complete IPv6 error at the
 // minimum IPv6 MTU.
-func (s *Stack) sendFragmentReassemblyTimeout(set *fragmentSet) error {
-	if !s.isLocal(set.target) {
+func (s *Stack) sendFragmentReassemblyTimeout(entry *ipPacketReassemblyEntry) error {
+	state := &entry.state
+	if !s.isLocal(state.target) {
 		return nil
 	}
-	fragment, ok := parseFragment(set.firstPacket)
-	if !ok || fragment.offset != 0 || packetInvokesICMPError(set.firstPacket) || !s.allowControlResponse(controlResponseFragmentTimeout) {
+	fragment, ok := parseFragment(state.firstPacket)
+	if !ok || fragment.offset != 0 || packetInvokesICMPError(state.firstPacket) || !s.allowControlResponse(controlResponseFragmentTimeout) {
 		return nil
 	}
-	quoteLength := len(set.firstPacket)
-	if !set.v6 {
-		headerSize := int(set.firstPacket[0]&0x0f) * 4
-		if quoteLength > headerSize+8 {
-			quoteLength = headerSize + 8
-		}
-		icmp := make([]byte, 8+quoteLength)
-		icmp[0], icmp[1] = ICMPv4TypeTimeExceeded, ICMPv4TimeExceededCodeFragmentReassembly
-		copy(icmp[8:], set.firstPacket[:quoteLength])
-		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		return s.writeIPPayload(set.target, set.source, ProtocolICMPv4, icmp, false)
+	if !state.v6 {
+		return s.writeICMPError(state.target, state.source, ICMPv4TypeTimeExceeded,
+			ICMPv4TimeExceededCodeFragmentReassembly, 0, 0, icmpErrorQuote(state.firstPacket, false))
 	}
-	maximumQuote := ipv6MinimumMTU - 48
-	if quoteLength > maximumQuote {
-		quoteLength = maximumQuote
-	}
-	icmp := make([]byte, 8+quoteLength)
-	icmp[0], icmp[1] = ICMPv6TypeTimeExceeded, ICMPv6TimeExceededCodeFragmentReassembly
-	copy(icmp[8:], set.firstPacket[:quoteLength])
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(set.target, set.source, ProtocolICMPv6, icmp))
-	return s.writeIPPayload(set.target, set.source, ProtocolICMPv6, icmp, false)
+	return s.writeICMPError(state.target, state.source, ICMPv6TypeTimeExceeded,
+		ICMPv6TimeExceededCodeFragmentReassembly, 0, 0, icmpErrorQuote(state.firstPacket, true))
 }
 
 // packetInvokesICMPError follows a complete or first-fragment header chain
@@ -1052,8 +1067,9 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 		if source.Is4In6() || target.Is4In6() {
 			return netip.Addr{}, netip.Addr{}, 0, nil, false
 		}
-		next, offset := packet[6], 40
-		for offset <= len(packet) {
+		payload := packet[40:]
+		next, offset := packet[6], 0
+		for {
 			if next == ProtocolNoNextHeader {
 				return source, target, next, nil, true
 			}
@@ -1061,24 +1077,25 @@ func quotedIPPayload(packet []byte) (netip.Addr, netip.Addr, byte, []byte, bool)
 			case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting,
 				IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderAuthentication,
 				IPv6ExtensionHeaderMobility:
-				length, valid := ipv6ExtensionHeaderLength(next, packet[offset:])
+				length, valid := ipv6ExtensionHeaderLength(next, payload[offset:])
 				if !valid {
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
 				}
-				next, offset = packet[offset], offset+length
+				next, offset = payload[offset], offset+length
 			case IPv6ExtensionHeaderFragment:
-				if len(packet)-offset < 8 {
+				if len(payload)-offset < 8 {
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
 				}
+				header := payload[offset : offset+8]
+				next, offset = header[0], offset+8
 				// A quoted first fragment is useful even when M is set. Only a
 				// nonzero offset prevents transport correlation; RFC 8200's
 				// reserved bits are ignored on reception.
-				if binary.BigEndian.Uint16(packet[offset+2:offset+4])&0xfff8 != 0 {
+				if binary.BigEndian.Uint16(header[2:4])&0xfff8 != 0 {
 					return netip.Addr{}, netip.Addr{}, 0, nil, false
 				}
-				next, offset = packet[offset], offset+8
 			default:
-				return source, target, next, packet[offset:], true
+				return source, target, next, payload[offset:], true
 			}
 		}
 	}
@@ -1097,29 +1114,12 @@ func (s *Stack) sendPortUnreachable(packet ipPacket) error {
 	if !s.allowControlResponse(controlResponsePortUnreachable) {
 		return nil
 	}
-	quoteLength := len(packet.original)
 	if packet.source.Is4() {
-		header := int(packet.original[0]&0x0f) * 4
-		if quoteLength > header+8 {
-			quoteLength = header + 8
-		}
-		quote := packet.original[:quoteLength]
-		icmp := make([]byte, 8+len(quote))
-		icmp[0], icmp[1] = ICMPv4TypeDestinationUnreachable, ICMPv4DestinationUnreachableCodePort
-		copy(icmp[8:], quote)
-		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
+		return s.writeICMPError(packet.target, packet.source, ICMPv4TypeDestinationUnreachable,
+			ICMPv4DestinationUnreachableCodePort, 0, 0, icmpErrorQuote(packet.original, false))
 	}
-	maximumQuote := ipv6MinimumMTU - 48
-	if quoteLength > maximumQuote {
-		quoteLength = maximumQuote
-	}
-	quote := packet.original[:quoteLength]
-	icmp := make([]byte, 8+len(quote))
-	icmp[0], icmp[1] = ICMPv6TypeDestinationUnreachable, ICMPv6DestinationUnreachableCodePort
-	copy(icmp[8:], quote)
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
-	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, icmp, false)
+	return s.writeICMPError(packet.target, packet.source, ICMPv6TypeDestinationUnreachable,
+		ICMPv6DestinationUnreachableCodePort, 0, 0, icmpErrorQuote(packet.original, true))
 }
 
 // sendProtocolUnreachable rejects a valid packet whose upper-layer protocol
@@ -1136,28 +1136,11 @@ func (s *Stack) sendProtocolUnreachable(packet ipPacket) error {
 		return nil
 	}
 	if packet.source.Is4() {
-		header := int(packet.original[0]&0x0f) * 4
-		quoteLength := len(packet.original)
-		if quoteLength > header+8 {
-			quoteLength = header + 8
-		}
-		icmp := make([]byte, 8+quoteLength)
-		icmp[0], icmp[1] = ICMPv4TypeDestinationUnreachable, ICMPv4DestinationUnreachableCodeProtocol
-		copy(icmp[8:], packet.original[:quoteLength])
-		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
+		return s.writeICMPError(packet.target, packet.source, ICMPv4TypeDestinationUnreachable,
+			ICMPv4DestinationUnreachableCodeProtocol, 0, 0, icmpErrorQuote(packet.original, false))
 	}
-	maximumQuote := ipv6MinimumMTU - 48
-	quoteLength := len(packet.original)
-	if quoteLength > maximumQuote {
-		quoteLength = maximumQuote
-	}
-	icmp := make([]byte, 8+quoteLength)
-	icmp[0], icmp[1] = ICMPv6TypeParameterProblem, ICMPv6ParameterProblemCodeUnrecognizedNextHeader
-	binary.BigEndian.PutUint32(icmp[4:8], uint32(packet.protocolOffset))
-	copy(icmp[8:], packet.original[:quoteLength])
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
-	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, icmp, false)
+	return s.writeICMPError(packet.target, packet.source, ICMPv6TypeParameterProblem,
+		ICMPv6ParameterProblemCodeUnrecognizedNextHeader, 0, uint32(packet.protocolOffset), icmpErrorQuote(packet.original, true))
 }
 
 // sendParameterProblem reports a malformed IPv4 option or an IPv6 field whose
@@ -1173,29 +1156,12 @@ func (s *Stack) sendParameterProblem(packet ipPacket) error {
 		if packetInvokesICMPError(packet.original) || !s.allowControlResponse(controlResponseParameterProblem) {
 			return nil
 		}
-		header := int(packet.original[0]&0x0f) * 4
-		quoteLength := len(packet.original)
-		if quoteLength > header+8 {
-			quoteLength = header + 8
-		}
-		icmp := make([]byte, 8+quoteLength)
-		icmp[0], icmp[1], icmp[4] = ICMPv4TypeParameterProblem, packet.parameterCode, byte(packet.parameterAt)
-		copy(icmp[8:], packet.original[:quoteLength])
-		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv4, icmp, false)
+		return s.writeICMPError(packet.target, packet.source, ICMPv4TypeParameterProblem,
+			packet.parameterCode, 0, packet.parameterAt, icmpErrorQuote(packet.original, false))
 	}
 	if packetInvokesICMPError(packet.original) || !s.allowControlResponse(controlResponseParameterProblem) {
 		return nil
 	}
-	maximumQuote := ipv6MinimumMTU - 48
-	quoteLength := len(packet.original)
-	if quoteLength > maximumQuote {
-		quoteLength = maximumQuote
-	}
-	icmp := make([]byte, 8+quoteLength)
-	icmp[0], icmp[1] = ICMPv6TypeParameterProblem, packet.parameterCode
-	binary.BigEndian.PutUint32(icmp[4:8], packet.parameterAt)
-	copy(icmp[8:], packet.original[:quoteLength])
-	binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(packet.target, packet.source, ProtocolICMPv6, icmp))
-	return s.writeIPPayload(packet.target, packet.source, ProtocolICMPv6, icmp, false)
+	return s.writeICMPError(packet.target, packet.source, ICMPv6TypeParameterProblem,
+		packet.parameterCode, 0, packet.parameterAt, icmpErrorQuote(packet.original, true))
 }

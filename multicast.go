@@ -2536,24 +2536,19 @@ func (s *multicastState) sendIGMPPacket(target netip.Addr, payload []byte, route
 		return
 	}
 	headerSize := 20
+	packetValue := IPPacket{
+		Source: source, Destination: target, Protocol: ProtocolIGMP,
+		HopLimit: 1, TrafficClass: 0xc0, Identification: uint16(s.stack.ipv4ID.Add(1)),
+		DontFragment: true, Payload: payload,
+	}
+	var routerAlertOption [4]byte
 	if routerAlert {
 		headerSize = 24
+		routerAlertOption = [4]byte{IPv4HeaderOptionRouterAlert, 4, 0, 0}
+		packetValue.IPv4Options = routerAlertOption[:]
 	}
 	packet := make([]byte, headerSize+len(payload))
-	packet[0], packet[1] = 0x45, 0xc0
-	if routerAlert {
-		packet[0] = 0x46
-		copy(packet[20:24], []byte{IPv4HeaderOptionRouterAlert, 4, 0, 0})
-	}
-	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
-	binary.BigEndian.PutUint16(packet[4:6], uint16(s.stack.ipv4ID.Add(1)))
-	binary.BigEndian.PutUint16(packet[6:8], 0x4000)
-	packet[8], packet[9] = 1, ProtocolIGMP
-	sourceBytes, targetBytes := source.As4(), target.As4()
-	copy(packet[12:16], sourceBytes[:])
-	copy(packet[16:20], targetBytes[:])
-	binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:headerSize]))
-	copy(packet[headerSize:], payload)
+	marshalPublicIPPacket(packet, packetValue, headerSize)
 	_ = s.stack.writePacketUntil(packet, socketWriteState{closed: cancel})
 }
 
@@ -2564,16 +2559,12 @@ func (s *multicastState) sendMLDPacket(target netip.Addr, payload []byte, cancel
 	if !ok || len(payload) < 4 {
 		return
 	}
-	payload[2], payload[3] = 0, 0
-	binary.BigEndian.PutUint16(payload[2:4], transportChecksum(source, target, ProtocolICMPv6, payload))
 	packet := make([]byte, 48+len(payload))
-	packet[0], packet[6], packet[7] = 0x60, 0, 1
-	binary.BigEndian.PutUint16(packet[4:6], uint16(8+len(payload)))
-	sourceBytes, targetBytes := source.As16(), target.As16()
-	copy(packet[8:24], sourceBytes[:])
-	copy(packet[24:40], targetBytes[:])
+	marshalPublicIPv6BaseHeader(packet, IPPacket{Source: source, Destination: target, HopLimit: 1}, IPv6ExtensionHeaderHopByHop, 8+len(payload))
 	copy(packet[40:48], []byte{ProtocolICMPv6, 0, IPv6ExtensionOptionRouterAlert, 2, 0, 0, IPv6ExtensionOptionPadN, 0})
-	copy(packet[48:], payload)
+	marshalPublicICMPMessage(packet[48:], ICMPMessage{
+		Source: source, Destination: target, Type: payload[0], Code: payload[1], Body: payload[4:],
+	})
 	_ = s.stack.writePacketUntil(packet, socketWriteState{closed: cancel})
 }
 

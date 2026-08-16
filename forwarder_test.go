@@ -4322,6 +4322,7 @@ func TestICMPForwarderMessageIsEchoRequest(t *testing.T) {
 		want    bool
 	}{
 		{name: "IPv4", message: ICMPForwarderMessage{Source: v4Source, Destination: v4Target, Type: 8, Payload: v4Echo}, want: true},
+		{name: "IPv4 mapped", message: ICMPForwarderMessage{Source: netip.MustParseAddr("::ffff:192.0.2.90"), Destination: netip.MustParseAddr("::ffff:198.51.100.90"), Type: 8, Payload: v4Echo}, want: true},
 		{name: "IPv6", message: ICMPForwarderMessage{Source: v6Source, Destination: v6Target, Type: 128, Payload: v6Echo}, want: true},
 		{name: "reply", message: ICMPForwarderMessage{Source: v4Source, Destination: v4Target, Payload: []byte{0, 0, 0, 0, 0, 1, 0, 2}}},
 		{name: "nonzero code", message: ICMPForwarderMessage{Source: v4Source, Destination: v4Target, Type: 8, Code: 1, Payload: []byte{8, 1, 0, 0, 0, 1, 0, 2}}},

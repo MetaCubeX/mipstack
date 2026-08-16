@@ -517,21 +517,17 @@ func (m *ICMPForwarderMessage) SetICMPMessage(message ICMPMessage) error {
 
 // IsEchoRequest reports whether the message is a complete IPv4 or IPv6 Echo
 // Request whose Type and Code fields agree with Payload. Source and Destination
-// must identify the same address family.
+// must identify the same address family; IPv4-mapped addresses select IPv4.
 func (m ICMPForwarderMessage) IsEchoRequest() bool {
 	if len(m.Payload) < 2 || m.Type != m.Payload[0] || m.Code != m.Payload[1] {
 		return false
 	}
-	protocol := byte(0)
-	switch {
-	case m.Source.Is4() && m.Destination.Is4():
-		protocol = ProtocolICMPv4
-	case m.Source.Is6() && m.Destination.Is6():
-		protocol = ProtocolICMPv6
-	default:
+	_, _, protocol, valid := normalizeICMPAddresses(m.Source, m.Destination)
+	if !valid {
 		return false
 	}
-	return isICMPEchoRequest(protocol, m.Payload)
+	request, valid := classifyICMPEcho(protocol, m.Payload[0], m.Payload[1], len(m.Payload)-4)
+	return valid && request
 }
 
 // ICMPForwarder owns the single fallback ICMP handler installed on a stack. It
