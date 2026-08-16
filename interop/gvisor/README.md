@@ -24,7 +24,9 @@ The suite covers:
 - connected and unconnected UDP in both arrangements, connected-peer
   filtering, zero-length and maximum-size datagrams, wildcard dual-stack
   sockets, IPv4 zero-checksum acceptance, mandatory IPv6 checksums, invalid
-  checksum rejection, and bidirectional ICMP Port Unreachable delivery;
+  checksum rejection, multipart Internet and transport checksums checked
+  against gVisor and delivered to its native sockets, and bidirectional ICMP
+  Port Unreachable delivery;
 - UDP fragmentation and reassembly in both directions, including reordered
   and duplicate IPv4 and IPv6 fragments;
 - bidirectional UDP and raw-IP ancillary data for destination address, TTL or

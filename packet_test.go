@@ -1454,6 +1454,112 @@ func TestPublicChecksumAPI(t *testing.T) {
 	}
 }
 
+func TestPublicChecksumPartsAPI(t *testing.T) {
+	payload := []byte("multipart-checksum-payload")
+	parts := [][]byte{payload[:1], nil, payload[1:6], {}, payload[6:17], payload[17:]}
+	if got, want := InternetChecksumParts(parts...), InternetChecksum(payload); got != want {
+		t.Fatalf("InternetChecksumParts = %#x, want %#x", got, want)
+	}
+	if got, want := InternetChecksumParts(), InternetChecksum(nil); got != want {
+		t.Fatalf("empty InternetChecksumParts = %#x, want %#x", got, want)
+	}
+
+	for _, addresses := range [][2]netip.Addr{
+		{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("198.51.100.1")},
+		{netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2")},
+		{netip.MustParseAddr("::ffff:192.0.2.1"), netip.MustParseAddr("::ffff:198.51.100.1")},
+	} {
+		got, err := IPTransportChecksumParts(addresses[0], addresses[1], ProtocolUDP, parts...)
+		want, wantErr := IPTransportChecksum(addresses[0], addresses[1], ProtocolUDP, payload)
+		if err != nil || wantErr != nil || got != want {
+			t.Fatalf("IPTransportChecksumParts(%s) = %#x, %v; want %#x, %v", addresses[0], got, err, want, wantErr)
+		}
+		empty, err := IPTransportChecksumParts(addresses[0], addresses[1], ProtocolUDP)
+		emptyWant, wantErr := IPTransportChecksum(addresses[0], addresses[1], ProtocolUDP, nil)
+		if err != nil || wantErr != nil || empty != emptyWant {
+			t.Fatalf("empty IPTransportChecksumParts(%s) = %#x, %v; want %#x, %v", addresses[0], empty, err, emptyWant, wantErr)
+		}
+	}
+
+	source, destination := netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2")
+	invalidCases := []struct {
+		name        string
+		source      netip.Addr
+		destination netip.Addr
+		protocol    int
+	}{
+		{name: "cross-family", source: source, destination: netip.MustParseAddr("192.0.2.1"), protocol: ProtocolUDP},
+		{name: "zoned", source: source.WithZone("test"), destination: destination, protocol: ProtocolUDP},
+		{name: "negative-protocol", source: source, destination: destination, protocol: -1},
+		{name: "large-protocol", source: source, destination: destination, protocol: 256},
+	}
+	oversized := [][]byte{make([]byte, 40000), make([]byte, 25536)}
+	for _, test := range invalidCases {
+		if _, err := IPTransportChecksumParts(test.source, test.destination, test.protocol, oversized...); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("%s checksum error = %v", test.name, err)
+		}
+	}
+	if _, err := IPTransportChecksumParts(source, destination, ProtocolUDP, oversized...); !errors.Is(err, syscall.EMSGSIZE) {
+		t.Fatalf("cumulative oversized checksum error = %v", err)
+	}
+	maximumPayload := make([]byte, 65535)
+	for index := range maximumPayload {
+		maximumPayload[index] = byte(index*29 + 7)
+	}
+	maximumParts := [][]byte{maximumPayload[:32767], nil, maximumPayload[32767:]}
+	maximum, err := IPTransportChecksumParts(source, destination, ProtocolUDP, maximumParts...)
+	maximumWant, wantErr := IPTransportChecksum(source, destination, ProtocolUDP, maximumPayload)
+	if err != nil || wantErr != nil || maximum != maximumWant {
+		t.Fatalf("maximum multipart checksum = %#x, %v; want %#x, %v", maximum, err, maximumWant, wantErr)
+	}
+	if allocations := testing.AllocsPerRun(1000, func() {
+		_ = InternetChecksumParts(parts...)
+		_, _ = IPTransportChecksumParts(source, destination, ProtocolUDP, parts...)
+	}); allocations != 0 {
+		t.Fatalf("multipart checksum allocations = %v", allocations)
+	}
+}
+
+func TestPublicChecksumPartsEveryPartition(t *testing.T) {
+	addresses := [][2]netip.Addr{
+		{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("198.51.100.1")},
+		{netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2")},
+	}
+	for size := 0; size <= 12; size++ {
+		payload := make([]byte, size)
+		for index := range payload {
+			payload[index] = byte(index*53 + size*17)
+		}
+		partitions := 1
+		if size > 1 {
+			partitions = 1 << (size - 1)
+		}
+		for mask := 0; mask < partitions; mask++ {
+			parts := make([][]byte, 0, size*2+2)
+			parts = append(parts, nil)
+			start := 0
+			for offset := 1; offset < size; offset++ {
+				if mask&(1<<(offset-1)) == 0 {
+					continue
+				}
+				parts = append(parts, payload[start:offset], []byte{})
+				start = offset
+			}
+			parts = append(parts, payload[start:], nil)
+			if got, want := InternetChecksumParts(parts...), InternetChecksum(payload); got != want {
+				t.Fatalf("size %d partition %#x Internet checksum = %#x, want %#x", size, mask, got, want)
+			}
+			for _, pair := range addresses {
+				got, err := IPTransportChecksumParts(pair[0], pair[1], ProtocolUDP, parts...)
+				want, wantErr := IPTransportChecksum(pair[0], pair[1], ProtocolUDP, payload)
+				if err != nil || wantErr != nil || got != want {
+					t.Fatalf("size %d partition %#x transport checksum for %s = %#x, %v; want %#x, %v", size, mask, pair[0], got, err, want, wantErr)
+				}
+			}
+		}
+	}
+}
+
 func FuzzPublicIPPacketCodec(f *testing.F) {
 	seeds := []IPPacket{
 		{Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"), Protocol: 99, HopLimit: 64, Payload: []byte("v4")},
@@ -1649,7 +1755,7 @@ func FuzzPublicIPv6ExtensionOptions(f *testing.F) {
 }
 
 // FuzzChecksumParts verifies the Internet checksum and both pseudo-header
-// variants across every odd or even split between adjacent payload regions.
+// variants across adjacent and arbitrary multipart payload regions.
 func FuzzChecksumParts(f *testing.F) {
 	f.Add([]byte(nil), uint16(0), false, byte(ProtocolUDP))
 	f.Add([]byte{1}, uint16(1), false, byte(ProtocolTCP))
@@ -1681,6 +1787,18 @@ func FuzzChecksumParts(f *testing.F) {
 		split := int(splitAt) % (len(payload) + 1)
 		if got, want := transportChecksumParts(source, target, protocol, len(payload), payload[:split], payload[split:]), referenceChecksum(pseudoHeader); got != want {
 			t.Fatalf("transport checksum at split %d/%d = %#x, want %#x", split, len(payload), got, want)
+		}
+		second := split
+		if remaining := len(payload) - split; remaining != 0 {
+			second += int(protocol) % (remaining + 1)
+		}
+		parts := [][]byte{payload[:split], nil, payload[split:second], {}, payload[second:]}
+		if got, want := InternetChecksumParts(parts...), referenceChecksum(payload); got != want {
+			t.Fatalf("multipart Internet checksum at %d/%d/%d = %#x, want %#x", split, second, len(payload), got, want)
+		}
+		got, err := IPTransportChecksumParts(source, target, int(protocol), parts...)
+		if want := referenceChecksum(pseudoHeader); err != nil || got != want {
+			t.Fatalf("multipart transport checksum at %d/%d/%d = %#x, %v; want %#x", split, second, len(payload), got, err, want)
 		}
 	})
 }
@@ -1735,6 +1853,52 @@ func BenchmarkChecksum(b *testing.B) {
 	}
 	if result == 0 {
 		b.Fatal("unexpected zero checksum")
+	}
+}
+
+func BenchmarkChecksumParts(b *testing.B) {
+	data := make([]byte, 1500)
+	for index := range data {
+		data[index] = byte(index*37 + 11)
+	}
+	tests := []struct {
+		name  string
+		parts [][]byte
+	}{
+		{name: "one", parts: [][]byte{data}},
+		{name: "two-even", parts: [][]byte{data[:750], data[750:]}},
+		{name: "two-odd", parts: [][]byte{data[:751], data[751:]}},
+		{name: "six-with-empty", parts: [][]byte{data[:1], nil, data[1:500], {}, data[500:1001], data[1001:]}},
+	}
+	source, destination := netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2")
+	for _, test := range tests {
+		test := test
+		b.Run("Internet/"+test.name, func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			var result uint16
+			for index := 0; index < b.N; index++ {
+				result = InternetChecksumParts(test.parts...)
+			}
+			if result == 0 {
+				b.Fatal("unexpected zero checksum")
+			}
+		})
+		b.Run("Transport/"+test.name, func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			var result uint16
+			for index := 0; index < b.N; index++ {
+				var err error
+				result, err = IPTransportChecksumParts(source, destination, ProtocolUDP, test.parts...)
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			if result == 0 {
+				b.Fatal("unexpected zero checksum")
+			}
+		})
 	}
 }
 

@@ -252,7 +252,10 @@ identifiers are exposed as untyped constants so callers can use them directly
 with the wire-sized integer fields. This includes `ProtocolESP` and
 `ProtocolNoNextHeader`. `TCPSegment.Flags` remains a `uint16`. The package also
 exposes `InternetChecksum` and `IPTransportChecksum` for callers building
-other upper-layer protocols. The codec intentionally stops at the 65,535-byte
+other upper-layer protocols. Their `InternetChecksumParts` and
+`IPTransportChecksumParts` counterparts checksum logically contiguous input
+without first gathering its parts; empty parts preserve byte alignment across
+part boundaries. The codec intentionally stops at the 65,535-byte
 non-jumbogram IP model used by the Stack.
 
 ## Socket API

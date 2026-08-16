@@ -965,6 +965,18 @@ func normalizeIPv6ExtensionFields(first byte, payload []byte) {
 // first; computing over a complete valid checksummed region returns zero.
 func InternetChecksum(data []byte) uint16 { return checksum(data) }
 
+// InternetChecksumParts computes the RFC 1071 one's-complement checksum of
+// parts as though their bytes were concatenated in order. Empty parts do not
+// disturb word alignment, and an odd trailing byte is paired with the first
+// byte of the next non-empty part. Zero parts computes the checksum of an
+// empty region.
+func InternetChecksumParts(parts ...[]byte) uint16 {
+	if len(parts) == 1 {
+		return checksum(parts[0])
+	}
+	return checksumParts(0, parts)
+}
+
 // IPTransportChecksum computes an IPv4 or IPv6 pseudo-header checksum over
 // payload. Protocol must be between 0 and 255, payload must not exceed 65535
 // bytes, and both addresses must be valid, unzoned members of the same family.
@@ -985,6 +997,49 @@ func IPTransportChecksum(source, destination netip.Addr, protocol int, payload [
 		return 0, syscall.EMSGSIZE
 	}
 	return transportChecksum(source, destination, byte(protocol), payload), nil
+}
+
+// IPTransportChecksumParts computes an IPv4 or IPv6 pseudo-header checksum
+// over parts as though their bytes were concatenated in order. It has the same
+// address, protocol, and protocol-specific wire semantics as
+// IPTransportChecksum. The combined payload must not exceed 65535 bytes.
+func IPTransportChecksumParts(source, destination netip.Addr, protocol int, parts ...[]byte) (uint16, error) {
+	if source.Zone() != "" || destination.Zone() != "" {
+		return 0, syscall.EINVAL
+	}
+	source, destination = source.Unmap(), destination.Unmap()
+	if !source.IsValid() || !destination.IsValid() || source.Is4() != destination.Is4() || protocol < 0 || protocol > 255 {
+		return 0, syscall.EINVAL
+	}
+	payloadLength := 0
+	for _, part := range parts {
+		if len(part) > 65535-payloadLength {
+			return 0, syscall.EMSGSIZE
+		}
+		payloadLength += len(part)
+	}
+	switch len(parts) {
+	case 1:
+		return transportChecksum(source, destination, byte(protocol), parts[0]), nil
+	case 2:
+		return transportChecksumParts(source, destination, byte(protocol), payloadLength, parts[0], parts[1]), nil
+	}
+	var sum uint32
+	if source.Is4() {
+		sourceBytes, destinationBytes := source.As4(), destination.As4()
+		sum += checksumSum(sourceBytes[:])
+		sum += checksumSum(destinationBytes[:])
+		sum += uint32(protocol)
+		sum += uint32(payloadLength)
+	} else {
+		sourceBytes, destinationBytes := source.As16(), destination.As16()
+		sum += checksumSum(sourceBytes[:])
+		sum += checksumSum(destinationBytes[:])
+		sum += uint32(payloadLength >> 16)
+		sum += uint32(payloadLength & 0xffff)
+		sum += uint32(protocol)
+	}
+	return checksumParts(sum, parts), nil
 }
 
 // ipPacket is a validated, complete IP packet and its upper-layer payload.
@@ -1070,6 +1125,42 @@ func checksumSum(data []byte) uint32 {
 		sum = sum&0xffff + sum>>16
 	}
 	return uint32(sum)
+}
+
+// checksumParts finishes an Internet checksum from an initial pseudo-header
+// sum and logically contiguous byte regions. Empty regions do not disturb the
+// pairing of bytes across odd boundaries.
+func checksumParts(sum uint32, parts [][]byte) uint16 {
+	var trailing byte
+	odd := false
+	for _, part := range parts {
+		if len(part) == 0 {
+			continue
+		}
+		if odd {
+			sum += uint32(trailing)<<8 | uint32(part[0])
+			part = part[1:]
+			odd = false
+		}
+		even := len(part) &^ 1
+		if even != 0 {
+			sum += checksumSum(part[:even])
+		}
+		if even != len(part) {
+			trailing = part[even]
+			odd = true
+		}
+		for sum>>16 != 0 {
+			sum = sum&0xffff + sum>>16
+		}
+	}
+	if odd {
+		sum += uint32(trailing) << 8
+	}
+	for sum>>16 != 0 {
+		sum = sum&0xffff + sum>>16
+	}
+	return ^uint16(sum)
 }
 
 // transportChecksum computes an IPv4 or IPv6 pseudo-header checksum.

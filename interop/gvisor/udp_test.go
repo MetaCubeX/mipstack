@@ -14,6 +14,7 @@ import (
 
 	"github.com/metacubex/gvisor/pkg/tcpip"
 	"github.com/metacubex/gvisor/pkg/tcpip/adapters/gonet"
+	"github.com/metacubex/gvisor/pkg/tcpip/checksum"
 	"github.com/metacubex/gvisor/pkg/tcpip/header"
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/udp"
 	"github.com/metacubex/gvisor/pkg/waiter"
@@ -517,6 +518,80 @@ func TestUDPChecksumInterop(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestPublicChecksumPartsInterop compares the multipart API with gVisor's
+// independent checksum implementation and sends its UDP result through a
+// native gVisor endpoint in both address families.
+func TestPublicChecksumPartsInterop(t *testing.T) {
+	const (
+		mipstackPort = 44821
+		gvisorPort   = 44822
+	)
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			payload := []byte("multipart-checksum-gvisor-interoperability")
+			payloadParts := [][]byte{payload[:1], nil, payload[1:12], {}, payload[12:29], payload[29:]}
+			var checksumer checksum.Checksumer
+			for _, part := range payloadParts {
+				checksumer.Add(part)
+			}
+			if got, want := mipstack.InternetChecksumParts(payloadParts...), ^checksumer.Checksum(); got != want {
+				t.Fatalf("InternetChecksumParts = %#x, gVisor %#x", got, want)
+			}
+
+			udpHeader := make([]byte, header.UDPMinimumSize)
+			binary.BigEndian.PutUint16(udpHeader[0:2], mipstackPort)
+			binary.BigEndian.PutUint16(udpHeader[2:4], gvisorPort)
+			binary.BigEndian.PutUint16(udpHeader[4:6], uint16(len(udpHeader)+len(payload)))
+			parts := [][]byte{udpHeader[:3], nil, udpHeader[3:7], udpHeader[7:], payload[:1], {}, payload[1:17], payload[17:]}
+			value, err := mipstack.IPTransportChecksumParts(
+				family.mipstackAddress, family.gvisorAddress, mipstack.ProtocolUDP, parts...,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			contiguous := append(append([]byte(nil), udpHeader...), payload...)
+			initial := header.PseudoHeaderChecksum(
+				udp.ProtocolNumber, gvisorAddress(family.mipstackAddress), gvisorAddress(family.gvisorAddress), uint16(len(contiguous)),
+			)
+			if want := ^checksum.Checksum(contiguous, initial); value != want {
+				t.Fatalf("IPTransportChecksumParts = %#x, gVisor %#x", value, want)
+			}
+			if value == 0 {
+				value = 0xffff
+			}
+			binary.BigEndian.PutUint16(udpHeader[6:8], value)
+
+			network := newFamilyInteropNetwork(t, family, 1500)
+			peer := newGVisorUDPSocket(
+				t, network, family.networkProtocol,
+				gvisorFullAddress(family.gvisorAddress, gvisorPort), func(tcpip.Endpoint) {},
+			)
+			defer peer.Close()
+			if err = peer.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			packet := mipstack.IPPacket{
+				Source: family.mipstackAddress, Destination: family.gvisorAddress,
+				Protocol: mipstack.ProtocolUDP, HopLimit: 64,
+				Payload: append(udpHeader, payload...),
+			}
+			wire, err := packet.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = network.deliverToGVisor(wire); err != nil {
+				t.Fatal(err)
+			}
+			storage := make([]byte, len(payload)+8)
+			read, source, err := peer.ReadFrom(storage)
+			if err != nil || !bytes.Equal(storage[:read], payload) || requireAddrPort(t, source) != netipAddrPort(family.mipstackAddress, mipstackPort) {
+				t.Fatalf("gVisor multipart-checksum UDP = n=%d source=%v payload=%q error=%v", read, source, storage[:read], err)
+			}
+		})
 	}
 }
 
