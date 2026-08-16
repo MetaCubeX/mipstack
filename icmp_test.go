@@ -44,7 +44,7 @@ func TestICMPErrorCodeValidation(t *testing.T) {
 		{ProtocolICMPv4, 12, 2, true},
 		{ProtocolICMPv4, 12, 3, false},
 		{ProtocolICMPv6, 1, ICMPv6DestinationUnreachableCodeSourceRoutingHeader, true},
-		{ProtocolICMPv6, 1, 8, false},
+		{ProtocolICMPv6, 1, ICMPv6DestinationUnreachableCodeHeadersTooLong, true},
 		{ProtocolICMPv6, 1, ICMPv6DestinationUnreachableCodePRoute, true},
 		{ProtocolICMPv6, 1, 10, false},
 		{ProtocolICMPv6, 2, 0, true},
@@ -220,6 +220,126 @@ func FuzzICMPErrorQuotes(f *testing.F) {
 		}
 		if !bytes.Equal(cloned.QuotedPacket, clonedPacket) || !bytes.Equal(cloned.QuotedPayload, clonedPayload) {
 			t.Fatal("cloned ICMP error retained caller-owned storage")
+		}
+	})
+}
+
+// FuzzICMPExtensionObjects verifies that the public object view and setter
+// agree on every accepted RFC 4884 framing without modifying caller input.
+func FuzzICMPExtensionObjects(f *testing.F) {
+	f.Add([]byte(nil))
+	f.Add([]byte{0, 8, ICMPExtensionClassExtendedInformation, ICMPExtensionExtendedInformationTypePointer, 0, 0, 0, 17})
+	f.Add([]byte{0, 4, 0xfe, 0x7d, 0, 8, 1, 2, 1, 2, 3, 4})
+	f.Add([]byte{0, 7, 1, 1, 1, 2, 3})
+	f.Fuzz(func(t *testing.T, encoded []byte) {
+		if len(encoded) > 65535 {
+			encoded = encoded[:65535]
+		}
+		before := append([]byte(nil), encoded...)
+		networkError := ICMPError{Extensions: encoded}
+		objects, err := networkError.ExtensionObjects()
+		if !bytes.Equal(encoded, before) {
+			t.Fatal("ExtensionObjects modified its input")
+		}
+		hasPointer, valid := validateICMPExtensionObjects(encoded)
+		if len(encoded) == 0 {
+			if err != nil || objects != nil || valid || hasPointer {
+				t.Fatalf("empty extension result = %+v, %v, %t/%t", objects, err, hasPointer, valid)
+			}
+			return
+		}
+		if err != nil {
+			if valid {
+				t.Fatal("public parser rejected an internally valid object sequence")
+			}
+			return
+		}
+		if !valid || len(objects) == 0 {
+			t.Fatal("public parser accepted an internally invalid object sequence")
+		}
+		var rebuilt ICMPError
+		if err = rebuilt.SetExtensionObjects(objects); err != nil || !bytes.Equal(rebuilt.Extensions, encoded) {
+			t.Fatalf("object round trip = %x, %v; want %x", rebuilt.Extensions, err, encoded)
+		}
+		foundPointer := false
+		for _, object := range objects {
+			_, pointer := object.Pointer()
+			foundPointer = foundPointer || pointer
+		}
+		if foundPointer != hasPointer {
+			t.Fatalf("Pointer classification = %t, want %t", foundPointer, hasPointer)
+		}
+	})
+}
+
+// FuzzICMPExtensionMessages exercises Length, padding, Extension Header, and
+// object framing through the shared public and stack parser.
+func FuzzICMPExtensionMessages(f *testing.F) {
+	source4 := netip.MustParseAddr("192.0.2.1")
+	target4 := netip.MustParseAddr("198.51.100.1")
+	source6 := netip.MustParseAddr("2001:db8::1")
+	target6 := netip.MustParseAddr("2001:db8::2")
+	quote4 := buildIPPacket(source4, target4, ProtocolUDP, make([]byte, udpHeaderSize), 21, true)
+	quote6 := buildIPPacket(source6, target6, ProtocolUDP, make([]byte, udpHeaderSize), 0, true)
+	for _, seed := range []struct {
+		ipv6        bool
+		messageType uint8
+		code        uint8
+		quote       []byte
+	}{
+		{messageType: ICMPv4TypeTimeExceeded, code: ICMPv4TimeExceededCodeTTLInTransit, quote: quote4},
+		{ipv6: true, messageType: ICMPv6TypeDestinationUnreachable, code: ICMPv6DestinationUnreachableCodeHeadersTooLong, quote: quote6},
+	} {
+		reporter, destination := netip.MustParseAddr("203.0.113.1"), source4
+		objects := []ICMPExtensionObject{{Class: 0xfe, Type: 1, Data: []byte{1, 2, 3, 4}}}
+		if seed.ipv6 {
+			reporter, destination = netip.MustParseAddr("2001:db8:ffff::1"), source6
+			var pointer ICMPExtensionObject
+			pointer.SetPointer(2048)
+			objects = append(objects, pointer)
+		}
+		networkError := ICMPError{Reporter: reporter, Type: seed.messageType, Code: seed.code, QuotedPacket: seed.quote}
+		if err := networkError.SetExtensionObjects(objects); err != nil {
+			f.Fatal(err)
+		}
+		message, err := networkError.ICMPMessage(destination)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(append([]byte(nil), message.Body...), seed.ipv6, seed.messageType, seed.code)
+	}
+	f.Add([]byte(nil), false, byte(3), byte(1))
+	f.Add(make([]byte, 4), true, byte(1), byte(8))
+	f.Fuzz(func(t *testing.T, body []byte, ipv6 bool, messageType, code byte) {
+		if len(body) > 65531 {
+			body = body[:65531]
+		}
+		before := append([]byte(nil), body...)
+		reporter, destination := netip.MustParseAddr("203.0.113.1"), source4
+		protocol := byte(ProtocolICMPv4)
+		if ipv6 {
+			reporter, destination = netip.MustParseAddr("2001:db8:ffff::1"), source6
+			protocol = ProtocolICMPv6
+		}
+		message := ICMPMessage{Source: reporter, Destination: destination, Type: messageType, Code: code, Body: body}
+		publicError, err := message.ICMPError()
+		stackError, ok := parseICMPErrorFields(reporter, protocol, messageType, code, body)
+		if !bytes.Equal(body, before) {
+			t.Fatal("extended ICMP parser modified its input")
+		}
+		if (err == nil) != ok || ok && !reflect.DeepEqual(publicError, stackError) {
+			t.Fatalf("public/stack parse disagreement: public=%+v/%v stack=%+v/%t", publicError, err, stackError, ok)
+		}
+		if err != nil {
+			return
+		}
+		rebuilt, rebuildErr := publicError.ICMPMessage(destination)
+		if rebuildErr != nil {
+			t.Fatalf("rebuild parsed extended error: %v", rebuildErr)
+		}
+		reparsed, reparseErr := rebuilt.ICMPError()
+		if reparseErr != nil || !reflect.DeepEqual(reparsed, publicError) {
+			t.Fatalf("extended semantic round trip: got %+v/%v, want %+v", reparsed, reparseErr, publicError)
 		}
 	})
 }
@@ -565,6 +685,394 @@ func TestPublicICMPErrorConstruction(t *testing.T) {
 				t.Fatalf("decoded constructed ICMP error = %+v", parsedError)
 			}
 		})
+	}
+}
+
+func TestPublicICMPExtensionObjects(t *testing.T) {
+	unknownData := []byte{1, 2, 3, 4}
+	pointer := ICMPExtensionObject{}
+	pointer.SetPointer(0x10203040)
+	pointerData := pointer.Data
+	objects := []ICMPExtensionObject{
+		{Class: 0xfe, Type: 0x7d, Data: unknownData},
+		pointer,
+		{Class: ICMPExtensionClassExtendedInformation, Type: ICMPExtensionExtendedInformationTypePointer, Data: []byte{5, 6, 7, 8}},
+	}
+	var networkError ICMPError
+	if err := networkError.SetExtensionObjects(objects); err != nil {
+		t.Fatalf("SetExtensionObjects: %v", err)
+	}
+	wantEncoding := []byte{
+		0, 8, 0xfe, 0x7d, 1, 2, 3, 4,
+		0, 8, ICMPExtensionClassExtendedInformation, ICMPExtensionExtendedInformationTypePointer, 0x10, 0x20, 0x30, 0x40,
+		0, 8, ICMPExtensionClassExtendedInformation, ICMPExtensionExtendedInformationTypePointer, 5, 6, 7, 8,
+	}
+	if !bytes.Equal(networkError.Extensions, wantEncoding) {
+		t.Fatalf("extension encoding = %x, want %x", networkError.Extensions, wantEncoding)
+	}
+	unknownData[0] ^= 0xff
+	pointerData[0] ^= 0xff
+	if !bytes.Equal(networkError.Extensions, wantEncoding) {
+		t.Fatal("SetExtensionObjects retained caller storage")
+	}
+
+	parsed, err := networkError.ExtensionObjects()
+	if err != nil || len(parsed) != len(objects) {
+		t.Fatalf("ExtensionObjects = %+v, %v", parsed, err)
+	}
+	if &parsed[0].Data[0] != &networkError.Extensions[icmpExtensionObjectHeaderSize] {
+		t.Fatal("ExtensionObjects copied object data")
+	}
+	if value, ok := parsed[1].Pointer(); !ok || value != 0x10203040 {
+		t.Fatalf("Pointer = %#x, %t", value, ok)
+	}
+	if value, ok := parsed[0].Pointer(); ok || value != 0 {
+		t.Fatalf("unknown object Pointer = %#x, %t", value, ok)
+	}
+
+	before := append([]byte(nil), networkError.Extensions...)
+	large := make([]byte, 40000)
+	for _, test := range []struct {
+		name    string
+		objects []ICMPExtensionObject
+		want    error
+	}{
+		{name: "unaligned data", objects: []ICMPExtensionObject{{Data: []byte{1}}}, want: syscall.EINVAL},
+		{name: "object too large", objects: []ICMPExtensionObject{{Data: make([]byte, 65532)}}, want: syscall.EMSGSIZE},
+		{name: "sequence too large", objects: []ICMPExtensionObject{{Data: large}, {Data: large}}, want: syscall.EMSGSIZE},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := networkError.SetExtensionObjects(test.objects); !errors.Is(err, test.want) {
+				t.Fatalf("SetExtensionObjects error = %v, want %v", err, test.want)
+			}
+			if !bytes.Equal(networkError.Extensions, before) {
+				t.Fatal("failed SetExtensionObjects changed receiver")
+			}
+		})
+	}
+
+	for _, encoded := range [][]byte{
+		{0, 3, 1, 1},
+		{0, 6, 1, 1, 0, 0},
+		{0, 8, 1, 1},
+		{0, 4, 1, 1, 0},
+	} {
+		if objects, err := (ICMPError{Extensions: encoded}).ExtensionObjects(); !errors.Is(err, syscall.EINVAL) || objects != nil {
+			t.Fatalf("malformed ExtensionObjects(%x) = %+v, %v", encoded, objects, err)
+		}
+	}
+	var nilError *ICMPError
+	if err := nilError.SetExtensionObjects(objects); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("nil SetExtensionObjects error = %v", err)
+	}
+	if err := networkError.SetExtensionObjects([]ICMPExtensionObject{}); err != nil || networkError.Extensions != nil {
+		t.Fatalf("clear ExtensionObjects = %x, %v", networkError.Extensions, err)
+	}
+	if objects, err := networkError.ExtensionObjects(); err != nil || objects != nil {
+		t.Fatalf("empty ExtensionObjects = %+v, %v", objects, err)
+	}
+	ordinary := cloneICMPError(ICMPError{QuotedPacket: []byte{1, 2, 3, 4}})
+	if ordinary.Extensions != nil {
+		t.Fatalf("ordinary clone has non-nil empty Extensions: %x", ordinary.Extensions)
+	}
+}
+
+func TestPublicICMPExtensionRoundTrip(t *testing.T) {
+	source4 := netip.MustParseAddr("192.0.2.1")
+	target4 := netip.MustParseAddr("198.51.100.1")
+	reporter4 := netip.MustParseAddr("198.51.100.254")
+	udp := make([]byte, udpHeaderSize+5)
+	binary.BigEndian.PutUint16(udp[:2], 42000)
+	binary.BigEndian.PutUint16(udp[2:4], 53)
+	quote4 := buildIPPacket(source4, target4, ProtocolUDP, udp, 9, true)
+
+	source6 := netip.MustParseAddr("2001:db8::1")
+	target6 := netip.MustParseAddr("2001:db8:1::1")
+	reporter6 := netip.MustParseAddr("2001:db8:ffff::1")
+	tcp := make([]byte, tcpHeaderSize+1)
+	binary.BigEndian.PutUint16(tcp[:2], 51000)
+	binary.BigEndian.PutUint16(tcp[2:4], 443)
+	quote6 := buildIPPacket(source6, target6, ProtocolTCP, tcp, 0, true)
+
+	for _, test := range []struct {
+		name                  string
+		reporter, destination netip.Addr
+		messageType, code     uint8
+		mtu, pointer          uint32
+		quote                 []byte
+		lengthOffset, unit    int
+	}{
+		{name: "IPv4 destination unreachable", reporter: reporter4, destination: source4, messageType: ICMPv4TypeDestinationUnreachable, code: ICMPv4DestinationUnreachableCodeFragmentationNeeded, mtu: 1280, quote: quote4, lengthOffset: 1, unit: 4},
+		{name: "IPv4 time exceeded", reporter: reporter4, destination: source4, messageType: ICMPv4TypeTimeExceeded, code: ICMPv4TimeExceededCodeTTLInTransit, quote: quote4, lengthOffset: 1, unit: 4},
+		{name: "IPv4 parameter problem", reporter: reporter4, destination: source4, messageType: ICMPv4TypeParameterProblem, code: ICMPv4ParameterProblemCodePointer, pointer: 17, quote: quote4, lengthOffset: 1, unit: 4},
+		{name: "IPv6 destination unreachable", reporter: reporter6, destination: source6, messageType: ICMPv6TypeDestinationUnreachable, code: ICMPv6DestinationUnreachableCodeNoRoute, quote: quote6, lengthOffset: 0, unit: 8},
+		{name: "IPv6 time exceeded", reporter: reporter6, destination: source6, messageType: ICMPv6TypeTimeExceeded, code: ICMPv6TimeExceededCodeHopLimitInTransit, quote: quote6, lengthOffset: 0, unit: 8},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			quote := append([]byte(nil), test.quote...)
+			networkError := ICMPError{
+				Reporter: test.reporter, Type: test.messageType, Code: test.code,
+				MTU: test.mtu, Pointer: test.pointer, QuotedPacket: quote,
+			}
+			objects := []ICMPExtensionObject{{Class: 0xee, Type: 7, Data: []byte{1, 2, 3, 4}}}
+			if err := networkError.SetExtensionObjects(objects); err != nil {
+				t.Fatal(err)
+			}
+			wantExtensions := append([]byte(nil), networkError.Extensions...)
+			message, err := networkError.ICMPMessage(test.destination)
+			if err != nil {
+				t.Fatalf("construct extended ICMP error: %v", err)
+			}
+			paddedLength := int(message.Body[test.lengthOffset]) * test.unit
+			if paddedLength < icmpExtensionMinimumQuoteSize || paddedLength%test.unit != 0 || len(message.Body) != 4+paddedLength+icmpExtensionHeaderSize+len(wantExtensions) {
+				t.Fatalf("extended body layout = length field %d, body %d", paddedLength, len(message.Body))
+			}
+			structure := message.Body[4+paddedLength:]
+			if structure[0] != icmpExtensionVersion<<4 || structure[1] != 0 || checksum(structure) != 0 ||
+				!bytes.Equal(structure[icmpExtensionHeaderSize:], wantExtensions) {
+				t.Fatalf("extension structure = %x", structure)
+			}
+			quote[0] ^= 0xff
+			networkError.Extensions[0] ^= 0xff
+			if !bytes.Equal(message.Body[4:4+len(test.quote)], test.quote) ||
+				!bytes.Equal(structure[icmpExtensionHeaderSize:], wantExtensions) {
+				t.Fatal("ICMPMessage retained constructor storage")
+			}
+
+			parsed, err := message.ICMPError()
+			if err != nil {
+				t.Fatalf("parse extended ICMP error: %v", err)
+			}
+			if parsed.Reporter != test.reporter || parsed.Type != test.messageType || parsed.Code != test.code ||
+				parsed.MTU != test.mtu || parsed.Pointer != test.pointer || !bytes.Equal(parsed.QuotedPacket, test.quote) ||
+				!bytes.Equal(parsed.Extensions, wantExtensions) {
+				t.Fatalf("parsed extended ICMP error = %+v", parsed)
+			}
+			parsedObjects, err := parsed.ExtensionObjects()
+			if err != nil || len(parsedObjects) != 1 || parsedObjects[0].Class != 0xee || parsedObjects[0].Type != 7 ||
+				!bytes.Equal(parsedObjects[0].Data, []byte{1, 2, 3, 4}) {
+				t.Fatalf("parsed extension objects = %+v, %v", parsedObjects, err)
+			}
+			cloned := cloneICMPError(parsed)
+			wantPacket := append([]byte(nil), cloned.QuotedPacket...)
+			wantClonedExtensions := append([]byte(nil), cloned.Extensions...)
+			parsed.QuotedPacket[0] ^= 0xff
+			parsed.Extensions[0] ^= 0xff
+			if !bytes.Equal(cloned.QuotedPacket, wantPacket) || !bytes.Equal(cloned.Extensions, wantClonedExtensions) {
+				t.Fatal("cloneICMPError retained extended message storage")
+			}
+			if got, want := socketErrorSize(cloned), socketErrorMetadataSize+len(cloned.QuotedPacket)+len(cloned.Extensions); got != want {
+				t.Fatalf("extended socket error size = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestPublicICMPv6HeadersTooLong(t *testing.T) {
+	source := netip.MustParseAddr("2001:db8::1")
+	target := netip.MustParseAddr("2001:db8:1::1")
+	reporter := netip.MustParseAddr("2001:db8:ffff::1")
+	udp := make([]byte, udpHeaderSize)
+	binary.BigEndian.PutUint16(udp[:2], 42000)
+	binary.BigEndian.PutUint16(udp[2:4], 443)
+	quote := buildIPPacket(source, target, ProtocolUDP, udp, 0, true)
+	pointer := ICMPExtensionObject{}
+	pointer.SetPointer(4096)
+	networkError := ICMPError{
+		Reporter: reporter, Type: ICMPv6TypeDestinationUnreachable,
+		Code: ICMPv6DestinationUnreachableCodeHeadersTooLong, QuotedPacket: quote,
+	}
+	if err := networkError.SetExtensionObjects([]ICMPExtensionObject{
+		{Class: 0xfc, Type: 3}, pointer, pointer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	message, err := networkError.ICMPMessage(source)
+	if err != nil || !message.IsError() {
+		t.Fatalf("construct Headers Too Long = %+v, %v", message, err)
+	}
+	wire, err := message.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedMessage, err := (IPPacket{
+		Source: reporter, Destination: source, Protocol: ProtocolICMPv6, HopLimit: 64, Payload: wire,
+	}).ICMPMessage()
+	if err != nil {
+		t.Fatalf("parse Headers Too Long wire message: %v", err)
+	}
+	parsed, err := parsedMessage.ICMPError()
+	if err != nil || parsed.Pointer != 0 || parsed.MTU != 0 {
+		t.Fatalf("parse Headers Too Long = %+v, %v", parsed, err)
+	}
+	objects, err := parsed.ExtensionObjects()
+	if err != nil || len(objects) != 3 {
+		t.Fatalf("Headers Too Long objects = %+v, %v", objects, err)
+	}
+	for _, index := range []int{1, 2} {
+		if value, ok := objects[index].Pointer(); !ok || value != 4096 {
+			t.Fatalf("Headers Too Long Pointer %d = %d, %t", index, value, ok)
+		}
+	}
+	control, err := socketErrorControlForRead(parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var controlMessage SocketErrorControlMessage
+	err = controlMessage.Parse(control)
+	if err != nil || controlMessage.Info != 0 || controlMessage.Errno != 71 {
+		t.Fatalf("Headers Too Long error control = %+v, %v", controlMessage, err)
+	}
+
+	missing := networkError
+	missing.Extensions = nil
+	if _, err = missing.ICMPMessage(source); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("Headers Too Long without extensions error = %v", err)
+	}
+	if err = missing.SetExtensionObjects([]ICMPExtensionObject{{Class: 0xfc, Type: 3}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = missing.ICMPMessage(source); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("Headers Too Long without Pointer error = %v", err)
+	}
+	plain := ICMPMessage{
+		Source: reporter, Destination: source, Type: ICMPv6TypeDestinationUnreachable,
+		Code: ICMPv6DestinationUnreachableCodeHeadersTooLong, Body: append(make([]byte, 4), quote...),
+	}
+	if !plain.IsError() {
+		t.Fatal("Headers Too Long was not classified as an ICMP error")
+	}
+	if _, err = plain.ICMPError(); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("Headers Too Long without wire Pointer error = %v", err)
+	}
+}
+
+func TestPublicICMPExtensionValidation(t *testing.T) {
+	source := netip.MustParseAddr("192.0.2.1")
+	target := netip.MustParseAddr("198.51.100.1")
+	reporter := netip.MustParseAddr("198.51.100.254")
+	quote := buildIPPacket(source, target, ProtocolUDP, make([]byte, udpHeaderSize+5), 11, true)
+	networkError := ICMPError{
+		Reporter: reporter, Type: ICMPv4TypeDestinationUnreachable,
+		Code: ICMPv4DestinationUnreachableCodeHost, QuotedPacket: quote,
+	}
+	if err := networkError.SetExtensionObjects([]ICMPExtensionObject{{Class: 7, Type: 9, Data: []byte{1, 2, 3, 4}}}); err != nil {
+		t.Fatal(err)
+	}
+	message, err := networkError.ICMPMessage(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := append([]byte(nil), message.Body...)
+	paddedLength := int(base[1]) * 4
+	structureOffset := 4 + paddedLength
+	parse := func(body []byte) error {
+		candidate := message
+		candidate.Body = body
+		_, parseErr := candidate.ICMPError()
+		return parseErr
+	}
+	check := func(name string, mutate func([]byte) []byte, wantError bool) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			body := mutate(append([]byte(nil), base...))
+			err := parse(body)
+			if (err != nil) != wantError {
+				t.Fatalf("ICMPError error = %v, wantError %t; body=%x", err, wantError, body)
+			}
+		})
+	}
+	check("checksum omitted", func(body []byte) []byte {
+		body[structureOffset+2], body[structureOffset+3] = 0, 0
+		return body
+	}, false)
+	check("nonzero reserved", func(body []byte) []byte {
+		body[structureOffset] |= 0x0f
+		body[structureOffset+1] = 0xff
+		body[structureOffset+2], body[structureOffset+3] = 0, 0
+		return body
+	}, false)
+	check("bad checksum", func(body []byte) []byte {
+		body[len(body)-1] ^= 0x80
+		return body
+	}, true)
+	check("unknown version", func(body []byte) []byte {
+		body[structureOffset] = 3 << 4
+		body[structureOffset+2], body[structureOffset+3] = 0, 0
+		return body
+	}, true)
+	check("quote shorter than minimum", func(body []byte) []byte {
+		body[1] = 31
+		return body
+	}, true)
+	check("no objects", func(body []byte) []byte {
+		return body[:structureOffset+icmpExtensionHeaderSize]
+	}, true)
+	check("object shorter than header", func(body []byte) []byte {
+		binary.BigEndian.PutUint16(body[structureOffset+4:structureOffset+6], 3)
+		body[structureOffset+2], body[structureOffset+3] = 0, 0
+		return body
+	}, true)
+	check("object not aligned", func(body []byte) []byte {
+		binary.BigEndian.PutUint16(body[structureOffset+4:structureOffset+6], 6)
+		body[structureOffset+2], body[structureOffset+3] = 0, 0
+		return body
+	}, true)
+	check("object overrun", func(body []byte) []byte {
+		binary.BigEndian.PutUint16(body[structureOffset+4:structureOffset+6], 12)
+		body[structureOffset+2], body[structureOffset+3] = 0, 0
+		return body
+	}, true)
+	check("trailing partial object", func(body []byte) []byte {
+		body[structureOffset+2], body[structureOffset+3] = 0, 0
+		return append(body, 0)
+	}, true)
+	check("nonzero quote padding", func(body []byte) []byte {
+		body[4+len(quote)] = 1
+		return body
+	}, true)
+
+	lengthZero := append([]byte(nil), base...)
+	lengthZero[1] = 0
+	withoutExtensions := message
+	withoutExtensions.Body = lengthZero
+	parsed, err := withoutExtensions.ICMPError()
+	if err != nil || len(parsed.Extensions) != 0 || len(parsed.QuotedPacket) != len(lengthZero)-4 {
+		t.Fatalf("zero Length extension handling = %+v, %v", parsed, err)
+	}
+
+	quote6 := buildIPPacket(
+		netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2"),
+		ProtocolUDP, make([]byte, udpHeaderSize), 0, true,
+	)
+	for _, test := range []ICMPError{
+		{Reporter: netip.MustParseAddr("2001:db8::ff"), Type: ICMPv6TypePacketTooBig, Code: 0, MTU: 1280, QuotedPacket: quote6, Extensions: networkError.Extensions},
+		{Reporter: netip.MustParseAddr("2001:db8::ff"), Type: ICMPv6TypeParameterProblem, Code: 0, QuotedPacket: quote6, Extensions: networkError.Extensions},
+	} {
+		if _, err := test.ICMPMessage(netip.MustParseAddr("2001:db8::1")); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("extensions on unsupported type %d error = %v", test.Type, err)
+		}
+	}
+
+	longQuote := buildIPPacket(source, target, ProtocolUDP, make([]byte, 180), 12, true)
+	truncated := networkError
+	truncated.QuotedPacket = longQuote[:100]
+	if _, err := truncated.ICMPMessage(source); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("short truncated extension quote error = %v", err)
+	}
+	truncated.QuotedPacket = longQuote[:130]
+	truncatedMessage, err := truncated.ICMPMessage(source)
+	if err != nil {
+		t.Fatalf("128-byte truncated extension quote: %v", err)
+	}
+	truncatedParsed, err := truncatedMessage.ICMPError()
+	if err != nil || len(truncatedParsed.QuotedPacket) != 132 {
+		t.Fatalf("aligned truncated quote = %d bytes, %v", len(truncatedParsed.QuotedPacket), err)
+	}
+	oversized := networkError
+	oversized.QuotedPacket = buildIPPacket(source, target, ProtocolUDP, make([]byte, 1001), 13, true)
+	if _, err := oversized.ICMPMessage(source); !errors.Is(err, syscall.EMSGSIZE) {
+		t.Fatalf("unrepresentable IPv4 quote error = %v", err)
 	}
 }
 
@@ -1085,6 +1593,115 @@ func TestUDPPathMTUAndICMPCorrelation(t *testing.T) {
 	}
 }
 
+func TestUDPExtendedICMPErrorCorrelation(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		local, remote netip.Addr
+		messageType   uint8
+		code          uint8
+	}{
+		{
+			name: "IPv4", local: netip.MustParseAddr("192.0.2.210"), remote: netip.MustParseAddr("192.0.2.211"),
+			messageType: ICMPv4TypeTimeExceeded, code: ICMPv4TimeExceededCodeTTLInTransit,
+		},
+		{
+			name: "IPv6", local: netip.MustParseAddr("2001:db8::210"), remote: netip.MustParseAddr("2001:db8::211"),
+			messageType: ICMPv6TypeDestinationUnreachable, code: ICMPv6DestinationUnreachableCodeHeadersTooLong,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bits, protocol := 32, ProtocolICMPv4
+			if test.local.Is6() {
+				bits, protocol = 128, ProtocolICMPv6
+			}
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.local, bits)}, MTU: 1400})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			connection, err := stack.ListenUDP(context.Background(), "udp", wildcardUDP(test.remote))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			target := netip.AddrPortFrom(test.remote, 5353)
+			payload := []byte("extended-error-correlation")
+			if _, err = connection.WriteTo(payload, net.UDPAddrFromAddrPort(target)); err != nil {
+				t.Fatal(err)
+			}
+			original := readOutboundPacket(t, stack)
+			networkError := ICMPError{
+				Reporter: test.remote, Type: test.messageType, Code: test.code,
+				QuotedPacket: original,
+			}
+			objects := []ICMPExtensionObject{{Class: 0xfe, Type: 7, Data: []byte{1, 2, 3, 4}}}
+			if test.local.Is6() {
+				var pointer ICMPExtensionObject
+				pointer.SetPointer(uint32(len(original) + 4096))
+				objects = []ICMPExtensionObject{pointer}
+			}
+			if err = networkError.SetExtensionObjects(objects); err != nil {
+				t.Fatal(err)
+			}
+			message, err := networkError.ICMPMessage(test.local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			icmpWire, err := message.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			errorPacket, err := (IPPacket{
+				Source: test.remote, Destination: test.local,
+				Protocol: protocol, HopLimit: 64, Payload: icmpWire,
+			}).MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = writeTestPacket(stack, errorPacket); err != nil {
+				t.Fatal(err)
+			}
+			for index := range errorPacket {
+				errorPacket[index] = 0
+			}
+			for index := range networkError.Extensions {
+				networkError.Extensions[index] = 0
+			}
+			if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			_, _, readErr := connection.ReadFrom(make([]byte, 1))
+			var operationError *net.OpError
+			if !errors.As(readErr, &operationError) {
+				t.Fatalf("ReadFrom error = %#v, want extended network error", readErr)
+			}
+			address, ok := operationError.Addr.(*net.UDPAddr)
+			if !ok || address.AddrPort() != target {
+				t.Fatalf("extended error address = %#v, want %s", operationError.Addr, target)
+			}
+			var received ICMPError
+			if !errors.As(readErr, &received) || received.Type != test.messageType || received.Code != test.code ||
+				!bytes.Equal(received.QuotedPacket, original) || len(received.QuotedPayload) != udpHeaderSize+len(payload) {
+				t.Fatalf("retained extended ICMP error = %+v, payload %x", received, received.QuotedPayload)
+			}
+			receivedObjects, err := received.ExtensionObjects()
+			if err != nil || len(receivedObjects) != 1 {
+				t.Fatalf("retained extension objects = %+v, %v", receivedObjects, err)
+			}
+			if test.local.Is6() {
+				if pointer, ok := receivedObjects[0].Pointer(); !ok || pointer != uint32(len(original)+4096) {
+					t.Fatalf("retained Headers Too Long Pointer = %d, %t", pointer, ok)
+				}
+			} else if !bytes.Equal(receivedObjects[0].Data, []byte{1, 2, 3, 4}) {
+				t.Fatalf("retained unknown extension = %+v", receivedObjects[0])
+			}
+		})
+	}
+}
+
 func TestIPConnPathMTUAndICMPCorrelation(t *testing.T) {
 	for _, test := range []struct {
 		name                   string
@@ -1359,4 +1976,89 @@ func TestLimitedBroadcastSourceIsDropped(t *testing.T) {
 	if dropped := stack.Stats().InboundDroppedPackets; dropped != 1 {
 		t.Fatalf("limited-broadcast drops = %d, want 1", dropped)
 	}
+}
+
+func BenchmarkPublicICMPErrorCodec(b *testing.B) {
+	source := netip.MustParseAddr("192.0.2.1")
+	target := netip.MustParseAddr("198.51.100.1")
+	reporter := netip.MustParseAddr("198.51.100.254")
+	quote := buildIPPacket(source, target, ProtocolUDP, make([]byte, udpHeaderSize+64), 31, true)
+	plainError := ICMPError{
+		Reporter: reporter, Type: ICMPv4TypeTimeExceeded,
+		Code: ICMPv4TimeExceededCodeTTLInTransit, QuotedPacket: quote,
+	}
+	extendedError := plainError
+	if err := extendedError.SetExtensionObjects([]ICMPExtensionObject{
+		{Class: 0xfe, Type: 1, Data: []byte{1, 2, 3, 4}},
+	}); err != nil {
+		b.Fatal(err)
+	}
+	plainMessage, err := plainError.ICMPMessage(source)
+	if err != nil {
+		b.Fatal(err)
+	}
+	extendedMessage, err := extendedError.ICMPMessage(source)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("ParsePlain", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(plainMessage.Body)))
+		var parsed ICMPError
+		var parseErr error
+		for i := 0; i < b.N; i++ {
+			parsed, parseErr = plainMessage.ICMPError()
+		}
+		if parseErr != nil || parsed.Reporter != reporter {
+			b.Fatal(parseErr)
+		}
+	})
+	b.Run("ParseExtended", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(extendedMessage.Body)))
+		var parsed ICMPError
+		var parseErr error
+		for i := 0; i < b.N; i++ {
+			parsed, parseErr = extendedMessage.ICMPError()
+		}
+		if parseErr != nil || len(parsed.Extensions) == 0 {
+			b.Fatal(parseErr)
+		}
+	})
+	b.Run("ExtensionObjects", func(b *testing.B) {
+		b.ReportAllocs()
+		var objects []ICMPExtensionObject
+		var parseErr error
+		for i := 0; i < b.N; i++ {
+			objects, parseErr = extendedError.ExtensionObjects()
+		}
+		if parseErr != nil || len(objects) != 1 {
+			b.Fatal(parseErr)
+		}
+	})
+	b.Run("ConstructPlain", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(plainMessage.Body)))
+		var message ICMPMessage
+		var constructErr error
+		for i := 0; i < b.N; i++ {
+			message, constructErr = plainError.ICMPMessage(source)
+		}
+		if constructErr != nil || len(message.Body) == 0 {
+			b.Fatal(constructErr)
+		}
+	})
+	b.Run("ConstructExtended", func(b *testing.B) {
+		b.ReportAllocs()
+		b.SetBytes(int64(len(extendedMessage.Body)))
+		var message ICMPMessage
+		var constructErr error
+		for i := 0; i < b.N; i++ {
+			message, constructErr = extendedError.ICMPMessage(source)
+		}
+		if constructErr != nil || len(message.Body) == 0 {
+			b.Fatal(constructErr)
+		}
+	})
 }

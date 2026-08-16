@@ -3,6 +3,7 @@ package gvisorinterop_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -277,6 +278,201 @@ func TestPublicICMPErrorConstructionInterop(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPublicICMPExtensionInterop verifies bidirectional raw-socket transport
+// of RFC 4884 errors at every family MTU. gVisor does not expose semantic RFC
+// 4884 decoding, so it acts as an unmodified L3/raw-socket peer while mipstack
+// independently parses and constructs the extension structure.
+func TestPublicICMPExtensionInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mtu := range interopMTUsForFamily(family) {
+			mtu := mtu
+			t.Run(family.name+"/"+interopMTUName(mtu), func(t *testing.T) {
+				network := newFamilyInteropNetwork(t, family, mtu)
+				connection, err := network.mipstack.ListenIP(context.Background(), family.icmpNetwork, family.mipstackAddress)
+				if err != nil {
+					t.Fatalf("listen mipstack raw ICMP: %v", err)
+				}
+				defer connection.Close()
+				if err = connection.SetDeadline(time.Now().Add(8 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+
+				var queue waiter.Queue
+				endpoint, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, family.icmpProtocol, &queue)
+				if tcpipErr != nil {
+					t.Fatalf("create gVisor raw ICMP endpoint: %s", tcpipErr.String())
+				}
+				defer endpoint.Close()
+				if tcpipErr = endpoint.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+					t.Fatalf("bind gVisor raw ICMP endpoint: %s", tcpipErr.String())
+				}
+				if tcpipErr = endpoint.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+					t.Fatalf("connect gVisor raw ICMP endpoint: %s", tcpipErr.String())
+				}
+				entry, notifications := registerReadable(&queue)
+				defer queue.EventUnregister(&entry)
+
+				gvisorWire, quote, pointer, err := makeInteropICMPExtension(
+					family, family.gvisorAddress, family.mipstackAddress,
+					family.mipstackAddress, family.gvisorAddress,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				written, writeErr := endpoint.Write(bytes.NewReader(gvisorWire), tcpip.WriteOptions{})
+				_, gvisorMTUFloor := writeErr.(*tcpip.ErrMessageTooLong)
+				// The pinned gVisor raw endpoint declines source fragmentation
+				// below this 148-byte message at IPv4's 68-byte minimum MTU.
+				// Keep that external policy as an explicit one-way exception;
+				// the reverse direction below still verifies mipstack's IPv4
+				// fragmentation and gVisor's reassembly at the same MTU.
+				if (writeErr != nil && !(family.mipstackAddress.Is4() && mtu == 68 && gvisorMTUFloor)) ||
+					(writeErr == nil && written != int64(len(gvisorWire))) {
+					t.Fatalf("write gVisor RFC 4884 message: n=%d, error=%s", written, tcpipErrorString(writeErr))
+				}
+				if writeErr == nil {
+					storage := make([]byte, 65535)
+					read, readErr := connection.Read(storage)
+					if readErr != nil {
+						t.Fatalf("read gVisor RFC 4884 message in mipstack: %v", readErr)
+					}
+					if !bytes.Equal(storage[:read], gvisorWire) {
+						t.Fatalf("mipstack received RFC 4884 message = %x, want %x", storage[:read], gvisorWire)
+					}
+					protocol := mipstack.ProtocolICMPv4
+					if family.mipstackAddress.Is6() {
+						protocol = mipstack.ProtocolICMPv6
+					}
+					parsedMessage, err := (mipstack.IPPacket{
+						Source: family.gvisorAddress, Destination: family.mipstackAddress,
+						Protocol: protocol, HopLimit: 64, Payload: storage[:read],
+					}).ICMPMessage()
+					if err != nil {
+						t.Fatalf("parse gVisor RFC 4884 message: %v", err)
+					}
+					parsedError, err := parsedMessage.ICMPError()
+					if err != nil || !bytes.Equal(parsedError.QuotedPacket, quote) {
+						t.Fatalf("decode gVisor RFC 4884 error = %+v, %v", parsedError, err)
+					}
+					objects, err := parsedError.ExtensionObjects()
+					if err != nil || len(objects) != 1 {
+						t.Fatalf("decode gVisor RFC 4884 objects = %+v, %v", objects, err)
+					}
+					if family.mipstackAddress.Is6() {
+						if value, ok := objects[0].Pointer(); !ok || value != pointer {
+							t.Fatalf("decode gVisor Headers Too Long Pointer = %d, %t", value, ok)
+						}
+					} else if objects[0].Class != 0xfe || objects[0].Type != 7 || !bytes.Equal(objects[0].Data, []byte{1, 2, 3, 4}) {
+						t.Fatalf("decode gVisor unknown extension object = %+v", objects[0])
+					}
+				}
+
+				mipWire, _, _, err := makeMipstackICMPExtension(
+					family, family.mipstackAddress, family.gvisorAddress,
+					family.gvisorAddress, family.mipstackAddress,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if written, writeErr := connection.WriteToIP(mipWire, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(mipWire) {
+					t.Fatalf("write mipstack RFC 4884 message: n=%d, error=%v", written, writeErr)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				received, _, readErr := readGVisorEndpoint(ctx, endpoint, notifications, 65535)
+				cancel()
+				if readErr != nil {
+					t.Fatalf("read mipstack RFC 4884 message in gVisor: %v", readErr)
+				}
+				received, err = stripGVisorRawHeader(family, received)
+				if err != nil || !bytes.Equal(received, mipWire) {
+					t.Fatalf("gVisor received RFC 4884 message = %x, %v; want %x", received, err, mipWire)
+				}
+			})
+		}
+	}
+}
+
+// makeInteropICMPExtension constructs an RFC 4884 error independently with
+// gVisor's checksum primitives for the gVisor-to-mipstack direction.
+func makeInteropICMPExtension(family interopFamily, reporter, destination, quotedSource, quotedTarget netip.Addr) (message, quote []byte, pointer uint32, err error) {
+	quote, err = makeInteropICMPQuote(quotedSource, quotedTarget)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	const paddedQuoteLength = 128
+	message = make([]byte, 8+paddedQuoteLength+4+8)
+	copy(message[8:], quote)
+	structure := message[8+paddedQuoteLength:]
+	structure[0] = 2 << 4
+	binary.BigEndian.PutUint16(structure[4:6], 8)
+	if family.mipstackAddress.Is4() {
+		message[0], message[1], message[5] = mipstack.ICMPv4TypeTimeExceeded, mipstack.ICMPv4TimeExceededCodeTTLInTransit, paddedQuoteLength/4
+		structure[6], structure[7] = 0xfe, 7
+		copy(structure[8:], []byte{1, 2, 3, 4})
+	} else {
+		message[0], message[1], message[4] = mipstack.ICMPv6TypeDestinationUnreachable, mipstack.ICMPv6DestinationUnreachableCodeHeadersTooLong, paddedQuoteLength/8
+		structure[6], structure[7] = mipstack.ICMPExtensionClassExtendedInformation, mipstack.ICMPExtensionExtendedInformationTypePointer
+		pointer = uint32(len(quote) + 4096)
+		binary.BigEndian.PutUint32(structure[8:12], pointer)
+	}
+	binary.BigEndian.PutUint16(structure[2:4], ^checksum.Checksum(structure, 0))
+	if family.mipstackAddress.Is4() {
+		binary.BigEndian.PutUint16(message[2:4], ^checksum.Checksum(message, 0))
+	} else {
+		icmpHeader := header.ICMPv6(message[:8])
+		icmpHeader.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+			Header: icmpHeader, Src: gvisorAddress(reporter), Dst: gvisorAddress(destination),
+			PayloadCsum: checksum.Checksum(message[8:], 0), PayloadLen: len(message) - 8,
+		}))
+	}
+	return message, quote, pointer, nil
+}
+
+// makeInteropICMPQuote constructs the invoking UDP/IP packet shared by both
+// independent extension encoders.
+func makeInteropICMPQuote(source, destination netip.Addr) ([]byte, error) {
+	udpWire, err := (mipstack.UDPDatagram{
+		Source: netipAddrPort(source, 45001), Destination: netipAddrPort(destination, 45002),
+		Payload: []byte("rfc4884-interop"),
+	}).MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	return (mipstack.IPPacket{
+		Source: source, Destination: destination,
+		Protocol: mipstack.ProtocolUDP, HopLimit: 31, Payload: udpWire,
+	}).MarshalBinary()
+}
+
+// makeMipstackICMPExtension constructs the reverse-direction message through
+// mipstack's semantic API.
+func makeMipstackICMPExtension(family interopFamily, reporter, destination, quotedSource, quotedTarget netip.Addr) (message, quote []byte, pointer uint32, err error) {
+	quote, err = makeInteropICMPQuote(quotedSource, quotedTarget)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	messageType, code := uint8(mipstack.ICMPv4TypeTimeExceeded), uint8(mipstack.ICMPv4TimeExceededCodeTTLInTransit)
+	objects := []mipstack.ICMPExtensionObject{{Class: 0xfe, Type: 7, Data: []byte{1, 2, 3, 4}}}
+	if family.mipstackAddress.Is6() {
+		messageType, code = mipstack.ICMPv6TypeDestinationUnreachable, mipstack.ICMPv6DestinationUnreachableCodeHeadersTooLong
+		pointer = uint32(len(quote) + 4096)
+		var object mipstack.ICMPExtensionObject
+		object.SetPointer(pointer)
+		objects = []mipstack.ICMPExtensionObject{object}
+	}
+	networkError := mipstack.ICMPError{Reporter: reporter, Type: messageType, Code: code, QuotedPacket: quote}
+	if err = networkError.SetExtensionObjects(objects); err != nil {
+		return nil, nil, 0, err
+	}
+	semantic, err := networkError.ICMPMessage(destination)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	message, err = semantic.MarshalBinary()
+	return message, quote, pointer, err
 }
 
 // TestMipstackICMPFilterInterop verifies that native gVisor raw ICMP traffic

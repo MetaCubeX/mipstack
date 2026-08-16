@@ -95,6 +95,8 @@ const (
 	ICMPv6DestinationUnreachableCodeRejectRoute = 6
 	// ICMPv6DestinationUnreachableCodeSourceRoutingHeader reports an error in a Source Routing Header.
 	ICMPv6DestinationUnreachableCodeSourceRoutingHeader = 7
+	// ICMPv6DestinationUnreachableCodeHeadersTooLong reports that processing could not continue because the IPv6 headers were too long.
+	ICMPv6DestinationUnreachableCodeHeadersTooLong = 8
 	// ICMPv6DestinationUnreachableCodePRoute reports an error in an RPL P-Route.
 	ICMPv6DestinationUnreachableCodePRoute = 9
 
@@ -124,6 +126,11 @@ const (
 	ICMPv6ParameterProblemCodeTooManyOptionsInExtensionHeader = 9
 	// ICMPv6ParameterProblemCodeOptionTooBig reports an option that exceeds a processing limit.
 	ICMPv6ParameterProblemCodeOptionTooBig = 10
+
+	// ICMPExtensionClassExtendedInformation identifies RFC 8883 Extended Information objects.
+	ICMPExtensionClassExtendedInformation = 4
+	// ICMPExtensionExtendedInformationTypePointer identifies an RFC 8883 Pointer object.
+	ICMPExtensionExtendedInformationTypePointer = 1
 )
 
 // ICMPMessage is the semantic representation of one ICMPv4 or ICMPv6
@@ -316,10 +323,11 @@ func (m ICMPMessage) IsError() bool {
 	return validICMPErrorCode(protocol, m.Type, m.Code)
 }
 
-// ICMPError validates and decodes m as a supported ICMP error. QuotedPacket
-// and QuotedPayload borrow m.Body, and available TCP or UDP ports are populated
-// immediately. The parser accepts the intentionally truncated quotations that
-// RFC 792 and RFC 4443 permit and does not apply socket-correlation policy.
+// ICMPError validates and decodes m as a supported ICMP error. QuotedPacket,
+// QuotedPayload, and Extensions borrow m.Body, and available TCP or UDP ports
+// are populated immediately. The parser accepts the intentionally truncated
+// quotations that RFC 792 and RFC 4443 permit and does not apply socket-
+// correlation policy.
 func (m ICMPMessage) ICMPError() (ICMPError, error) {
 	normalized, _, err := m.wireLayout()
 	if err != nil {
@@ -387,6 +395,38 @@ func marshalPublicICMPMessage(dst []byte, m ICMPMessage) {
 	binary.BigEndian.PutUint16(dst[2:4], value)
 }
 
+// ICMPExtensionObject is one RFC 4884 extension object in semantic wire order.
+// Data excludes the four-byte object header. ExtensionObjects returns Data
+// slices that borrow ICMPError.Extensions, while SetExtensionObjects copies
+// every Data slice. Unknown classes and types, duplicates, and order are
+// preserved.
+type ICMPExtensionObject struct {
+	// Class is the object's Class-Num.
+	Class uint8
+	// Type is the class-specific C-Type.
+	Type uint8
+	// Data is the object payload following Length, Class-Num, and C-Type.
+	Data []byte
+}
+
+// Pointer returns the byte offset carried by an RFC 8883 Extended Information
+// Pointer object.
+func (o ICMPExtensionObject) Pointer() (uint32, bool) {
+	if o.Class != ICMPExtensionClassExtendedInformation ||
+		o.Type != ICMPExtensionExtendedInformationTypePointer || len(o.Data) != 4 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint32(o.Data), true
+}
+
+// SetPointer replaces o with an RFC 8883 Extended Information Pointer object.
+func (o *ICMPExtensionObject) SetPointer(pointer uint32) {
+	o.Class = ICMPExtensionClassExtendedInformation
+	o.Type = ICMPExtensionExtendedInformationTypePointer
+	o.Data = make([]byte, 4)
+	binary.BigEndian.PutUint32(o.Data, pointer)
+}
+
 // ICMPError describes a validated remote network error.
 type ICMPError struct {
 	// Reporter is the router or destination that generated the error.
@@ -402,6 +442,10 @@ type ICMPError struct {
 	// Pointer is present for IPv4 or IPv6 Parameter Problem errors. It is also
 	// consumed by ICMPError.ICMPMessage when the error type defines that field.
 	Pointer uint32
+	// Extensions contains the encoded RFC 4884 extension-object sequence,
+	// excluding the four-byte Extension Header. Parsed errors borrow the ICMP
+	// message body. ICMPError.ICMPMessage validates and copies this storage.
+	Extensions []byte
 	// QuotedSource is the source of the failed original packet. It is derived
 	// from QuotedPacket and ignored by ICMPError.ICMPMessage.
 	QuotedSource netip.Addr
@@ -424,6 +468,124 @@ type ICMPError struct {
 	// QuotedTargetPort is the original TCP or UDP destination port when present.
 	// It is derived from QuotedPacket and ignored by ICMPError.ICMPMessage.
 	QuotedTargetPort uint16
+}
+
+const (
+	icmpExtensionVersion          = 2
+	icmpExtensionHeaderSize       = 4
+	icmpExtensionObjectHeaderSize = 4
+	icmpExtensionMinimumQuoteSize = 128
+	maximumICMPExtensionDataSize  = 65535 - 8 - icmpExtensionMinimumQuoteSize - icmpExtensionHeaderSize
+)
+
+// icmpExtensionObjectCursor shares object framing between the public parser
+// and validation on the stack receive path without allocating descriptors.
+type icmpExtensionObjectCursor struct {
+	remaining []byte
+}
+
+// next returns one borrowed object. valid distinguishes the end of a valid
+// sequence from malformed framing.
+func (c *icmpExtensionObjectCursor) next() (object ICMPExtensionObject, ok, valid bool) {
+	if len(c.remaining) == 0 {
+		return ICMPExtensionObject{}, false, true
+	}
+	if len(c.remaining) < icmpExtensionObjectHeaderSize {
+		return ICMPExtensionObject{}, false, false
+	}
+	length := int(binary.BigEndian.Uint16(c.remaining[:2]))
+	if length < icmpExtensionObjectHeaderSize || length&3 != 0 || length > len(c.remaining) {
+		return ICMPExtensionObject{}, false, false
+	}
+	object = ICMPExtensionObject{
+		Class: c.remaining[2], Type: c.remaining[3],
+		Data: c.remaining[icmpExtensionObjectHeaderSize:length],
+	}
+	c.remaining = c.remaining[length:]
+	return object, true, true
+}
+
+// validateICMPExtensionObjects validates one nonempty object sequence and
+// reports whether it contains an RFC 8883 Pointer object.
+func validateICMPExtensionObjects(encoded []byte) (hasPointer, valid bool) {
+	cursor := icmpExtensionObjectCursor{remaining: encoded}
+	count := 0
+	for {
+		object, ok, framingValid := cursor.next()
+		if !framingValid {
+			return false, false
+		}
+		if !ok {
+			return hasPointer, count != 0
+		}
+		count++
+		if _, pointer := object.Pointer(); pointer {
+			hasPointer = true
+		}
+	}
+}
+
+// ExtensionObjects parses the RFC 4884 object sequence. The returned slice
+// owns its descriptors, but every Data field borrows e.Extensions. An error
+// reports malformed object framing. An ICMPError with no extensions returns a
+// nil slice and nil error.
+func (e ICMPError) ExtensionObjects() ([]ICMPExtensionObject, error) {
+	if len(e.Extensions) == 0 {
+		return nil, nil
+	}
+	cursor := icmpExtensionObjectCursor{remaining: e.Extensions}
+	objects := make([]ICMPExtensionObject, 0, 1)
+	for {
+		object, ok, valid := cursor.next()
+		if !valid {
+			return nil, syscall.EINVAL
+		}
+		if !ok {
+			return objects, nil
+		}
+		objects = append(objects, object)
+	}
+}
+
+// SetExtensionObjects replaces Extensions with an encoded RFC 4884 object
+// sequence. Each Data length must be a multiple of four bytes. The method
+// preserves unknown classes and types, duplicates, and order, copies every
+// input Data slice, and leaves e unchanged on failure. An empty sequence clears
+// Extensions; an encoded Extension Structure is generated only when at least
+// one object is present.
+func (e *ICMPError) SetExtensionObjects(objects []ICMPExtensionObject) error {
+	if e == nil {
+		return syscall.EINVAL
+	}
+	if len(objects) == 0 {
+		e.Extensions = nil
+		return nil
+	}
+	size := 0
+	for _, object := range objects {
+		if len(object.Data) > 1<<16-1-icmpExtensionObjectHeaderSize {
+			return syscall.EMSGSIZE
+		}
+		if len(object.Data)&3 != 0 {
+			return syscall.EINVAL
+		}
+		length := icmpExtensionObjectHeaderSize + len(object.Data)
+		if size > maximumICMPExtensionDataSize-length {
+			return syscall.EMSGSIZE
+		}
+		size += length
+	}
+	encoded := make([]byte, size)
+	offset := 0
+	for _, object := range objects {
+		length := icmpExtensionObjectHeaderSize + len(object.Data)
+		binary.BigEndian.PutUint16(encoded[offset:offset+2], uint16(length))
+		encoded[offset+2], encoded[offset+3] = object.Class, object.Type
+		copy(encoded[offset+icmpExtensionObjectHeaderSize:offset+length], object.Data)
+		offset += length
+	}
+	e.Extensions = encoded
+	return nil
 }
 
 // icmpErrorFieldKinds identifies the four-byte error-body fields whose wire
@@ -457,12 +619,165 @@ func marshalICMPErrorBody(body []byte, protocol, messageType, code byte, mtu, po
 	copy(body[4:], quote)
 }
 
+// icmpExtensionLayout returns the RFC 4884 Length-field offset within the
+// four-byte error body and its address-family unit.
+func icmpExtensionLayout(protocol, messageType byte) (lengthOffset, unit int, ok bool) {
+	if protocol == ProtocolICMPv4 {
+		switch messageType {
+		case ICMPv4TypeDestinationUnreachable, ICMPv4TypeTimeExceeded, ICMPv4TypeParameterProblem:
+			return 1, 4, true
+		}
+	}
+	if protocol == ProtocolICMPv6 {
+		switch messageType {
+		case ICMPv6TypeDestinationUnreachable, ICMPv6TypeTimeExceeded:
+			return 0, 8, true
+		}
+	}
+	return 0, 0, false
+}
+
+// parseICMPExtensionStructure validates the RFC 4884 header, optional
+// checksum, and complete nonempty object sequence. The returned bytes exclude
+// the Extension Header and borrow structure.
+func parseICMPExtensionStructure(structure []byte) (objects []byte, hasPointer, ok bool) {
+	if len(structure) < icmpExtensionHeaderSize+icmpExtensionObjectHeaderSize ||
+		structure[0]>>4 != icmpExtensionVersion {
+		return nil, false, false
+	}
+	if binary.BigEndian.Uint16(structure[2:4]) != 0 && checksum(structure) != 0 {
+		return nil, false, false
+	}
+	objects = structure[icmpExtensionHeaderSize:]
+	hasPointer, valid := validateICMPExtensionObjects(objects)
+	if !valid {
+		return nil, false, false
+	}
+	return objects, hasPointer, true
+}
+
+// quotedIPDeclaredLength returns the original IP length when its base header
+// makes that boundary unambiguous. IPv6 Payload Length zero remains unknown
+// because the quote may be a jumbogram.
+func quotedIPDeclaredLength(quote []byte) (int, bool) {
+	if len(quote) == 0 {
+		return 0, false
+	}
+	switch quote[0] >> 4 {
+	case 4:
+		if len(quote) < 20 {
+			return 0, false
+		}
+		headerSize := int(quote[0]&0x0f) * 4
+		totalSize := int(binary.BigEndian.Uint16(quote[2:4]))
+		if headerSize < 20 || totalSize < headerSize {
+			return 0, false
+		}
+		return totalSize, true
+	case 6:
+		if len(quote) < 40 {
+			return 0, false
+		}
+		payloadSize := int(binary.BigEndian.Uint16(quote[4:6]))
+		if payloadSize == 0 {
+			// A zero Payload Length with a Hop-by-Hop header may identify a
+			// jumbogram. Every other Next Header unambiguously describes an
+			// ordinary zero-payload packet.
+			if quote[6] == IPv6ExtensionHeaderHopByHop {
+				return 0, false
+			}
+			return 40, true
+		}
+		return 40 + payloadSize, true
+	default:
+		return 0, false
+	}
+}
+
+// trimICMPExtensionQuote removes RFC 4884 padding only when the quoted IP
+// header proves the original boundary. Nonzero bytes beyond a proven boundary
+// violate the required zero padding.
+func trimICMPExtensionQuote(quote []byte) ([]byte, bool) {
+	declared, known := quotedIPDeclaredLength(quote)
+	if !known || declared > len(quote) {
+		return quote, true
+	}
+	for _, value := range quote[declared:] {
+		if value != 0 {
+			return nil, false
+		}
+	}
+	return quote[:declared], true
+}
+
+// splitICMPErrorQuote separates a compliant RFC 4884 Extension Structure from
+// its padded quote. A zero Length field always means that no extensions are
+// present, as required for compatibility by RFC 4884 section 5.4.
+func splitICMPErrorQuote(protocol, messageType byte, body []byte) (quote, extensions []byte, hasPointer, ok bool) {
+	lengthOffset, unit, extensible := icmpExtensionLayout(protocol, messageType)
+	if !extensible || body[lengthOffset] == 0 {
+		return body[4:], nil, false, true
+	}
+	paddedLength := int(body[lengthOffset]) * unit
+	if paddedLength < icmpExtensionMinimumQuoteSize || len(body) < 4+paddedLength+icmpExtensionHeaderSize+icmpExtensionObjectHeaderSize {
+		return nil, nil, false, false
+	}
+	extensions, hasPointer, valid := parseICMPExtensionStructure(body[4+paddedLength:])
+	if !valid {
+		return nil, nil, false, false
+	}
+	quote, valid = trimICMPExtensionQuote(body[4 : 4+paddedLength])
+	if !valid {
+		return nil, nil, false, false
+	}
+	return quote, extensions, hasPointer, true
+}
+
+// icmpExtensionQuoteLength validates that zero padding cannot replace known
+// quoted bytes, then returns the representable padded quote length.
+func icmpExtensionQuoteLength(protocol, messageType byte, quote []byte) (int, error) {
+	_, unit, ok := icmpExtensionLayout(protocol, messageType)
+	if !ok {
+		return 0, syscall.EINVAL
+	}
+	if declared, known := quotedIPDeclaredLength(quote); known {
+		if declared <= len(quote) {
+			for _, value := range quote[declared:] {
+				if value != 0 {
+					return 0, syscall.EINVAL
+				}
+			}
+		} else if len(quote) < icmpExtensionMinimumQuoteSize {
+			return 0, syscall.EINVAL
+		}
+	} else if len(quote) < icmpExtensionMinimumQuoteSize {
+		return 0, syscall.EINVAL
+	}
+	paddedLength := len(quote)
+	if paddedLength < icmpExtensionMinimumQuoteSize {
+		paddedLength = icmpExtensionMinimumQuoteSize
+	}
+	paddedLength = (paddedLength + unit - 1) &^ (unit - 1)
+	if paddedLength/unit > 255 {
+		return 0, syscall.EMSGSIZE
+	}
+	return paddedLength, nil
+}
+
+// marshalICMPExtensionStructure writes one validated RFC 4884 structure.
+func marshalICMPExtensionStructure(structure, objects []byte) {
+	structure[0], structure[1], structure[2], structure[3] = icmpExtensionVersion<<4, 0, 0, 0
+	copy(structure[icmpExtensionHeaderSize:], objects)
+	binary.BigEndian.PutUint16(structure[2:4], checksum(structure))
+}
+
 // ICMPMessage constructs the semantic ICMP error represented by e for
 // destination. Reporter and destination select the address family; Type, Code,
-// MTU, Pointer, and QuotedPacket provide the wire fields. It validates the
-// possibly truncated quote, copies QuotedPacket, and ignores the fields derived
-// from that quote. Routing, source ownership, rate limits, quote truncation,
-// and recursive-error suppression remain Stack transmission policy.
+// MTU, Pointer, QuotedPacket, and Extensions provide the wire fields. It
+// validates the possibly truncated quote and extension objects, copies both
+// byte slices, and ignores the fields derived from the quote. Routing, source
+// ownership, rate limits, quote truncation, and recursive-error suppression
+// remain Stack transmission policy.
 func (e ICMPError) ICMPMessage(destination netip.Addr) (ICMPMessage, error) {
 	reporter, destination, protocol, valid := normalizeICMPAddresses(e.Reporter, destination)
 	if !valid || !validICMPErrorCode(protocol, e.Type, e.Code) {
@@ -482,8 +797,36 @@ func (e ICMPError) ICMPMessage(destination netip.Addr) (ICMPMessage, error) {
 		protocol == ProtocolICMPv4 && pointerField && e.Pointer > 1<<8-1 {
 		return ICMPMessage{}, syscall.EINVAL
 	}
-	body := make([]byte, 4+len(e.QuotedPacket))
+	if len(e.Extensions) == 0 {
+		if protocol == ProtocolICMPv6 && e.Type == ICMPv6TypeDestinationUnreachable &&
+			e.Code == ICMPv6DestinationUnreachableCodeHeadersTooLong {
+			return ICMPMessage{}, syscall.EINVAL
+		}
+		body := make([]byte, 4+len(e.QuotedPacket))
+		marshalICMPErrorBody(body, protocol, e.Type, e.Code, e.MTU, e.Pointer, e.QuotedPacket)
+		return ICMPMessage{Source: reporter, Destination: destination, Type: e.Type, Code: e.Code, Body: body}, nil
+	}
+	if len(e.Extensions) > maximumICMPExtensionDataSize {
+		return ICMPMessage{}, syscall.EMSGSIZE
+	}
+	hasPointer, validExtensions := validateICMPExtensionObjects(e.Extensions)
+	if !validExtensions || protocol == ProtocolICMPv6 && e.Type == ICMPv6TypeDestinationUnreachable &&
+		e.Code == ICMPv6DestinationUnreachableCodeHeadersTooLong && !hasPointer {
+		return ICMPMessage{}, syscall.EINVAL
+	}
+	paddedQuoteLength, err := icmpExtensionQuoteLength(protocol, e.Type, e.QuotedPacket)
+	if err != nil {
+		return ICMPMessage{}, err
+	}
+	bodyLength := 4 + paddedQuoteLength + icmpExtensionHeaderSize + len(e.Extensions)
+	if bodyLength > 65535-4 {
+		return ICMPMessage{}, syscall.EMSGSIZE
+	}
+	body := make([]byte, bodyLength)
 	marshalICMPErrorBody(body, protocol, e.Type, e.Code, e.MTU, e.Pointer, e.QuotedPacket)
+	lengthOffset, unit, _ := icmpExtensionLayout(protocol, e.Type)
+	body[lengthOffset] = byte(paddedQuoteLength / unit)
+	marshalICMPExtensionStructure(body[4+paddedQuoteLength:], e.Extensions)
 	return ICMPMessage{Source: reporter, Destination: destination, Type: e.Type, Code: e.Code, Body: body}, nil
 }
 
@@ -935,6 +1278,19 @@ func parseICMPErrorFields(reporter netip.Addr, protocol, messageType, code byte,
 		return ICMPError{}, false
 	}
 	quote := body[4:]
+	var extensions []byte
+	hasExtensionPointer := false
+	if lengthOffset, _, extensible := icmpExtensionLayout(protocol, messageType); extensible && body[lengthOffset] != 0 {
+		var split bool
+		quote, extensions, hasExtensionPointer, split = splitICMPErrorQuote(protocol, messageType, body)
+		if !split {
+			return ICMPError{}, false
+		}
+	}
+	if protocol == ProtocolICMPv6 && messageType == ICMPv6TypeDestinationUnreachable &&
+		code == ICMPv6DestinationUnreachableCodeHeadersTooLong && !hasExtensionPointer {
+		return ICMPError{}, false
+	}
 	source, target, quotedProtocol, payload, ok := quotedIPPayload(quote)
 	if !ok || protocol == ProtocolICMPv4 && (!source.Is4() || !target.Is4()) ||
 		protocol == ProtocolICMPv6 && (!source.Is6() || !target.Is6()) {
@@ -945,6 +1301,7 @@ func parseICMPErrorFields(reporter netip.Addr, protocol, messageType, code byte,
 	}
 	result := ICMPError{
 		Reporter: reporter, Type: messageType, Code: code,
+		Extensions:   extensions,
 		QuotedSource: source, QuotedTarget: target, QuotedProtocol: quotedProtocol,
 		QuotedPacket: quote, QuotedPayload: payload,
 	}
@@ -976,20 +1333,35 @@ func parseICMPErrorFields(reporter netip.Addr, protocol, messageType, code byte,
 // cloneICMPError gives one queued consumer independent ownership while keeping
 // QuotedPayload as a suffix of QuotedPacket whenever the parsed error did so.
 func cloneICMPError(networkError ICMPError) ICMPError {
-	if len(networkError.QuotedPacket) != 0 && len(networkError.QuotedPayload) == 0 {
-		networkError.QuotedPacket = append([]byte(nil), networkError.QuotedPacket...)
-		return networkError
+	payloadOffset := 0
+	payloadAliasesPacket := false
+	if len(networkError.QuotedPacket) != 0 && len(networkError.QuotedPayload) != 0 &&
+		len(networkError.QuotedPayload) <= len(networkError.QuotedPacket) {
+		payloadOffset = len(networkError.QuotedPacket) - len(networkError.QuotedPayload)
+		payloadAliasesPacket = &networkError.QuotedPayload[0] == &networkError.QuotedPacket[payloadOffset]
 	}
-	if len(networkError.QuotedPacket) != 0 && len(networkError.QuotedPayload) <= len(networkError.QuotedPacket) {
-		payloadOffset := len(networkError.QuotedPacket) - len(networkError.QuotedPayload)
-		if &networkError.QuotedPayload[0] == &networkError.QuotedPacket[payloadOffset] {
-			networkError.QuotedPacket = append([]byte(nil), networkError.QuotedPacket...)
-			networkError.QuotedPayload = networkError.QuotedPacket[payloadOffset:]
-			return networkError
+	packetLength := len(networkError.QuotedPacket)
+	extensionLength := len(networkError.Extensions)
+	if packetLength+extensionLength != 0 {
+		storage := make([]byte, packetLength+extensionLength)
+		copy(storage, networkError.QuotedPacket)
+		copy(storage[packetLength:], networkError.Extensions)
+		if packetLength != 0 {
+			networkError.QuotedPacket = storage[:packetLength:packetLength]
+		} else {
+			networkError.QuotedPacket = nil
+		}
+		if extensionLength != 0 {
+			networkError.Extensions = storage[packetLength:]
+		} else {
+			networkError.Extensions = nil
 		}
 	}
-	networkError.QuotedPacket = append([]byte(nil), networkError.QuotedPacket...)
-	networkError.QuotedPayload = append([]byte(nil), networkError.QuotedPayload...)
+	if payloadAliasesPacket {
+		networkError.QuotedPayload = networkError.QuotedPacket[payloadOffset:]
+	} else {
+		networkError.QuotedPayload = append([]byte(nil), networkError.QuotedPayload...)
+	}
 	return networkError
 }
 
@@ -1009,10 +1381,10 @@ func validICMPErrorCode(protocol, messageType, code byte) bool {
 	case ProtocolICMPv6:
 		switch messageType {
 		case ICMPv6TypeDestinationUnreachable:
-			// RFC 8883 code 8 requires an RFC 4884 extension object that
-			// ICMPError does not yet model. RFC 9914 code 9 retains the
-			// ordinary Destination Unreachable body and is fully representable.
-			return code <= ICMPv6DestinationUnreachableCodeSourceRoutingHeader || code == ICMPv6DestinationUnreachableCodePRoute
+			// RFC 8883 code 8 is accepted here as a classification; complete
+			// parsing separately requires its RFC 4884 Pointer object. RFC
+			// 9914 code 9 retains the ordinary Destination Unreachable body.
+			return code <= ICMPv6DestinationUnreachableCodePRoute
 		case ICMPv6TypePacketTooBig:
 			return code == ICMPCodeNone
 		case ICMPv6TypeTimeExceeded:

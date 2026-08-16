@@ -590,6 +590,7 @@ func socketErrorSize(err error) int {
 		} else {
 			size += len(networkError.QuotedPayload)
 		}
+		size += len(networkError.Extensions)
 	}
 	return size
 }

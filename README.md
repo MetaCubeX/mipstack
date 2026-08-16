@@ -147,11 +147,17 @@ copies that quote; route selection, rate limiting, recursive-error suppression,
 and quote truncation remain transmission policy rather than codec behavior.
 The exported untyped ICMP type and code constants cover every error subtype the
 stack accepts as well as Echo Request and Reply. This includes the RFC 8883
-IPv6 Parameter Problem processing-limit codes and RFC 9914 P-Route errors.
-RFC 8883's Destination Unreachable "Headers too long" code remains excluded
-because its required RFC 4884 extension object is not represented by
-`ICMPError`; accepting it as an ordinary quoted error would lose its pointer
-and misidentify extension bytes as part of the quoted packet.
+IPv6 Parameter Problem processing-limit codes and Destination Unreachable
+"Headers too long", plus RFC 9914 P-Route errors. `ICMPError.Extensions`
+retains the RFC 4884 object sequence without its four-byte Extension Header;
+`ExtensionObjects` exposes ordered borrowed `ICMPExtensionObject` views and
+`SetExtensionObjects` performs the copying reverse conversion. Unknown and
+repeated objects remain lossless. `ICMPExtensionObject.Pointer` and
+`SetPointer` handle RFC 8883's Extended Information Pointer object, including
+pointers beyond the available quote. Encoding supplies the version, checksum,
+128-byte minimum quotation, and family-specific four- or eight-byte padding;
+decoding verifies those fields and never guesses an extension when the RFC
+4884 Length field is zero.
 
 TCP options are available in wire order through `TCPSegment.HeaderOptions` and
 `SetHeaderOptions`. `TCPHeaderOption` preserves unknown and repeated kinds and
