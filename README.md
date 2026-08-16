@@ -67,11 +67,21 @@ wait for TCP actors or user forwarder handlers to return. Stack-owned queues
 and caches are discarded before it returns, while actor-owned buffers are
 released as those actors observe cancellation.
 `Read` requires `sizes` to be at least as long as the buffer slice and honors
-the same leading `offset` in every buffer. Both methods report the successfully
-completed packet prefix before any later-buffer error, as expected by wireguard-go's
-packet-device loops. They also accept a buffer slice larger than `BatchSize`
-because a composite WireGuard device may use a larger Bind batch; `Read`
-still returns no more than 64 packets.
+the same leading `offset` in every buffer. Only `sizes` entries below the
+returned count are valid; later entries are unchanged. Both methods report the
+successfully completed packet prefix before any later-buffer error, as expected
+by wireguard-go's packet-device loops. A short `Read` destination consumes and
+discards that packet before returning `io.ErrShortBuffer`. Invalid, unrelated,
+and unsupported packets passed to `Write` are accounted as drops but count as
+successfully consumed. `Write` accepts a buffer slice larger than `BatchSize`
+because a composite WireGuard device may use a larger Bind batch; `Read` also
+accepts such a slice but still returns no more than 64 packets.
+
+`Read` and `Write` may run concurrently, including multiple calls to the same
+method. Concurrent calls have no relative completion or processing order, and
+each queued outbound packet is assigned to at most one `Read`. The Stack does
+not retain input buffers after `Write` returns or access destination buffers
+after `Read` returns, so callers may immediately reuse them.
 
 The outbound link queue uses byte-based deficit round robin modeled on the
 local-flow scheduling in Linux `sch_fq`. New flows receive a bounded initial

@@ -2639,9 +2639,20 @@ func (s *Stack) localEndpointFor(network string, remote, requested netip.AddrPor
 	return netip.AddrPortFrom(address, requested.Port()), nil
 }
 
-// Read blocks for one complete outbound IP packet, then drains up to
-// BatchSize packets into consecutive buffers at offset. On success it sets
-// the corresponding packet lengths in sizes, matching tun.Device.Read.
+// Read copies complete outbound IP packets into consecutive buffers beginning
+// at offset. It blocks for the first packet, then drains only packets that are
+// already ready, returning at most BatchSize packets. It writes lengths only to
+// sizes[:n]; later elements are unchanged and must be ignored.
+//
+// If a destination buffer is too short, Read discards that packet and returns
+// io.ErrShortBuffer together with the number of earlier packets copied by the
+// call. Other errors likewise return the successfully completed packet prefix.
+// Close unblocks a waiting Read with os.ErrClosed.
+//
+// Read may run concurrently with Write and with other Read calls. Each queued
+// packet is assigned to at most one call, but concurrent calls have no relative
+// completion order. Stack does not access the destination buffers after Read
+// returns, so the caller may reuse them immediately.
 func (s *Stack) Read(buffers [][]byte, sizes []int, offset int) (int, error) {
 	if err := s.ready(); err != nil {
 		if errors.Is(err, ErrClosed) {
@@ -2694,8 +2705,16 @@ func (s *Stack) Read(buffers [][]byte, sizes []int, offset int) (int, error) {
 	return count, nil
 }
 
-// Write delivers complete inbound IP packets from buffers at offset. Invalid,
-// unrelated, and unsupported packets are silently discarded.
+// Write consumes complete inbound IP packets from buffers beginning at offset,
+// in slice order. It accepts any number of buffers and is not limited by
+// BatchSize. Invalid, unrelated, and unsupported packets are accounted as
+// drops but still count as successfully consumed and do not produce an error.
+//
+// An error after one or more buffers returns the successfully completed packet
+// prefix. Close causes pending or subsequent work to return os.ErrClosed.
+// Write may run concurrently with Read and with other Write calls; concurrent
+// calls have no relative processing order. Stack retains no reference to the
+// buffers after Write returns, so the caller may reuse them immediately.
 func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 	if err := s.ready(); err != nil {
 		if errors.Is(err, ErrClosed) {
