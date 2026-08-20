@@ -761,10 +761,10 @@ func TestDatagramSocketLayouts(t *testing.T) {
 
 func TestSocketDeadlineRefreshAndClear(t *testing.T) {
 	var deadline socketDeadline
-	initial := deadline.wait()
-	deadline.set(time.Now().Add(20 * time.Millisecond).Round(0))
-	deadline.set(time.Now().Add(time.Hour).Round(0))
-	if current := deadline.wait(); current != initial {
+	initial := deadline.waitLocked()
+	deadline.setLocked(time.Now().Add(20 * time.Millisecond).Round(0))
+	deadline.setLocked(time.Now().Add(time.Hour).Round(0))
+	if current := deadline.waitLocked(); current != initial {
 		t.Fatal("live deadline update replaced the waiter channel")
 	}
 	wait := time.NewTimer(40 * time.Millisecond)
@@ -774,18 +774,18 @@ func TestSocketDeadlineRefreshAndClear(t *testing.T) {
 		t.Fatal("superseded deadline closed the waiter channel")
 	case <-wait.C:
 	}
-	deadline.set(time.Time{})
-	if current := deadline.wait(); current != initial {
+	deadline.setLocked(time.Time{})
+	if current := deadline.waitLocked(); current != initial {
 		t.Fatal("clearing a live deadline replaced the waiter channel")
 	}
-	deadline.set(time.Now().Add(-time.Second))
+	deadline.setLocked(time.Now().Add(-time.Second))
 	select {
 	case <-initial:
 	default:
 		t.Fatal("expired deadline did not close the waiter channel")
 	}
-	deadline.set(time.Now().Add(time.Hour))
-	refreshed := deadline.wait()
+	deadline.setLocked(time.Now().Add(time.Hour))
+	refreshed := deadline.waitLocked()
 	if refreshed == initial {
 		t.Fatal("refreshing an expired deadline retained its closed channel")
 	}
@@ -794,20 +794,18 @@ func TestSocketDeadlineRefreshAndClear(t *testing.T) {
 		t.Fatal("refreshed deadline channel is already closed")
 	default:
 	}
-	deadline.stop()
-	deadline.mu.Lock()
+	deadline.stopLocked()
 	armed := deadline.timer != nil
-	deadline.mu.Unlock()
 	if armed {
 		t.Fatal("stopped deadline retained its timer")
 	}
 }
 
-func TestSocketDeadlineZeroDoesNotAllocateWaiter(t *testing.T) {
+func TestSocketDeadlineZeroDoesNotAllocateChannel(t *testing.T) {
 	var deadline socketDeadline
-	deadline.set(time.Time{})
-	if deadline.waiter.Load() != nil {
-		t.Fatal("zero deadline allocated a waiter")
+	deadline.setLocked(time.Time{})
+	if deadline.channelLocked() != nil {
+		t.Fatal("zero deadline allocated a channel generation")
 	}
 }
 

@@ -3089,6 +3089,110 @@ func TestTCPCloseWithUnreadDataIsAbortive(t *testing.T) {
 	}
 }
 
+// TestTCPConcurrentAbortPublication verifies that the first cause and reset
+// policy remain immutable across concurrent termination requests.
+func TestTCPConcurrentAbortPublication(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	first := errors.New("first abort")
+	connection.abortWithoutReset(first)
+
+	var wait sync.WaitGroup
+	for index := 0; index < 32; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			connection.abort(errors.New("later abort"))
+		}()
+	}
+	wait.Wait()
+	select {
+	case <-connection.abortCh:
+	default:
+		t.Fatal("abort did not close its notification channel")
+	}
+	if err := connection.abortedError(); err != first {
+		t.Fatalf("abort error = %v, want first publication", err)
+	}
+	if connection.takeAbortReset() {
+		t.Fatal("later abort changed the first publication's reset policy")
+	}
+
+	nilCause := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	nilCause.abortWithoutReset(nil)
+	nilCause.abort(errors.New("later abort"))
+	if err := nilCause.abortedError(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("nil abort error = %v, want net.ErrClosed", err)
+	}
+	if nilCause.takeAbortReset() {
+		t.Fatal("later abort changed a nil cause's reset policy")
+	}
+}
+
+// TestTCPConcurrentClosePublication verifies that c.mu provides the one-time
+// public Close transition without retaining a separate sync.Once.
+func TestTCPConcurrentClosePublication(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	connection.linger = 0
+	const callers = 32
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	for index := 0; index < callers; index++ {
+		go func() {
+			<-start
+			results <- connection.Close()
+		}()
+	}
+	close(start)
+	succeeded := 0
+	for index := 0; index < callers; index++ {
+		err := <-results
+		if err == nil {
+			succeeded++
+		} else if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("concurrent Close error = %v, want net.ErrClosed", err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("successful concurrent Close calls = %d, want 1", succeeded)
+	}
+	if !connection.takeAbortReset() || connection.takeAbortReset() {
+		t.Fatal("concurrent Close did not publish exactly one abortive reset")
+	}
+}
+
+// TestTCPImmediateIODoesNotAllocateDeadlineChannels covers the ordinary fast
+// path before either direction has to block or receives a deadline.
+func TestTCPImmediateIODoesNotAllocateDeadlineChannels(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	connection.mu.Lock()
+	connection.readBuffer.append([]byte{0x5a})
+	connection.mu.Unlock()
+	var payload [1]byte
+	if n, err := connection.Read(payload[:]); err != nil || n != len(payload) {
+		t.Fatalf("immediate Read = %d, %v", n, err)
+	}
+	if n, err := connection.Write(payload[:]); err != nil || n != len(payload) {
+		t.Fatalf("immediate Write = %d, %v", n, err)
+	}
+	connection.mu.Lock()
+	readDeadline := connection.readDeadline.channelLocked()
+	writeDeadline := connection.writeDeadline.channelLocked()
+	connection.mu.Unlock()
+	if readDeadline != nil || writeDeadline != nil {
+		t.Fatal("immediate I/O allocated a deadline channel")
+	}
+}
+
+// TestTCPNetworkNamePreserved keeps the compact representation transparent in
+// net.OpError metadata.
+func TestTCPNetworkNamePreserved(t *testing.T) {
+	for _, network := range []string{"tcp", "tcp4", "tcp6"} {
+		if got := newTCPNetwork(network).name(); got != network {
+			t.Errorf("network name = %q, want %q", got, network)
+		}
+	}
+}
+
 func TestTCPConnectionMemoryLayout(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
 		return
@@ -3098,7 +3202,8 @@ func TestTCPConnectionMemoryLayout(t *testing.T) {
 		got  uintptr
 		want uintptr
 	}{
-		{"TCPConn", unsafe.Sizeof(TCPConn{}), 752},
+		{"TCPConn", unsafe.Sizeof(TCPConn{}), 696},
+		{"socketDeadline", unsafe.Sizeof(socketDeadline{}), 16},
 		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1528},
 		{"tcpEstablishedLivenessState", unsafe.Sizeof(tcpEstablishedLivenessState{}), 72},
 		{"tcpEstablishedPathMTUState", unsafe.Sizeof(tcpEstablishedPathMTUState{}), 120},

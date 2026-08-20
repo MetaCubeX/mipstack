@@ -806,6 +806,43 @@ type tcpInitialReceive struct {
 	fin     bool
 }
 
+// tcpNetwork retains the caller's validated network spelling without storing
+// a string header on every connection.
+type tcpNetwork byte
+
+const (
+	// tcpNetworkGeneric preserves the dual-stack "tcp" spelling.
+	tcpNetworkGeneric tcpNetwork = iota
+	// tcpNetworkIPv4 preserves the IPv4-only "tcp4" spelling.
+	tcpNetworkIPv4
+	// tcpNetworkIPv6 preserves the IPv6-only "tcp6" spelling.
+	tcpNetworkIPv6
+)
+
+// newTCPNetwork encodes one of the three networks accepted by TCP APIs.
+func newTCPNetwork(network string) tcpNetwork {
+	switch network {
+	case "tcp4":
+		return tcpNetworkIPv4
+	case "tcp6":
+		return tcpNetworkIPv6
+	default:
+		return tcpNetworkGeneric
+	}
+}
+
+// name reconstructs the original network for net.OpError.
+func (n tcpNetwork) name() string {
+	switch n {
+	case tcpNetworkIPv4:
+		return "tcp4"
+	case tcpNetworkIPv6:
+		return "tcp6"
+	default:
+		return "tcp"
+	}
+}
+
 // tcpSegment is a validated segment delivered to one connection actor.
 type tcpSegment struct {
 	sequence        uint32
@@ -2823,7 +2860,6 @@ type TCPConn struct {
 	stack *Stack
 	key   tcpKey
 	mtu   int
-	net   string
 
 	inbound        tcpSegmentQueue
 	actorWakeFlags atomic.Uint32
@@ -2831,8 +2867,6 @@ type TCPConn struct {
 	done           chan struct{}
 	// lingerDone remains nil unless a positive-linger Close must block.
 	lingerDone        chan struct{}
-	abortOnce         sync.Once
-	closeOnce         sync.Once
 	readCallMu        sync.Mutex
 	writeCallMu       sync.Mutex
 	icmpSequence      atomic.Uint64
@@ -2912,6 +2946,7 @@ type TCPConn struct {
 	peerWindowScaling                         bool
 	peerSACK, peerTimestamp, peerECN          bool
 	echoCongestion, sendCWR, handshakeTimeout bool
+	net                                       tcpNetwork
 }
 
 // tcpListenKey identifies one specific or wildcard passive TCP endpoint.
@@ -3341,7 +3376,7 @@ func (l *TCPListener) AcceptTCP() (*TCPConn, error) {
 		return nil, l.operationError("accept", net.ErrClosed)
 	default:
 	}
-	timeout := l.deadline.wait()
+	timeout := l.deadline.waitLocked()
 	select {
 	case <-timeout:
 		l.mu.Unlock()
@@ -3418,7 +3453,7 @@ func (l *TCPListener) SetDeadline(deadline time.Time) error {
 		return l.operationError("set", net.ErrClosed)
 	default:
 	}
-	l.deadline.set(deadline)
+	l.deadline.setLocked(deadline)
 	l.mu.Unlock()
 	return nil
 }
@@ -3508,7 +3543,7 @@ func (l *TCPListener) noteHandshakeFailure(err error) {
 func (l *TCPListener) closeFromStack() {
 	l.once.Do(func() {
 		l.mu.Lock()
-		l.deadline.stop()
+		l.deadline.stopLocked()
 		close(l.closed)
 		pending := make([]*TCPConn, 0, len(l.pending))
 		for connection := range l.pending {
@@ -3625,7 +3660,7 @@ func newTCPConn(stack *Stack, network string, key tcpKey, mtu int, options tcpSo
 	}
 	defaults = applyTCPSocketOptions(defaults, options)
 	connection := &TCPConn{
-		stack: stack, net: network, key: key, mtu: mtu,
+		stack: stack, net: newTCPNetwork(network), key: key, mtu: mtu,
 		inbound: newTCPSegmentQueue(),
 		abortCh: make(chan struct{}), done: make(chan struct{}),
 		noDelay: !defaults.DisableNoDelay, linger: -1,
@@ -4260,7 +4295,7 @@ func (c *TCPConn) readChunk(destination []byte, maximum int) ([]byte, int, bool,
 			c.mu.Unlock()
 			return nil, 0, false, net.ErrClosed
 		}
-		timeout := c.readDeadline.wait()
+		timeout := c.readDeadline.channelLocked()
 		select {
 		case <-timeout:
 			c.mu.Unlock()
@@ -4291,6 +4326,9 @@ func (c *TCPConn) readChunk(destination []byte, maximum int) ([]byte, int, bool,
 			c.readNotify = make(chan struct{}, 1)
 		}
 		notified := c.readNotify
+		if timeout == nil {
+			timeout = c.readDeadline.waitLocked()
+		}
 		c.mu.Unlock()
 		select {
 		case <-notified:
@@ -4390,7 +4428,7 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 			c.mu.Unlock()
 			return written, err
 		}
-		timeout := c.writeDeadline.wait()
+		timeout := c.writeDeadline.channelLocked()
 		select {
 		case <-timeout:
 			c.mu.Unlock()
@@ -4411,6 +4449,9 @@ func (c *TCPConn) write(payload []byte) (int, error) {
 				c.sendChanged = make(chan struct{}, 1)
 			}
 			sendChanged = c.sendChanged
+			if timeout == nil {
+				timeout = c.writeDeadline.waitLocked()
+			}
 		}
 		c.mu.Unlock()
 		if available > 0 {
@@ -4516,39 +4557,36 @@ func (c *TCPConn) CloseRead() error {
 // the background.
 func (c *TCPConn) Close() error {
 	startedAt := time.Now()
-	closedNow := false
 	linger := -1
 	var lingerDone <-chan struct{}
 	abortive := false
-	c.closeOnce.Do(func() {
-		closedNow = true
-		c.mu.Lock()
-		c.readDeadline.stop()
-		c.writeDeadline.stop()
-		if !c.writeClosed {
-			c.writeClosed = true
-		}
-		linger = c.linger
-		abortive = linger == 0 || c.readBuffer.size != 0 || c.outOfOrderUnread.Load() != 0
-		if linger > 0 && !abortive && !c.lingerComplete {
-			if c.lingerDone == nil {
-				c.lingerDone = make(chan struct{})
-			}
-			lingerDone = c.lingerDone
-		}
-		c.userClosed = true
-		c.readErr = net.ErrClosed
-		c.readBuffer.reset()
-		if abortive {
-			c.sendBuffer.clear()
-		}
-		c.notifySendChangedLocked()
-		c.notifyReadLocked()
+	c.mu.Lock()
+	if c.userClosed {
 		c.mu.Unlock()
-	})
-	if !closedNow {
 		return c.operationError("close", net.ErrClosed)
 	}
+	c.readDeadline.stopLocked()
+	c.writeDeadline.stopLocked()
+	if !c.writeClosed {
+		c.writeClosed = true
+	}
+	linger = c.linger
+	abortive = linger == 0 || c.readBuffer.size != 0 || c.outOfOrderUnread.Load() != 0
+	if linger > 0 && !abortive && !c.lingerComplete {
+		if c.lingerDone == nil {
+			c.lingerDone = make(chan struct{})
+		}
+		lingerDone = c.lingerDone
+	}
+	c.userClosed = true
+	c.readErr = net.ErrClosed
+	c.readBuffer.reset()
+	if abortive {
+		c.sendBuffer.clear()
+	}
+	c.notifySendChangedLocked()
+	c.notifyReadLocked()
+	c.mu.Unlock()
 	if abortive {
 		c.abort(net.ErrClosed)
 		return nil
@@ -4692,13 +4730,13 @@ func (c *TCPConn) MultipathTCP() (bool, error) { return false, nil }
 // operationError wraps a TCP socket failure in the same public shape used by
 // the standard net package.
 func (c *TCPConn) operationError(operation string, err error) error {
-	return socketOperationError(operation, c.net, c.LocalAddr(), c.RemoteAddr(), err)
+	return socketOperationError(operation, c.net.name(), c.LocalAddr(), c.RemoteAddr(), err)
 }
 
 // setOperationError wraps a deadline-setting failure using the local-address
 // metadata shape of the standard net package.
 func (c *TCPConn) setOperationError(err error) error {
-	return socketOperationError("set", c.net, nil, c.LocalAddr(), err)
+	return socketOperationError("set", c.net.name(), nil, c.LocalAddr(), err)
 }
 
 // SetDeadline updates both application deadlines.
@@ -4708,8 +4746,8 @@ func (c *TCPConn) SetDeadline(deadline time.Time) error {
 		c.mu.Unlock()
 		return c.setOperationError(net.ErrClosed)
 	}
-	c.readDeadline.set(deadline)
-	c.writeDeadline.set(deadline)
+	c.readDeadline.setLocked(deadline)
+	c.writeDeadline.setLocked(deadline)
 	c.mu.Unlock()
 	return nil
 }
@@ -4721,7 +4759,7 @@ func (c *TCPConn) SetReadDeadline(deadline time.Time) error {
 		c.mu.Unlock()
 		return c.setOperationError(net.ErrClosed)
 	}
-	c.readDeadline.set(deadline)
+	c.readDeadline.setLocked(deadline)
 	c.mu.Unlock()
 	return nil
 }
@@ -4733,7 +4771,7 @@ func (c *TCPConn) SetWriteDeadline(deadline time.Time) error {
 		c.mu.Unlock()
 		return c.setOperationError(net.ErrClosed)
 	}
-	c.writeDeadline.set(deadline)
+	c.writeDeadline.setLocked(deadline)
 	c.mu.Unlock()
 	return nil
 }
@@ -5015,13 +5053,17 @@ func (c *TCPConn) abortWithoutReset(err error) {
 
 // abortWithReset publishes one actor termination request and its wire policy.
 func (c *TCPConn) abortWithReset(err error, reset bool) {
-	c.abortOnce.Do(func() {
-		c.abortMu.Lock()
+	c.abortMu.Lock()
+	// abortCh is the publication marker because a nil cause is valid and is
+	// exposed as net.ErrClosed by abortedError.
+	select {
+	case <-c.abortCh:
+	default:
 		c.abortErr = err
 		c.abortRST = reset
-		c.abortMu.Unlock()
 		close(c.abortCh)
-	})
+	}
+	c.abortMu.Unlock()
 }
 
 // abortedError returns the cause stored before abortCh was closed.
@@ -5253,8 +5295,8 @@ func (c *TCPConn) finish(err error) {
 	}
 	c.mu.Lock()
 	c.terminalErr = err
-	c.readDeadline.stop()
-	c.writeDeadline.stop()
+	c.readDeadline.stopLocked()
+	c.writeDeadline.stopLocked()
 	if discardReceive {
 		c.readBuffer = tcpReadBuffer{}
 		c.outOfOrderUnread.Store(0)

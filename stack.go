@@ -3090,21 +3090,15 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-// socketDeadline follows the channel-generation model used by net.Pipe. One
-// timer closes the current wait channel to wake every blocked operation;
-// extending or clearing a live deadline keeps that channel stable, so existing
-// waiters observe the update without allocating their own timers. The zero
-// value is ready for use.
+// socketDeadline follows the channel-generation model used by net.Pipe. Its
+// owning TCP connection or listener mutex serializes every method. One timer
+// closes the current wait channel to wake every blocked operation; extending
+// or clearing a live deadline keeps that channel stable, so existing waiters
+// observe the update without allocating their own timers. The zero value is
+// ready for use.
 type socketDeadline struct {
-	mu     sync.Mutex
-	timer  *time.Timer
-	waiter atomic.Pointer[socketDeadlineWaiter]
-}
-
-// socketDeadlineWaiter is one immutable channel generation. Publishing a new
-// pointer lets the I/O fast path obtain the current channel without a lock.
-type socketDeadlineWaiter struct {
-	done chan struct{}
+	timer *time.Timer
+	done  chan struct{}
 }
 
 // datagramSocketDeadline keeps UDP and raw IP deadline state out of sockets
@@ -3217,73 +3211,66 @@ func (d *datagramSocketDeadline) stop() {
 	}
 }
 
-// set replaces the deadline. A zero time disables it, and an expired deadline
-// closes the current generation immediately.
-func (d *socketDeadline) set(deadline time.Time) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	waiter := d.waiter.Load()
-	if deadline.IsZero() && waiter == nil && d.timer == nil {
+// setLocked replaces the deadline while the owner mutex is held. A zero time
+// disables it, and an expired deadline closes the current generation
+// immediately.
+func (d *socketDeadline) setLocked(deadline time.Time) {
+	if deadline.IsZero() && d.done == nil && d.timer == nil {
 		return
 	}
-	if waiter == nil {
-		waiter = &socketDeadlineWaiter{done: make(chan struct{})}
-		d.waiter.Store(waiter)
+	if d.done == nil {
+		d.done = make(chan struct{})
 	}
 	if d.timer != nil && !d.timer.Stop() {
-		<-waiter.done
+		<-d.done
 	}
 	d.timer = nil
 	closed := false
 	select {
-	case <-waiter.done:
+	case <-d.done:
 		closed = true
 	default:
 	}
 	if deadline.IsZero() {
 		if closed {
-			d.waiter.Store(&socketDeadlineWaiter{done: make(chan struct{})})
+			d.done = make(chan struct{})
 		}
 		return
 	}
 	if duration := time.Until(deadline); duration > 0 {
 		if closed {
-			waiter = &socketDeadlineWaiter{done: make(chan struct{})}
-			d.waiter.Store(waiter)
+			d.done = make(chan struct{})
 		}
-		done := waiter.done
+		done := d.done
 		d.timer = time.AfterFunc(duration, func() { close(done) })
 		return
 	}
 	if !closed {
-		close(waiter.done)
+		close(d.done)
 	}
 }
 
-// wait returns the channel closed by the current deadline generation.
-func (d *socketDeadline) wait() <-chan struct{} {
-	if waiter := d.waiter.Load(); waiter != nil {
-		return waiter.done
+// channelLocked returns the current generation without allocating one. The
+// caller holds the owner mutex.
+func (d *socketDeadline) channelLocked() <-chan struct{} { return d.done }
+
+// waitLocked returns the channel closed by the current deadline generation.
+// The caller holds the owner mutex.
+func (d *socketDeadline) waitLocked() <-chan struct{} {
+	if d.done == nil {
+		d.done = make(chan struct{})
 	}
-	d.mu.Lock()
-	waiter := d.waiter.Load()
-	if waiter == nil {
-		waiter = &socketDeadlineWaiter{done: make(chan struct{})}
-		d.waiter.Store(waiter)
-	}
-	d.mu.Unlock()
-	return waiter.done
+	return d.done
 }
 
-// stop releases an armed timer when its owning socket can no longer perform
-// I/O. A callback that has already started may still close its private channel.
-func (d *socketDeadline) stop() {
-	d.mu.Lock()
+// stopLocked releases an armed timer while the owner mutex is held because its
+// socket can no longer perform I/O. A callback that has already started may
+// still close its private channel.
+func (d *socketDeadline) stopLocked() {
 	if d.timer != nil {
 		d.timer.Stop()
 		d.timer = nil
 	}
-	d.mu.Unlock()
 }
 
 // socketWriteState carries the two independent events that can interrupt a
