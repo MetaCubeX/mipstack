@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 var _ func(*Stack, context.Context, string, netip.AddrPort, netip.AddrPort) (net.Conn, error) = (*Stack).DialTCP
@@ -271,10 +272,10 @@ func TestPacketQueueWaitDoesNotSerializeWriteDeadlines(t *testing.T) {
 	<-firstStarted
 
 	deadline := time.Now().Add(25 * time.Millisecond)
-	var secondDeadline socketDeadline
-	secondDeadline.set(deadline)
+	var secondControl datagramSocketWriteControl
+	secondControl.writeDeadline.set(deadline)
 	startedAt := time.Now()
-	err = stack.writePacketUntil(packet, socketWriteState{deadline: &secondDeadline, closed: make(chan struct{})})
+	err = stack.writePacketUntil(packet, socketWriteState{datagram: &secondControl})
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("second queue write = %v, want deadline exceeded", err)
 	}
@@ -731,6 +732,33 @@ func TestDatagramQueueRetainsOnlySmallBacking(t *testing.T) {
 	}
 }
 
+// TestDatagramSocketLayouts locks the cold-state split to the intended 64-bit
+// allocation classes. These objects dominate idle UDP and raw IP socket cost.
+func TestDatagramSocketLayouts(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("64-bit layout assertion")
+	}
+	for _, test := range []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{name: "UDPConn", got: unsafe.Sizeof(UDPConn{}), want: 288},
+		{name: "IPConn", got: unsafe.Sizeof(IPConn{}), want: 288},
+		{name: "socket write state", got: unsafe.Sizeof(socketWriteState{}), want: 24},
+		{name: "datagram write control", got: unsafe.Sizeof(datagramSocketWriteControl{}), want: 16},
+		{name: "datagram socket error state", got: unsafe.Sizeof(datagramSocketErrorState{}), want: 64},
+		{name: "datagram deadline state", got: unsafe.Sizeof(datagramSocketDeadlineState{}), want: 16},
+		{name: "IP socket ICMP filter", got: unsafe.Sizeof(ipConnICMPFilter{}), want: 32},
+		{name: "recent destination cache", got: unsafe.Sizeof(recentDestinationCache[netip.AddrPort]{}), want: 8},
+		{name: "recent destination state", got: unsafe.Sizeof(recentDestinationCacheState[netip.AddrPort]{}), want: 48},
+	} {
+		if test.got != test.want {
+			t.Errorf("%s size = %d, want %d", test.name, test.got, test.want)
+		}
+	}
+}
+
 func TestSocketDeadlineRefreshAndClear(t *testing.T) {
 	var deadline socketDeadline
 	initial := deadline.wait()
@@ -775,6 +803,58 @@ func TestSocketDeadlineRefreshAndClear(t *testing.T) {
 	}
 }
 
+func TestSocketDeadlineZeroDoesNotAllocateWaiter(t *testing.T) {
+	var deadline socketDeadline
+	deadline.set(time.Time{})
+	if deadline.waiter.Load() != nil {
+		t.Fatal("zero deadline allocated a waiter")
+	}
+}
+
+func TestDatagramSocketDeadlineLifecycle(t *testing.T) {
+	var deadline datagramSocketDeadline
+	deadline.set(time.Time{})
+	if deadline.channel() != nil || deadline.state.Load() != nil {
+		t.Fatal("zero deadline allocated state")
+	}
+	initial := deadline.wait()
+	deadline.set(time.Now().Add(20 * time.Millisecond).Round(0))
+	deadline.set(time.Now().Add(time.Hour).Round(0))
+	if current := deadline.wait(); current != initial {
+		t.Fatal("live deadline update replaced the waiter channel")
+	}
+	wait := time.NewTimer(40 * time.Millisecond)
+	select {
+	case <-initial:
+		wait.Stop()
+		t.Fatal("superseded deadline closed the waiter channel")
+	case <-wait.C:
+	}
+	deadline.set(time.Time{})
+	select {
+	case <-initial:
+		t.Fatal("cleared live deadline closed the waiter channel")
+	default:
+	}
+	deadline.set(time.Now().Add(-time.Second))
+	select {
+	case <-initial:
+	case <-time.After(time.Second):
+		t.Fatal("expired deadline did not close the waiter channel")
+	}
+	deadline.set(time.Time{})
+	if deadline.channel() != nil {
+		t.Fatal("cleared expired deadline retained a closed generation")
+	}
+	if next := deadline.wait(); next == nil || next == initial {
+		t.Fatal("wait after clear did not create a live generation")
+	}
+	deadline.stop()
+	if deadline.state.Load() != stoppedDatagramSocketDeadline || deadline.wait() != nil {
+		t.Fatal("stop did not publish the terminal state")
+	}
+}
+
 type deadlineOperationResult struct {
 	bytes int
 	err   error
@@ -784,6 +864,11 @@ type deadlineOperationResult struct {
 // net.Conn, net.PacketConn, and net.Listener.
 func testMutableDeadline(t *testing.T, set func(time.Time) error, operation func() (int, error)) {
 	t.Helper()
+	// This test checks deadline-generation replacement, not scheduler wake
+	// precision. Keep enough headroom that a loaded Windows scheduler cannot
+	// resume the test only after the deadline it was supposed to extend or
+	// clear has already expired.
+	const pendingDeadlineWindow = 250 * time.Millisecond
 	checkTimeout := func(result deadlineOperationResult) {
 		t.Helper()
 		if result.bytes != 0 || !errors.Is(result.err, os.ErrDeadlineExceeded) {
@@ -835,13 +920,13 @@ func testMutableDeadline(t *testing.T, set func(time.Time) error, operation func
 		t.Fatal("operation did not observe an earlier deadline")
 	}
 
-	oldDeadline := time.Now().Add(75 * time.Millisecond)
+	oldDeadline := time.Now().Add(pendingDeadlineWindow)
 	if err := set(oldDeadline); err != nil {
 		t.Fatal(err)
 	}
 	done = start()
 	time.Sleep(10 * time.Millisecond)
-	later := time.Now().Add(175 * time.Millisecond)
+	later := time.Now().Add(2 * pendingDeadlineWindow)
 	if err := set(later); err != nil {
 		t.Fatal(err)
 	}
@@ -856,7 +941,7 @@ func testMutableDeadline(t *testing.T, set func(time.Time) error, operation func
 		t.Fatal("operation did not observe an extended deadline")
 	}
 
-	clearedDeadline := time.Now().Add(75 * time.Millisecond)
+	clearedDeadline := time.Now().Add(pendingDeadlineWindow)
 	if err := set(clearedDeadline); err != nil {
 		t.Fatal(err)
 	}
@@ -1380,30 +1465,65 @@ func TestListenAddressesOverlap(t *testing.T) {
 
 func TestRecentDestinationCacheEvictionAndExpiry(t *testing.T) {
 	now := time.Unix(1000, 0)
-	cache := make(recentDestinationCache[int])
-	cache.remember(0, now.Add(-time.Second))
+	epoch := now.Add(-time.Hour)
+	stamp := func(value time.Time) monotonicStamp { return monotonicStampAt(epoch, value) }
+	var cache recentDestinationCache[int]
+	cache.remember(0, stamp(now.Add(-time.Second)))
 	for destination := 1; destination < recentDestinationMaximum; destination++ {
-		cache.remember(destination, now)
+		cache.remember(destination, stamp(now))
 	}
-	cache.remember(recentDestinationMaximum, now)
-	if len(cache) != recentDestinationMaximum || cache.contains(0, now) || !cache.contains(recentDestinationMaximum, now) {
-		t.Fatalf("oldest-entry eviction = size %d oldest %t newest %t", len(cache), cache.contains(0, now), cache.contains(recentDestinationMaximum, now))
+	cache.remember(recentDestinationMaximum, stamp(now))
+	if len(cache.state.entries) != recentDestinationMaximum || cache.contains(0, stamp(now)) || !cache.contains(recentDestinationMaximum, stamp(now)) {
+		t.Fatalf("oldest-entry eviction = size %d oldest %t newest %t", len(cache.state.entries), cache.contains(0, stamp(now)), cache.contains(recentDestinationMaximum, stamp(now)))
 	}
-	cache[1] = now.Add(-recentDestinationLifetime)
-	cache.remember(recentDestinationMaximum+1, now)
-	if len(cache) != recentDestinationMaximum || cache.contains(1, now) || !cache.contains(recentDestinationMaximum+1, now) {
-		t.Fatalf("expired-entry eviction = size %d expired %t newest %t", len(cache), cache.contains(1, now), cache.contains(recentDestinationMaximum+1, now))
+	expiryTime := now.Add(recentDestinationLifetime)
+	for destination := range cache.state.entries {
+		cache.state.entries[destination] = stamp(expiryTime)
 	}
-	cache.remember(2, now.Add(time.Second))
-	if updated := cache[2]; updated != now.Add(time.Second) || len(cache) != recentDestinationMaximum {
-		t.Fatalf("existing-entry update = %v, size %d", updated, len(cache))
+	cache.state.entries[1] = stamp(now)
+	cache.remember(recentDestinationMaximum+1, stamp(expiryTime))
+	if len(cache.state.entries) != recentDestinationMaximum || cache.contains(1, stamp(expiryTime)) || !cache.contains(recentDestinationMaximum+1, stamp(expiryTime)) {
+		t.Fatalf("expired-entry eviction = size %d expired %t newest %t", len(cache.state.entries), cache.contains(1, stamp(expiryTime)), cache.contains(recentDestinationMaximum+1, stamp(expiryTime)))
 	}
-	cache[3] = now.Add(-recentDestinationLifetime)
-	if cache.contains(3, now) {
+	cache.remember(2, stamp(expiryTime.Add(time.Second)))
+	if updated := cache.state.entries[2]; updated != stamp(expiryTime.Add(time.Second)) || len(cache.state.entries) != recentDestinationMaximum {
+		t.Fatalf("existing-entry update = %v, size %d", updated, len(cache.state.entries))
+	}
+	cache.state.entries[3] = stamp(expiryTime)
+	if cache.contains(3, stamp(expiryTime.Add(recentDestinationLifetime))) {
 		t.Fatal("expired destination remained present")
 	}
-	if _, exists := cache[3]; exists {
+	if _, exists := cache.state.entries[3]; exists {
 		t.Fatal("contains retained expired destination")
+	}
+}
+
+func TestRecentDestinationCacheDefersMapAllocation(t *testing.T) {
+	now := time.Unix(1000, 0)
+	epoch := now
+	stamp := func(value time.Time) monotonicStamp { return monotonicStampAt(epoch, value) }
+	var cache recentDestinationCache[int]
+	cache.remember(1, stamp(now))
+	cache.remember(1, stamp(now.Add(time.Second)))
+	if cache.state == nil || cache.state.entries != nil || !cache.contains(1, stamp(now.Add(time.Second))) {
+		t.Fatalf("single destination state = %#v", cache.state)
+	}
+	cache.remember(2, stamp(now.Add(2*time.Second)))
+	if len(cache.state.entries) != 2 || !cache.contains(1, stamp(now.Add(2*time.Second))) || !cache.contains(2, stamp(now.Add(2*time.Second))) {
+		t.Fatalf("promoted destination state = %#v", cache.state)
+	}
+}
+
+var benchmarkRecentDestinationCache recentDestinationCache[netip.AddrPort]
+
+func BenchmarkRecentDestinationCacheSingleTarget(b *testing.B) {
+	target := netip.MustParseAddrPort("198.51.100.1:53")
+	now := monotonicStampAt(time.Unix(1000, 0), time.Unix(1000, 0))
+	b.ReportAllocs()
+	for index := 0; index < b.N; index++ {
+		var cache recentDestinationCache[netip.AddrPort]
+		cache.remember(target, now)
+		benchmarkRecentDestinationCache = cache
 	}
 }
 

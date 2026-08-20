@@ -1393,7 +1393,8 @@ func (s *multicastState) deliverImplicitIP(packet ipPacket, endpoints ipEndpoint
 		s.stack.mu.RUnlock()
 		return false
 	}
-	connections := state.connectionsForLocked(packet.target, packet.protocol)
+	var connectionStorage [ipEndpointInlineFanout]*IPConn
+	connections := state.connectionsForLocked(connectionStorage[:0], packet.target, packet.protocol)
 	s.stack.mu.RUnlock()
 	options := ipPacketOptions{hopLimit: packet.hopLimit, trafficClass: packet.trafficClass, flowLabel: packet.flowLabel}
 	delivered := false
@@ -1477,7 +1478,7 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 	if ipSize == 0 {
 		return syscall.EMSGSIZE
 	}
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
+	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
 	if ipSize+udpSize <= mtu {
 		identification := uint16(0)
 		if source.Is4() && fragmentation.requiresIPv4ID() {
@@ -1521,7 +1522,7 @@ func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byt
 		if !external {
 			return nil
 		}
-		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
+		state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
 		return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, fragmentation, options, c.stack.network.Load().mtu, state)
 	}
 	if source.Is6() && !options.flowLabelSet {
@@ -1529,7 +1530,7 @@ func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byt
 		options.flowLabelSet = true
 	}
 	mtu := c.stack.network.Load().mtu
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
+	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
 	if ipSize+len(payload) <= mtu {
 		identification := uint16(0)
 		if source.Is4() && fragmentation.requiresIPv4ID() {

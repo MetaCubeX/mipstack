@@ -211,6 +211,17 @@ type ipEndpointState struct {
 	bindings map[ipKey]map[*IPConn]struct{}
 }
 
+// ipEndpointInlineFanout is the number of matching raw sockets collected
+// without allocation. Larger fan-outs grow normally and are never truncated.
+const ipEndpointInlineFanout = 8
+
+// ipConnICMPFilter retains a receive mask only for sockets that block at
+// least one ICMP type. A socket's fixed protocol selects either the first word
+// as the Linux ICMPv4 mask or all eight words as the RFC 3542 ICMPv6 mask.
+type ipConnICMPFilter struct {
+	blocked [8]uint32
+}
+
 // IPConn is a connected or unconnected userspace IP protocol socket. It
 // exchanges protocol payloads by default.
 // SocketOptions.IPHeaderIncludedOnWrite and
@@ -223,42 +234,35 @@ type IPConn struct {
 	protocol                byte
 	v6                      bool
 	dual                    bool
+	receiveErrors           bool
+	ipHeaderIncludedOnWrite atomic.Bool
 	local                   netip.Addr
 	remote                  netip.Addr
-	ipHeaderIncludedOnWrite atomic.Bool
-	ipHeaderIncludedOnRead  bool
 
-	closed chan struct{}
-	once   sync.Once
+	datagramSocketWriteControl
 
-	mu                 sync.Mutex
-	receive            datagramQueue[ipDatagram]
-	receiveSpare       []byte
-	receiveNotify      chan struct{}
-	receiveCapacity    int
-	queuedBytes        int
-	errorQueue         datagramQueue[queuedSocketError]
-	errorQueuedBytes   int
-	receiveErrors      bool
-	readDeadline       socketDeadline
-	writeDeadline      socketDeadline
-	recentTargets      recentDestinationCache[netip.Addr]
-	defaultOptions     ipPacketOptions
-	pathMTUDiscovery   PathMTUDiscovery
-	multicastHopLimit  byte
-	multicastLoopback  bool
-	broadcast          bool
-	icmpV4Filter       ICMPv4Filter
-	icmpV6Filter       ICMPv6Filter
-	ipv6ChecksumOffset int
-	lastError          error
-	packetsSent        atomic.Uint64
-	bytesSent          atomic.Uint64
-	packetsReceived    atomic.Uint64
-	bytesReceived      atomic.Uint64
-	packetsDropped     atomic.Uint64
-	icmpErrors         atomic.Uint64
-	errorsDropped      atomic.Uint64
+	mu                     sync.Mutex
+	receive                datagramQueue[ipDatagram]
+	receiveSpare           []byte
+	receiveNotify          chan struct{}
+	receiveCapacity        int
+	queuedBytes            int
+	errorState             *datagramSocketErrorState
+	readDeadline           datagramSocketDeadline
+	recentTargets          recentDestinationCache[netip.Addr]
+	pathMTUDiscovery       PathMTUDiscovery
+	icmpFilter             *ipConnICMPFilter
+	ipv6ChecksumOffset     int
+	packetsSent            atomic.Uint64
+	bytesSent              atomic.Uint64
+	packetsReceived        atomic.Uint64
+	bytesReceived          atomic.Uint64
+	packetsDropped         atomic.Uint64
+	defaultOptions         ipPacketOptions
+	ipHeaderIncludedOnRead bool
+	multicastHopLimit      byte
+	multicastLoopback      bool
+	broadcast              bool
 }
 
 // ipWriteParameters is one validated output-policy snapshot shared by
@@ -477,8 +481,9 @@ func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.
 	}
 	connection := &IPConn{
 		stack: stack, net: network, protocol: protocol, v6: local.Is6(), local: local, remote: remote,
-		closed: make(chan struct{}), receiveNotify: make(chan struct{}, 1), receiveCapacity: defaults.ReceiveBuffer,
-		ipHeaderIncludedOnRead: options.ip.headerIncludedOnRead,
+		datagramSocketWriteControl: datagramSocketWriteControl{closed: make(chan struct{})},
+		receiveCapacity:            defaults.ReceiveBuffer,
+		ipHeaderIncludedOnRead:     options.ip.headerIncludedOnRead,
 		defaultOptions: ipPacketOptions{
 			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
 			flowLabel: defaults.FlowLabel, hopLimitSet: options.datagram.hopLimit.set,
@@ -487,8 +492,13 @@ func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.
 		receiveErrors:     defaults.ReceiveErrors,
 		pathMTUDiscovery:  defaults.PathMTUDiscovery,
 		multicastHopLimit: byte(defaults.MulticastHopLimit), multicastLoopback: !defaults.DisableMulticastLoopback,
-		broadcast: !defaults.DisableBroadcast, icmpV4Filter: options.ip.icmpV4Filter.value,
-		icmpV6Filter: options.ip.icmpV6Filter.value, ipv6ChecksumOffset: checksumOffset,
+		broadcast: !defaults.DisableBroadcast, ipv6ChecksumOffset: checksumOffset,
+	}
+	if filter := options.ip.icmpV4Filter.value; protocol == ProtocolICMPv4 && filter != (ICMPv4Filter{}) {
+		connection.icmpFilter = &ipConnICMPFilter{}
+		connection.icmpFilter.blocked[0] = filter.blocked
+	} else if filter := options.ip.icmpV6Filter.value; protocol == ProtocolICMPv6 && filter != (ICMPv6Filter{}) {
+		connection.icmpFilter = &ipConnICMPFilter{blocked: filter.blocked}
 	}
 	connection.ipHeaderIncludedOnWrite.Store(options.ip.headerIncludedOnWrite)
 	return connection
@@ -524,7 +534,8 @@ func (state *ipEndpointState) deliver(stack *Stack, packet ipPacket) bool {
 		stack.mu.RUnlock()
 		return false
 	}
-	connections := state.connectionsForLocked(packet.target, packet.protocol)
+	var connectionStorage [ipEndpointInlineFanout]*IPConn
+	connections := state.connectionsForLocked(connectionStorage[:0], packet.target, packet.protocol)
 	stack.mu.RUnlock()
 	accepted := false
 	options := ipPacketOptions{hopLimit: packet.hopLimit, trafficClass: packet.trafficClass, flowLabel: packet.flowLabel}
@@ -538,10 +549,10 @@ func (state *ipEndpointState) deliver(stack *Stack, packet ipPacket) bool {
 	return accepted
 }
 
-// connectionsForLocked returns exact, family-wildcard, and dual-stack raw
-// bindings while Stack.mu is held.
-func (state *ipEndpointState) connectionsForLocked(address netip.Addr, protocol byte) []*IPConn {
-	connections := make([]*IPConn, 0)
+// connectionsForLocked appends exact, family-wildcard, and dual-stack raw
+// bindings to storage while Stack.mu is held.
+func (state *ipEndpointState) connectionsForLocked(storage []*IPConn, address netip.Addr, protocol byte) []*IPConn {
+	connections := storage
 	for connection := range state.bindings[ipKey{address: address, protocol: protocol}] {
 		connections = append(connections, connection)
 	}
@@ -570,7 +581,8 @@ func (state *ipEndpointState) deliverError(stack *Stack, networkError ICMPError)
 		stack.mu.RUnlock()
 		return false
 	}
-	connections := state.connectionsForLocked(networkError.QuotedSource, networkError.QuotedProtocol)
+	var connectionStorage [ipEndpointInlineFanout]*IPConn
+	connections := state.connectionsForLocked(connectionStorage[:0], networkError.QuotedSource, networkError.QuotedProtocol)
 	stack.mu.RUnlock()
 	accepted := false
 	acceptedPathMTU := false
@@ -661,8 +673,9 @@ func (c *IPConn) enqueuePacket(packet ipPacket, options ipPacketOptions) {
 	}
 	size := ipDatagramMetadataSize + len(payload)
 	c.mu.Lock()
-	blocked := len(packet.payload) != 0 && (packet.source.Is4() && c.protocol == ProtocolICMPv4 && packet.payload[0] < 32 && c.icmpV4Filter.WillBlock(packet.payload[0]) ||
-		packet.source.Is6() && c.protocol == ProtocolICMPv6 && c.icmpV6Filter.WillBlock(packet.payload[0]))
+	filter := c.icmpFilter
+	blocked := filter != nil && len(packet.payload) != 0 && (packet.source.Is4() && c.protocol == ProtocolICMPv4 && packet.payload[0] < 32 && filter.blocked[0]&(uint32(1)<<packet.payload[0]) != 0 ||
+		packet.source.Is6() && c.protocol == ProtocolICMPv6 && filter.blocked[packet.payload[0]>>5]&(uint32(1)<<(packet.payload[0]&31)) != 0)
 	if blocked || packet.source.Is6() && c.protocol != ProtocolICMPv6 && c.ipv6ChecksumOffset >= 0 &&
 		(c.ipv6ChecksumOffset > len(packet.payload)-2 || transportChecksum(packet.source, packet.target, c.protocol, packet.payload) != 0) {
 		c.mu.Unlock()
@@ -676,7 +689,7 @@ func (c *IPConn) enqueuePacket(packet ipPacket, options ipPacketOptions) {
 		return
 	default:
 	}
-	if size > c.receiveCapacity || c.queuedBytes+c.errorQueuedBytes > c.receiveCapacity-size {
+	if size > c.receiveCapacity || c.queuedBytes+c.errorState.bytes() > c.receiveCapacity-size {
 		c.mu.Unlock()
 		c.stack.stats.inboundDroppedPackets.Add(1)
 		c.packetsDropped.Add(1)
@@ -704,7 +717,10 @@ func (c *IPConn) enqueuePacket(packet ipPacket, options ipPacketOptions) {
 // notifyReceiveLocked keeps one edge notification armed while queued data
 // remains and removes a stale token when the queue becomes empty.
 func (c *IPConn) notifyReceiveLocked() {
-	if c.receive.len() != 0 || !c.receiveErrors && c.errorQueue.len() != 0 {
+	if c.receiveNotify == nil {
+		return
+	}
+	if c.receive.len() != 0 || !c.receiveErrors && c.errorState.len() != 0 {
 		select {
 		case c.receiveNotify <- struct{}{}:
 		default:
@@ -715,6 +731,15 @@ func (c *IPConn) notifyReceiveLocked() {
 	case <-c.receiveNotify:
 	default:
 	}
+}
+
+// receiveNotificationLocked returns the shared edge notification, allocating
+// it only when an empty receive path is about to block.
+func (c *IPConn) receiveNotificationLocked() <-chan struct{} {
+	if c.receiveNotify == nil {
+		c.receiveNotify = make(chan struct{}, 1)
+	}
+	return c.receiveNotify
 }
 
 // ReadFrom implements net.PacketConn.
@@ -838,7 +863,7 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 			return 0, ipDatagram{}, false, net.ErrClosed
 		default:
 		}
-		timeout := c.readDeadline.wait()
+		timeout := c.readDeadline.channel()
 		select {
 		case <-timeout:
 			c.mu.Unlock()
@@ -866,15 +891,17 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 			return n, datagram, n < len(datagram.payload), nil
 		}
 		if !c.receiveErrors {
-			queuedError, queued := c.errorQueue.pop()
+			queuedError, queued := c.errorState.pop()
 			if queued {
-				c.errorQueuedBytes -= queuedError.size
 				c.notifyReceiveLocked()
 				c.mu.Unlock()
 				return 0, ipDatagram{}, false, queuedError.err
 			}
 		}
-		notified := c.receiveNotify
+		notified := c.receiveNotificationLocked()
+		if timeout == nil {
+			timeout = c.readDeadline.wait()
+		}
 		c.mu.Unlock()
 		select {
 		case <-notified:
@@ -898,7 +925,7 @@ func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, peek
 			return 0, ipDatagram{}, false, net.ErrClosed
 		default:
 		}
-		timeout := c.readDeadline.wait()
+		timeout := c.readDeadline.channel()
 		select {
 		case <-timeout:
 			c.mu.Unlock()
@@ -939,11 +966,10 @@ func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, peek
 		}
 		if !c.receiveErrors && consumeErrors {
 			var queued queuedSocketError
-			queued, ok = c.errorQueue.pop()
+			queued, ok = c.errorState.pop()
 			if ok {
 				// Linux MSG_PEEK preserves queued payloads but consumes a pending
 				// socket error returned by the ordinary receive path.
-				c.errorQueuedBytes -= queued.size
 				c.notifyReceiveLocked()
 				c.mu.Unlock()
 				return 0, ipDatagram{}, false, queued.err
@@ -953,7 +979,10 @@ func (c *IPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, peek
 			c.mu.Unlock()
 			return 0, ipDatagram{}, false, syscall.EAGAIN
 		}
-		notified := c.receiveNotify
+		notified := c.receiveNotificationLocked()
+		if timeout == nil {
+			timeout = c.readDeadline.wait()
+		}
 		c.mu.Unlock()
 		select {
 		case <-notified:
@@ -979,7 +1008,7 @@ func (c *IPConn) readErrorBatch(messages []SocketMessage, flags int) (int, error
 			return 0, c.operationError("read", net.ErrClosed)
 		default:
 		}
-		size, ok, err := readSocketErrorMessage(&c.errorQueue, &messages[index], flags)
+		ok, err := c.errorState.readMessage(&messages[index], flags)
 		if !ok {
 			c.mu.Unlock()
 			if index != 0 {
@@ -994,10 +1023,7 @@ func (c *IPConn) readErrorBatch(messages []SocketMessage, flags int) (int, error
 			}
 			return 0, c.operationError("read", err)
 		}
-		if size != 0 {
-			c.errorQueuedBytes -= size
-			c.notifyReceiveLocked()
-		}
+		c.notifyReceiveLocked()
 		c.mu.Unlock()
 	}
 	return len(messages), nil
@@ -1125,7 +1151,7 @@ func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn i
 	}
 	// Match net.IPConn: destination conversion precedes poll state, while an
 	// expired deadline or closed descriptor precedes ancillary-data parsing.
-	if err = (socketWriteState{deadline: &c.writeDeadline, closed: c.closed}).err(); err != nil {
+	if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
 		return 0, 0, c.operationErrorTo("write", netAddress, err)
 	}
 	source, options, err := parseControlMessageForWrite(oob, target.Is6())
@@ -1208,7 +1234,7 @@ func (c *IPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int, 
 		return 0, 0, c.operationErrorTo("write", address, syscall.EMSGSIZE)
 	}
 	if len(message.Buffers) == 1 {
-		if err = (socketWriteState{deadline: &c.writeDeadline, closed: c.closed}).err(); err != nil {
+		if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
 			return 0, 0, c.operationErrorTo("write", address, err)
 		}
 		source, options, parseErr := parseControlMessageForWrite(message.OOB, validated.Is6())
@@ -1221,7 +1247,7 @@ func (c *IPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int, 
 		}
 		return n, len(message.OOB), nil
 	}
-	if err = (socketWriteState{deadline: &c.writeDeadline, closed: c.closed}).err(); err != nil {
+	if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
 		return 0, 0, c.operationErrorTo("write", address, err)
 	}
 	source, options, err := parseControlMessageForWrite(message.OOB, validated.Is6())
@@ -1284,7 +1310,7 @@ func (c *IPConn) writeHeaderIncludedBatchMessage(message *SocketMessage, dontWai
 	if payloadSize > 65535 {
 		return 0, 0, c.operationErrorTo("write", address, syscall.EMSGSIZE)
 	}
-	if err = (socketWriteState{deadline: &c.writeDeadline, closed: c.closed}).err(); err != nil {
+	if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
 		return 0, 0, c.operationErrorTo("write", address, err)
 	}
 	source, options, err := parseControlMessageForWrite(message.OOB, validated.Is6())
@@ -1326,7 +1352,7 @@ func (c *IPConn) writeHeaderIncluded(input []byte, target, packetInfoSource neti
 	if err != nil {
 		return 0, err
 	}
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
+	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
 	if parameters.nonUnicast {
 		c.mu.Lock()
 		_, external, loopback, policyErr := nonUnicastOutputPolicy(parameters.target, c.multicastHopLimit, c.multicastLoopback, c.broadcast, ipPacketOptions{hopLimit: hopLimit, hopLimitSet: true})
@@ -1517,7 +1543,7 @@ func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options
 	if nonUnicast {
 		return c.writeNonUnicastPayload(source, target, payload, options, pathMTUDiscovery, dontWait)
 	}
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
+	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
 	mtu, fragmentation := c.stack.pathMTUOutputPolicy(target, pathMTUDiscovery)
 	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, fragmentation, options, mtu, state)
 }
@@ -1541,7 +1567,7 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 		if err = setIPv6PayloadChecksum(payload, source, target, c.protocol, checksumOffset); err != nil {
 			return err
 		}
-		state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
+		state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
 		return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, fragmentation, options, mtu, state)
 	}
 	if source.Is6() && !options.flowLabelSet {
@@ -1555,7 +1581,7 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 		identification = uint16(c.stack.ipv4ID.Add(1))
 	}
 	queue, loopback := c.stack.outputQueueFor(target)
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
+	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
 	slot, err := c.stack.reservePacketUntil(queue, loopback, state)
 	if err != nil {
 		return err
@@ -1587,7 +1613,7 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 // writePathMTUProbePayload emits explicitly unfragmented output against the
 // first-hop MTU.
 func (c *IPConn) writePathMTUProbePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, _ PathMTUDiscovery, _, dontWait bool) error {
-	state := socketWriteState{deadline: &c.writeDeadline, closed: c.closed, dontWait: dontWait}
+	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
 	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, sourceFragmentation{dontFragment: true}, options, c.stack.network.Load().mtu, state)
 }
 
@@ -1599,23 +1625,27 @@ func (c *IPConn) Close() error {
 	return c.operationError("close", net.ErrClosed)
 }
 
-// closeFromStack publishes closure and releases payload-bearing and
-// error-correlation state.
+// closeFromStack publishes closure exactly once and releases payload-bearing
+// and error-correlation state.
 func (c *IPConn) closeFromStack() {
-	c.once.Do(func() {
-		c.mu.Lock()
-		c.readDeadline.stop()
-		c.writeDeadline.stop()
-		c.receive.clear()
-		c.errorQueue.clear()
-		c.receiveSpare = nil
-		c.queuedBytes = 0
-		c.errorQueuedBytes = 0
-		c.recentTargets = nil
-		c.lastError = nil
-		close(c.closed)
+	c.mu.Lock()
+	select {
+	case <-c.closed:
 		c.mu.Unlock()
-	})
+		return
+	default:
+	}
+	c.readDeadline.stop()
+	c.writeDeadline.stop()
+	c.receive.clear()
+	c.errorState.releaseRetained()
+	c.receiveSpare = nil
+	c.receiveNotify = nil
+	c.queuedBytes = 0
+	c.recentTargets = recentDestinationCache[netip.Addr]{}
+	c.icmpFilter = nil
+	close(c.closed)
+	c.mu.Unlock()
 }
 
 // LocalAddr returns the bound protocol address.
@@ -1632,16 +1662,23 @@ func (c *IPConn) Info() IPConnInfo {
 	if !c.v6 && !c.dual {
 		flowLabel = 0
 	}
+	errorEntries, errorBytes := c.errorState.len(), c.errorState.bytes()
+	var lastError error
+	var icmpErrors, errorsDropped uint64
+	if c.errorState != nil {
+		lastError = c.errorState.lastError
+		icmpErrors, errorsDropped = c.errorState.icmpErrors, c.errorState.dropped
+	}
 	info := IPConnInfo{
 		LocalAddress: c.local, RemoteAddress: c.remote, Protocol: c.protocol,
 		IPHeaderIncludedOnWrite: c.ipHeaderIncludedOnWrite.Load(), IPHeaderIncludedOnRead: c.ipHeaderIncludedOnRead,
 		ReceiveQueuePackets: c.receive.len(), ReceiveQueueBytes: c.queuedBytes, ReceiveQueueCapacity: c.receiveCapacity,
-		ReceiveErrors: c.receiveErrors, ErrorQueueEntries: c.errorQueue.len(), ErrorQueueBytes: c.errorQueuedBytes,
+		ReceiveErrors: c.receiveErrors, ErrorQueueEntries: errorEntries, ErrorQueueBytes: errorBytes,
 		HopLimit: int(c.defaultOptions.hopLimit), TrafficClass: c.defaultOptions.trafficClass,
 		PathMTUDiscovery:  c.pathMTUDiscovery,
 		MulticastHopLimit: int(c.multicastHopLimit), MulticastLoopback: c.multicastLoopback, Broadcast: c.broadcast,
 		FlowLabel: flowLabel,
-		LastError: c.lastError,
+		LastError: lastError, ICMPErrors: icmpErrors, ErrorsDropped: errorsDropped,
 	}
 	select {
 	case <-c.closed:
@@ -1651,8 +1688,7 @@ func (c *IPConn) Info() IPConnInfo {
 	c.mu.Unlock()
 	info.PacketsSent, info.BytesSent = c.packetsSent.Load(), c.bytesSent.Load()
 	info.PacketsReceived, info.BytesReceived = c.packetsReceived.Load(), c.bytesReceived.Load()
-	info.PacketsDropped, info.ICMPErrors = c.packetsDropped.Load(), c.icmpErrors.Load()
-	info.ErrorsDropped = c.errorsDropped.Load()
+	info.PacketsDropped = c.packetsDropped.Load()
 	if c.remote.IsValid() && !c.remote.IsMulticast() && !c.stack.network.Load().broadcastDestination(c.remote) {
 		info.PathMTU = c.stack.mtuFor(c.remote)
 	}
@@ -1688,7 +1724,16 @@ func (c *IPConn) SetICMPv4Filter(filter ICMPv4Filter) error {
 	case <-c.closed:
 		return c.setOperationError(net.ErrClosed)
 	default:
-		c.icmpV4Filter = filter
+		if c.icmpFilter == nil {
+			if filter == (ICMPv4Filter{}) {
+				return nil
+			}
+			c.icmpFilter = &ipConnICMPFilter{}
+		}
+		c.icmpFilter.blocked[0] = filter.blocked
+		if filter == (ICMPv4Filter{}) {
+			c.icmpFilter = nil
+		}
 		return nil
 	}
 }
@@ -1708,7 +1753,10 @@ func (c *IPConn) ICMPv4Filter() (ICMPv4Filter, error) {
 	case <-c.closed:
 		return ICMPv4Filter{}, c.setOperationError(net.ErrClosed)
 	default:
-		return c.icmpV4Filter, nil
+		if c.icmpFilter == nil {
+			return ICMPv4Filter{}, nil
+		}
+		return ICMPv4Filter{blocked: c.icmpFilter.blocked[0]}, nil
 	}
 }
 
@@ -1727,7 +1775,16 @@ func (c *IPConn) SetICMPv6Filter(filter ICMPv6Filter) error {
 	case <-c.closed:
 		return c.setOperationError(net.ErrClosed)
 	default:
-		c.icmpV6Filter = filter
+		if c.icmpFilter == nil {
+			if filter == (ICMPv6Filter{}) {
+				return nil
+			}
+			c.icmpFilter = &ipConnICMPFilter{}
+		}
+		c.icmpFilter.blocked = filter.blocked
+		if filter == (ICMPv6Filter{}) {
+			c.icmpFilter = nil
+		}
 		return nil
 	}
 }
@@ -1747,7 +1804,10 @@ func (c *IPConn) ICMPv6Filter() (ICMPv6Filter, error) {
 	case <-c.closed:
 		return ICMPv6Filter{}, c.setOperationError(net.ErrClosed)
 	default:
-		return c.icmpV6Filter, nil
+		if c.icmpFilter == nil {
+			return ICMPv6Filter{}, nil
+		}
+		return ICMPv6Filter{blocked: c.icmpFilter.blocked}, nil
 	}
 }
 
@@ -1911,12 +1971,11 @@ func (c *IPConn) ReadError() (*net.OpError, error) {
 		return nil, c.operationError("read", net.ErrClosed)
 	default:
 	}
-	queued, ok := c.errorQueue.pop()
+	queued, ok := c.errorState.pop()
 	if !ok {
 		c.mu.Unlock()
 		return nil, c.operationError("read", syscall.EAGAIN)
 	}
-	c.errorQueuedBytes -= queued.size
 	c.notifyReceiveLocked()
 	c.mu.Unlock()
 	return queued.err, nil
@@ -2040,7 +2099,7 @@ func (c *IPConn) rememberTarget(target netip.Addr) {
 		return
 	default:
 	}
-	c.recentTargets.remember(target, time.Now())
+	c.recentTargets.remember(target, monotonicStampAt(c.stack.timestampEpoch, time.Now()))
 	c.mu.Unlock()
 }
 
@@ -2051,7 +2110,7 @@ func (c *IPConn) acceptsError(target netip.Addr) bool {
 		return target == c.remote
 	}
 	c.mu.Lock()
-	exists := c.recentTargets.contains(target, time.Now())
+	exists := c.recentTargets.contains(target, monotonicStampAt(c.stack.timestampEpoch, time.Now()))
 	c.mu.Unlock()
 	return exists
 }
@@ -2077,12 +2136,16 @@ func (c *IPConn) deliverError(target netip.Addr, err error) {
 		return
 	default:
 	}
-	c.lastError = operationError
+	if c.errorState == nil {
+		c.errorState = &datagramSocketErrorState{}
+	}
+	errorState := c.errorState
+	errorState.lastError = operationError
 	size := socketErrorSize(err)
-	if size > c.receiveCapacity || c.queuedBytes+c.errorQueuedBytes > c.receiveCapacity-size {
+	if size > c.receiveCapacity || c.queuedBytes+errorState.queuedBytes > c.receiveCapacity-size {
+		errorState.icmpErrors++
+		errorState.dropped++
 		c.mu.Unlock()
-		c.icmpErrors.Add(1)
-		c.errorsDropped.Add(1)
 		return
 	}
 	var payload []byte
@@ -2093,11 +2156,10 @@ func (c *IPConn) deliverError(target netip.Addr, err error) {
 			payload = networkError.QuotedPacket
 		}
 	}
-	c.errorQueue.push(queuedSocketError{err: operationError, payload: payload, size: size})
-	c.errorQueuedBytes += size
+	errorState.push(queuedSocketError{err: operationError, payload: payload, size: size})
+	errorState.icmpErrors++
 	c.notifyReceiveLocked()
 	c.mu.Unlock()
-	c.icmpErrors.Add(1)
 }
 
 // writeStateAndOptions reads the output defaults, PMTU policy, and raw IPv6
@@ -2109,7 +2171,7 @@ func (c *IPConn) writeStateAndOptions(options ipPacketOptions) (socketWriteState
 	pathMTUDiscovery := c.pathMTUDiscovery
 	checksumOffset := c.ipv6ChecksumOffset
 	c.mu.Unlock()
-	return socketWriteState{deadline: &c.writeDeadline, closed: c.closed}, options, pathMTUDiscovery, checksumOffset
+	return socketWriteState{datagram: &c.datagramSocketWriteControl}, options, pathMTUDiscovery, checksumOffset
 }
 
 // operationError wraps an error for the bound or connected socket.

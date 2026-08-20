@@ -794,6 +794,43 @@ func TestUDPConcurrentReadersShareDeadline(t *testing.T) {
 	}
 }
 
+func TestUDPReceiveNotificationIsLazy(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.240")
+	remote := netip.MustParseAddrPort("198.51.100.240:5353")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := newUDPConn(stack, "udp4", 5300, false, local, remote, datagramSocketOptionSet{})
+	defer connection.closeFromStack()
+	connection.enqueue([]byte{1}, remote, local, ipPacketOptions{})
+	buffer := make([]byte, 1)
+	if n, readErr := connection.Read(buffer); readErr != nil || n != 1 {
+		t.Fatalf("ready read = %d, %v", n, readErr)
+	}
+	connection.mu.Lock()
+	allocated := connection.receiveNotify != nil || connection.readDeadline.state.Load() != nil || connection.errorState != nil
+	connection.mu.Unlock()
+	if allocated {
+		t.Fatal("ready receive path allocated blocking state")
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, readErr := connection.Read(buffer)
+		result <- readErr
+	}()
+	waitFor(t, time.Second, func() bool {
+		connection.mu.Lock()
+		waiting := connection.receiveNotify != nil && connection.readDeadline.state.Load() != nil
+		connection.mu.Unlock()
+		return waiting
+	})
+	connection.enqueue([]byte{2}, remote, local, ipPacketOptions{})
+	if readErr := <-result; readErr != nil || buffer[0] != 2 {
+		t.Fatalf("blocked read = %x, %v", buffer, readErr)
+	}
+}
+
 func TestUDPDialNetworkValidation(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.121")
 	remote := netip.MustParseAddrPort("198.51.100.121:53")
@@ -871,7 +908,7 @@ func TestConnectedUDP(t *testing.T) {
 			if _, err = udpConnection.WriteTo(payload, net.UDPAddrFromAddrPort(remote)); err == nil {
 				t.Fatal("WriteTo on connected UDP succeeded")
 			} else {
-				checkNetOpError(t, err, "write", udpConnection.net)
+				checkNetOpError(t, err, "write", udpConnection.net.name())
 			}
 
 			spoof, err := peer.ListenUDP(context.Background(), `udp`, wildcardUDP(test.client))
@@ -1868,11 +1905,11 @@ func TestUDPConnCloseReleasesRetainedState(t *testing.T) {
 	connection.enqueue(make([]byte, 1200), remote, local, ipPacketOptions{})
 	connection.mu.Lock()
 	released := connection.receive.values == nil && connection.receiveSpare == nil && connection.queuedBytes == 0 &&
-		connection.errorQueue.values == nil && connection.errorQueuedBytes == 0 &&
-		connection.recentTargets == nil && connection.lastError == nil &&
-		connection.readDeadline.timer == nil && connection.writeDeadline.timer == nil
+		connection.errorState != nil && connection.errorState.queue.values == nil && connection.errorState.queuedBytes == 0 &&
+		connection.recentTargets.state == nil && connection.errorState.lastError == nil &&
+		connection.readDeadline.state.Load() == stoppedDatagramSocketDeadline && connection.writeDeadline.state.Load() == stoppedDatagramSocketDeadline
 	connection.mu.Unlock()
-	if !released || connection.icmpErrors.Load() != 1 {
+	if !released || connection.errorState.icmpErrors != 1 {
 		t.Fatal("closed UDP socket retained or recreated payload-bearing state")
 	}
 }

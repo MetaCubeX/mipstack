@@ -248,6 +248,144 @@ func TestIPConnFanoutAndLinuxControl(t *testing.T) {
 	}
 }
 
+// TestIPConnFanoutExceedsInlineStorage verifies that the stack-local fan-out
+// array is only an allocation optimization and never a socket-count limit.
+func TestIPConnFanoutExceedsInlineStorage(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.111")
+	remote := netip.MustParseAddr("198.51.100.111")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	connections := make([]*IPConn, 0, ipEndpointInlineFanout+3)
+	for index := 0; index < cap(connections); index++ {
+		connection, listenErr := stack.ListenIP(context.Background(), "ip4:99", netip.IPv4Unspecified())
+		if listenErr != nil {
+			t.Fatal(listenErr)
+		}
+		connections = append(connections, connection)
+		defer connection.Close()
+	}
+	packet := buildIPPacket(remote, local, 99, []byte("fan-out"), 0, true)
+	if err = writeTestPacket(stack, packet); err != nil {
+		t.Fatal(err)
+	}
+	for index, connection := range connections {
+		if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		buffer := make([]byte, 16)
+		n, _, readErr := connection.ReadFrom(buffer)
+		if readErr != nil || string(buffer[:n]) != "fan-out" {
+			t.Fatalf("connection %d read = %q, %v", index, buffer[:n], readErr)
+		}
+	}
+}
+
+// TestIPConnConcurrentClose verifies mutex-based close idempotence across
+// simultaneous public Close calls without retaining a second once primitive.
+func TestIPConnConcurrentClose(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.112")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection, err := stack.ListenIP(context.Background(), "ip4:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const closers = 32
+	start := make(chan struct{})
+	results := make(chan error, closers)
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(closers)
+	for index := 0; index < closers; index++ {
+		go func() {
+			defer waitGroup.Done()
+			<-start
+			results <- connection.Close()
+		}()
+	}
+	close(start)
+	waitGroup.Wait()
+	close(results)
+	nilResults := 0
+	for closeErr := range results {
+		if closeErr == nil {
+			nilResults++
+		} else if !errors.Is(closeErr, net.ErrClosed) {
+			t.Fatalf("Close = %v", closeErr)
+		}
+	}
+	if nilResults != 1 {
+		t.Fatalf("successful Close calls = %d, want 1", nilResults)
+	}
+	if stats := stack.Stats(); stats.ActiveIPSockets != 0 {
+		t.Fatalf("active IP sockets = %d, want 0", stats.ActiveIPSockets)
+	}
+}
+
+// TestIPConnConcurrentStackAndSocketClose covers the two independent close
+// origins and verifies that their mutex-based idempotence still wakes a
+// blocked public operation.
+func TestIPConnConcurrentStackAndSocketClose(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.113")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := stack.ListenIP(context.Background(), "ip4:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readResult := make(chan error, 1)
+	go func() {
+		_, readErr := connection.Read(make([]byte, 1))
+		readResult <- readErr
+	}()
+	waitFor(t, time.Second, func() bool {
+		connection.mu.Lock()
+		waiting := connection.receiveNotify != nil
+		connection.mu.Unlock()
+		return waiting
+	})
+
+	start := make(chan struct{})
+	stackResult := make(chan error, 1)
+	connectionResult := make(chan error, 1)
+	go func() {
+		<-start
+		stackResult <- stack.Close()
+	}()
+	go func() {
+		<-start
+		connectionResult <- connection.Close()
+	}()
+	close(start)
+	if closeErr := <-stackResult; closeErr != nil {
+		t.Fatalf("Stack.Close = %v", closeErr)
+	}
+	if closeErr := <-connectionResult; closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		t.Fatalf("IPConn.Close = %v", closeErr)
+	}
+	if readErr := <-readResult; !errors.Is(readErr, net.ErrClosed) {
+		t.Fatalf("blocked Read = %v, want net.ErrClosed", readErr)
+	}
+}
+
 func TestIPNetworkAPI(t *testing.T) {
 	local4 := netip.MustParseAddr("192.0.2.122")
 	local6 := netip.MustParseAddr("2001:db8::122")
@@ -707,6 +845,23 @@ func TestIPConnICMPReceiveFilters(t *testing.T) {
 				t.Fatal("a filtered raw ICMP packet generated output")
 			}
 		})
+	}
+}
+
+func TestIPConnICMPFilterStateIsLazy(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.241")
+	connection := newIPConn(nil, "ip4:icmp", ProtocolICMPv4, local, netip.Addr{}, socketOptionSet{})
+	if connection.icmpFilter != nil {
+		t.Fatal("default ICMP filter allocated state")
+	}
+	var filter ICMPv4Filter
+	filter.Block(ICMPv4TypeEchoRequest)
+	if err := connection.SetICMPv4Filter(filter); err != nil || connection.icmpFilter == nil {
+		t.Fatalf("SetICMPv4Filter = %v, state %p", err, connection.icmpFilter)
+	}
+	filter.SetAll(false)
+	if err := connection.SetICMPv4Filter(filter); err != nil || connection.icmpFilter != nil {
+		t.Fatalf("clear ICMPv4 filter = %v, state %p", err, connection.icmpFilter)
 	}
 }
 
@@ -1645,6 +1800,43 @@ func TestIPConcurrentReadersShareDeadline(t *testing.T) {
 	}
 }
 
+func TestIPReceiveNotificationIsLazy(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.239")
+	remote := netip.MustParseAddr("198.51.100.239")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
+	defer connection.closeFromStack()
+	connection.enqueuePacket(ipPacket{payload: []byte{1}, source: remote, target: local}, ipPacketOptions{})
+	buffer := make([]byte, 1)
+	if n, readErr := connection.Read(buffer); readErr != nil || n != 1 {
+		t.Fatalf("ready read = %d, %v", n, readErr)
+	}
+	connection.mu.Lock()
+	allocated := connection.receiveNotify != nil || connection.readDeadline.state.Load() != nil || connection.errorState != nil
+	connection.mu.Unlock()
+	if allocated {
+		t.Fatal("ready receive path allocated blocking state")
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, readErr := connection.Read(buffer)
+		result <- readErr
+	}()
+	waitFor(t, time.Second, func() bool {
+		connection.mu.Lock()
+		waiting := connection.receiveNotify != nil && connection.readDeadline.state.Load() != nil
+		connection.mu.Unlock()
+		return waiting
+	})
+	connection.enqueuePacket(ipPacket{payload: []byte{2}, source: remote, target: local}, ipPacketOptions{})
+	if readErr := <-result; readErr != nil || buffer[0] != 2 {
+		t.Fatalf("blocked read = %x, %v", buffer, readErr)
+	}
+}
+
 // TestUnconnectedIPReadAndConnectedWriteToError matches the standard IPConn
 // behavior for payload reads and destination-specific writes.
 func TestUnconnectedIPReadAndConnectedWriteToError(t *testing.T) {
@@ -1804,6 +1996,38 @@ func BenchmarkIPReceiveQueue(b *testing.B) {
 	}
 }
 
+func BenchmarkIPInboundDispatch(b *testing.B) {
+	local := netip.MustParseAddr("192.0.2.238")
+	remote := netip.MustParseAddr("198.51.100.238")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	connection := newIPConn(stack, "ip4:99", 99, local, netip.Addr{}, socketOptionSet{})
+	stack.mu.Lock()
+	state := stack.ipEndpointStateLocked()
+	state.register(connection)
+	stack.mu.Unlock()
+	b.Cleanup(func() {
+		connection.closeFromStack()
+		_ = stack.Close()
+	})
+	payload := bytes.Repeat([]byte{0x6b}, 1200)
+	packet := ipPacket{payload: payload, source: remote, target: local, protocol: 99}
+	buffer := make([]byte, len(payload))
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		if !state.deliver(stack, packet) {
+			b.Fatal("raw IP packet was not delivered")
+		}
+		if n, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) {
+			b.Fatalf("readDatagram = %d, %v", n, readErr)
+		}
+	}
+}
+
 func TestIPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.248")
 	remote := netip.MustParseAddr("198.51.100.248")
@@ -1869,11 +2093,11 @@ func TestIPConnCloseReleasesRetainedState(t *testing.T) {
 	connection.enqueuePacket(ipPacket{payload: make([]byte, 1200), source: remote, target: local}, ipPacketOptions{})
 	connection.mu.Lock()
 	released := connection.receive.values == nil && connection.receiveSpare == nil && connection.queuedBytes == 0 &&
-		connection.errorQueue.values == nil && connection.errorQueuedBytes == 0 &&
-		connection.recentTargets == nil && connection.lastError == nil &&
-		connection.readDeadline.timer == nil && connection.writeDeadline.timer == nil
+		connection.errorState != nil && connection.errorState.queue.values == nil && connection.errorState.queuedBytes == 0 &&
+		connection.recentTargets.state == nil && connection.errorState.lastError == nil &&
+		connection.readDeadline.state.Load() == stoppedDatagramSocketDeadline && connection.writeDeadline.state.Load() == stoppedDatagramSocketDeadline
 	connection.mu.Unlock()
-	if !released || connection.icmpErrors.Load() != 1 {
+	if !released || connection.errorState.icmpErrors != 1 {
 		t.Fatal("closed IP socket retained or recreated payload-bearing state")
 	}
 }

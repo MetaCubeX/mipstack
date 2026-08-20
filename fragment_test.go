@@ -626,9 +626,9 @@ func TestDirectFragmentOutputPreservesPartialDeadlineEmission(t *testing.T) {
 		}
 	}
 	stack.ipv4ID.Store(100)
-	var deadline socketDeadline
-	deadline.set(time.Now().Add(20 * time.Millisecond))
-	state := socketWriteState{deadline: &deadline, closed: make(chan struct{})}
+	var control datagramSocketWriteControl
+	control.writeDeadline.set(time.Now().Add(20 * time.Millisecond))
+	state := socketWriteState{datagram: &control}
 	err = stack.writeIPPayloadUntilOptionsForMTU(local, remote, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, 68, state)
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("fragmented write error = %v, want deadline exceeded", err)

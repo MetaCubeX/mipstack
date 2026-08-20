@@ -516,32 +516,59 @@ type pathMTUEntry struct {
 }
 
 // recentDestinationCache retains bounded evidence that a connectionless
-// socket actually sent to a destination quoted by an ICMP error. Callers own
-// synchronization so the cache can share their existing socket mutex.
-type recentDestinationCache[T comparable] map[T]time.Time
+// socket actually sent to a destination quoted by an ICMP error. Its zero
+// value has no allocation, and the common single-destination case avoids a
+// map. Callers own synchronization so the cache can share their socket mutex.
+type recentDestinationCache[T comparable] struct {
+	state *recentDestinationCacheState[T]
+}
+
+// recentDestinationCacheState is allocated by the first unconnected write.
+// entries remains nil until a second distinct destination is observed. Every
+// timestamp is measured against the owning Stack's shared epoch.
+type recentDestinationCacheState[T comparable] struct {
+	first        T
+	firstUpdated monotonicStamp
+	entries      map[T]monotonicStamp
+}
 
 // remember records a successful transmission and evicts expired or oldest
 // evidence when the bound is full.
-func (c *recentDestinationCache[T]) remember(destination T, now time.Time) {
-	if *c == nil {
-		*c = make(recentDestinationCache[T])
+func (c *recentDestinationCache[T]) remember(destination T, now monotonicStamp) {
+	if c.state == nil {
+		c.state = &recentDestinationCacheState[T]{first: destination, firstUpdated: now}
+		return
 	}
-	cache := *c
+	state := c.state
+	if state.entries == nil {
+		if state.first == destination {
+			state.firstUpdated = now
+			return
+		}
+		state.entries = make(map[T]monotonicStamp, 2)
+		state.entries[state.first] = state.firstUpdated
+		state.entries[destination] = now
+		var zero T
+		state.first = zero
+		state.firstUpdated = 0
+		return
+	}
+	cache := state.entries
 	if _, exists := cache[destination]; exists {
 		cache[destination] = now
 		return
 	}
 	if len(cache) >= recentDestinationMaximum {
 		var oldest T
-		var oldestTime time.Time
+		var oldestStamp monotonicStamp
 		haveOldest := false
-		for candidate, updated := range cache {
-			if now.Sub(updated) >= recentDestinationLifetime {
+		for candidate, candidateStamp := range cache {
+			if recentDestinationExpired(candidateStamp, now) {
 				delete(cache, candidate)
 				continue
 			}
-			if !haveOldest || updated.Before(oldestTime) {
-				oldest, oldestTime, haveOldest = candidate, updated, true
+			if !haveOldest || candidateStamp < oldestStamp {
+				oldest, oldestStamp, haveOldest = candidate, candidateStamp, true
 			}
 		}
 		if len(cache) >= recentDestinationMaximum && haveOldest {
@@ -552,13 +579,33 @@ func (c *recentDestinationCache[T]) remember(destination T, now time.Time) {
 }
 
 // contains reports recent transmission evidence and removes it after expiry.
-func (c recentDestinationCache[T]) contains(destination T, now time.Time) bool {
-	updated, exists := c[destination]
-	if exists && now.Sub(updated) >= recentDestinationLifetime {
-		delete(c, destination)
+func (c *recentDestinationCache[T]) contains(destination T, now monotonicStamp) bool {
+	if c.state == nil {
+		return false
+	}
+	state := c.state
+	if state.entries == nil {
+		if state.first != destination {
+			return false
+		}
+		if recentDestinationExpired(state.firstUpdated, now) {
+			c.state = nil
+			return false
+		}
+		return true
+	}
+	updated, exists := state.entries[destination]
+	if exists && recentDestinationExpired(updated, now) {
+		delete(state.entries, destination)
 		return false
 	}
 	return exists
+}
+
+// recentDestinationExpired compares stamps taken against the same Stack epoch.
+// A defensive backwards value remains recent instead of underflowing.
+func recentDestinationExpired(updated, now monotonicStamp) bool {
+	return now >= updated && now-updated >= monotonicStamp(recentDestinationLifetime)
 }
 
 // datagramQueue is a compact FIFO whose small backing allocation survives an
@@ -577,6 +624,76 @@ type queuedSocketError struct {
 	err     *net.OpError
 	payload []byte
 	size    int
+}
+
+// datagramSocketErrorState owns state that ordinary UDP and raw IP sockets do
+// not need until an asynchronous network error arrives. The owning socket
+// mutex protects every field, including the cumulative diagnostic counters.
+type datagramSocketErrorState struct {
+	queue       datagramQueue[queuedSocketError]
+	queuedBytes int
+	lastError   *net.OpError
+	icmpErrors  uint64
+	dropped     uint64
+}
+
+// len returns the number of queued asynchronous errors. A nil receiver is an
+// empty cold state.
+func (s *datagramSocketErrorState) len() int {
+	if s == nil {
+		return 0
+	}
+	return s.queue.len()
+}
+
+// bytes returns the receive-buffer charge of queued asynchronous errors.
+func (s *datagramSocketErrorState) bytes() int {
+	if s == nil {
+		return 0
+	}
+	return s.queuedBytes
+}
+
+// push retains one validated asynchronous error.
+func (s *datagramSocketErrorState) push(queued queuedSocketError) {
+	s.queue.push(queued)
+	s.queuedBytes += queued.size
+}
+
+// pop removes the oldest asynchronous error and its receive-buffer charge.
+func (s *datagramSocketErrorState) pop() (queuedSocketError, bool) {
+	if s == nil {
+		return queuedSocketError{}, false
+	}
+	queued, ok := s.queue.pop()
+	if ok {
+		s.queuedBytes -= queued.size
+	}
+	return queued, ok
+}
+
+// readMessage consumes one error into its public scatter/gather form after
+// successful validation and ancillary-data conversion.
+func (s *datagramSocketErrorState) readMessage(message *SocketMessage, flags int) (bool, error) {
+	if s == nil {
+		return false, nil
+	}
+	size, ok, err := readSocketErrorMessage(&s.queue, message, flags)
+	if ok && err == nil {
+		s.queuedBytes -= size
+	}
+	return ok, err
+}
+
+// releaseRetained clears payload-bearing error state while preserving the
+// cumulative counters reported after socket closure.
+func (s *datagramSocketErrorState) releaseRetained() {
+	if s == nil {
+		return
+	}
+	s.queue.clear()
+	s.queuedBytes = 0
+	s.lastError = nil
 }
 
 // socketErrorSize returns the receive-buffer charge for an asynchronous
@@ -2929,8 +3046,10 @@ func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, state sock
 		}
 	}
 	var timeout <-chan struct{}
-	if state.deadline != nil {
-		timeout = state.deadline.wait()
+	closed := state.closed
+	if state.datagram != nil {
+		timeout = state.datagram.writeDeadline.wait()
+		closed = state.datagram.closed
 	}
 	select {
 	case slot := <-queue.free:
@@ -2941,7 +3060,7 @@ func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, state sock
 		return slot, nil
 	case <-timeout:
 		return 0, os.ErrDeadlineExceeded
-	case <-state.closed:
+	case <-closed:
 		return 0, net.ErrClosed
 	case <-s.closeCh:
 		return 0, ErrClosed
@@ -2988,12 +3107,125 @@ type socketDeadlineWaiter struct {
 	done chan struct{}
 }
 
+// datagramSocketDeadline keeps UDP and raw IP deadline state out of sockets
+// that never block or set a deadline. Set and stop are serialized by the
+// owning socket mutex; channel and wait may run concurrently with them.
+type datagramSocketDeadline struct {
+	state atomic.Pointer[datagramSocketDeadlineState]
+}
+
+// datagramSocketDeadlineState is one live channel generation and its optional
+// timer. A closed generation is replaced when a later deadline is cleared or
+// extended.
+type datagramSocketDeadlineState struct {
+	timer *time.Timer
+	done  chan struct{}
+}
+
+// datagramSocketWriteControl groups the close signal and mutable write
+// deadline observed by a blocked UDP or raw IP output operation. Embedding it
+// in each datagram socket keeps socketWriteState compact without adding an
+// allocation or indirection to the socket's ordinary deadline methods.
+type datagramSocketWriteControl struct {
+	closed        chan struct{}
+	writeDeadline datagramSocketDeadline
+}
+
+// stoppedDatagramSocketDeadline is the shared terminal state installed during
+// socket closure. Its nil channel disables deadline selection without allowing
+// a concurrent wait to recreate retained state.
+var stoppedDatagramSocketDeadline = &datagramSocketDeadlineState{}
+
+// channel returns the current deadline generation without allocating one.
+func (d *datagramSocketDeadline) channel() <-chan struct{} {
+	state := d.state.Load()
+	if state == nil || state == stoppedDatagramSocketDeadline {
+		return nil
+	}
+	return state.done
+}
+
+// wait returns a generation that a later deadline update can close.
+func (d *datagramSocketDeadline) wait() <-chan struct{} {
+	for {
+		state := d.state.Load()
+		if state == stoppedDatagramSocketDeadline {
+			return nil
+		}
+		if state != nil {
+			return state.done
+		}
+		state = &datagramSocketDeadlineState{done: make(chan struct{})}
+		if d.state.CompareAndSwap(nil, state) {
+			return state.done
+		}
+	}
+}
+
+// set replaces the deadline. The owning socket mutex serializes calls to set
+// and stop while wait may install the initial generation concurrently.
+func (d *datagramSocketDeadline) set(deadline time.Time) {
+	state := d.state.Load()
+	if (deadline.IsZero() && state == nil) || state == stoppedDatagramSocketDeadline {
+		return
+	}
+	if state == nil {
+		d.wait()
+		state = d.state.Load()
+		if state == stoppedDatagramSocketDeadline {
+			return
+		}
+	}
+	if state.timer != nil && !state.timer.Stop() {
+		<-state.done
+	}
+	state.timer = nil
+	closed := false
+	select {
+	case <-state.done:
+		closed = true
+	default:
+	}
+	if deadline.IsZero() {
+		if closed {
+			d.state.CompareAndSwap(state, nil)
+		}
+		return
+	}
+	if duration := time.Until(deadline); duration > 0 {
+		if closed {
+			state = &datagramSocketDeadlineState{done: make(chan struct{})}
+			d.state.Store(state)
+		}
+		done := state.done
+		state.timer = time.AfterFunc(duration, func() { close(done) })
+		return
+	}
+	if !closed {
+		close(state.done)
+	}
+}
+
+// stop permanently disables the deadline and releases its retained timer and
+// channel state. Socket closure separately wakes operations already waiting on
+// an earlier generation.
+func (d *datagramSocketDeadline) stop() {
+	state := d.state.Swap(stoppedDatagramSocketDeadline)
+	if state != nil && state != stoppedDatagramSocketDeadline && state.timer != nil {
+		state.timer.Stop()
+		state.timer = nil
+	}
+}
+
 // set replaces the deadline. A zero time disables it, and an expired deadline
 // closes the current generation immediately.
 func (d *socketDeadline) set(deadline time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	waiter := d.waiter.Load()
+	if deadline.IsZero() && waiter == nil && d.timer == nil {
+		return
+	}
 	if waiter == nil {
 		waiter = &socketDeadlineWaiter{done: make(chan struct{})}
 		d.waiter.Store(waiter)
@@ -3057,7 +3289,7 @@ func (d *socketDeadline) stop() {
 // socketWriteState carries the two independent events that can interrupt a
 // write blocked on the stack's bounded packet queue.
 type socketWriteState struct {
-	deadline *socketDeadline
+	datagram *datagramSocketWriteControl
 	closed   <-chan struct{}
 	dontWait bool
 }
@@ -3065,17 +3297,23 @@ type socketWriteState struct {
 // err reports an already-observable close before a deadline, matching socket
 // methods that reject operations after Close even when a deadline also fired.
 func (s socketWriteState) err() error {
+	if s.datagram != nil {
+		select {
+		case <-s.datagram.closed:
+			return net.ErrClosed
+		default:
+		}
+		select {
+		case <-s.datagram.writeDeadline.channel():
+			return os.ErrDeadlineExceeded
+		default:
+		}
+		return nil
+	}
 	select {
 	case <-s.closed:
 		return net.ErrClosed
 	default:
-	}
-	if s.deadline != nil {
-		select {
-		case <-s.deadline.wait():
-			return os.ErrDeadlineExceeded
-		default:
-		}
 	}
 	return nil
 }
