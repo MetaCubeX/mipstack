@@ -57,7 +57,7 @@ func TestPublicCongestionControllerAPI(t *testing.T) {
 	_, _, _, _, _, _, _ = sample.ApplicationLimited(), sample.SchedulerLimited(), sample.Retransmitted(), sample.InRecovery(), sample.InFastRecovery(), sample.ACKDelayed(), sample.Valid()
 	_, _ = sample.PacketState(), sample.TailLossProbeACK()
 
-	name := mipstack.CongestionControl(fmt.Sprintf("external-test-%d", externalCongestionName.Add(1)))
+	name := fmt.Sprintf("external-test-%d", externalCongestionName.Add(1))
 	factory, err := mipstack.NewCongestionControlFactory(mipstack.CongestionControlDefinition{
 		Name: name,
 		New: func(mipstack.CongestionControlContext) mipstack.CongestionController {
@@ -95,7 +95,7 @@ func TestPublicLocalCongestionControlFactoryConnection(t *testing.T) {
 	clientAddress := netip.MustParseAddr("192.0.2.240")
 	serverAddress := netip.MustParseAddr("192.0.2.241")
 	contexts := make(chan mipstack.CongestionControlContext, 2)
-	name := mipstack.CongestionControl(fmt.Sprintf("external-local-%d", externalCongestionName.Add(1)))
+	name := fmt.Sprintf("external-local-%d", externalCongestionName.Add(1))
 	factory, err := mipstack.NewCongestionControlFactory(mipstack.CongestionControlDefinition{
 		Name: name,
 		New: func(context mipstack.CongestionControlContext) mipstack.CongestionController {

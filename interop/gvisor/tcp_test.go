@@ -219,7 +219,7 @@ func TestTCPLocalCongestionControlFactoryInterop(t *testing.T) {
 			}
 			t.Run(family.name+"/"+role, func(t *testing.T) {
 				contexts := make(chan mipstack.CongestionControlContext, 1)
-				name := mipstack.CongestionControl("interop-local-" + family.name + "-" + role)
+				name := "interop-local-" + family.name + "-" + role
 				factory, err := mipstack.NewCongestionControlFactory(mipstack.CongestionControlDefinition{
 					Name: name,
 					New: func(context mipstack.CongestionControlContext) mipstack.CongestionController {

@@ -145,7 +145,7 @@ type userTimeoutSocketOption socketOptionOverride[time.Duration]
 // congestionControlSocketOption stores one registered TCP congestion-control
 // name. It shares its destination slot with congestionControlFactorySocketOption.
 type congestionControlSocketOption struct {
-	name CongestionControl
+	name string
 	set  bool
 }
 
@@ -471,11 +471,11 @@ func (option userTimeoutSocketOption) apply(set socketOptionSet, use socketOptio
 	return set, nil
 }
 
-// CongestionControl selects one registered algorithm for newly created TCP
-// connections. It overrides CongestionControlFactory when it appears later in
-// the same option list. It is valid for ListenConfig.ListenTCP,
+// CongestionControl selects one registered algorithm by name for newly created
+// TCP connections. It overrides CongestionControlFactory when it appears later
+// in the same option list. It is valid for ListenConfig.ListenTCP,
 // Dialer.DialTCP, and TCPForwarderRequest.Accept.
-func (SocketOptionFactory) CongestionControl(algorithm CongestionControl) SocketOption {
+func (SocketOptionFactory) CongestionControl(algorithm string) SocketOption {
 	return congestionControlSocketOption{name: algorithm, set: true}
 }
 

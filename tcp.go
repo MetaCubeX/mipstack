@@ -674,8 +674,8 @@ type TCPConnInfo struct {
 	RemoteAddress netip.AddrPort
 	// State is the current RFC 9293 connection state.
 	State TCPState
-	// CongestionControl identifies the selected congestion controller.
-	CongestionControl CongestionControl
+	// CongestionControl is the selected controller's diagnostic name.
+	CongestionControl string
 	// RTT is the smoothed round-trip time.
 	RTT time.Duration
 	// MinimumRTT is the minimum recent round-trip time.
@@ -4824,9 +4824,10 @@ func (c *TCPConn) SetNoDelay(noDelay bool) error {
 	return err
 }
 
-// SetCongestionControl changes the algorithm for this connection and prevents
-// later stack-default updates from overriding the explicit choice.
-func (c *TCPConn) SetCongestionControl(algorithm CongestionControl) error {
+// SetCongestionControl selects a registered algorithm by name for this
+// connection and prevents later stack-default updates from overriding the
+// explicit choice.
+func (c *TCPConn) SetCongestionControl(algorithm string) error {
 	factory, exists := registeredCongestionControlFactory(algorithm)
 	if !exists {
 		return c.setOperationError(syscall.EINVAL)

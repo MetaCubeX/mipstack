@@ -659,10 +659,11 @@ connection tuple; a nonzero value fixes the label for new connections. A zero
 maximum pacing rate is unlimited; nonzero values cap paced data in bytes per
 second. The initial data burst and control packets are not strictly shaped, so
 this policy is not a byte-exact traffic shaper.
-Congestion control accepts
-`CongestionControlCUBIC`, `CongestionControlReno`, `CongestionControlBBR`, or
-`CongestionControlBBR3`; its zero value selects CUBIC. A programmatic caller
-may instead supply a local `CongestionControlFactory`, described below.
+Congestion-control selectors accept registered string names. The built-in names
+are available as `CongestionControlCUBIC`, `CongestionControlReno`,
+`CongestionControlBBR`, and `CongestionControlBBR3`; an empty name selects
+CUBIC. A programmatic caller may instead supply a local
+`CongestionControlFactory`, described below.
 `UpdateConfig` applies a changed congestion controller to established
 connections without an explicit per-connection override. Existing sockets
 retain the other inherited policies. Receive window

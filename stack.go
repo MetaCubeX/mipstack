@@ -92,11 +92,12 @@ var (
 // TCPSocketDefaults configures policies inherited by newly created TCP
 // connections and listeners. Zero fields retain the package defaults.
 type TCPSocketDefaults struct {
-	// CongestionControl selects the algorithm used by new connections. The
-	// zero value selects CUBIC. UpdateConfig also applies a changed value to
-	// established connections without an explicit per-connection override. It
-	// must be empty when CongestionControlFactory is set.
-	CongestionControl CongestionControl
+	// CongestionControl selects a registered algorithm by name for new
+	// connections. The zero value selects CUBIC. UpdateConfig also applies a
+	// changed value to established connections without an explicit
+	// per-connection override. It must be empty when CongestionControlFactory is
+	// set.
+	CongestionControl string
 	// CongestionControlFactory selects an immutable local factory without
 	// process-wide registration. It must be created by
 	// NewCongestionControlFactory and is mutually exclusive with

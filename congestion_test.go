@@ -113,7 +113,7 @@ func TestCongestionControllerComposesDeliverySamplingWithCommonPacing(t *testing
 
 func TestCongestionControllerFactoryProvidesIndependentImplementations(t *testing.T) {
 	tests := []struct {
-		name               CongestionControl
+		name               string
 		deliveryRate       bool
 		transmissionEvents bool
 		customPacing       bool
@@ -229,7 +229,7 @@ func TestMaximumPacingRateLimitsEveryController(t *testing.T) {
 		mss   = 1000
 		limit = uint64(50_000)
 	)
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		controller := newTCPCongestionController(algorithm)
 		controller.setMaximumPacingRate(limit)
 		controller.initialize(time.Unix(99, 0), 0, time.Millisecond, 10*mss, 20*mss, mss, 1)
@@ -375,7 +375,7 @@ func TestBBRGainsAndUnknownRTTWindowMatchLinux(t *testing.T) {
 
 func TestECNCongestionWindowCanReachOneSegment(t *testing.T) {
 	const mss = 1000
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC} {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			controller := newTCPCongestionController(algorithm)
 			if threshold, window := controller.onECN(mss, mss, 0, mss, time.Time{}); threshold != mss || window != mss {
@@ -418,7 +418,7 @@ func TestTCPRestartWindowAfterIdle(t *testing.T) {
 
 func TestSlowStartReturnsExcessACKCreditToCongestionAvoidance(t *testing.T) {
 	const mss = 1000
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC} {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			controller := newTCPCongestionController(algorithm)
 			const window = uint32(9 * mss)
@@ -431,7 +431,7 @@ func TestSlowStartReturnsExcessACKCreditToCongestionAvoidance(t *testing.T) {
 }
 
 func TestTCPSelectableCongestionControls(t *testing.T) {
-	for index, algorithm := range []CongestionControl{CongestionControlCUBIC, CongestionControlReno, CongestionControlBBR, CongestionControlBBR3} {
+	for index, algorithm := range []string{CongestionControlCUBIC, CongestionControlReno, CongestionControlBBR, CongestionControlBBR3} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			local := netip.AddrFrom4([4]byte{192, 0, 2, byte(50 + index*2)})
 			remote := netip.AddrFrom4([4]byte{192, 0, 2, byte(51 + index*2)})
@@ -521,7 +521,7 @@ func TestTCPControllerChangePreservesCongestionState(t *testing.T) {
 }
 
 func TestTCPSelectableCongestionControlsRecoverMultipleLosses(t *testing.T) {
-	for index, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+	for index, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			local := netip.AddrFrom4([4]byte{192, 0, 2, byte(70 + index*2)})
 			remote := netip.AddrFrom4([4]byte{192, 0, 2, byte(71 + index*2)})
@@ -616,7 +616,7 @@ func TestTCPAlgorithmsUnderCombinedImpairment(t *testing.T) {
 		LossRate: 0.02, BurstEnterRate: 0.01, BurstExitRate: 0.5,
 		DuplicateRate: 0.05, Bandwidth: 2 * 1024 * 1024, QueueBytes: 64 * 1024,
 	}
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			client, server, link := newTestTCPConnectionPair(t, algorithm, testLinkConditions{
 				Seed: 3779, ClientToPeer: condition, PeerToClient: condition,
@@ -643,7 +643,7 @@ func TestTCPAlgorithmsShareBottleneckWithoutStarvation(t *testing.T) {
 	}
 	fairCompletion := time.Duration(payloadSize*flows) * time.Second / time.Duration(condition.Bandwidth)
 	maximumCompletion := 4*fairCompletion + 250*time.Millisecond
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			clientAddress := netip.MustParseAddr("192.0.2.231")
 			serverAddress := netip.MustParseAddr("192.0.2.232")
@@ -766,7 +766,7 @@ func TestTCPAlgorithmsUnderSustainedSchedulerPressure(t *testing.T) {
 		close(stop)
 		workers.Wait()
 	}()
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		t.Run(string(algorithm), func(t *testing.T) {
 			client, server, _ := newTestTCPConnectionPair(t, algorithm, testLinkConditions{
 				Seed:         6113,
@@ -813,7 +813,7 @@ type testDeviceBottleneck struct {
 	done   sync.WaitGroup
 }
 
-func newTestDeviceBottleneck(t testing.TB, algorithm CongestionControl, bytesPerSecond int, fair bool) (*Stack, *Stack) {
+func newTestDeviceBottleneck(t testing.TB, algorithm string, bytesPerSecond int, fair bool) (*Stack, *Stack) {
 	t.Helper()
 	clientAddress := netip.MustParseAddr("192.0.2.241")
 	serverAddress := netip.MustParseAddr("192.0.2.242")
@@ -950,7 +950,7 @@ func TestTCPAlgorithmsShareDeviceBottleneck(t *testing.T) {
 		name string
 		fair bool
 	}{{name: "fifo"}, {name: "drr", fair: true}} {
-		for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 			t.Run(scheduler.name+"/"+string(algorithm), func(t *testing.T) {
 				client, server := newTestDeviceBottleneck(t, algorithm, 4*1024*1024, scheduler.fair)
 				clients, servers := openTestDeviceBottleneckTCPFlows(t, client, server, flows)
@@ -996,7 +996,7 @@ func TestTCPAlgorithmsShareDeviceBottleneck(t *testing.T) {
 // testUDPLatencyDuringTCPDeviceBottleneck measures latency rather than merely
 // checking eventual delivery, so FIFO and fair schedulers can be compared with
 // the same transport implementation.
-func testUDPLatencyDuringTCPDeviceBottleneck(t *testing.T, algorithm CongestionControl, fair bool) []time.Duration {
+func testUDPLatencyDuringTCPDeviceBottleneck(t *testing.T, algorithm string, fair bool) []time.Duration {
 	t.Helper()
 	client, server := newTestDeviceBottleneck(t, algorithm, 4*1024*1024, fair)
 	clients, servers := openTestDeviceBottleneckTCPFlows(t, client, server, 4)
@@ -1071,7 +1071,7 @@ func TestUDPLatencyDuringTCPDeviceBottleneck(t *testing.T) {
 		name string
 		fair bool
 	}{{name: "fifo"}, {name: "drr", fair: true}} {
-		for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 			t.Run(scheduler.name+"/"+string(algorithm), func(t *testing.T) {
 				latencies := testUDPLatencyDuringTCPDeviceBottleneck(t, algorithm, scheduler.fair)
 				// Host preemption is outside the scheduler and makes a fixed wall-clock

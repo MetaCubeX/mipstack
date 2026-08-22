@@ -8,18 +8,15 @@ import (
 	"time"
 )
 
-// CongestionControl identifies a TCP congestion-control algorithm.
-type CongestionControl string
-
 const (
 	// CongestionControlCUBIC selects RFC 9438 CUBIC with Reno-friendly growth.
-	CongestionControlCUBIC CongestionControl = "cubic"
+	CongestionControlCUBIC = "cubic"
 	// CongestionControlReno selects RFC 5681 Reno congestion avoidance.
-	CongestionControlReno CongestionControl = "reno"
+	CongestionControlReno = "reno"
 	// CongestionControlBBR selects model-based BBR congestion control.
-	CongestionControlBBR CongestionControl = "bbr"
+	CongestionControlBBR = "bbr"
 	// CongestionControlBBR3 selects Google's loss-bounded BBRv3 model.
-	CongestionControlBBR3 CongestionControl = "bbr3"
+	CongestionControlBBR3 = "bbr3"
 )
 
 // CongestionControlContext identifies the TCP connection for which a
@@ -98,7 +95,7 @@ const congestionControlKnownFeatures = CongestionControlFeatureDeliveryRate |
 // multiple of cwnd; zero retains the ordinary socket auto-tuning policy.
 type CongestionControlDefinition struct {
 	// Name is the diagnostic name and, when registered, the process-registry key.
-	Name CongestionControl
+	Name string
 	// New creates one independent controller for the supplied connection.
 	New func(CongestionControlContext) CongestionController
 	// Features requests optional transport work for the controller.
@@ -129,7 +126,7 @@ func NewCongestionControlFactory(definition CongestionControlDefinition) (*Conge
 
 // Name returns the diagnostic name reported by TCPConnInfo. A nil factory has an
 // empty name and is not a valid connection policy.
-func (f *CongestionControlFactory) Name() CongestionControl {
+func (f *CongestionControlFactory) Name() string {
 	if f == nil {
 		return ""
 	}
@@ -164,8 +161,8 @@ func validateCongestionControlDefinition(definition CongestionControlDefinition)
 // congestionControlRegistry holds built-in and application-registered factories.
 var congestionControlRegistry = struct {
 	sync.RWMutex
-	factories map[CongestionControl]*CongestionControlFactory
-}{factories: map[CongestionControl]*CongestionControlFactory{
+	factories map[string]*CongestionControlFactory
+}{factories: map[string]*CongestionControlFactory{
 	CongestionControlCUBIC: mustCongestionControlFactory(CongestionControlDefinition{
 		Name:     CongestionControlCUBIC,
 		New:      func(CongestionControlContext) CongestionController { return newCUBICCongestionControl() },
@@ -226,9 +223,9 @@ func RegisterCongestionControl(factory *CongestionControlFactory) error {
 
 // AvailableCongestionControls returns the registered algorithm names in
 // lexical order. The returned slice is independent of the registry.
-func AvailableCongestionControls() []CongestionControl {
+func AvailableCongestionControls() []string {
 	congestionControlRegistry.RLock()
-	controls := make([]CongestionControl, 0, len(congestionControlRegistry.factories))
+	controls := make([]string, 0, len(congestionControlRegistry.factories))
 	for name := range congestionControlRegistry.factories {
 		controls = append(controls, name)
 	}
@@ -238,7 +235,7 @@ func AvailableCongestionControls() []CongestionControl {
 }
 
 // registeredCongestionControlFactory returns one stable registry entry.
-func registeredCongestionControlFactory(name CongestionControl) (*CongestionControlFactory, bool) {
+func registeredCongestionControlFactory(name string) (*CongestionControlFactory, bool) {
 	congestionControlRegistry.RLock()
 	factory, exists := congestionControlRegistry.factories[name]
 	congestionControlRegistry.RUnlock()

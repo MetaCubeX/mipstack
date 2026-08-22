@@ -343,14 +343,14 @@ func (l *testImpairedLink) Stats(direction int) testLinkDirectionStats {
 }
 
 // newTestTCPConnectionPair opens one client and server through an impaired link.
-func newTestTCPConnectionPair(t *testing.T, algorithm CongestionControl, conditions testLinkConditions) (*TCPConn, *TCPConn, *testImpairedLink) {
+func newTestTCPConnectionPair(t *testing.T, algorithm string, conditions testLinkConditions) (*TCPConn, *TCPConn, *testImpairedLink) {
 	return newTestTCPConnectionPairForAddresses(t, algorithm, conditions,
 		netip.MustParseAddr("192.0.2.201"), netip.MustParseAddr("192.0.2.202"))
 }
 
 // newTestTCPConnectionPairForAddresses opens one addressed client and server
 // through an impaired link.
-func newTestTCPConnectionPairForAddresses(t *testing.T, algorithm CongestionControl, conditions testLinkConditions, clientAddress, serverAddress netip.Addr) (*TCPConn, *TCPConn, *testImpairedLink) {
+func newTestTCPConnectionPairForAddresses(t *testing.T, algorithm string, conditions testLinkConditions, clientAddress, serverAddress netip.Addr) (*TCPConn, *TCPConn, *testImpairedLink) {
 	t.Helper()
 	client, server, link := newTestImpairedStackPair(t, algorithm, conditions, clientAddress, serverAddress)
 	network := "tcp6"
@@ -394,7 +394,7 @@ func newTestTCPConnectionPairForAddresses(t *testing.T, algorithm CongestionCont
 }
 
 // newTestImpairedStackPair constructs two addressed stacks around one link.
-func newTestImpairedStackPair(t *testing.T, algorithm CongestionControl, conditions testLinkConditions, clientAddress, serverAddress netip.Addr) (*Stack, *Stack, *testImpairedLink) {
+func newTestImpairedStackPair(t *testing.T, algorithm string, conditions testLinkConditions, clientAddress, serverAddress netip.Addr) (*Stack, *Stack, *testImpairedLink) {
 	t.Helper()
 	newStack := func(address netip.Addr) *Stack {
 		bits := 128

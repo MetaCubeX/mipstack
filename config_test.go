@@ -230,7 +230,7 @@ func TestCongestionControlConfiguration(t *testing.T) {
 	if defaults := stack.network.Load().tcpDefaults; defaults.CongestionControl != "" || defaults.CongestionControlFactory.Name() != CongestionControlCUBIC {
 		t.Fatalf("default congestion control = name %q factory %q, want factory %q", defaults.CongestionControl, defaults.CongestionControlFactory.Name(), CongestionControlCUBIC)
 	}
-	for _, algorithm := range []CongestionControl{CongestionControlCUBIC, CongestionControlReno, CongestionControlBBR, CongestionControlBBR3} {
+	for _, algorithm := range []string{CongestionControlCUBIC, CongestionControlReno, CongestionControlBBR, CongestionControlBBR3} {
 		if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{local}, TCP: TCPSocketDefaults{CongestionControl: algorithm}}); err != nil {
 			t.Fatalf("UpdateConfig(%q): %v", algorithm, err)
 		}

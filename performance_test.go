@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func benchmarkTCPControllerConnection(b *testing.B, algorithm CongestionControl) (net.Conn, *Stack, *stackBridge) {
+func benchmarkTCPControllerConnection(b *testing.B, algorithm string) (net.Conn, *Stack, *stackBridge) {
 	b.Helper()
 	clientAddress := netip.MustParseAddr("192.0.2.201")
 	serverAddress := netip.MustParseAddr("192.0.2.202")
@@ -77,7 +77,7 @@ func benchmarkTCPControllerConnection(b *testing.B, algorithm CongestionControl)
 
 func BenchmarkTCPControllerThroughput(b *testing.B) {
 	const size = 4 * 1024 * 1024
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		b.Run(string(algorithm), func(b *testing.B) {
 			connection, peer, bridge := benchmarkTCPControllerConnection(b, algorithm)
 			payload := bytes.Repeat([]byte{0x5a}, size)
@@ -134,7 +134,7 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 }
 
 func BenchmarkTCPControllerLatency(b *testing.B) {
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		b.Run(string(algorithm), func(b *testing.B) {
 			connection, _, _ := benchmarkTCPControllerConnection(b, algorithm)
 			_ = connection.SetDeadline(time.Now().Add(time.Minute))
@@ -153,7 +153,7 @@ func BenchmarkTCPControllerLatency(b *testing.B) {
 	}
 }
 
-func benchmarkTCPControllerConnections(b *testing.B, algorithm CongestionControl, count int) []net.Conn {
+func benchmarkTCPControllerConnections(b *testing.B, algorithm string, count int) []net.Conn {
 	b.Helper()
 	clientAddress := netip.MustParseAddr("192.0.2.211")
 	serverAddress := netip.MustParseAddr("192.0.2.212")
@@ -247,7 +247,7 @@ func benchmarkTCPControllerConnections(b *testing.B, algorithm CongestionControl
 
 func BenchmarkTCPControllerConcurrency(b *testing.B) {
 	const size = 128 * 1024
-	for _, algorithm := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		for _, count := range []int{16, 64, 256, 512, 1024, 2048, 4096} {
 			b.Run(fmt.Sprintf("%s-%d", algorithm, count), func(b *testing.B) {
 				connections := benchmarkTCPControllerConnections(b, algorithm, count)

@@ -184,7 +184,7 @@ func (h *tcpHyStart) onACK(acknowledgement, sendNext, acknowledged uint32, sampl
 // newTCPCongestionController constructs one per-connection controller from the
 // immutable registered factory. Invalid internal input retains CUBIC's
 // historical fallback; public configuration is validated before this point.
-func newTCPCongestionController(algorithm CongestionControl) tcpCongestionController {
+func newTCPCongestionController(algorithm string) tcpCongestionController {
 	factory, exists := registeredCongestionControlFactory(algorithm)
 	if !exists {
 		factory, _ = registeredCongestionControlFactory(CongestionControlCUBIC)
@@ -708,7 +708,7 @@ func (c *tcpCongestionController) onMTUChange(window, slowStartThreshold uint32,
 }
 
 // algorithmName reports the selected public algorithm identifier.
-func (c *tcpCongestionController) algorithmName() CongestionControl {
+func (c *tcpCongestionController) algorithmName() string {
 	return c.factory.Name()
 }
 

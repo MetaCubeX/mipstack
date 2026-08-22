@@ -17,8 +17,8 @@ var congestionAPITestName atomic.Uint64
 
 // nextCongestionAPITestName returns a process-unique registry name so tests
 // remain repeatable under go test -count without requiring unregister support.
-func nextCongestionAPITestName() CongestionControl {
-	return CongestionControl(fmt.Sprintf("mipstack-test-%d", congestionAPITestName.Add(1)))
+func nextCongestionAPITestName() string {
+	return fmt.Sprintf("mipstack-test-%d", congestionAPITestName.Add(1))
 }
 
 type congestionAPIRecorder struct {
@@ -157,7 +157,7 @@ func TestCongestionControlRegistry(t *testing.T) {
 	if !sort.SliceIsSorted(controls, func(i, j int) bool { return controls[i] < controls[j] }) {
 		t.Fatalf("available congestion controls are not sorted: %v", controls)
 	}
-	for _, builtin := range []CongestionControl{CongestionControlBBR, CongestionControlBBR3, CongestionControlCUBIC, CongestionControlReno} {
+	for _, builtin := range []string{CongestionControlBBR, CongestionControlBBR3, CongestionControlCUBIC, CongestionControlReno} {
 		index := sort.Search(len(controls), func(index int) bool { return controls[index] >= builtin })
 		if index == len(controls) || controls[index] != builtin {
 			t.Fatalf("built-in congestion control %q is unavailable: %v", builtin, controls)
@@ -746,7 +746,7 @@ func TestRegisteredCongestionControllerRunsOnTCPConnection(t *testing.T) {
 }
 
 func TestCongestionControllerIgnoresUnknownEvents(t *testing.T) {
-	for _, name := range []CongestionControl{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+	for _, name := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		controller := newTCPCongestionController(name)
 		before := controller.algorithm
 		state := CongestionState{CongestionWindow: 12345, DeliveredBytes: 6789}
