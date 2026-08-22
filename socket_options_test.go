@@ -156,7 +156,7 @@ func TestTCPCreationOptionsApplyToDialedAndAcceptedConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	if info := listener.Info(); info.AcceptQueueCapacity != 3 || info.SYNBacklogCapacity != 2 {
+	if info := listener.(*TCPListener).Info(); info.AcceptQueueCapacity != 3 || info.SYNBacklogCapacity != 2 {
 		t.Fatalf("listener creation policy = %+v", info)
 	}
 
@@ -174,7 +174,7 @@ func TestTCPCreationOptionsApplyToDialedAndAcceptedConnections(t *testing.T) {
 	}
 	dialed := dialedNet.(*TCPConn)
 	defer dialed.Close()
-	accepted, err := listener.AcceptTCP()
+	accepted, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestTCPCreationOptionsApplyToDialedAndAcceptedConnections(t *testing.T) {
 		}
 	}
 	check("dialed", dialed.Info(), 7002, 8002, clientKeepAlive, 900002, 0xa8, 0x23456)
-	check("accepted", accepted.Info(), 7001, 8001, keepAlive, 900001, 0xac, 0x12345)
+	check("accepted", accepted.(*TCPConn).Info(), 7001, 8001, keepAlive, 900001, 0xac, 0x12345)
 }
 
 func TestTCPListenerOverridesOnlyExplicitPolicies(t *testing.T) {
@@ -218,17 +218,17 @@ func TestTCPListenerOverridesOnlyExplicitPolicies(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clientConnection.Close()
-	accepted, err := listener.AcceptTCP()
+	accepted, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer accepted.Close()
-	info := accepted.Info()
+	info := accepted.(*TCPConn).Info()
 	if info.ReceiveBufferCapacity != 7777 || info.MaximumReceiveBuffer != 7777 || info.NoDelay ||
 		!info.KeepAlive || info.CongestionControl != CongestionControlBBR || info.MaximumPacingRate != 7654321 {
 		t.Fatalf("accepted policy after UpdateConfig = %+v", info)
 	}
-	if listenerInfo := listener.Info(); listenerInfo.AcceptQueueCapacity != 2 || listenerInfo.SYNBacklogCapacity != 1 {
+	if listenerInfo := listener.(*TCPListener).Info(); listenerInfo.AcceptQueueCapacity != 2 || listenerInfo.SYNBacklogCapacity != 1 {
 		t.Fatalf("listener policy changed with Stack defaults = %+v", listenerInfo)
 	}
 }
@@ -292,7 +292,7 @@ func TestDatagramCreationOptionsAndConfiguredDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ipConnection.Close()
-	if info := ipConnection.Info(); info.ReceiveQueueCapacity != ipDatagramMetadataSize || info.ReceiveErrors ||
+	if info := ipConnection.(*IPConn).Info(); info.ReceiveQueueCapacity != ipDatagramMetadataSize || info.ReceiveErrors ||
 		info.PathMTUDiscovery != PathMTUDiscoveryProbe || info.HopLimit != 0 || !info.Broadcast ||
 		info.MulticastHopLimit != 0 || !info.MulticastLoopback || info.TrafficClass != 0 || info.FlowLabel != 0 ||
 		!info.IPHeaderIncludedOnWrite || !info.IPHeaderIncludedOnRead {
@@ -393,7 +393,7 @@ func TestRawIPSocketOptionProtocolValidationDoesNotCreateEndpoint(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current, filterErr := ipv4.ICMPv4Filter(); filterErr != nil || !current.WillBlock(0) {
+	if current, filterErr := ipv4.(*IPConn).ICMPv4Filter(); filterErr != nil || !current.WillBlock(0) {
 		t.Fatalf("created IPv4 filter = %+v, %v", current, filterErr)
 	}
 	_ = ipv4.Close()
@@ -408,10 +408,10 @@ func TestRawIPSocketOptionProtocolValidationDoesNotCreateEndpoint(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer ipv6.Close()
-	if current, filterErr := ipv6.ICMPv6Filter(); filterErr != nil || !current.WillBlock(129) {
+	if current, filterErr := ipv6.(*IPConn).ICMPv6Filter(); filterErr != nil || !current.WillBlock(129) {
 		t.Fatalf("created IPv6 filter = %+v, %v", current, filterErr)
 	}
-	if enabled, offset, checksumErr := ipv6.IPv6Checksum(); checksumErr != nil || !enabled || offset != 2 {
+	if enabled, offset, checksumErr := ipv6.(*IPConn).IPv6Checksum(); checksumErr != nil || !enabled || offset != 2 {
 		t.Fatalf("unset ICMPv6 checksum default = %v/%d, %v", enabled, offset, checksumErr)
 	}
 }
@@ -638,8 +638,8 @@ func TestSocketOptionUnsetRestoresOperationDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !tcpListener.reuseAddress || tcpListener.reusePort {
-		t.Fatalf("unset TCP reuse policy = address:%v port:%v", tcpListener.reuseAddress, tcpListener.reusePort)
+	if !tcpListener.(*TCPListener).reuseAddress || tcpListener.(*TCPListener).reusePort {
+		t.Fatalf("unset TCP reuse policy = address:%v port:%v", tcpListener.(*TCPListener).reuseAddress, tcpListener.(*TCPListener).reusePort)
 	}
 	_ = tcpListener.Close()
 
@@ -664,7 +664,7 @@ func TestSocketOptionUnsetRestoresOperationDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ipConnection.Close()
-	if info := ipConnection.Info(); info.IPHeaderIncludedOnWrite || info.IPHeaderIncludedOnRead {
+	if info := ipConnection.(*IPConn).Info(); info.IPHeaderIncludedOnWrite || info.IPHeaderIncludedOnRead {
 		t.Fatalf("unset IP representation policy = %+v", info)
 	}
 }
@@ -685,8 +685,8 @@ func TestSocketOptionDefaultsOrderAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !defaultTCP.reuseAddress || defaultTCP.reusePort {
-		t.Fatalf("default TCP reuse policy = address:%v port:%v", defaultTCP.reuseAddress, defaultTCP.reusePort)
+	if !defaultTCP.(*TCPListener).reuseAddress || defaultTCP.(*TCPListener).reusePort {
+		t.Fatalf("default TCP reuse policy = address:%v port:%v", defaultTCP.(*TCPListener).reuseAddress, defaultTCP.(*TCPListener).reusePort)
 	}
 	_ = defaultTCP.Close()
 
@@ -695,11 +695,11 @@ func TestSocketOptionDefaultsOrderAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tcpListener.reuseAddress {
+	if tcpListener.(*TCPListener).reuseAddress {
 		t.Fatal("last TCP ReuseAddress option did not win")
 	}
 	tcpOptions[1] = SocketOptions.ReuseAddress(true)
-	if tcpListener.reuseAddress {
+	if tcpListener.(*TCPListener).reuseAddress {
 		t.Fatal("TCP listener retained the caller's option slice")
 	}
 	_ = tcpListener.Close()
@@ -738,15 +738,15 @@ func TestSocketOptionDefaultsOrderAndSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ipConnection.Close()
-	if info := ipConnection.Info(); !info.IPHeaderIncludedOnWrite || info.IPHeaderIncludedOnRead {
+	if info := ipConnection.(*IPConn).Info(); !info.IPHeaderIncludedOnWrite || info.IPHeaderIncludedOnRead {
 		t.Fatalf("ordered IP representation policy = %+v", info)
 	}
 	ipOptions[1] = SocketOptions.IPHeaderIncludedOnWrite(false)
-	if !ipConnection.Info().IPHeaderIncludedOnWrite {
+	if !ipConnection.(*IPConn).Info().IPHeaderIncludedOnWrite {
 		t.Fatal("IP socket retained the caller's option slice")
 	}
-	if err = ipConnection.SetIPHeaderIncludedOnWrite(false); err != nil || ipConnection.Info().IPHeaderIncludedOnWrite {
-		t.Fatalf("runtime IPHeaderIncludedOnWrite(false) = %+v, %v", ipConnection.Info(), err)
+	if err = ipConnection.(*IPConn).SetIPHeaderIncludedOnWrite(false); err != nil || ipConnection.(*IPConn).Info().IPHeaderIncludedOnWrite {
+		t.Fatalf("runtime IPHeaderIncludedOnWrite(false) = %+v, %v", ipConnection.(*IPConn).Info(), err)
 	}
 
 	dialedNet, err := (&Dialer{Options: []SocketOption{
@@ -781,7 +781,7 @@ func TestIPHeaderIncludedOnWriteSelectsErrorQueueRepresentationAtDelivery(t *tes
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	if err = connection.SetReceiveErrors(true); err != nil {
+	if err = connection.(*IPConn).SetReceiveErrors(true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -796,15 +796,15 @@ func TestIPHeaderIncludedOnWriteSelectsErrorQueueRepresentationAtDelivery(t *tes
 		QuotedPacket: packet, QuotedPayload: parsed.payload,
 	}
 
-	connection.deliverError(remote, networkError)
-	if err = connection.SetIPHeaderIncludedOnWrite(false); err != nil {
+	connection.(*IPConn).deliverError(remote, networkError)
+	if err = connection.(*IPConn).SetIPHeaderIncludedOnWrite(false); err != nil {
 		t.Fatal(err)
 	}
-	connection.deliverError(remote, networkError)
+	connection.(*IPConn).deliverError(remote, networkError)
 	for index, want := range [][]byte{packet, parsed.payload} {
 		buffer := make([]byte, len(packet))
 		messages := []SocketMessage{{Buffers: [][]byte{buffer}, OOB: make([]byte, 128)}}
-		if count, readErr := connection.ReadBatch(messages, MessageFlagErrorQueue); readErr != nil || count != 1 || !bytes.Equal(buffer[:messages[0].N], want) {
+		if count, readErr := connection.(*IPConn).ReadBatch(messages, MessageFlagErrorQueue); readErr != nil || count != 1 || !bytes.Equal(buffer[:messages[0].N], want) {
 			t.Fatalf("error queue representation %d = count %d payload %x, %v; want %x", index, count, buffer[:messages[0].N], readErr, want)
 		}
 	}
@@ -838,7 +838,7 @@ func TestIPHeaderIncludedOnWriteLinuxRepresentation(t *testing.T) {
 		copy(packet[20:24], []byte{1, 1, 0, 0})
 		copy(packet[24:], payload)
 		original := append([]byte(nil), packet...)
-		if n, writeErr := connection.WriteToIP(packet, ipNetAddr(routeTarget)); writeErr != nil || n != len(packet) {
+		if n, writeErr := connection.WriteTo(packet, ipNetAddr(routeTarget)); writeErr != nil || n != len(packet) {
 			t.Fatalf("header-included IPv4 write = %d, %v", n, writeErr)
 		}
 		if !bytes.Equal(packet, original) {
@@ -883,7 +883,7 @@ func TestIPHeaderIncludedOnWriteLinuxRepresentation(t *testing.T) {
 		copy(packet[24:40], local.AsSlice())
 		copy(packet[40:], payload)
 		original := append([]byte(nil), packet...)
-		if n, writeErr := connection.WriteToIP(packet, ipNetAddr(routeTarget)); writeErr != nil || n != len(packet) {
+		if n, writeErr := connection.WriteTo(packet, ipNetAddr(routeTarget)); writeErr != nil || n != len(packet) {
 			t.Fatalf("header-included IPv6 write = %d, %v", n, writeErr)
 		}
 		if !bytes.Equal(packet, original) {
@@ -922,7 +922,7 @@ func TestIPReceiveHeaderPreservesCompleteReassembledPacket(t *testing.T) {
 			t.Fatal(err)
 		}
 		buffer := make([]byte, 256)
-		n, source, readErr := connection.ReadFromIP(buffer)
+		n, source, readErr := connection.ReadFrom(buffer)
 		if readErr != nil || source.String() != remote.String() || !bytes.Equal(buffer[:n], packet) {
 			t.Fatalf("complete IPv4 options read = %d from %v, %v", n, source, readErr)
 		}
@@ -956,7 +956,7 @@ func TestIPReceiveHeaderPreservesCompleteReassembledPacket(t *testing.T) {
 			t.Fatal(err)
 		}
 		buffer := make([]byte, 256)
-		n, _, readErr := connection.ReadFromIP(buffer)
+		n, _, readErr := connection.ReadFrom(buffer)
 		if readErr != nil || !bytes.Equal(buffer[:n], packet) {
 			t.Fatalf("complete IPv6 extension read = %d, %v", n, readErr)
 		}
@@ -1002,7 +1002,7 @@ func TestIPReceiveHeaderPreservesCompleteReassembledPacket(t *testing.T) {
 				}
 			}
 			buffer := make([]byte, 65535)
-			n, _, readErr := connection.ReadFromIP(buffer)
+			n, _, readErr := connection.ReadFrom(buffer)
 			packet, ok := parseIPPacket(buffer[:n])
 			if readErr != nil || !ok || packet.source != test.remote || packet.target != test.local || packet.protocol != 99 || !bytes.Equal(packet.payload, payload) {
 				t.Fatalf("complete reassembled packet = %d bytes, %+v, parsed=%v, error=%v", n, packet, ok, readErr)

@@ -14,13 +14,27 @@ import (
 	"unsafe"
 )
 
-var _ func(*Stack, context.Context, string, netip.AddrPort, netip.AddrPort) (net.Conn, error) = (*Stack).DialTCP
-var _ func(*Stack, context.Context, string, netip.AddrPort, netip.AddrPort) (net.Conn, error) = (*Stack).DialUDP
-var _ func(*Stack, context.Context, string, netip.Addr, netip.Addr) (net.Conn, error) = (*Stack).DialIP
-var _ func(*Stack, context.Context, string, netip.AddrPort) (*TCPListener, error) = (*Stack).ListenTCP
-var _ func(*Stack, context.Context, string, netip.AddrPort) (net.PacketConn, error) = (*Stack).ListenUDP
-var _ func(*ListenConfig, context.Context, *Stack, string, netip.AddrPort) (*TCPListener, error) = (*ListenConfig).ListenTCP
-var _ func(*ListenConfig, context.Context, *Stack, string, netip.AddrPort) (net.PacketConn, error) = (*ListenConfig).ListenUDP
+var _ interface {
+	DialTCP(ctx context.Context, network string, source, remote netip.AddrPort) (net.Conn, error)
+	DialUDP(ctx context.Context, network string, source, remote netip.AddrPort) (net.Conn, error)
+	DialIP(ctx context.Context, network string, source, remote netip.Addr) (net.Conn, error)
+	ListenTCP(ctx context.Context, network string, local netip.AddrPort) (net.Listener, error)
+	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
+	ListenIP(ctx context.Context, network string, local netip.Addr) (net.PacketConn, error)
+	ListenMulticastUDP(ctx context.Context, network string, group netip.AddrPort) (*UDPConn, error)
+} = (*Stack)(nil)
+
+var _ interface {
+	ListenTCP(ctx context.Context, stack *Stack, network string, local netip.AddrPort) (net.Listener, error)
+	ListenUDP(ctx context.Context, stack *Stack, network string, local netip.AddrPort) (net.PacketConn, error)
+	ListenIP(ctx context.Context, stack *Stack, network string, local netip.Addr) (net.PacketConn, error)
+} = (*ListenConfig)(nil)
+
+var _ interface {
+	DialTCP(ctx context.Context, stack *Stack, network string, source, remote netip.AddrPort) (net.Conn, error)
+	DialUDP(ctx context.Context, stack *Stack, network string, source, remote netip.AddrPort) (net.Conn, error)
+	DialIP(ctx context.Context, stack *Stack, network string, source, remote netip.Addr) (net.Conn, error)
+} = (*Dialer)(nil)
 
 func TestStackReadCompletedPacketWinsCloseRace(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.249")
@@ -321,19 +335,59 @@ func TestListenValidationPrecedesLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	if _, err = stack.ListenTCP(context.Background(), "udp", netip.AddrPort{}); err == nil {
+	listener, err := stack.ListenTCP(context.Background(), "udp", netip.AddrPort{})
+	if err == nil {
 		t.Fatal("ListenTCP accepted an invalid network before Start")
 	} else {
+		if listener != nil {
+			t.Fatalf("ListenTCP error returned non-nil listener %T", listener)
+		}
 		var unknown net.UnknownNetworkError
 		if !errors.As(err, &unknown) {
 			t.Fatalf("invalid network error = %v, want net.UnknownNetworkError", err)
 		}
 	}
-	if _, err = stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(netip.IPv6Unspecified(), 0)); !errors.Is(err, syscall.EAFNOSUPPORT) {
+	packet, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(netip.IPv6Unspecified(), 0))
+	if !errors.Is(err, syscall.EAFNOSUPPORT) {
 		t.Fatalf("mismatched listen family error = %v, want EAFNOSUPPORT", err)
+	} else if packet != nil {
+		t.Fatalf("ListenUDP error returned non-nil packet connection %T", packet)
 	}
-	if _, err = stack.ListenTCP(context.Background(), "tcp", netip.AddrPort{}); !errors.Is(err, ErrNotStarted) {
+	listener, err = stack.ListenTCP(context.Background(), "tcp", netip.AddrPort{})
+	if !errors.Is(err, ErrNotStarted) {
 		t.Fatalf("valid listen before Start error = %v, want ErrNotStarted", err)
+	} else if listener != nil {
+		t.Fatalf("ListenTCP before Start returned non-nil listener %T", listener)
+	}
+}
+
+func TestListenErrorsReturnNilResults(t *testing.T) {
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	packet, err := stack.ListenIP(context.Background(), "tcp", netip.Addr{})
+	if err == nil || packet != nil {
+		t.Fatalf("ListenIP invalid network = %T, %v; want nil, error", packet, err)
+	}
+	multicastConnection, err := stack.ListenMulticastUDP(context.Background(), "udp4", netip.MustParseAddrPort("192.0.2.1:5353"))
+	if !errors.Is(err, syscall.EINVAL) || multicastConnection != nil {
+		t.Fatalf("ListenMulticastUDP invalid group = %T, %v; want nil, EINVAL", multicastConnection, err)
+	}
+
+	listener, err := (*ListenConfig)(nil).ListenTCP(context.Background(), nil, "tcp", netip.AddrPort{})
+	if err == nil || listener != nil {
+		t.Fatalf("ListenConfig.ListenTCP nil stack = %T, %v; want nil, error", listener, err)
+	}
+	packet, err = (*ListenConfig)(nil).ListenUDP(context.Background(), nil, "udp", netip.AddrPort{})
+	if err == nil || packet != nil {
+		t.Fatalf("ListenConfig.ListenUDP nil stack = %T, %v; want nil, error", packet, err)
+	}
+	packet, err = (*ListenConfig)(nil).ListenIP(context.Background(), nil, "ip:99", netip.Addr{})
+	if err == nil || packet != nil {
+		t.Fatalf("ListenConfig.ListenIP nil stack = %T, %v; want nil, error", packet, err)
 	}
 }
 
@@ -380,16 +434,16 @@ func TestListenNetworkWildcardNormalization(t *testing.T) {
 	}
 	defer tcpListener.Close()
 	tcpLocal := tcpListener.Addr().(*net.TCPAddr).AddrPort()
-	if !tcpLocal.Addr().Is6() || !tcpLocal.Addr().IsUnspecified() || !tcpListener.dual {
-		t.Fatalf("generic TCP wildcard = %v, dual = %v", tcpLocal, tcpListener.dual)
+	if !tcpLocal.Addr().Is6() || !tcpLocal.Addr().IsUnspecified() || !tcpListener.(*TCPListener).dual {
+		t.Fatalf("generic TCP wildcard = %v, dual = %v", tcpLocal, tcpListener.(*TCPListener).dual)
 	}
 	stack.mu.RLock()
 	passive := stack.tcpPassive.(*tcpPassiveState)
 	lookup4 := passive.listener(netip.AddrPortFrom(local4, tcpLocal.Port()), netip.AddrPort{})
 	lookup6 := passive.listener(netip.AddrPortFrom(local6, tcpLocal.Port()), netip.AddrPort{})
 	stack.mu.RUnlock()
-	if lookup4 != tcpListener || lookup6 != tcpListener {
-		t.Fatalf("dual TCP lookup = %p/%p, want %p", lookup4, lookup6, tcpListener)
+	if lookup4 != tcpListener.(*TCPListener) || lookup6 != tcpListener.(*TCPListener) {
+		t.Fatalf("dual TCP lookup = %p/%p, want %p", lookup4, lookup6, tcpListener.(*TCPListener))
 	}
 
 	udpConnection, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(netip.Addr{}, 46000))
@@ -423,8 +477,8 @@ func TestListenNetworkWildcardNormalization(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tcp6.Close()
-	if tcp6.dual || tcp6.Addr().(*net.TCPAddr).AddrPort() != netip.AddrPortFrom(netip.IPv6Unspecified(), 46001) {
-		t.Fatalf("tcp6 wildcard = %v, dual = %v", tcp6.Addr(), tcp6.dual)
+	if tcp6.(*TCPListener).dual || tcp6.Addr().(*net.TCPAddr).AddrPort() != netip.AddrPortFrom(netip.IPv6Unspecified(), 46001) {
+		t.Fatalf("tcp6 wildcard = %v, dual = %v", tcp6.Addr(), tcp6.(*TCPListener).dual)
 	}
 	udp4, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(netip.Addr{}, 46002))
 	if err != nil {
@@ -1002,7 +1056,7 @@ func TestPendingReadDeadlineUpdates(t *testing.T) {
 			n, _, readErr := ipConnection.ReadFrom(make([]byte, 1))
 			return n, readErr
 		}},
-		{name: "TCP accept", set: listener.SetDeadline, operation: func() (int, error) {
+		{name: "TCP accept", set: listener.(*TCPListener).SetDeadline, operation: func() (int, error) {
 			_, acceptErr := listener.Accept()
 			return 0, acceptErr
 		}},
@@ -1084,7 +1138,7 @@ func TestExpiredDeadlinePrecedesQueuedIO(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer connection.Close()
-		connection.enqueuePacket(ipPacket{payload: []byte("i"), source: remote, target: local}, ipPacketOptions{})
+		connection.(*IPConn).enqueuePacket(ipPacket{payload: []byte("i"), source: remote, target: local}, ipPacketOptions{})
 		if err = connection.SetReadDeadline(past); err != nil {
 			t.Fatal(err)
 		}
@@ -1107,19 +1161,19 @@ func TestExpiredDeadlinePrecedesQueuedIO(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer listener.Close()
-		client, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, listener.local)
+		client, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, listener.(*TCPListener).local)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer client.Close()
-		waitFor(t, time.Second, func() bool { return listener.Info().AcceptQueueConnections == 1 })
-		if err = listener.SetDeadline(past); err != nil {
+		waitFor(t, time.Second, func() bool { return listener.(*TCPListener).Info().AcceptQueueConnections == 1 })
+		if err = listener.(*TCPListener).SetDeadline(past); err != nil {
 			t.Fatal(err)
 		}
 		if connection, acceptErr := listener.Accept(); connection != nil || !errors.Is(acceptErr, os.ErrDeadlineExceeded) {
 			t.Fatalf("expired TCP Accept = %v, %v", connection, acceptErr)
 		}
-		if err = listener.SetDeadline(time.Time{}); err != nil {
+		if err = listener.(*TCPListener).SetDeadline(time.Time{}); err != nil {
 			t.Fatal(err)
 		}
 		server, err := listener.Accept()

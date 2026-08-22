@@ -1730,7 +1730,7 @@ func TestIPConnPathMTUAndICMPCorrelation(t *testing.T) {
 			}
 			defer connection.Close()
 			payload := bytes.Repeat([]byte{0x5a}, 256)
-			if _, err = connection.WriteToIP(payload, ipNetAddr(test.remote)); err != nil {
+			if _, err = connection.WriteTo(payload, ipNetAddr(test.remote)); err != nil {
 				t.Fatal(err)
 			}
 			original := readOutboundPacket(t, stack)
@@ -1761,7 +1761,7 @@ func TestIPConnPathMTUAndICMPCorrelation(t *testing.T) {
 			if unknown := stack.mtuFor(test.unknown); unknown != 1400 {
 				t.Fatalf("unmatched target PMTU = %d, want 1400", unknown)
 			}
-			info := connection.Info()
+			info := connection.(*IPConn).Info()
 			if info.ICMPErrors != 1 || info.LastError == nil || info.PathMTU != 0 {
 				t.Fatalf("IP socket diagnostics = %+v", info)
 			}
@@ -1893,7 +1893,7 @@ func TestIPConnICMPErrorDoesNotRequireTransportHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	if _, err = connection.WriteToIP([]byte{1, 2, 3, 4}, ipNetAddr(remote)); err != nil {
+	if _, err = connection.WriteTo([]byte{1, 2, 3, 4}, ipNetAddr(remote)); err != nil {
 		t.Fatal(err)
 	}
 	original := readOutboundPacket(t, stack)

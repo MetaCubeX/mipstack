@@ -241,12 +241,12 @@ func TestIPSocketOptionsInterop(t *testing.T) {
 				t.Fatalf("write gVisor raw request: n=%d, error=%s", written, tcpipErrorString(writeErr))
 			}
 			storage := make([]byte, 256)
-			read, source, err := connection.ReadFromIP(storage)
+			read, source, err := connection.ReadFrom(storage)
 			if err != nil || !bytes.Equal(storage[:read], request) {
 				t.Fatalf("read mipstack raw request: n=%d source=%v error=%v", read, source, err)
 			}
 			response := []byte("socket-option-raw-response")
-			if written, writeErr := connection.WriteToIP(response, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(response) {
+			if written, writeErr := connection.WriteTo(response, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(response) {
 				t.Fatalf("write mipstack raw response: n=%d error=%v", written, writeErr)
 			}
 			select {
@@ -263,7 +263,7 @@ func TestIPSocketOptionsInterop(t *testing.T) {
 			if err != nil || !bytes.Equal(payload, response) {
 				t.Fatalf("read gVisor raw response: payload=%x error=%v", payload, err)
 			}
-			info := connection.Info()
+			info := connection.(*mipstack.IPConn).Info()
 			if info.ReceiveQueueCapacity != 24*1024 || !info.ReceiveErrors || info.PathMTUDiscovery != mipstack.PathMTUDiscoveryWant ||
 				info.HopLimit != 41 || info.Broadcast || info.MulticastHopLimit != 3 || info.MulticastLoopback ||
 				info.TrafficClass != 0xb8 || info.FlowLabel != flowLabel {

@@ -36,12 +36,12 @@ func TestTCPListenerAcceptAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clientConnection.Close()
-	serverConnection, err := listener.AcceptTCP()
+	serverConnection, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer serverConnection.Close()
-	listenerInfo := listener.Info()
+	listenerInfo := listener.(*TCPListener).Info()
 	if listenerInfo.LocalAddress != serverEndpoint || listenerInfo.Closed || listenerInfo.AcceptQueueConnections != 0 ||
 		listenerInfo.SYNBacklogConnections != 0 || listenerInfo.AcceptQueueCapacity == 0 || listenerInfo.SYNBacklogCapacity == 0 ||
 		listenerInfo.AcceptQueuePeak > 1 || listenerInfo.SYNBacklogPeak != 1 || listenerInfo.SYNsReceived != 1 ||
@@ -60,7 +60,7 @@ func TestTCPListenerAcceptAndClose(t *testing.T) {
 	if err = listener.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if closedInfo := listener.Info(); !closedInfo.Closed || closedInfo.AcceptedConnections != 1 ||
+	if closedInfo := listener.(*TCPListener).Info(); !closedInfo.Closed || closedInfo.AcceptedConnections != 1 ||
 		closedInfo.AcceptQueueCapacity != listenerInfo.AcceptQueueCapacity || closedInfo.SYNBacklogCapacity != listenerInfo.SYNBacklogCapacity {
 		t.Fatalf("closed listener diagnostics = %+v", closedInfo)
 	}
@@ -81,7 +81,7 @@ func TestTCPListenerAcceptAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer deadlineListener.Close()
-	if err = deadlineListener.SetDeadline(time.Now()); err != nil {
+	if err = deadlineListener.(*TCPListener).SetDeadline(time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = deadlineListener.Accept(); !errors.Is(err, os.ErrDeadlineExceeded) {
@@ -244,7 +244,7 @@ func TestTCPConnectionInfo(t *testing.T) {
 		t.Fatal(err)
 	}
 	clientConnection := connection.(*TCPConn)
-	serverConnection, err := listener.AcceptTCP()
+	serverConnection, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -519,7 +519,7 @@ func TestTCPReaderFromWriterToAndMultipathQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	server, err := listener.AcceptTCP()
+	server, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +533,7 @@ func TestTCPReaderFromWriterToAndMultipathQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	var received bytes.Buffer
-	n, err = server.WriteTo(&received)
+	n, err = server.(*TCPConn).WriteTo(&received)
 	if err != nil || n != int64(len(payload)) || received.String() != payload {
 		t.Fatalf("WriteTo = %d bytes, %v, content match = %v", n, err, received.String() == payload)
 	}
@@ -696,7 +696,7 @@ func TestTCPListenerIPv6WildcardAndBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clientConnection.Close()
-	serverConnection, err := listener.AcceptTCP()
+	serverConnection, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6098,13 +6098,13 @@ func TestTCPPassiveHandshakeInfoAndFailure(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for passive SYN-ACK")
 	}
-	listener.mu.Lock()
+	listener.(*TCPListener).mu.Lock()
 	var connection *TCPConn
-	for candidate := range listener.handshaking {
+	for candidate := range listener.(*TCPListener).handshaking {
 		connection = candidate
 		break
 	}
-	listener.mu.Unlock()
+	listener.(*TCPListener).mu.Unlock()
 	if connection == nil {
 		t.Fatal("passive handshake was not tracked")
 	}
@@ -6120,8 +6120,8 @@ func TestTCPPassiveHandshakeInfoAndFailure(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("passive handshake remained active after listener close")
 	}
-	waitFor(t, time.Second, func() bool { return listener.Info().HandshakeFailures == 1 })
-	closed := listener.Info()
+	waitFor(t, time.Second, func() bool { return listener.(*TCPListener).Info().HandshakeFailures == 1 })
+	closed := listener.(*TCPListener).Info()
 	if closed.HandshakeTimeouts != 0 || closed.HandshakeFailures != 1 {
 		t.Fatalf("aborted passive handshake diagnostics = %+v", closed)
 	}
@@ -6409,11 +6409,11 @@ func TestTCPConnectionChurnUnderImpairment(t *testing.T) {
 	endpoint := listener.Addr().(*net.TCPAddr).AddrPort()
 	const waves, flows = 3, 8
 	for wave := 0; wave < waves; wave++ {
-		accepted := make(chan *TCPConn, flows)
+		accepted := make(chan net.Conn, flows)
 		acceptError := make(chan error, 1)
 		go func() {
 			for flow := 0; flow < flows; flow++ {
-				connection, acceptErr := listener.AcceptTCP()
+				connection, acceptErr := listener.Accept()
 				if acceptErr != nil {
 					acceptError <- acceptErr
 					return
@@ -6452,7 +6452,7 @@ func TestTCPConnectionChurnUnderImpairment(t *testing.T) {
 			select {
 			case connection := <-accepted:
 				port := connection.RemoteAddr().(*net.TCPAddr).AddrPort().Port()
-				servers[port] = connection
+				servers[port] = connection.(*TCPConn)
 			case err = <-acceptError:
 				t.Fatal(err)
 			case <-acceptDeadline:
@@ -6481,7 +6481,7 @@ func TestTCPConnectionChurnUnderImpairment(t *testing.T) {
 			_ = server.Close()
 		}
 	}
-	info := listener.Info()
+	info := listener.(*TCPListener).Info()
 	if info.AcceptedConnections != waves*flows || info.HandshakeCompletions != waves*flows {
 		t.Fatalf("listener churn diagnostics = %+v", info)
 	}

@@ -129,10 +129,10 @@ func TestPublicLocalCongestionControlFactoryConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	accepted := make(chan *mipstack.TCPConn, 1)
+	accepted := make(chan net.Conn, 1)
 	acceptErrors := make(chan error, 1)
 	go func() {
-		connection, acceptErr := listener.AcceptTCP()
+		connection, acceptErr := listener.Accept()
 		if acceptErr != nil {
 			acceptErrors <- acceptErr
 			return
@@ -146,7 +146,7 @@ func TestPublicLocalCongestionControlFactoryConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clientConnection.Close()
-	var serverConnection *mipstack.TCPConn
+	var serverConnection net.Conn
 	select {
 	case serverConnection = <-accepted:
 		defer serverConnection.Close()
@@ -180,7 +180,7 @@ func TestPublicLocalCongestionControlFactoryConnection(t *testing.T) {
 			t.Fatal(ctx.Err())
 		}
 	}
-	if !seenActive || !seenPassive || clientConnection.(*mipstack.TCPConn).Info().CongestionControl != name || serverConnection.Info().CongestionControl != name {
+	if !seenActive || !seenPassive || clientConnection.(*mipstack.TCPConn).Info().CongestionControl != name || serverConnection.(*mipstack.TCPConn).Info().CongestionControl != name {
 		t.Fatalf("local factory contexts active/passive = %t/%t", seenActive, seenPassive)
 	}
 }

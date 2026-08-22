@@ -3,6 +3,7 @@ package mipstack
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"sort"
 	"sync"
@@ -300,21 +301,21 @@ func TestLocalCongestionControlFactoryConnectionContexts(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	accepted := make(chan *TCPConn, 1)
+	accepted := make(chan net.Conn, 1)
 	acceptErrors := make(chan error, 1)
 	go func() {
-		connection, acceptErr := listener.AcceptTCP()
+		connection, acceptErr := listener.Accept()
 		if acceptErr != nil {
 			acceptErrors <- acceptErr
 			return
 		}
 		accepted <- connection
 	}()
-	clientConnection, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, listener.local)
+	clientConnection, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, listener.(*TCPListener).local)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var serverConnection *TCPConn
+	var serverConnection net.Conn
 	select {
 	case serverConnection = <-accepted:
 	case err = <-acceptErrors:
@@ -336,10 +337,10 @@ func TestLocalCongestionControlFactoryConnectionContexts(t *testing.T) {
 	for _, context := range contexts {
 		switch {
 		case context.LocalAddress.Addr() == clientAddress:
-			if context.RemoteAddress != listener.local || context.Passive || context.Forwarded {
+			if context.RemoteAddress != listener.(*TCPListener).local || context.Passive || context.Forwarded {
 				t.Fatalf("active factory context = %+v", context)
 			}
-		case context.LocalAddress == listener.local:
+		case context.LocalAddress == listener.(*TCPListener).local:
 			if context.RemoteAddress != clientConnection.(*TCPConn).key.local || !context.Passive || context.Forwarded {
 				t.Fatalf("passive factory context = %+v", context)
 			}
@@ -353,7 +354,7 @@ func TestLocalCongestionControlFactoryConnectionContexts(t *testing.T) {
 	if err = server.Close(); err != nil {
 		t.Fatal(err)
 	}
-	for _, connection := range []*TCPConn{clientConnection.(*TCPConn), serverConnection} {
+	for _, connection := range []*TCPConn{clientConnection.(*TCPConn), serverConnection.(*TCPConn)} {
 		select {
 		case <-connection.done:
 		case <-time.After(time.Second):

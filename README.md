@@ -293,6 +293,14 @@ MIPS provides:
 - exported `TCPConn`, `TCPListener`, `UDPConn`, and `IPConn` implementations of the
   corresponding standard `net` interfaces.
 
+The `Stack` dial methods and their `Dialer` counterparts return `net.Conn`.
+`Stack.ListenTCP` and `ListenConfig.ListenTCP` return `net.Listener`, while
+ordinary UDP and IP listen methods return `net.PacketConn`. Their dynamic types
+are `*TCPConn`, `*TCPListener`, `*UDPConn`, and `*IPConn` as appropriate, and
+`TCPListener.Accept` returns a `net.Conn` with dynamic type `*TCPConn`. Callers
+only need a type assertion when using MIPS-specific extensions.
+`ListenMulticastUDP` returns `*UDPConn`.
+
 The zero-value `ListenConfig` and `Dialer` mirror the creation-time policy
 pattern used by `net.ListenConfig` and `net.Dialer`. Their `Options` slices are
 read in order and are not retained. `SocketOptions` constructs sealed,

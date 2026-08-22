@@ -3104,18 +3104,19 @@ type TCPListener struct {
 
 // ListenTCP creates a passive TCP endpoint. Network must be tcp, tcp4, or
 // tcp6. A wildcard with tcp uses one dual-stack endpoint when both families
-// are configured. Port zero selects an automatic port.
-func (s *Stack) ListenTCP(ctx context.Context, network string, local netip.AddrPort) (*TCPListener, error) {
+// are configured. Port zero selects an automatic port. The returned
+// net.Listener has dynamic type *TCPListener.
+func (s *Stack) ListenTCP(ctx context.Context, network string, local netip.AddrPort) (net.Listener, error) {
 	return s.listenTCP(ctx, network, local, exclusiveTCPListenerBinding{reuseAddress: true}, tcpSocketOptionSet{})
 }
 
 // listenTCP contains validation, automatic port allocation, and listener
 // construction shared by the ordinary and optional REUSEPORT entry points.
-func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrPort, binding tcpListenerBinding, options tcpSocketOptionSet) (*TCPListener, error) {
+func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrPort, binding tcpListenerBinding, options tcpSocketOptionSet) (net.Listener, error) {
 	address := local.Addr().Unmap()
 	local = netip.AddrPortFrom(address, local.Port())
 	target := net.TCPAddrFromAddrPort(local)
-	wrap := func(err error) (*TCPListener, error) {
+	wrap := func(err error) (net.Listener, error) {
 		return nil, socketOperationError("listen", network, nil, target, err)
 	}
 	if err := validateListenNetwork(network, "tcp", address); err != nil {
@@ -3360,15 +3361,6 @@ func (state *tcpPassiveState) remove(listener *TCPListener) bool {
 
 // Accept waits for and returns the next completed passive connection.
 func (l *TCPListener) Accept() (net.Conn, error) {
-	connection, err := l.AcceptTCP()
-	if err != nil {
-		return nil, err
-	}
-	return connection, nil
-}
-
-// AcceptTCP waits for and returns the next completed passive connection.
-func (l *TCPListener) AcceptTCP() (*TCPConn, error) {
 	l.mu.Lock()
 	select {
 	case <-l.closed:

@@ -2593,7 +2593,8 @@ func (s *Stack) tcpPortListenedLocked(local netip.Addr, port uint16) bool {
 
 // ListenUDP binds an unconnected UDP packet socket. Network must be udp, udp4,
 // or udp6. A wildcard with udp uses one dual-stack endpoint when both families
-// are configured. Port zero selects an automatic port.
+// are configured. Port zero selects an automatic port. The returned
+// net.PacketConn has dynamic type *UDPConn.
 func (s *Stack) ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error) {
 	return s.listenUDP(ctx, network, local, exclusiveUDPSocketBinding{}, datagramSocketOptionSet{})
 }

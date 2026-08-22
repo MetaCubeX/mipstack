@@ -659,10 +659,10 @@ func TestTCPAlgorithmsShareBottleneckWithoutStarvation(t *testing.T) {
 			clients := make([]*TCPConn, flows)
 			servers := make([]*TCPConn, flows)
 			for flow := 0; flow < flows; flow++ {
-				accepted := make(chan *TCPConn, 1)
+				accepted := make(chan net.Conn, 1)
 				acceptError := make(chan error, 1)
 				go func() {
-					connection, acceptErr := listener.AcceptTCP()
+					connection, acceptErr := listener.Accept()
 					if acceptErr != nil {
 						acceptError <- acceptErr
 						return
@@ -677,7 +677,8 @@ func TestTCPAlgorithmsShareBottleneckWithoutStarvation(t *testing.T) {
 				}
 				clients[flow] = connection.(*TCPConn)
 				select {
-				case servers[flow] = <-accepted:
+				case connection := <-accepted:
+					servers[flow] = connection.(*TCPConn)
 				case acceptErr := <-acceptError:
 					t.Fatal(acceptErr)
 				case <-time.After(10 * time.Second):
@@ -895,10 +896,10 @@ func openTestDeviceBottleneckTCPFlows(t testing.TB, client, server *Stack, flows
 	clients := make([]*TCPConn, flows)
 	servers := make([]*TCPConn, flows)
 	for flow := 0; flow < flows; flow++ {
-		accepted := make(chan *TCPConn, 1)
+		accepted := make(chan net.Conn, 1)
 		acceptError := make(chan error, 1)
 		go func() {
-			connection, acceptErr := listener.AcceptTCP()
+			connection, acceptErr := listener.Accept()
 			if acceptErr != nil {
 				acceptError <- acceptErr
 				return
@@ -913,7 +914,8 @@ func openTestDeviceBottleneckTCPFlows(t testing.TB, client, server *Stack, flows
 		}
 		clients[flow] = connection.(*TCPConn)
 		select {
-		case servers[flow] = <-accepted:
+		case connection := <-accepted:
+			servers[flow] = connection.(*TCPConn)
 		case acceptErr := <-acceptError:
 			t.Fatal(acceptErr)
 		case <-time.After(5 * time.Second):

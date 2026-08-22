@@ -45,7 +45,7 @@ func TestTCPReusePortFlowSelectionAndRebind(t *testing.T) {
 	}
 
 	var clients []net.Conn
-	var accepted []*TCPConn
+	var accepted []net.Conn
 	for listener, port := range ports {
 		connection, dialErr := client.DialTCP(context.Background(), "tcp4", netip.AddrPortFrom(clientAddress, port), local)
 		if dialErr != nil {
@@ -55,7 +55,7 @@ func TestTCPReusePortFlowSelectionAndRebind(t *testing.T) {
 		if deadlineErr := listener.SetDeadline(time.Now().Add(time.Second)); deadlineErr != nil {
 			t.Fatal(deadlineErr)
 		}
-		serverConnection, acceptErr := listener.AcceptTCP()
+		serverConnection, acceptErr := listener.Accept()
 		if acceptErr != nil {
 			t.Fatal(acceptErr)
 		}
@@ -331,7 +331,7 @@ func TestTCPReuseAddressDisabledPreventsLiveConnectionRebind(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clientConnection.Close()
-	serverConnection, err := listener.AcceptTCP()
+	serverConnection, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +363,7 @@ func TestTCPReusePortOnlyAllowsLiveConnectionRebind(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clientConnection.Close()
-	serverConnection, err := listener.AcceptTCP()
+	serverConnection, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,8 +452,8 @@ func TestReusePortConfigInvalidationClosesGroups(t *testing.T) {
 	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(retained, 32)}}); err != nil {
 		t.Fatal(err)
 	}
-	for index, listener := range []*TCPListener{tcpFirst, tcpSecond} {
-		if !listener.Info().Closed {
+	for index, listener := range []net.Listener{tcpFirst, tcpSecond} {
+		if !listener.(*TCPListener).Info().Closed {
 			t.Fatalf("TCP REUSEPORT listener %d remained open", index)
 		}
 		if _, acceptErr := listener.Accept(); !errors.Is(acceptErr, net.ErrClosed) {

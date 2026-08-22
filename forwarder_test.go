@@ -151,7 +151,7 @@ func TestTCPForwarderInterceptsNonlocalDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	_ = listener.SetDeadline(time.Now().Add(50 * time.Millisecond))
+	_ = listener.(*TCPListener).SetDeadline(time.Now().Add(50 * time.Millisecond))
 
 	type acceptResult struct {
 		connection *TCPConn
@@ -188,7 +188,7 @@ func TestTCPForwarderInterceptsNonlocalDestination(t *testing.T) {
 	if got := serverConnection.LocalAddr().(*net.TCPAddr).AddrPort(); got != netip.AddrPortFrom(intercepted, 8080) {
 		t.Fatalf("forwarded TCP local address = %v", got)
 	}
-	if _, err = listener.AcceptTCP(); !errors.Is(err, os.ErrDeadlineExceeded) {
+	if _, err = listener.Accept(); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("ordinary wildcard listener accepted nonlocal flow: %v", err)
 	}
 	localClient, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, netip.AddrPortFrom(serverAddress, 8080))
@@ -196,8 +196,8 @@ func TestTCPForwarderInterceptsNonlocalDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer localClient.Close()
-	_ = listener.SetDeadline(time.Now().Add(time.Second))
-	localServer, err := listener.AcceptTCP()
+	_ = listener.(*TCPListener).SetDeadline(time.Now().Add(time.Second))
+	localServer, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}

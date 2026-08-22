@@ -362,10 +362,10 @@ func newTestTCPConnectionPairForAddresses(t *testing.T, algorithm CongestionCont
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	accepted := make(chan *TCPConn, 1)
+	accepted := make(chan net.Conn, 1)
 	acceptError := make(chan error, 1)
 	go func() {
-		connection, acceptErr := listener.AcceptTCP()
+		connection, acceptErr := listener.Accept()
 		if acceptErr != nil {
 			acceptError <- acceptErr
 			return
@@ -384,7 +384,7 @@ func newTestTCPConnectionPairForAddresses(t *testing.T, algorithm CongestionCont
 			_ = connection.Close()
 			_ = serverConnection.Close()
 		})
-		return connection.(*TCPConn), serverConnection, link
+		return connection.(*TCPConn), serverConnection.(*TCPConn), link
 	case err = <-acceptError:
 		t.Fatal(err)
 	case <-ctx.Done():

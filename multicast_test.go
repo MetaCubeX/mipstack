@@ -918,7 +918,7 @@ func TestMulticastRawSocketAndNoBroadcastAmplification(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	if err = raw.JoinGroup(group); err != nil {
+	if err = raw.(*IPConn).JoinGroup(group); err != nil {
 		t.Fatal(err)
 	}
 	drainMulticastTestOutput(stack)
@@ -929,7 +929,7 @@ func TestMulticastRawSocketAndNoBroadcastAmplification(t *testing.T) {
 		t.Fatal(err)
 	}
 	buffer := make([]byte, 64)
-	n, source, err := raw.ReadFromIP(buffer)
+	n, source, err := raw.ReadFrom(buffer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -969,69 +969,69 @@ func TestRawIPMulticastMembershipAndSocketOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if broadcast, err := raw.Broadcast(); err != nil || !broadcast {
+	if broadcast, err := raw.(*IPConn).Broadcast(); err != nil || !broadcast {
 		t.Fatalf("raw Broadcast() = %t, %v", broadcast, err)
 	}
-	if hopLimit, err := raw.MulticastHopLimit(); err != nil || hopLimit != 1 {
+	if hopLimit, err := raw.(*IPConn).MulticastHopLimit(); err != nil || hopLimit != 1 {
 		t.Fatalf("raw MulticastHopLimit() = %d, %v", hopLimit, err)
 	}
-	if loopback, err := raw.MulticastLoopback(); err != nil || !loopback {
+	if loopback, err := raw.(*IPConn).MulticastLoopback(); err != nil || !loopback {
 		t.Fatalf("raw MulticastLoopback() = %t, %v", loopback, err)
 	}
-	if err = raw.SetBroadcast(false); err != nil {
+	if err = raw.(*IPConn).SetBroadcast(false); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.SetMulticastHopLimit(7); err != nil {
+	if err = raw.(*IPConn).SetMulticastHopLimit(7); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.SetMulticastLoopback(false); err != nil {
+	if err = raw.(*IPConn).SetMulticastLoopback(false); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.JoinSourceSpecificGroup(group, source1); err != nil {
+	if err = raw.(*IPConn).JoinSourceSpecificGroup(group, source1); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.JoinSourceSpecificGroup(group, source1); !errors.Is(err, syscall.EADDRINUSE) {
+	if err = raw.(*IPConn).JoinSourceSpecificGroup(group, source1); !errors.Is(err, syscall.EADDRINUSE) {
 		t.Fatalf("duplicate raw SSM join = %v, want EADDRINUSE", err)
 	}
-	if err = raw.ExcludeSourceSpecificGroup(group, source2); !errors.Is(err, syscall.EINVAL) {
+	if err = raw.(*IPConn).ExcludeSourceSpecificGroup(group, source2); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("exclude on raw INCLUDE membership = %v, want EINVAL", err)
 	}
-	if err = raw.JoinSourceSpecificGroup(group, source2); err != nil {
+	if err = raw.(*IPConn).JoinSourceSpecificGroup(group, source2); err != nil {
 		t.Fatal(err)
 	}
-	filter, err := raw.MulticastSourceFilter(group)
+	filter, err := raw.(*IPConn).MulticastSourceFilter(group)
 	if err != nil || filter.Mode != MulticastSourceFilterInclude || len(filter.Sources) != 2 || filter.Sources[0] != source1 || filter.Sources[1] != source2 {
 		t.Fatalf("raw INCLUDE filter = %+v, %v", filter, err)
 	}
-	if err = raw.LeaveSourceSpecificGroup(group, source2); err != nil {
+	if err = raw.(*IPConn).LeaveSourceSpecificGroup(group, source2); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.LeaveSourceSpecificGroup(group, source1); err != nil {
+	if err = raw.(*IPConn).LeaveSourceSpecificGroup(group, source1); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.JoinGroup(group); err != nil {
+	if err = raw.(*IPConn).JoinGroup(group); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.ExcludeSourceSpecificGroup(group, source1); err != nil {
+	if err = raw.(*IPConn).ExcludeSourceSpecificGroup(group, source1); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.IncludeSourceSpecificGroup(group, source1); err != nil {
+	if err = raw.(*IPConn).IncludeSourceSpecificGroup(group, source1); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.SetMulticastSourceFilter(group, MulticastSourceFilter{Mode: MulticastSourceFilterExclude, Sources: []netip.Addr{source2}}); err != nil {
+	if err = raw.(*IPConn).SetMulticastSourceFilter(group, MulticastSourceFilter{Mode: MulticastSourceFilterExclude, Sources: []netip.Addr{source2}}); err != nil {
 		t.Fatal(err)
 	}
-	filter, err = raw.MulticastSourceFilter(group)
+	filter, err = raw.(*IPConn).MulticastSourceFilter(group)
 	if err != nil || filter.Mode != MulticastSourceFilterExclude || len(filter.Sources) != 1 || filter.Sources[0] != source2 {
 		t.Fatalf("raw EXCLUDE filter = %+v, %v", filter, err)
 	}
-	if err = raw.LeaveGroup(group); err != nil {
+	if err = raw.(*IPConn).LeaveGroup(group); err != nil {
 		t.Fatal(err)
 	}
 	if err = raw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = raw.MulticastSourceFilter(group); !errors.Is(err, net.ErrClosed) {
+	if _, err = raw.(*IPConn).MulticastSourceFilter(group); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closed raw source filter = %v, want net.ErrClosed", err)
 	}
 }
@@ -1046,24 +1046,24 @@ func TestRawIPMulticastAndBroadcastOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	if err = raw.JoinGroup(group); err != nil {
+	if err = raw.(*IPConn).JoinGroup(group); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.SetMulticastLoopback(true); err != nil {
+	if err = raw.(*IPConn).SetMulticastLoopback(true); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.SetMulticastHopLimit(3); err != nil {
+	if err = raw.(*IPConn).SetMulticastHopLimit(3); err != nil {
 		t.Fatal(err)
 	}
 	clearMulticastTestControl(stack)
-	if _, err = raw.WriteToIP([]byte("raw-multicast-output"), ipNetAddr(group)); err != nil {
+	if _, err = raw.WriteTo([]byte("raw-multicast-output"), ipNetAddr(group)); err != nil {
 		t.Fatal(err)
 	}
 	if err = raw.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	buffer := make([]byte, 64)
-	n, source, err := raw.ReadFromIP(buffer)
+	n, source, err := raw.ReadFrom(buffer)
 	if err != nil || string(buffer[:n]) != "raw-multicast-output" || source.String() != local.String() {
 		t.Fatalf("raw multicast loopback = %q from %v, %v", buffer[:n], source, err)
 	}
@@ -1073,16 +1073,16 @@ func TestRawIPMulticastAndBroadcastOutput(t *testing.T) {
 	if outbound.source != local || outbound.hopLimit != 3 {
 		t.Fatalf("raw multicast output = %s -> %s hop %d", outbound.source, outbound.target, outbound.hopLimit)
 	}
-	if err = raw.SetBroadcast(false); err != nil {
+	if err = raw.(*IPConn).SetBroadcast(false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = raw.WriteToIP([]byte("denied"), ipNetAddr(broadcast)); !errors.Is(err, syscall.EACCES) {
+	if _, err = raw.WriteTo([]byte("denied"), ipNetAddr(broadcast)); !errors.Is(err, syscall.EACCES) {
 		t.Fatalf("raw broadcast without SO_BROADCAST = %v, want EACCES", err)
 	}
-	if err = raw.SetBroadcast(true); err != nil {
+	if err = raw.(*IPConn).SetBroadcast(true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = raw.WriteToIP([]byte("raw-broadcast-output"), ipNetAddr(broadcast)); err != nil {
+	if _, err = raw.WriteTo([]byte("raw-broadcast-output"), ipNetAddr(broadcast)); err != nil {
 		t.Fatal(err)
 	}
 	outbound = nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
@@ -1102,10 +1102,10 @@ func TestRawIPNoOutputMulticastStillValidatesPayloadSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
-	if err = raw.SetMulticastLoopback(false); err != nil {
+	if err = raw.(*IPConn).SetMulticastLoopback(false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = raw.WriteToIP(make([]byte, 65536), ipNetAddr(group)); !errors.Is(err, syscall.EMSGSIZE) {
+	if _, err = raw.WriteTo(make([]byte, 65536), ipNetAddr(group)); !errors.Is(err, syscall.EMSGSIZE) {
 		t.Fatalf("oversized host-local multicast payload = %v, want EMSGSIZE", err)
 	}
 }
@@ -2603,17 +2603,17 @@ func TestAllHostsGroupIsImplicitForRawControl(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := make([]byte, 16)
-	n, _, err := raw.ReadFromIP(payload)
+	n, _, err := raw.ReadFrom(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 8 || payload[0] != igmpMembershipQuery {
 		t.Fatalf("raw implicit all-hosts payload = %x", payload[:n])
 	}
-	if err = raw.JoinGroup(allHosts); err != nil {
+	if err = raw.(*IPConn).JoinGroup(allHosts); err != nil {
 		t.Fatal(err)
 	}
-	if err = raw.SetMulticastSourceFilter(allHosts, MulticastSourceFilter{Mode: MulticastSourceFilterInclude, Sources: []netip.Addr{allowed}}); err != nil {
+	if err = raw.(*IPConn).SetMulticastSourceFilter(allHosts, MulticastSourceFilter{Mode: MulticastSourceFilterInclude, Sources: []netip.Addr{allowed}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = stack.Write([][]byte{query}, 0); err != nil {
@@ -2622,7 +2622,7 @@ func TestAllHostsGroupIsImplicitForRawControl(t *testing.T) {
 	if err = raw.SetReadDeadline(time.Now().Add(25 * time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err = raw.ReadFromIP(payload); err == nil {
+	if _, _, err = raw.ReadFrom(payload); err == nil {
 		t.Fatal("explicit all-hosts source filter accepted a blocked raw packet")
 	} else if netError, ok := err.(net.Error); !ok || !netError.Timeout() {
 		t.Fatalf("blocked all-hosts raw read = %v, want timeout", err)
@@ -2634,7 +2634,7 @@ func TestAllHostsGroupIsImplicitForRawControl(t *testing.T) {
 	if err = raw.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if n, _, err = raw.ReadFromIP(payload); err != nil || n != 8 || payload[0] != igmpMembershipQuery {
+	if n, _, err = raw.ReadFrom(payload); err != nil || n != 8 || payload[0] != igmpMembershipQuery {
 		t.Fatalf("allowed all-hosts raw packet = n %d payload %x error %v", n, payload, err)
 	}
 }

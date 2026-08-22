@@ -1221,8 +1221,9 @@ type ListenConfig struct {
 	Options []SocketOption
 }
 
-// ListenTCP binds a TCP listener on stack.
-func (config *ListenConfig) ListenTCP(ctx context.Context, stack *Stack, network string, local netip.AddrPort) (*TCPListener, error) {
+// ListenTCP binds a TCP listener on stack. The returned net.Listener has
+// dynamic type *TCPListener.
+func (config *ListenConfig) ListenTCP(ctx context.Context, stack *Stack, network string, local netip.AddrPort) (net.Listener, error) {
 	if stack == nil {
 		return nil, socketOperationError("listen", network, nil, net.TCPAddrFromAddrPort(local), errors.New("mipstack: nil Stack"))
 	}
@@ -1237,7 +1238,8 @@ func (config *ListenConfig) ListenTCP(ctx context.Context, stack *Stack, network
 	return stack.listenTCP(ctx, network, local, binding, options.tcp)
 }
 
-// ListenUDP binds an unconnected UDP packet socket on stack.
+// ListenUDP binds an unconnected UDP packet socket on stack. The returned
+// net.PacketConn has dynamic type *UDPConn.
 func (config *ListenConfig) ListenUDP(ctx context.Context, stack *Stack, network string, local netip.AddrPort) (net.PacketConn, error) {
 	if stack == nil {
 		return nil, socketOperationError("listen", network, nil, net.UDPAddrFromAddrPort(local), errors.New("mipstack: nil Stack"))
@@ -1255,8 +1257,9 @@ func (config *ListenConfig) ListenUDP(ctx context.Context, stack *Stack, network
 	return stack.listenUDP(ctx, network, local, binding, options.datagram)
 }
 
-// ListenIP binds an unconnected IP protocol socket on stack.
-func (config *ListenConfig) ListenIP(ctx context.Context, stack *Stack, network string, local netip.Addr) (*IPConn, error) {
+// ListenIP binds an unconnected IP protocol socket on stack. The returned
+// net.PacketConn has dynamic type *IPConn.
+func (config *ListenConfig) ListenIP(ctx context.Context, stack *Stack, network string, local netip.Addr) (net.PacketConn, error) {
 	if stack == nil {
 		return nil, socketOperationError("listen", network, nil, ipNetAddr(local), errors.New("mipstack: nil Stack"))
 	}

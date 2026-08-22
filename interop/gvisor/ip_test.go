@@ -572,11 +572,11 @@ func TestIPv6RawChecksumInterop(t *testing.T) {
 				t.Fatalf("write gVisor checksummed payload: n=%d, error=%s", written, tcpipErrorString(writeErr))
 			}
 			storage := make([]byte, 65535)
-			read, source, readErr := connection.ReadFromIP(storage)
+			read, source, readErr := connection.ReadFrom(storage)
 			if readErr != nil {
 				t.Fatalf("read gVisor checksummed payload in mipstack: %v", readErr)
 			}
-			sourceAddress, valid := netip.AddrFromSlice(source.IP)
+			sourceAddress, valid := netip.AddrFromSlice(source.(*net.IPAddr).IP)
 			if !valid || sourceAddress != family.gvisorAddress || !validIPv6RawChecksum(storage[:read], family.gvisorAddress, family.mipstackAddress, byte(interopRawIPProtocol)) {
 				t.Fatalf("mipstack received invalid gVisor checksum: source=%v payload=%x", source, storage[:read])
 			}
@@ -587,7 +587,7 @@ func TestIPv6RawChecksumInterop(t *testing.T) {
 
 			response := patternedPayload(263, 0x71)
 			original := append([]byte(nil), response...)
-			writtenInt, writeToErr := connection.WriteToIP(response, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
+			writtenInt, writeToErr := connection.WriteTo(response, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
 			if writeToErr != nil || writtenInt != len(response) {
 				t.Fatalf("write mipstack checksummed payload: n=%d, error=%v", writtenInt, writeToErr)
 			}
@@ -644,7 +644,7 @@ func testIPv6RawChecksumFragmentInterop(t *testing.T, ctx context.Context, netwo
 		t.Fatalf("write gVisor UDP checksum request: n=%d, error=%v", written, writeErr)
 	}
 	storage := make([]byte, 65535)
-	read, source, readErr := connection.ReadFromIP(storage)
+	read, source, readErr := connection.ReadFrom(storage)
 	if readErr != nil {
 		t.Fatalf("read checksummed gVisor UDP payload: %v", readErr)
 	}
@@ -662,7 +662,7 @@ func testIPv6RawChecksumFragmentInterop(t *testing.T, ctx context.Context, netwo
 	binary.BigEndian.PutUint16(datagram[4:6], uint16(len(datagram)))
 	copy(datagram[udpHeaderLen:], payload)
 	original := append([]byte(nil), datagram...)
-	written, writeErr = connection.WriteToIP(datagram, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
+	written, writeErr = connection.WriteTo(datagram, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
 	if writeErr != nil || written != len(datagram) {
 		t.Fatalf("write fragmented raw UDP checksum response: n=%d, error=%v", written, writeErr)
 	}
@@ -714,17 +714,17 @@ func TestIPDualStackWildcardInterop(t *testing.T) {
 			if writeErr != nil || written != int64(len(request)) {
 				t.Fatalf("write dual-stack raw IP request: n=%d, error=%s", written, tcpipErrorString(writeErr))
 			}
-			read, source, readErr := listener.ReadFromIP(storage)
+			read, source, readErr := listener.ReadFrom(storage)
 			if readErr != nil || !bytes.Equal(storage[:read], request) {
 				t.Fatalf("read dual-stack raw IP request: n=%d, source=%v, error=%v", read, source, readErr)
 			}
-			sourceAddress, valid := netip.AddrFromSlice(source.IP)
+			sourceAddress, valid := netip.AddrFromSlice(source.(*net.IPAddr).IP)
 			if !valid || sourceAddress.Unmap() != family.gvisorAddress {
 				t.Fatalf("dual-stack raw IP source = %v, want %v", source, family.gvisorAddress)
 			}
 
 			response := patternedPayload(79+index, byte(67+index))
-			writtenInt, writeToErr := listener.WriteToIP(response, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
+			writtenInt, writeToErr := listener.WriteTo(response, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
 			if writeToErr != nil || writtenInt != len(response) {
 				t.Fatalf("write dual-stack raw IP response: n=%d, error=%v", writtenInt, writeToErr)
 			}
@@ -813,7 +813,7 @@ func TestIPControlMessageInterop(t *testing.T) {
 			}
 			payload := make([]byte, 256)
 			control := make([]byte, 256)
-			read, controlRead, flags, source, err := connection.ReadMsgIP(payload, control)
+			read, controlRead, flags, source, err := connection.(*mipstack.IPConn).ReadMsgIP(payload, control)
 			if err != nil || flags != 0 || !bytes.Equal(payload[:read], request) {
 				t.Fatalf("read mipstack raw control request: n=%d, oob=%d, flags=%#x, source=%v, error=%v", read, controlRead, flags, source, err)
 			}
@@ -845,7 +845,7 @@ func TestIPControlMessageInterop(t *testing.T) {
 			}
 
 			response := []byte("raw-control-response")
-			writtenInt, controlWritten, err := connection.WriteMsgIP(response, control, source)
+			writtenInt, controlWritten, err := connection.(*mipstack.IPConn).WriteMsgIP(response, control, source)
 			if err != nil || writtenInt != len(response) || controlWritten != len(control) {
 				t.Fatalf("write mipstack raw control response: n=%d, oob=%d, error=%v", writtenInt, controlWritten, err)
 			}
@@ -926,7 +926,7 @@ func TestIPHeaderIncludedInterop(t *testing.T) {
 				defer queue.EventUnregister(&entry)
 
 				request := buildHeaderIncludedInteropPacket(family, family.mipstackAddress, family.gvisorAddress, patternedPayload(19, 0xa1))
-				written, writeErr := mips.WriteToIP(request, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
+				written, writeErr := mips.WriteTo(request, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
 				if writeErr != nil || written != len(request) {
 					t.Fatalf("write mipstack complete packet: n=%d, error=%v", written, writeErr)
 				}
@@ -941,7 +941,7 @@ func TestIPHeaderIncludedInterop(t *testing.T) {
 					t.Fatalf("write gVisor complete packet: n=%d, error=%s", written64, tcpipErrorString(tcpipErr))
 				}
 				storage := make([]byte, mtu)
-				read, source, readErr := mips.ReadFromIP(storage)
+				read, source, readErr := mips.ReadFrom(storage)
 				if readErr != nil || source.String() != family.gvisorAddress.String() || !bytes.Equal(storage[:read], response) {
 					t.Fatalf("mipstack complete-packet read: bytes=%d, source=%v, error=%v", read, source, readErr)
 				}
@@ -1004,7 +1004,7 @@ func TestIPCompletePacketReassemblyInterop(t *testing.T) {
 					t.Fatalf("write fragmented gVisor UDP datagram: n=%d, error=%s", written, tcpipErrorString(tcpipErr))
 				}
 				packet := make([]byte, 65535)
-				read, source, readErr := rawConnection.ReadFromIP(packet)
+				read, source, readErr := rawConnection.ReadFrom(packet)
 				if readErr != nil || source.String() != family.gvisorAddress.String() {
 					t.Fatalf("read complete reassembled packet: bytes=%d, source=%v, error=%v", read, source, readErr)
 				}
@@ -1115,17 +1115,17 @@ func testRawIP(t *testing.T, network *interopNetwork, family interopFamily, mtu 
 		if writeErr != nil || written != int64(len(request)) {
 			t.Fatalf("write gVisor raw IP payload: n=%d, error=%s", written, tcpipErrorString(writeErr))
 		}
-		read, source, readErr := mipstackConnection.ReadFromIP(storage)
+		read, source, readErr := mipstackConnection.ReadFrom(storage)
 		if readErr != nil {
 			t.Fatalf("read mipstack raw IP payload: %v", readErr)
 		}
-		sourceAddress, validSource := netip.AddrFromSlice(source.IP)
+		sourceAddress, validSource := netip.AddrFromSlice(source.(*net.IPAddr).IP)
 		if !validSource || sourceAddress.Unmap() != family.gvisorAddress || !bytes.Equal(storage[:read], request) {
 			t.Fatalf("mipstack raw IP request mismatch: source=%v, bytes=%d", source, read)
 		}
 
 		response := patternedPayload(testCase.responseSize, byte(149+index))
-		writtenInt, writeToErr := mipstackConnection.WriteToIP(response, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
+		writtenInt, writeToErr := mipstackConnection.WriteTo(response, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
 		if writeToErr != nil || writtenInt != len(response) {
 			t.Fatalf("write mipstack raw IP payload: n=%d, error=%v", writtenInt, writeToErr)
 		}

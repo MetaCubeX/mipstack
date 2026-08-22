@@ -217,13 +217,13 @@ func TestIPConnFanoutAndLinuxControl(t *testing.T) {
 				t.Fatal(err)
 			}
 			buffer := make([]byte, 32)
-			n, source, err := exact.ReadFromIP(buffer)
-			if err != nil || string(buffer[:n]) != "raw-payload" || !source.IP.Equal(net.IP(test.remote.AsSlice())) {
-				t.Fatalf("ReadFromIP = %q from %v, %v", buffer[:n], source, err)
+			n, source, err := exact.ReadFrom(buffer)
+			if err != nil || string(buffer[:n]) != "raw-payload" || !source.(*net.IPAddr).IP.Equal(net.IP(test.remote.AsSlice())) {
+				t.Fatalf("ReadFrom = %q from %v, %v", buffer[:n], source, err)
 			}
 			short := make([]byte, 3)
 			oob := make([]byte, 128)
-			n, oobn, flags, source, err := all.ReadMsgIP(short, oob)
+			n, oobn, flags, source, err := all.(*IPConn).ReadMsgIP(short, oob)
 			if err != nil || n != len(short) || string(short) != "raw" || flags != MessageFlagTruncated || oobn != test.controlSize {
 				t.Fatalf("ReadMsgIP = %q/%d flags %#x from %v, %v", short[:n], oobn, flags, source, err)
 			}
@@ -262,7 +262,7 @@ func TestIPConnFanoutExceedsInlineStorage(t *testing.T) {
 	}
 	defer stack.Close()
 
-	connections := make([]*IPConn, 0, ipEndpointInlineFanout+3)
+	connections := make([]net.PacketConn, 0, ipEndpointInlineFanout+3)
 	for index := 0; index < cap(connections); index++ {
 		connection, listenErr := stack.ListenIP(context.Background(), "ip4:99", netip.IPv4Unspecified())
 		if listenErr != nil {
@@ -353,13 +353,13 @@ func TestIPConnConcurrentStackAndSocketClose(t *testing.T) {
 	}
 	readResult := make(chan error, 1)
 	go func() {
-		_, readErr := connection.Read(make([]byte, 1))
+		_, readErr := connection.(*IPConn).Read(make([]byte, 1))
 		readResult <- readErr
 	}()
 	waitFor(t, time.Second, func() bool {
-		connection.mu.Lock()
-		waiting := connection.receiveNotify != nil
-		connection.mu.Unlock()
+		connection.(*IPConn).mu.Lock()
+		waiting := connection.(*IPConn).receiveNotify != nil
+		connection.(*IPConn).mu.Unlock()
 		return waiting
 	})
 
@@ -457,8 +457,8 @@ func TestListenIPEmptyAddressDualStack(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	if !connection.dual || connection.local != netip.IPv6Unspecified() {
-		t.Fatalf("generic IP wildcard = %v, dual = %v", connection.local, connection.dual)
+	if !connection.(*IPConn).dual || connection.(*IPConn).local != netip.IPv6Unspecified() {
+		t.Fatalf("generic IP wildcard = %v, dual = %v", connection.(*IPConn).local, connection.(*IPConn).dual)
 	}
 	for _, packet := range [][]byte{
 		buildIPPacket(remote4, local4, 99, []byte("v4"), 1, true),
@@ -484,8 +484,8 @@ func TestListenIPEmptyAddressDualStack(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ipv4Only.Close()
-	if ipv4Only.dual || ipv4Only.local != netip.IPv4Unspecified() {
-		t.Fatalf("IPv4 IP wildcard = %v, dual = %v", ipv4Only.local, ipv4Only.dual)
+	if ipv4Only.(*IPConn).dual || ipv4Only.(*IPConn).local != netip.IPv4Unspecified() {
+		t.Fatalf("IPv4 IP wildcard = %v, dual = %v", ipv4Only.(*IPConn).local, ipv4Only.(*IPConn).dual)
 	}
 }
 
@@ -514,7 +514,7 @@ func TestIPConnObservesUDPWithoutConsumingIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	rawBuffer := make([]byte, 64)
-	n, source, err := raw.ReadFromIP(rawBuffer)
+	n, source, err := raw.ReadFrom(rawBuffer)
 	if err != nil || source.String() != remote.String() || n < udpHeaderSize || string(rawBuffer[udpHeaderSize:n]) != "both" {
 		t.Fatalf("raw UDP copy = %x from %v, %v", rawBuffer[:n], source, err)
 	}
@@ -547,7 +547,7 @@ func TestIPConnWriteMsgSourceAndHeaderOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, oobn, err := connection.WriteMsgIP([]byte("raw-output"), oob, ipNetAddr(remote))
+	n, oobn, err := connection.(*IPConn).WriteMsgIP([]byte("raw-output"), oob, ipNetAddr(remote))
 	if err != nil || n != 10 || oobn != len(oob) {
 		t.Fatalf("WriteMsgIP = %d/%d, %v", n, oobn, err)
 	}
@@ -555,10 +555,10 @@ func TestIPConnWriteMsgSourceAndHeaderOptions(t *testing.T) {
 	if !ok || packet.source != second || packet.target != remote || packet.protocol != 99 || packet.hopLimit != options.hopLimit || packet.trafficClass != options.trafficClass || string(packet.payload) != "raw-output" {
 		t.Fatalf("raw output = %+v, parsed = %v", packet, ok)
 	}
-	if err = connection.SetWriteBuffer(64 * 1024); err != nil {
+	if err = connection.(*IPConn).SetWriteBuffer(64 * 1024); err != nil {
 		t.Fatalf("SetWriteBuffer no-op = %v", err)
 	}
-	if err = connection.SetWriteBuffer(0); !errors.Is(err, syscall.EINVAL) {
+	if err = connection.(*IPConn).SetWriteBuffer(0); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("SetWriteBuffer(0) = %v, want EINVAL", err)
 	}
 }
@@ -579,10 +579,10 @@ func TestIPConnTypedWritesAndDeadlines(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	if connection.RemoteAddr() != nil {
-		t.Fatalf("unconnected remote address = %v", connection.RemoteAddr())
+	if connection.(*IPConn).RemoteAddr() != nil {
+		t.Fatalf("unconnected remote address = %v", connection.(*IPConn).RemoteAddr())
 	}
-	if _, writeErr := connection.WriteToIP([]byte("missing"), nil); writeErr == nil {
+	if _, writeErr := connection.(*IPConn).WriteToIP([]byte("missing"), nil); writeErr == nil {
 		t.Fatal("WriteToIP accepted a nil address")
 	} else if operationError := checkNetOpError(t, writeErr, "write", "ip4:99"); operationError.Addr != nil {
 		t.Fatalf("nil WriteToIP error address = %#v, want nil", operationError.Addr)
@@ -596,7 +596,7 @@ func TestIPConnTypedWritesAndDeadlines(t *testing.T) {
 	if err = connection.SetDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if n, writeErr := connection.WriteToIP([]byte("typed"), ipNetAddr(remote)); writeErr != nil || n != len("typed") {
+	if n, writeErr := connection.(*IPConn).WriteToIP([]byte("typed"), ipNetAddr(remote)); writeErr != nil || n != len("typed") {
 		t.Fatalf("WriteToIP = %d, %v", n, writeErr)
 	}
 	if packet, ok := parseIPPacket(readOutboundPacket(t, stack)); !ok || string(packet.payload) != "typed" || packet.target != remote {
@@ -611,14 +611,14 @@ func TestIPConnTypedWritesAndDeadlines(t *testing.T) {
 	if err = connection.SetWriteDeadline(time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = connection.WriteToIP([]byte("late"), ipNetAddr(remote)); !errors.Is(err, os.ErrDeadlineExceeded) {
+	if _, err = connection.(*IPConn).WriteToIP([]byte("late"), ipNetAddr(remote)); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("expired WriteToIP = %v, want deadline", err)
 	}
-	if _, _, err = connection.WriteMsgIP([]byte("late"), []byte{1}, ipNetAddr(remote)); !errors.Is(err, os.ErrDeadlineExceeded) {
+	if _, _, err = connection.(*IPConn).WriteMsgIP([]byte("late"), []byte{1}, ipNetAddr(remote)); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("expired WriteMsgIP with invalid control = %v, want deadline", err)
 	}
 	wrongFamily := &net.IPAddr{IP: net.ParseIP("2001:db8::123")}
-	if _, _, err = connection.WriteMsgIP([]byte("wrong-family"), []byte{1}, wrongFamily); err == nil {
+	if _, _, err = connection.(*IPConn).WriteMsgIP([]byte("wrong-family"), []byte{1}, wrongFamily); err == nil {
 		t.Fatal("WriteMsgIP accepted an IPv6 destination on an IPv4 socket")
 	} else {
 		var addressError *net.AddrError
@@ -770,7 +770,7 @@ func TestIPConnICMPReceiveFilters(t *testing.T) {
 			}
 			assertEmpty := func() {
 				messages := []SocketMessage{{Buffers: [][]byte{make([]byte, 32)}}}
-				if count, readErr := connection.ReadBatch(messages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+				if count, readErr := connection.(*IPConn).ReadBatch(messages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
 					t.Fatalf("filtered read = %d, %v, want EAGAIN", count, readErr)
 				}
 			}
@@ -780,45 +780,45 @@ func TestIPConnICMPReceiveFilters(t *testing.T) {
 			switch filter := originalFilter.(type) {
 			case ICMPv4Filter:
 				filter.Accept(test.messageType)
-				current, filterErr := connection.ICMPv4Filter()
+				current, filterErr := connection.(*IPConn).ICMPv4Filter()
 				if filterErr != nil || !current.WillBlock(test.messageType) {
 					t.Fatalf("ICMPv4 creation snapshot = %+v, %v", current, filterErr)
 				}
 				current.Accept(test.messageType)
-				again, filterErr := connection.ICMPv4Filter()
+				again, filterErr := connection.(*IPConn).ICMPv4Filter()
 				if filterErr != nil || !again.WillBlock(test.messageType) {
 					t.Fatalf("ICMPv4 getter retained caller mutation: %+v, %v", again, filterErr)
 				}
 				var accepting ICMPv4Filter
-				if filterErr = connection.SetICMPv4Filter(accepting); filterErr != nil {
+				if filterErr = connection.(*IPConn).SetICMPv4Filter(accepting); filterErr != nil {
 					t.Fatal(filterErr)
 				}
 				write()
 				var blocking ICMPv4Filter
 				blocking.Block(test.messageType)
-				if filterErr = connection.SetICMPv4Filter(blocking); filterErr != nil {
+				if filterErr = connection.(*IPConn).SetICMPv4Filter(blocking); filterErr != nil {
 					t.Fatal(filterErr)
 				}
 				blocking.Accept(test.messageType)
 			case ICMPv6Filter:
 				filter.Accept(test.messageType)
-				current, filterErr := connection.ICMPv6Filter()
+				current, filterErr := connection.(*IPConn).ICMPv6Filter()
 				if filterErr != nil || !current.WillBlock(test.messageType) {
 					t.Fatalf("ICMPv6 creation snapshot = %+v, %v", current, filterErr)
 				}
 				current.Accept(test.messageType)
-				again, filterErr := connection.ICMPv6Filter()
+				again, filterErr := connection.(*IPConn).ICMPv6Filter()
 				if filterErr != nil || !again.WillBlock(test.messageType) {
 					t.Fatalf("ICMPv6 getter retained caller mutation: %+v, %v", again, filterErr)
 				}
 				var accepting ICMPv6Filter
-				if filterErr = connection.SetICMPv6Filter(accepting); filterErr != nil {
+				if filterErr = connection.(*IPConn).SetICMPv6Filter(accepting); filterErr != nil {
 					t.Fatal(filterErr)
 				}
 				write()
 				var blocking ICMPv6Filter
 				blocking.Block(test.messageType)
-				if filterErr = connection.SetICMPv6Filter(blocking); filterErr != nil {
+				if filterErr = connection.(*IPConn).SetICMPv6Filter(blocking); filterErr != nil {
 					t.Fatal(filterErr)
 				}
 				blocking.Accept(test.messageType)
@@ -883,13 +883,13 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	if enabled, offset, checksumErr := connection.IPv6Checksum(); checksumErr != nil || !enabled || offset != 2 {
+	if enabled, offset, checksumErr := connection.(*IPConn).IPv6Checksum(); checksumErr != nil || !enabled || offset != 2 {
 		t.Fatalf("initial IPv6 checksum policy = %v/%d, %v", enabled, offset, checksumErr)
 	}
-	if err = connection.SetIPv6Checksum(true, -1); !errors.Is(err, syscall.EINVAL) {
+	if err = connection.(*IPConn).SetIPv6Checksum(true, -1); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("negative enabled checksum offset = %v, want EINVAL", err)
 	}
-	if err = connection.SetIPv6Checksum(true, 3); !errors.Is(err, syscall.EINVAL) {
+	if err = connection.(*IPConn).SetIPv6Checksum(true, 3); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("odd enabled checksum offset = %v, want EINVAL", err)
 	}
 
@@ -910,13 +910,13 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 		}
 	}
 	messages := []SocketMessage{{Buffers: [][]byte{buffer}}}
-	if count, readErr := connection.ReadBatch(messages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+	if count, readErr := connection.(*IPConn).ReadBatch(messages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
 		t.Fatalf("invalid-checksum receive = %d, %v, want EAGAIN", count, readErr)
 	}
-	if err = connection.SetIPv6Checksum(false, -99); err != nil {
+	if err = connection.(*IPConn).SetIPv6Checksum(false, -99); err != nil {
 		t.Fatal(err)
 	}
-	if enabled, offset, checksumErr := connection.IPv6Checksum(); checksumErr != nil || enabled || offset != 0 {
+	if enabled, offset, checksumErr := connection.(*IPConn).IPv6Checksum(); checksumErr != nil || enabled || offset != 0 {
 		t.Fatalf("disabled IPv6 checksum policy = %v/%d, %v", enabled, offset, checksumErr)
 	}
 	if err = writeTestPacket(stack, buildIPPacket(remote, local, 99, invalid, 3, true)); err != nil {
@@ -925,13 +925,13 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 	if read, _, readErr := connection.ReadFrom(buffer); readErr != nil || !bytes.Equal(buffer[:read], invalid) {
 		t.Fatalf("disabled-checksum raw receive = %x, %v", buffer[:read], readErr)
 	}
-	if err = connection.SetIPv6Checksum(true, 2); err != nil {
+	if err = connection.(*IPConn).SetIPv6Checksum(true, 2); err != nil {
 		t.Fatal(err)
 	}
 
 	outbound := []byte{0x41, 0x42, 0xaa, 0xbb, 0x45, 0x46, 0x47, 0x48}
 	original := append([]byte(nil), outbound...)
-	if written, writeErr := connection.WriteToIP(outbound, ipNetAddr(remote)); writeErr != nil || written != len(outbound) {
+	if written, writeErr := connection.(*IPConn).WriteToIP(outbound, ipNetAddr(remote)); writeErr != nil || written != len(outbound) {
 		t.Fatalf("checksummed WriteToIP = %d, %v", written, writeErr)
 	}
 	if !bytes.Equal(outbound, original) {
@@ -945,7 +945,7 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 	batchPayload := []byte{0x51, 0x52, 0xaa, 0xbb, 0x55, 0x56, 0x57, 0x58}
 	batchOriginal := append([]byte(nil), batchPayload...)
 	batch := []SocketMessage{{Buffers: [][]byte{batchPayload[:3], batchPayload[3:]}, Addr: ipNetAddr(remote)}}
-	if count, writeErr := connection.WriteBatch(batch, 0); writeErr != nil || count != 1 || batch[0].N != len(batchPayload) {
+	if count, writeErr := connection.(*IPConn).WriteBatch(batch, 0); writeErr != nil || count != 1 || batch[0].N != len(batchPayload) {
 		t.Fatalf("checksummed WriteBatch = %d, %v, message=%+v", count, writeErr, batch[0])
 	}
 	if !bytes.Equal(batchPayload, batchOriginal) {
@@ -959,7 +959,7 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 	fragmented := bytes.Repeat([]byte{0x6b}, 3000)
 	fragmentedOriginal := append([]byte(nil), fragmented...)
 	fragmentedBatch := []SocketMessage{{Buffers: [][]byte{fragmented[:317], fragmented[317:1301], fragmented[1301:]}, Addr: ipNetAddr(remote)}}
-	if count, writeErr := connection.WriteBatch(fragmentedBatch, 0); writeErr != nil || count != 1 {
+	if count, writeErr := connection.(*IPConn).WriteBatch(fragmentedBatch, 0); writeErr != nil || count != 1 {
 		t.Fatalf("checksummed fragmented WriteBatch = %d, %v", count, writeErr)
 	}
 	if !bytes.Equal(fragmented, fragmentedOriginal) {
@@ -978,7 +978,7 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 	if !ok || transportChecksum(local, remote, 99, packet.payload) != 0 || len(packet.payload) != len(fragmented) {
 		t.Fatalf("checksummed fragmented output = %+v, parsed=%v", packet, ok)
 	}
-	if _, writeErr := connection.WriteToIP([]byte{1, 2, 3}, ipNetAddr(remote)); !errors.Is(writeErr, syscall.EINVAL) {
+	if _, writeErr := connection.(*IPConn).WriteToIP([]byte{1, 2, 3}, ipNetAddr(remote)); !errors.Is(writeErr, syscall.EINVAL) {
 		t.Fatalf("short checksummed write = %v, want EINVAL", writeErr)
 	}
 }
@@ -1007,7 +1007,7 @@ func TestIPConnDualStackIPv6ChecksumIsolation(t *testing.T) {
 	defer connection.Close()
 	payload4 := []byte{1, 2, 0xaa, 0xbb, 5, 6, 7, 8}
 	original4 := append([]byte(nil), payload4...)
-	if _, err = connection.WriteToIP(payload4, ipNetAddr(remote4)); err != nil {
+	if _, err = connection.WriteTo(payload4, ipNetAddr(remote4)); err != nil {
 		t.Fatal(err)
 	}
 	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
@@ -1016,7 +1016,7 @@ func TestIPConnDualStackIPv6ChecksumIsolation(t *testing.T) {
 	}
 	payload6 := []byte{1, 2, 0xaa, 0xbb, 5, 6, 7, 8}
 	original6 := append([]byte(nil), payload6...)
-	if _, err = connection.WriteToIP(payload6, ipNetAddr(remote6)); err != nil {
+	if _, err = connection.WriteTo(payload6, ipNetAddr(remote6)); err != nil {
 		t.Fatal(err)
 	}
 	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
@@ -1031,7 +1031,7 @@ func TestIPConnDualStackIPv6ChecksumIsolation(t *testing.T) {
 	defer protocol58.Close()
 	icmpNumberOverIPv4 := []byte{0x81, 0, 0xaa, 0xbb, 1, 2, 3, 4}
 	want := append([]byte(nil), icmpNumberOverIPv4...)
-	if _, err = protocol58.WriteToIP(icmpNumberOverIPv4, ipNetAddr(remote4)); err != nil {
+	if _, err = protocol58.WriteTo(icmpNumberOverIPv4, ipNetAddr(remote4)); err != nil {
 		t.Fatal(err)
 	}
 	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
@@ -1063,7 +1063,7 @@ func TestIPConnIPv6ChecksumHeaderIncludedOwnership(t *testing.T) {
 
 	complete := buildIPPacket(local, remote, 99, []byte{1, 2, 0xaa, 0xbb, 5, 6, 7, 8}, 0, true)
 	wantComplete := append([]byte(nil), complete...)
-	if written, writeErr := connection.WriteToIP(complete, ipNetAddr(remote)); writeErr != nil || written != len(complete) {
+	if written, writeErr := connection.WriteTo(complete, ipNetAddr(remote)); writeErr != nil || written != len(complete) {
 		t.Fatalf("header-included checksummed write = %d, %v", written, writeErr)
 	}
 	if !bytes.Equal(complete, wantComplete) {
@@ -1089,7 +1089,7 @@ func TestIPConnIPv6ChecksumHeaderIncludedOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	messages := []SocketMessage{{Buffers: [][]byte{buffer}}}
-	if count, readErr := connection.ReadBatch(messages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+	if count, readErr := connection.(*IPConn).ReadBatch(messages, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
 		t.Fatalf("header-included invalid checksum read = %d, %v, want EAGAIN", count, readErr)
 	}
 }
@@ -1215,7 +1215,11 @@ func TestIPPathMTUProbing(t *testing.T) {
 					connection = netConnection.(*IPConn)
 				}
 			} else {
-				connection, err = stack.ListenIP(context.Background(), "ip:99", netip.Addr{})
+				var packetConnection net.PacketConn
+				packetConnection, err = stack.ListenIP(context.Background(), "ip:99", netip.Addr{})
+				if err == nil {
+					connection = packetConnection.(*IPConn)
+				}
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -1284,7 +1288,7 @@ func TestIPIPv6FlowLabelPolicy(t *testing.T) {
 	defer connection.Close()
 	writeAndLabel := func() uint32 {
 		t.Helper()
-		if _, writeErr := connection.WriteToIP([]byte("flow"), ipNetAddr(remote)); writeErr != nil {
+		if _, writeErr := connection.(*IPConn).WriteToIP([]byte("flow"), ipNetAddr(remote)); writeErr != nil {
 			t.Fatal(writeErr)
 		}
 		packet, ok := parseIPPacket(readOutboundPacket(t, stack))
@@ -1297,16 +1301,16 @@ func TestIPIPv6FlowLabelPolicy(t *testing.T) {
 	if first == 0 || writeAndLabel() != first {
 		t.Fatalf("unstable automatic IP flow label %#x", first)
 	}
-	if info := connection.Info(); info.FlowLabel != 0 {
+	if info := connection.(*IPConn).Info(); info.FlowLabel != 0 {
 		t.Fatalf("automatic IP flow-label diagnostics = %+v", info)
 	}
-	if err = connection.SetFlowLabel(0x34567); err != nil {
+	if err = connection.(*IPConn).SetFlowLabel(0x34567); err != nil {
 		t.Fatal(err)
 	}
 	if label := writeAndLabel(); label != 0x34567 {
 		t.Fatalf("IP socket flow label = %#x, want 0x34567", label)
 	}
-	if info := connection.Info(); info.FlowLabel != 0x34567 {
+	if info := connection.(*IPConn).Info(); info.FlowLabel != 0x34567 {
 		t.Fatalf("fixed IP flow-label diagnostics = %+v", info)
 	}
 }
@@ -1347,12 +1351,12 @@ func TestIPConnFragmentReassembly(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if n, _, writeErr := connection.WriteMsgIP(payload, oob, ipNetAddr(test.remote)); writeErr != nil || n != len(payload) {
+			if n, _, writeErr := connection.(*IPConn).WriteMsgIP(payload, oob, ipNetAddr(test.remote)); writeErr != nil || n != len(payload) {
 				t.Fatalf("fragmented WriteMsgIP = %d, %v", n, writeErr)
 			}
 			buffer := make([]byte, len(payload))
 			control := make([]byte, 128)
-			n, oobn, flags, source, readErr := listener.ReadMsgIP(buffer, control)
+			n, oobn, flags, source, readErr := listener.(*IPConn).ReadMsgIP(buffer, control)
 			if readErr != nil || n != len(payload) || flags != 0 || !bytes.Equal(buffer, payload) || source.String() != test.local.String() {
 				t.Fatalf("reassembled ReadMsgIP = %d flags %#x from %v, %v", n, flags, source, readErr)
 			}
@@ -1571,7 +1575,7 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 		{Buffers: [][]byte{second}, OOB: make([]byte, 8)},
 		{Buffers: [][]byte{make([]byte, 1)}, N: 91, NN: 92, Flags: 93, Addr: ipNetAddr(remote)},
 	}
-	n, err := connection.ReadBatch(messages, 0)
+	n, err := connection.(*IPConn).ReadBatch(messages, 0)
 	if err != nil || n != 2 {
 		t.Fatalf("ReadBatch = %d, %v", n, err)
 	}
@@ -1591,7 +1595,7 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 	if messages[2].N != 91 || messages[2].NN != 92 || messages[2].Flags != 93 || messages[2].Addr == nil {
 		t.Fatalf("unprocessed IP batch message changed = %+v", messages[2])
 	}
-	if n, err = connection.ReadBatch(messages[:1], MessageFlagDontWait); n != 0 || !errors.Is(err, syscall.EAGAIN) {
+	if n, err = connection.(*IPConn).ReadBatch(messages[:1], MessageFlagDontWait); n != 0 || !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("nonblocking empty IP ReadBatch = %d, %v", n, err)
 	}
 
@@ -1600,7 +1604,7 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 		{Buffers: [][]byte{[]byte("ab"), []byte("cd")}, Addr: ipNetAddr(remote)},
 		{Buffers: [][]byte{[]byte("ef"), []byte("gh")}, OOB: controlBytes, Addr: ipNetAddr(remote)},
 	}
-	if n, err = connection.WriteBatch(writes, 0); n != 2 || err != nil {
+	if n, err = connection.(*IPConn).WriteBatch(writes, 0); n != 2 || err != nil {
 		t.Fatalf("WriteBatch = %d, %v", n, err)
 	}
 	for index, source := range []netip.Addr{firstLocal, secondLocal} {
@@ -1613,14 +1617,14 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 		}
 	}
 	prefix := []SocketMessage{writes[0], {Buffers: nil, Addr: ipNetAddr(remote), N: 91, NN: 92, Flags: 93}}
-	if n, err = connection.WriteBatch(prefix, 0); n != 1 || err != nil {
+	if n, err = connection.(*IPConn).WriteBatch(prefix, 0); n != 1 || err != nil {
 		t.Fatalf("partial IP WriteBatch = %d, %v", n, err)
 	}
 	if prefix[1].N != 91 || prefix[1].NN != 92 || prefix[1].Flags != 93 {
 		t.Fatalf("unprocessed IP WriteBatch message changed = %+v", prefix[1])
 	}
 	_ = readOutboundPacket(t, stack)
-	if n, err = connection.WriteBatch(prefix[1:], 0); n != 0 || !errors.Is(err, syscall.EINVAL) {
+	if n, err = connection.(*IPConn).WriteBatch(prefix[1:], 0); n != 0 || !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("retried invalid IP WriteBatch suffix = %d, %v", n, err)
 	}
 
@@ -1731,7 +1735,7 @@ func TestIPConnReceiveCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	if err = connection.SetReadBuffer(2 * (ipDatagramMetadataSize + 1)); err != nil {
+	if err = connection.(*IPConn).SetReadBuffer(2 * (ipDatagramMetadataSize + 1)); err != nil {
 		t.Fatal(err)
 	}
 	for index := 0; index < 3; index++ {
@@ -1853,7 +1857,7 @@ func TestUnconnectedIPReadAndConnectedWriteToError(t *testing.T) {
 		t.Fatal(err)
 	}
 	buffer := make([]byte, 4)
-	if n, readErr := listener.Read(buffer); readErr != nil || n != 4 || string(buffer) != "read" {
+	if n, readErr := listener.(*IPConn).Read(buffer); readErr != nil || n != 4 || string(buffer) != "read" {
 		t.Fatalf("unconnected IP Read = %q, %v", buffer[:n], readErr)
 	}
 	netConnection, err := stack.DialIP(context.Background(), "ip4:99", netip.Addr{}, remote)

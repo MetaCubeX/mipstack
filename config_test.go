@@ -331,8 +331,8 @@ func TestTCPSocketDefaultConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cap(listener.accept) != defaults.AcceptQueue || listener.backlog != defaults.SYNBacklog {
-		t.Fatalf("listener queue/backlog = %d/%d, want %d/%d", cap(listener.accept), listener.backlog, defaults.AcceptQueue, defaults.SYNBacklog)
+	if cap(listener.(*TCPListener).accept) != defaults.AcceptQueue || listener.(*TCPListener).backlog != defaults.SYNBacklog {
+		t.Fatalf("listener queue/backlog = %d/%d, want %d/%d", cap(listener.(*TCPListener).accept), listener.(*TCPListener).backlog, defaults.AcceptQueue, defaults.SYNBacklog)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	dialDone := make(chan struct{})

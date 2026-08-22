@@ -30,15 +30,15 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	defer listener.Close()
 	for index := 0; index < tcpSYNBacklog; index++ {
 		connection := &TCPConn{}
-		if !listener.trackHandshake(connection) {
+		if !listener.(*TCPListener).trackHandshake(connection) {
 			t.Fatalf("failed to fill SYN backlog at %d", index)
 		}
 	}
 	defer func() {
-		listener.mu.Lock()
-		listener.pending = make(map[*TCPConn]struct{})
-		listener.handshaking = make(map[*TCPConn]struct{})
-		listener.mu.Unlock()
+		listener.(*TCPListener).mu.Lock()
+		listener.(*TCPListener).pending = make(map[*TCPConn]struct{})
+		listener.(*TCPListener).handshaking = make(map[*TCPConn]struct{})
+		listener.(*TCPListener).mu.Unlock()
 	}()
 
 	clientSequence := uint32(0x12345678)
@@ -94,30 +94,31 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	if err = writeTestPacket(stack, ack); err != nil {
 		t.Fatal(err)
 	}
-	if err = listener.SetDeadline(time.Now().Add(time.Second)); err != nil {
+	if err = listener.(*TCPListener).SetDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	connection, err := listener.AcceptTCP()
+	connection, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
+	connectionTCP := connection.(*TCPConn)
 	defer connection.Close()
-	if connection.peerMSS != 1440 || !connection.peerWindowScaling || connection.peerWindowScale != 5 ||
-		!connection.peerSACK || !connection.peerTimestamp || !connection.peerECN || connection.recentTimestamp != clientTimestamp+1 {
+	if connectionTCP.peerMSS != 1440 || !connectionTCP.peerWindowScaling || connectionTCP.peerWindowScale != 5 ||
+		!connectionTCP.peerSACK || !connectionTCP.peerTimestamp || !connectionTCP.peerECN || connectionTCP.recentTimestamp != clientTimestamp+1 {
 		t.Fatalf("restored SYN-cookie options = MSS %d scale %d/%v SACK %v TS %v/%d ECN %v",
-			connection.peerMSS, connection.peerWindowScale, connection.peerWindowScaling, connection.peerSACK,
-			connection.peerTimestamp, connection.recentTimestamp, connection.peerECN)
+			connectionTCP.peerMSS, connectionTCP.peerWindowScale, connectionTCP.peerWindowScaling, connectionTCP.peerSACK,
+			connectionTCP.peerTimestamp, connectionTCP.recentTimestamp, connectionTCP.peerECN)
 	}
-	if connection.peerWindow != uint32(1234)<<5 {
-		t.Fatalf("restored peer window = %d, want %d", connection.peerWindow, uint32(1234)<<5)
+	if connectionTCP.peerWindow != uint32(1234)<<5 {
+		t.Fatalf("restored peer window = %d, want %d", connectionTCP.peerWindow, uint32(1234)<<5)
 	}
-	if connection.receiveWindowScale != serverWindowScale {
-		t.Fatalf("restored local window scale = %d, want advertised %d", connection.receiveWindowScale, serverWindowScale)
+	if connectionTCP.receiveWindowScale != serverWindowScale {
+		t.Fatalf("restored local window scale = %d, want advertised %d", connectionTCP.receiveWindowScale, serverWindowScale)
 	}
 	if connection.RemoteAddr().(*net.TCPAddr).AddrPort() != netip.AddrPortFrom(remote, 43001) {
 		t.Fatalf("cookie connection remote = %v", connection.RemoteAddr())
 	}
-	info := listener.Info()
+	info := listener.(*TCPListener).Info()
 	if info.SYNsReceived != 1 || info.SYNCookiesSent != 1 || info.SYNCookiesRejected != 1 || info.SYNCookiesAccepted != 1 ||
 		info.HandshakeCompletions != 1 || info.AcceptedConnections != 1 || info.AcceptQueuePeak > 1 ||
 		info.SYNBacklogConnections != tcpSYNBacklog || info.SYNBacklogPeak != tcpSYNBacklog {
@@ -146,15 +147,15 @@ func TestSYNCookieFastOpenFallsBackToFinalACK(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 	for index := 0; index < tcpSYNBacklog; index++ {
-		if !listener.trackHandshake(&TCPConn{}) {
+		if !listener.(*TCPListener).trackHandshake(&TCPConn{}) {
 			t.Fatalf("failed to fill SYN backlog at %d", index)
 		}
 	}
 	t.Cleanup(func() {
-		listener.mu.Lock()
-		listener.pending = make(map[*TCPConn]struct{})
-		listener.handshaking = make(map[*TCPConn]struct{})
-		listener.mu.Unlock()
+		listener.(*TCPListener).mu.Lock()
+		listener.(*TCPListener).pending = make(map[*TCPConn]struct{})
+		listener.(*TCPListener).handshaking = make(map[*TCPConn]struct{})
+		listener.(*TCPListener).mu.Unlock()
 	})
 
 	const clientSequence = uint32(0x23456789)
@@ -177,10 +178,10 @@ func TestSYNCookieFastOpenFallsBackToFinalACK(t *testing.T) {
 	if err = writeTestPacket(stack, finalACK); err != nil {
 		t.Fatal(err)
 	}
-	if err = listener.SetDeadline(time.Now().Add(time.Second)); err != nil {
+	if err = listener.(*TCPListener).SetDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	connection, err := listener.AcceptTCP()
+	connection, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,14 +226,14 @@ func TestSYNCookieListenerCloseResetsPendingConnection(t *testing.T) {
 	connection := newTCPConn(stack, "tcp4", key, 1500, tcpSocketOptionSet{})
 	connection.passive = true
 	connection.receiveNext = 0x12345679
-	if !listener.trackCompleted(connection) {
+	if !listener.(*TCPListener).trackCompleted(connection) {
 		t.Fatal("failed to track pending cookie connection")
 	}
 	if err = listener.Close(); err != nil {
 		t.Fatal(err)
 	}
 	const initialSequence = uint32(0x87654321)
-	connection.runPassiveCookie(listener, tcpSegment{}, initialSequence)
+	connection.runPassiveCookie(listener.(*TCPListener), tcpSegment{}, initialSequence)
 	packet := readOutboundPacket(t, stack)
 	parsed, ok := parseIPPacket(packet)
 	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {

@@ -283,17 +283,18 @@ type ipPayloadWriter func(source, target netip.Addr, payload []byte, options ipP
 // ListenIP creates an unconnected IPv4 or IPv6 protocol socket. Network must
 // be an IP network with a numeric or well-known protocol, such as ip4:icmp or
 // ip:99. An empty Local selects the network's wildcard address; a generic ip
-// wildcard is dual-stack when both address families are configured.
-func (s *Stack) ListenIP(ctx context.Context, network string, local netip.Addr) (*IPConn, error) {
+// wildcard is dual-stack when both address families are configured. The
+// returned net.PacketConn has dynamic type *IPConn.
+func (s *Stack) ListenIP(ctx context.Context, network string, local netip.Addr) (net.PacketConn, error) {
 	return s.listenIP(ctx, network, local, socketOptionSet{})
 }
 
 // listenIP contains protocol-socket construction shared by Stack and
 // ListenConfig.
-func (s *Stack) listenIP(ctx context.Context, network string, local netip.Addr, options socketOptionSet) (*IPConn, error) {
+func (s *Stack) listenIP(ctx context.Context, network string, local netip.Addr, options socketOptionSet) (net.PacketConn, error) {
 	local = local.Unmap()
 	target := ipNetAddr(local)
-	wrap := func(err error) (*IPConn, error) {
+	wrap := func(err error) (net.PacketConn, error) {
 		return nil, socketOperationError("listen", network, nil, target, err)
 	}
 	protocol, err := parseIPNetwork(network, local)

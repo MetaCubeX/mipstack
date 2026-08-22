@@ -335,7 +335,7 @@ func TestPublicICMPExtensionInterop(t *testing.T) {
 				}
 				if writeErr == nil {
 					storage := make([]byte, 65535)
-					read, readErr := connection.Read(storage)
+					read, readErr := connection.(*mipstack.IPConn).Read(storage)
 					if readErr != nil {
 						t.Fatalf("read gVisor RFC 4884 message in mipstack: %v", readErr)
 					}
@@ -377,7 +377,7 @@ func TestPublicICMPExtensionInterop(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if written, writeErr := connection.WriteToIP(mipWire, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(mipWire) {
+				if written, writeErr := connection.WriteTo(mipWire, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(mipWire) {
 					t.Fatalf("write mipstack RFC 4884 message: n=%d, error=%v", written, writeErr)
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -520,16 +520,16 @@ func TestMipstackICMPFilterInterop(t *testing.T) {
 			if err = connection.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 				t.Fatal(err)
 			}
-			if _, readErr := connection.Read(make([]byte, 64)); !errors.Is(readErr, os.ErrDeadlineExceeded) {
+			if _, readErr := connection.(*mipstack.IPConn).Read(make([]byte, 64)); !errors.Is(readErr, os.ErrDeadlineExceeded) {
 				t.Fatalf("blocked ICMP read = %v, want deadline", readErr)
 			}
 			if err = connection.SetReadDeadline(time.Time{}); err != nil {
 				t.Fatal(err)
 			}
 			if family.mipstackAddress.Is4() {
-				err = connection.SetICMPv4Filter(mipstack.ICMPv4Filter{})
+				err = connection.(*mipstack.IPConn).SetICMPv4Filter(mipstack.ICMPv4Filter{})
 			} else {
-				err = connection.SetICMPv6Filter(mipstack.ICMPv6Filter{})
+				err = connection.(*mipstack.IPConn).SetICMPv6Filter(mipstack.ICMPv6Filter{})
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -539,7 +539,7 @@ func TestMipstackICMPFilterInterop(t *testing.T) {
 				t.Fatalf("write accepted gVisor ICMP: n=%d, error=%s", written, tcpipErrorString(writeErr))
 			}
 			storage := make([]byte, 64)
-			read, readErr := connection.Read(storage)
+			read, readErr := connection.(*mipstack.IPConn).Read(storage)
 			if readErr != nil || !bytes.Equal(storage[:read], message) {
 				t.Fatalf("accepted gVisor ICMP = %x, %v", storage[:read], readErr)
 			}
@@ -579,7 +579,7 @@ func TestGVisorICMPv6FilterInterop(t *testing.T) {
 	defer queue.EventUnregister(&entry)
 
 	message := makeICMPEcho(family, true, 0x5320, 1, []byte("filtered"), family.mipstackAddress, family.gvisorAddress)
-	if written, writeErr := connection.WriteToIP(message, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(message) {
+	if written, writeErr := connection.WriteTo(message, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(message) {
 		t.Fatalf("write filtered mipstack ICMPv6: n=%d, error=%v", written, writeErr)
 	}
 	blockedContext, cancelBlocked := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -592,7 +592,7 @@ func TestGVisorICMPv6FilterInterop(t *testing.T) {
 		t.Fatalf("clear gVisor ICMPv6 filter: %s", tcpipErr.String())
 	}
 	message = makeICMPEcho(family, true, 0x5320, 2, []byte("accepted"), family.mipstackAddress, family.gvisorAddress)
-	if written, writeErr := connection.WriteToIP(message, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(message) {
+	if written, writeErr := connection.WriteTo(message, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || written != len(message) {
 		t.Fatalf("write accepted mipstack ICMPv6: n=%d, error=%v", written, writeErr)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
