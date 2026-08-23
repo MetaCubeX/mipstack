@@ -4550,7 +4550,8 @@ func TestTCPTimerBacklogSnapshotDoesNotGrow(t *testing.T) {
 }
 
 // TestTCPConcurrentCloseAndDeadlines exercises socket state broadcasts while
-// Read, Write, deadline changes, and Close race at the public API boundary.
+// Read, Write, deadline and ACK-policy changes, and Close race at the public
+// API boundary.
 func TestTCPConcurrentCloseAndDeadlines(t *testing.T) {
 	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
 	defer stack.Close()
@@ -4561,7 +4562,7 @@ func TestTCPConcurrentCloseAndDeadlines(t *testing.T) {
 		t.Fatal(err)
 	}
 	var wait sync.WaitGroup
-	wait.Add(3)
+	wait.Add(4)
 	go func() {
 		defer wait.Done()
 		_, _ = connection.Write(make([]byte, tcpSendCapacity*2))
@@ -4574,6 +4575,13 @@ func TestTCPConcurrentCloseAndDeadlines(t *testing.T) {
 		defer wait.Done()
 		for index := 0; index < 100; index++ {
 			_ = connection.SetDeadline(time.Now().Add(time.Duration(index+1) * time.Millisecond))
+		}
+	}()
+	go func() {
+		defer wait.Done()
+		tcpConnection := connection.(*TCPConn)
+		for index := 0; index < 100; index++ {
+			_ = tcpConnection.SetQuickACK(index%2 == 0)
 		}
 	}()
 	time.Sleep(5 * time.Millisecond)
@@ -4622,8 +4630,163 @@ func TestTCPPortReuseByFourTuple(t *testing.T) {
 	}
 }
 
-// TestTCPDelayedACK verifies ACK-every-two-segments and the bounded timer for
-// a lone in-order segment.
+// TestTCPACKPolicy verifies bounded quick ACKs, ping-pong transitions, and
+// successful ACK accounting with and without selective acknowledgements.
+func TestTCPACKPolicy(t *testing.T) {
+	epoch := time.Now()
+	connection := &TCPConn{stack: &Stack{timestampEpoch: epoch}}
+	state := tcpEstablishedState{
+		connection: connection, pathMSS: 1460, receiveMSS: 1460,
+		receiveNext: 1000, lastACKSent: 1000,
+		receiveWindowState: tcpReceiveWindow{right: 1000 + 1024*1024},
+		rtt:                rttEstimator{rto: 200 * time.Millisecond},
+		ackPending:         true,
+		ackPingPong:        true,
+	}
+	state.replenishQuickACK(tcpMaximumQuickACKs)
+	if state.quickACKBudget != tcpMaximumQuickACKs {
+		t.Fatalf("quick ACK budget = %d, want %d", state.quickACKBudget, tcpMaximumQuickACKs)
+	}
+	if !state.ackPending || !state.ackPingPong {
+		t.Fatal("budget replenishment discarded pending or ping-pong state")
+	}
+	state.enterQuickACK(2)
+	if state.ackPingPong {
+		t.Fatal("enterQuickACK retained ping-pong state")
+	}
+	state.quickACKBudget = 0
+	state.ackPending = false
+	state.ackPingPong = true
+	state.lastDataReceived = monotonicStampAt(epoch, epoch)
+	state.observeReceivedData(epoch.Add(time.Second))
+	if state.quickACKBudget != tcpMaximumQuickACKs || !state.ackPingPong {
+		t.Fatalf("idle replenishment state = budget %d, ping-pong %t", state.quickACKBudget, state.ackPingPong)
+	}
+	state.quickACKBudget = 0
+	state.enterQuickACK(2)
+	if state.quickACKBudget != 2 || state.ackPingPong {
+		t.Fatalf("explicit quick ACK state = budget %d, ping-pong %t", state.quickACKBudget, state.ackPingPong)
+	}
+	state.quickACKBudget = 2
+	state.ackPending = true
+	state.receiveNext++
+	state.commitAcknowledgment(512, false)
+	if state.quickACKBudget != 1 || state.ackPending {
+		t.Fatalf("committed ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
+	}
+	state.lastDataReceived = monotonicStampAt(epoch, epoch.Add(time.Second))
+	state.observeSentData(monotonicStampAt(epoch, epoch.Add(time.Second+time.Millisecond)))
+	if !state.ackPingPong {
+		t.Fatal("prompt application response did not enter ping-pong mode")
+	}
+	state.quickACKBudget = 2
+	state.ackPending = true
+	state.outOfOrder = []tcpReceivedPiece{{sequence: state.receiveNext + 1, payload: []byte{1}}}
+	state.peerSACK = false
+	state.commitAcknowledgment(512, false)
+	if state.ackPending || state.quickACKBudget != 1 {
+		t.Fatalf("non-SACK ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
+	}
+	state.quickACKBudget = 2
+	state.ackPending = true
+	state.peerSACK = true
+	state.commitAcknowledgment(512, false)
+	if !state.ackPending || state.quickACKBudget != 2 {
+		t.Fatalf("omitted SACK ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
+	}
+	state.commitAcknowledgment(512, true)
+	if state.ackPending || state.quickACKBudget != 1 {
+		t.Fatalf("selective ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
+	}
+	if state.observeDataECN(2) || !state.ecnDataSeen {
+		t.Fatal("first ECT data requested a quick ACK or was not recorded")
+	}
+	if !state.observeDataECN(0) {
+		t.Fatal("non-ECT data after ECT did not request a quick ACK")
+	}
+	if !state.observeDataECN(3) || !connection.echoCongestion {
+		t.Fatal("new CE episode did not request a quick ACK and ECE")
+	}
+	if state.observeDataECN(3) {
+		t.Fatal("continuing CE episode requested another quick ACK transition")
+	}
+}
+
+// TestTCPReceiveMSSMeasurement verifies that repeated full segments can lower
+// the delayed-ACK threshold without treating an application remnant as an MSS.
+func TestTCPReceiveMSSMeasurement(t *testing.T) {
+	state := tcpEstablishedState{connection: &TCPConn{}, pathMSS: 1460, receiveMSS: 1460}
+	segment := tcpSegment{payload: make([]byte, 536)}
+	state.measureReceiveMSS(&segment)
+	if state.receiveMSS != 1460 || state.lastReceiveSegmentSize != 536 {
+		t.Fatalf("first smaller segment = MSS %d candidate %d", state.receiveMSS, state.lastReceiveSegmentSize)
+	}
+	state.measureReceiveMSS(&segment)
+	if state.receiveMSS != 536 || state.lastReceiveSegmentSize != 0 {
+		t.Fatalf("confirmed smaller segment = MSS %d candidate %d", state.receiveMSS, state.lastReceiveSegmentSize)
+	}
+	segment = tcpSegment{flags: TCPFlagPSH, payload: make([]byte, 1200)}
+	state.measureReceiveMSS(&segment)
+	if state.receiveMSS != 1200 {
+		t.Fatalf("larger segment MSS = %d, want 1200", state.receiveMSS)
+	}
+	segment = tcpSegment{flags: TCPFlagPSH, payload: make([]byte, 64)}
+	state.measureReceiveMSS(&segment)
+	segment.flags = 0
+	state.measureReceiveMSS(&segment)
+	if state.receiveMSS != 1200 || state.lastReceiveSegmentSize != 64 {
+		t.Fatalf("PSH remnant changed MSS: MSS %d candidate %d", state.receiveMSS, state.lastReceiveSegmentSize)
+	}
+	state.measureReceiveMSS(&segment)
+	if state.receiveMSS != 64 {
+		t.Fatalf("repeated path-limited segment MSS = %d, want 64", state.receiveMSS)
+	}
+	state.receiveMSS = 536
+	segment = tcpSegment{payload: make([]byte, tcpMinimumPeerMSS-1)}
+	state.measureReceiveMSS(&segment)
+	state.measureReceiveMSS(&segment)
+	if state.receiveMSS != 536 || state.lastReceiveSegmentSize != 0 {
+		t.Fatalf("sub-minimum MSS changed estimate: MSS %d candidate %d", state.receiveMSS, state.lastReceiveSegmentSize)
+	}
+	state.pathMSS = 16
+	state.receiveMSS = 16
+	segment = tcpSegment{payload: []byte{1}}
+	state.measureReceiveMSS(&segment)
+	state.measureReceiveMSS(&segment)
+	if state.receiveMSS != 1 || state.lastReceiveSegmentSize != 0 {
+		t.Fatalf("legacy low-MTU MSS = %d candidate %d, want 1 and 0", state.receiveMSS, state.lastReceiveSegmentSize)
+	}
+	state.pathMSS = 1460
+	state.connection.peerTimestamp = true
+	state.receiveMSS = 1460
+	segment = tcpSegment{optionLength: 24, payload: make([]byte, 1188)}
+	state.measureReceiveMSS(&segment)
+	segment = tcpSegment{optionLength: 32, payload: make([]byte, 1180)}
+	state.measureReceiveMSS(&segment)
+	if state.receiveMSS != 1200 || state.lastReceiveSegmentSize != 0 {
+		t.Fatalf("variable-option MSS = %d candidate %d", state.receiveMSS, state.lastReceiveSegmentSize)
+	}
+}
+
+// TestTCPQuickACKWakeLastRequestWins verifies mutually exclusive policy
+// requests retain the most recently published state before actor processing.
+func TestTCPQuickACKWakeLastRequestWins(t *testing.T) {
+	connection := TCPConn{}
+	connection.inbound.notify = make(chan struct{}, 1)
+	connection.updateActorWake(tcpActorWakeQuickACKMask, tcpActorWakeQuickACKEnable)
+	connection.updateActorWake(tcpActorWakeQuickACKMask, tcpActorWakeQuickACKDisable)
+	if wake := connection.takeActorWake(); wake&tcpActorWakeQuickACKMask != tcpActorWakeQuickACKDisable {
+		t.Fatalf("last quick ACK wake = %#x, want disable", wake)
+	}
+	select {
+	case <-connection.inbound.notify:
+	default:
+		t.Fatal("quick ACK wake did not notify the actor")
+	}
+}
+
+// TestTCPDelayedACK verifies byte-based coalescing and the bounded timer after
+// an application explicitly favors response piggybacking.
 func TestTCPDelayedACK(t *testing.T) {
 	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
 	defer stack.Close()
@@ -4634,6 +4797,9 @@ func TestTCPDelayedACK(t *testing.T) {
 	}
 	defer connection.Close()
 	tcpConnection := connection.(*TCPConn)
+	if err = tcpConnection.SetQuickACK(false); err != nil {
+		t.Fatal(err)
+	}
 	waitFor(t, time.Second, func() bool {
 		link.mu.Lock()
 		defer link.mu.Unlock()
@@ -4671,6 +4837,22 @@ func TestTCPDelayedACK(t *testing.T) {
 		defer link.mu.Unlock()
 		return link.clientACKs >= afterPair+1
 	})
+	link.mu.Lock()
+	afterTimer := link.clientACKs
+	link.mu.Unlock()
+	deliver(4)
+	deliver(5)
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		defer link.mu.Unlock()
+		return link.clientACKs >= afterTimer+2
+	})
+	if err = tcpConnection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = tcpConnection.SetQuickACK(true); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("SetQuickACK after Close = %v, want net.ErrClosed", err)
+	}
 }
 
 // TestTCPZeroWindowProbePreservesSequenceSpace verifies that persist recovery

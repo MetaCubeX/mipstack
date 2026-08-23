@@ -63,6 +63,46 @@ func TestTCPInterop(t *testing.T) {
 	}
 }
 
+// TestTCPQuickACKInterop verifies that transient Linux-style quick-ACK
+// requests preserve application data in both endpoint roles and address
+// families. Wire timing remains an implementation policy rather than a peer
+// requirement, so the test asserts complete duplex behavior after each mode.
+func TestTCPQuickACKInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mipstackListens := range []bool{true, false} {
+			mipstackListens := mipstackListens
+			role := "gvisor-listens"
+			if mipstackListens {
+				role = "mipstack-listens"
+			}
+			t.Run(family.name+"/"+role, func(t *testing.T) {
+				network := newFamilyInteropNetwork(t, family, 1500)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+				defer listener.Close()
+				defer client.Close()
+				defer server.Close()
+				connection, peer := client, server
+				if mipstackListens {
+					connection, peer = server, client
+				}
+				quick := connection.(*mipstack.TCPConn)
+				if err := quick.SetQuickACK(false); err != nil {
+					t.Fatalf("disable quick ACK: %v", err)
+				}
+				exchangeTCPPayload(t, peer, connection, patternedPayload(4096, 31))
+				if err := quick.SetQuickACK(true); err != nil {
+					t.Fatalf("enable quick ACK: %v", err)
+				}
+				exchangeTCPPayload(t, peer, connection, patternedPayload(4096, 79))
+				exchangeTCPPayload(t, connection, peer, patternedPayload(4096, 113))
+			})
+		}
+	}
+}
+
 // TestPublicTCPSegmentCodecInterop verifies that gVisor accepts a SYN built by
 // the public codec and that its native SYN-ACK is decoded by the same API.
 func TestPublicTCPSegmentCodecInterop(t *testing.T) {
@@ -857,6 +897,37 @@ func exerciseFullDuplexTCP(t *testing.T, client, server net.Conn, payloadSize in
 		if err := <-results; err != nil {
 			t.Error(err)
 		}
+	}
+}
+
+// exchangeTCPPayload transfers one length-delimited payload without closing
+// either write half, allowing the same connection to exercise later policy
+// changes.
+func exchangeTCPPayload(t *testing.T, sender, receiver net.Conn, payload []byte) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	if err := sender.SetWriteDeadline(deadline); err != nil {
+		t.Fatalf("set sender write deadline: %v", err)
+	}
+	if err := receiver.SetReadDeadline(deadline); err != nil {
+		t.Fatalf("set receiver read deadline: %v", err)
+	}
+	written := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(sender, bytes.NewReader(payload))
+		written <- err
+	}()
+	received := make([]byte, len(payload))
+	_, readErr := io.ReadFull(receiver, received)
+	writeErr := <-written
+	if writeErr != nil {
+		t.Fatalf("write payload: %v", writeErr)
+	}
+	if readErr != nil {
+		t.Fatalf("read payload: %v", readErr)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatal("payload mismatch")
 	}
 }
 

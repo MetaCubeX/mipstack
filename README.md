@@ -301,6 +301,14 @@ are `*TCPConn`, `*TCPListener`, `*UDPConn`, and `*IPConn` as appropriate, and
 only need a type assertion when using MIPS-specific extensions.
 `ListenMulticastUDP` returns `*UDPConn`.
 
+`TCPConn.SetQuickACK` mirrors Linux's transient `TCP_QUICKACK` policy.
+Enabling it replenishes a bounded immediate-ACK budget, leaves
+response-piggybacking mode, and queues an immediate flush of any pending
+acknowledgement; disabling it favors response piggybacking. Protocol events and
+the delayed-ACK timer may subsequently change the mode, so the setting is not
+persistent. A successful call queues the actor-owned change without waiting
+for the acknowledgement to reach the embedding link.
+
 The zero-value `ListenConfig` and `Dialer` mirror the creation-time policy
 pattern used by `net.ListenConfig` and `net.Dialer`. Their `Options` slices are
 read in order and are not retained. `SocketOptions` constructs sealed,
@@ -828,7 +836,12 @@ send and receive buffers, adaptive RTO with exponential backoff, selectable
 CUBIC, Reno, BBRv1, and BBRv3 congestion control, window scaling,
 delayed ACKs, SACK multi-hole recovery with Proportional Rate Reduction, RACK
 time-based loss detection, tail-loss probes, timestamp negotiation with PAWS,
-and classic ECN feedback. Text and FIN carried in a stateful SYN or SYN-ACK are
+and classic ECN feedback. The receive ACK policy learns the peer's effective
+segment size without mistaking variable SACK options or application remnants
+for a smaller MSS. It sends an ACK once unacknowledged data exceeds one learned
+segment, uses a bounded quick-ACK budget for startup, idle restart, reordering,
+loss, and ECN feedback, and favors acknowledgement piggybacking for prompt
+request/reply traffic. Text and FIN carried in a stateful SYN or SYN-ACK are
 retained through the handshake and processed only after the connection enters
 ESTABLISHED. SYN-cookie mode remains stateless, so unacknowledged SYN text is
 accepted only when the peer retransmits it with or after the final ACK.
