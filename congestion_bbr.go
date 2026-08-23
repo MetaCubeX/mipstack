@@ -369,6 +369,9 @@ func (b *bbrCongestionControl) handleRecoveryEvent(event *CongestionEvent) {
 		event.State.CongestionWindow = event.Recovery.PreviousWindow
 	case CongestionRecoveryUndo:
 		b.undoRecovery(event.Time)
+		if event.State.CongestionWindow < b.priorWindow {
+			event.State.CongestionWindow = b.priorWindow
+		}
 	}
 }
 

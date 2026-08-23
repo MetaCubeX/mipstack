@@ -412,11 +412,16 @@ func (c *tcpCongestionController) onACKWithThreshold(window, acknowledged, ackno
 
 // finishDeliveryRateSample converts delivery snapshots selected during cumulative
 // ACK and SACK processing into one Linux-style rate sample.
-func (c *tcpCongestionController) finishDeliveryRateSample(sample *tcpDeliveryRateSample, acknowledged uint32, priorInFlight, inFlight uint32, now time.Time, nowStamp monotonicStamp, minimumRTT, smoothedRTT, sampleRTT time.Duration) {
+func (c *tcpCongestionController) finishDeliveryRateSample(sample *tcpDeliveryRateSample, acknowledged uint32, priorInFlight, inFlight uint32, now time.Time, nowStamp monotonicStamp, minimumRTT, smoothedRTT, sampleRTT time.Duration, sackReneging bool) {
 	if !c.usesDeliveryRate() {
 		return
 	}
 	c.delivery.finishRateSample(sample, acknowledged, priorInFlight, inFlight, now, nowStamp, minimumRTT, smoothedRTT, sampleRTT)
+	if sackReneging {
+		// Linux rejects rate samples during SACK reneging because their delivered
+		// interval can include ranges counted before the receiver discarded them.
+		sample.valid = false
+	}
 	c.state.MinimumRTT = minimumRTT
 	c.state.SmoothedRTT = smoothedRTT
 	c.syncDeliveryState()
@@ -737,6 +742,12 @@ func (c *tcpCongestionController) customRecovery() bool {
 	return c.features&CongestionControlFeatureCustomRecovery != 0
 }
 
+// customWindowValidation reports whether the controller owns idle and
+// under-utilization congestion-window validation.
+func (c *tcpCongestionController) customWindowValidation() bool {
+	return c.features&CongestionControlFeatureCustomWindowValidation != 0
+}
+
 // initialize seeds optional delivery and pacing models from the connection's
 // handshake observations.
 func (c *tcpCongestionController) initialize(now time.Time, minimumRTT, smoothedRTT time.Duration, window, slowStartThreshold uint32, mss int, stamp monotonicStamp) (uint32, uint32) {
@@ -786,13 +797,28 @@ func (c *tcpCongestionController) checkpointRecovery(now time.Time, window, thre
 }
 
 // undoRecovery reports a congestion episode proven spurious after synchronizing
-// the transport state that will be restored.
-func (c *tcpCongestionController) undoRecovery(now time.Time, window, threshold, flight uint32, mss int) {
+// the transport state that TCP proposes to restore. Custom recovery controllers
+// may replace the proposed window and threshold.
+func (c *tcpCongestionController) undoRecovery(now time.Time, previousWindow, window, threshold, flight uint32, mss int, phase CongestionPhase) (uint32, uint32) {
 	c.syncTransportState(window, threshold, flight, mss, c.state.SmoothedRTT)
 	event := c.prepareEvent(CongestionEventRecovery, now)
-	event.Recovery.Stage = CongestionRecoveryUndo
+	event.Recovery = CongestionRecovery{
+		Stage: CongestionRecoveryUndo, Flight: flight,
+		PreviousWindow: previousWindow, ProposedWindow: window,
+	}
 	c.handleEvent()
-	c.setCongestionPhase(CongestionPhaseOpen, now)
+	if c.customRecovery() {
+		window = c.state.CongestionWindow
+		threshold = c.state.SlowStartThreshold
+	} else {
+		// Checkpoint and undo notifications are delivered to every controller so
+		// private state can be restored, but only an explicit custom-recovery
+		// feature may replace TCP's RFC response.
+		c.state.CongestionWindow = window
+		c.state.SlowStartThreshold = threshold
+	}
+	c.setCongestionPhase(phase, now)
+	return window, threshold
 }
 
 // recoveryFlight selects the flight estimate used to enter recovery.

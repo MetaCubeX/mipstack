@@ -327,6 +327,9 @@ func (b *bbr3CongestionControl) handleRecoveryEvent(event *CongestionEvent) {
 		event.State.CongestionWindow = event.Recovery.PreviousWindow
 	case CongestionRecoveryUndo:
 		b.undoRecovery()
+		if event.State.CongestionWindow < b.priorWindow {
+			event.State.CongestionWindow = b.priorWindow
+		}
 	}
 }
 
@@ -1351,7 +1354,8 @@ func (b *bbr3CongestionControl) saveWindow(window uint32) {
 	}
 }
 
-// undoRecovery restores model state after Eifel or DSACK proves recovery spurious.
+// undoRecovery restores model state after Eifel, DSACK, or F-RTO proves
+// recovery spurious.
 func (b *bbr3CongestionControl) undoRecovery() {
 	b.resetFullBandwidth()
 	b.recovery = false

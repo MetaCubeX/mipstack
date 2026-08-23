@@ -110,7 +110,24 @@ type testPacketLink struct {
 	tcpPathMTU             uint32
 	pathMTUInjected        bool
 	postPathMTUMaximum     int
+	sackReneging           bool
+	sackRenegingAt         time.Time
+	sackRenegingDelay      time.Duration
+	tcpDelaySpike          testTCPDelaySpike
 	done                   chan struct{}
+}
+
+// testTCPDelaySpike retains one original TCP flight until its first range is
+// retransmitted. All fields are protected by testPacketLink.mu.
+type testTCPDelaySpike struct {
+	armed, released, triggered bool
+	haveFirst                  bool
+	firstSequence              uint32
+	held, repeated             [][]byte
+	delayedOriginal            [][]byte
+	seen                       map[uint32]struct{}
+	heldRanges, releaseAfter   int
+	firstRetransmissions       int
 }
 
 func consumeTestPacket(queue *packetQueue, entry packetQueueEntry) []byte {
@@ -407,6 +424,9 @@ func (l *testPacketLink) handleOutboundPacket(packet []byte) error {
 		}
 	}
 	if parsed.protocol == ProtocolTCP && echoTCP {
+		if handled, err := l.handleTCPDelaySpike(packet, parsed); handled {
+			return err
+		}
 		return l.handleTCP(parsed)
 	}
 	select {
@@ -414,6 +434,97 @@ func (l *testPacketLink) handleOutboundPacket(packet []byte) error {
 	default:
 	}
 	return nil
+}
+
+// armTCPDelaySpike delays the next TCP data flight until retransmissions of
+// its first range reach releaseAfter.
+func (l *testPacketLink) armTCPDelaySpike(releaseAfter int) {
+	l.mu.Lock()
+	l.tcpDelaySpike = testTCPDelaySpike{armed: true, releaseAfter: releaseAfter, seen: make(map[uint32]struct{})}
+	l.mu.Unlock()
+}
+
+// tcpDelaySpikeStatus returns stable coverage state for assertions.
+func (l *testPacketLink) tcpDelaySpikeStatus() (triggered, released bool, held int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.tcpDelaySpike.triggered, l.tcpDelaySpike.released, l.tcpDelaySpike.heldRanges
+}
+
+// releaseTCPDelayOriginal supplies original copies kept beyond F-RTO
+// detection, proving that the timeout resulted from delay rather than loss.
+func (l *testPacketLink) releaseTCPDelayOriginal() error {
+	l.mu.Lock()
+	packets := l.tcpDelaySpike.delayedOriginal
+	l.tcpDelaySpike.delayedOriginal = nil
+	l.mu.Unlock()
+	for _, raw := range packets {
+		packet, ok := parseIPPacket(raw)
+		if ok {
+			if err := l.handleTCP(packet); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// handleTCPDelaySpike applies the armed delay before the emulated TCP peer.
+// The peer itself still validates sequence space and generates every ACK.
+func (l *testPacketLink) handleTCPDelaySpike(raw []byte, packet ipPacket) (bool, error) {
+	tcp := packet.payload
+	if len(tcp) < tcpHeaderSize {
+		return false, nil
+	}
+	headerSize := int(tcp[12]>>4) * 4
+	if headerSize < tcpHeaderSize || headerSize >= len(tcp) {
+		return false, nil
+	}
+	sequence := binary.BigEndian.Uint32(tcp[4:8])
+	l.mu.Lock()
+	delay := &l.tcpDelaySpike
+	if !delay.armed || delay.released {
+		l.mu.Unlock()
+		return false, nil
+	}
+	if _, exists := delay.seen[sequence]; !exists {
+		delay.seen[sequence] = struct{}{}
+		delay.held = append(delay.held, append([]byte(nil), raw...))
+		if !delay.haveFirst {
+			delay.firstSequence, delay.haveFirst = sequence, true
+		}
+		l.mu.Unlock()
+		return true, nil
+	} else if sequence != delay.firstSequence {
+		delay.repeated = append(delay.repeated, append([]byte(nil), raw...))
+		l.mu.Unlock()
+		return true, nil
+	}
+	delay.firstRetransmissions++
+	if delay.firstRetransmissions < delay.releaseAfter {
+		l.mu.Unlock()
+		return true, nil
+	}
+	held := delay.held
+	delay.heldRanges = len(held)
+	delay.delayedOriginal = append(delay.delayedOriginal, held[0])
+	delay.delayedOriginal = append(delay.delayedOriginal, delay.repeated...)
+	delay.held, delay.repeated = nil, nil
+	delay.triggered, delay.released = true, true
+	l.mu.Unlock()
+
+	if err := l.handleTCP(packet); err != nil {
+		return true, err
+	}
+	for _, delayed := range held[1:] {
+		original, ok := parseIPPacket(delayed)
+		if ok {
+			if err := l.handleTCP(original); err != nil {
+				return true, err
+			}
+		}
+	}
+	return true, nil
 }
 
 // handleTCP applies the test peer's loss, ACK, echo, and FIN policy.
@@ -563,8 +674,16 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 		return l.deliverTCP(serverPort, clientPort, serverSequence, acknowledgement, TCPFlagACK, 65535, options, nil)
 	}
 	if len(payload) != 0 && sequence == peer.clientNext {
+		if !l.sackRenegingAt.IsZero() && l.sackRenegingDelay == 0 {
+			l.sackRenegingDelay = time.Since(l.sackRenegingAt)
+		}
 		if droppedAt, retransmitted := peer.dropped[sequence]; retransmitted {
 			delete(peer.dropped, sequence)
+			if l.sackReneging && len(peer.outOfOrder) != 0 {
+				peer.outOfOrder = make(map[uint32][]byte)
+				l.sackReneging = false
+				l.sackRenegingAt = time.Now()
+			}
 			if len(peer.outOfOrder) != 0 {
 				l.sackRecovery = true
 				l.sackRecoveries++

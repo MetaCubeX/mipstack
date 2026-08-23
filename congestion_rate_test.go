@@ -27,6 +27,22 @@ func TestTCPDeliveryRateSampleUsesLongerPipelinePhase(t *testing.T) {
 	}
 }
 
+func TestTCPDeliveryRateSampleRejectsSACKReneging(t *testing.T) {
+	controller := newTCPCongestionController(CongestionControlBBR)
+	sample := tcpDeliveryRateSample{
+		priorStamp: 1,
+		firstSent:  1,
+		lastSent:   monotonicStamp(2*time.Millisecond) + 1,
+	}
+	controller.finishDeliveryRateSample(&sample, 1000, 1000, 0, time.Unix(100, 0), monotonicStamp(3*time.Millisecond)+1, 0, time.Millisecond, 0, true)
+	if sample.delivered != 1000 || sample.interval == 0 {
+		t.Fatalf("reneging sample accounting = delivered %d interval %v", sample.delivered, sample.interval)
+	}
+	if sample.valid {
+		t.Fatal("SACK reneging produced a valid delivery-rate sample")
+	}
+}
+
 func TestTCPDeliveryTimestampWrapsAcrossUint32(t *testing.T) {
 	earlier := tcpDeliveryTimestamp(^uint32(0) - 5)
 	later := tcpDeliveryTimestamp(5)

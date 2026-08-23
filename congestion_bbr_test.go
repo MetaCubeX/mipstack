@@ -802,12 +802,12 @@ func TestBBRLossSamplingSeparatesACKAndTimerEvents(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlBBR)
 	controller.noteLoss(1000, false)
 	var sample tcpDeliveryRateSample
-	controller.finishDeliveryRateSample(&sample, 0, 0, 0, time.Unix(100, 0), 1, 0, 0, 0)
+	controller.finishDeliveryRateSample(&sample, 0, 0, 0, time.Unix(100, 0), 1, 0, 0, 0, false)
 	if sample.losses != 0 {
 		t.Fatalf("timer loss repeated on ACK as %d bytes", sample.losses)
 	}
 	controller.noteLoss(500, true)
-	controller.finishDeliveryRateSample(&sample, 0, 0, 0, time.Unix(101, 0), 2, 0, 0, 0)
+	controller.finishDeliveryRateSample(&sample, 0, 0, 0, time.Unix(101, 0), 2, 0, 0, 0, false)
 	if sample.losses != 500 {
 		t.Fatalf("ACK loss sample = %d, want 500", sample.losses)
 	}
@@ -853,7 +853,7 @@ func TestBBRSpuriousRecoveryUndoRetainsDeliveryAccounting(t *testing.T) {
 	bbrState(t, &controller).longTermSampling = true
 	bbrState(t, &controller).recovery = true
 	bbrState(t, &controller).packetConservation = true
-	_, _ = undo.restore(10_000, 1000, 1000, &controller, time.Unix(100, 0))
+	_, _ = undo.restore(1000, 10_000, 1000, 1000, &controller, time.Unix(100, 0), CongestionPhaseOpen)
 	if bbrState(t, &controller).delivered != 5000 || bbrState(t, &controller).bandwidth != 1_000_000 {
 		t.Fatalf("BBR undo rewound delivery model: delivered %d bandwidth %v", bbrState(t, &controller).delivered, bbrState(t, &controller).bandwidth)
 	}

@@ -248,7 +248,7 @@ func benchmarkTCPControllerConnections(b *testing.B, algorithm string, count int
 func BenchmarkTCPControllerConcurrency(b *testing.B) {
 	const size = 128 * 1024
 	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
-		for _, count := range []int{16, 64, 256, 512, 1024, 2048, 4096} {
+		for _, count := range []int{16, 64, 256, 512, 1024, 2048, 4096, 8192} {
 			b.Run(fmt.Sprintf("%s-%d", algorithm, count), func(b *testing.B) {
 				connections := benchmarkTCPControllerConnections(b, algorithm, count)
 				payload := bytes.Repeat([]byte{0x6b}, size)

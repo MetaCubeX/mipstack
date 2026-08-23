@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -1679,7 +1680,7 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 		t.Fatal("Eifel rejected conservative timestamp and prior-DSACK evidence")
 	}
 	response := eifel.eifelRTOResponse()
-	window, threshold := eifel.restore(6000, 4000, 1000, &controller, time.Unix(100, 0))
+	window, threshold := eifel.restore(1000, 6000, 4000, 1000, &controller, time.Unix(100, 0), CongestionPhaseOpen)
 	if window != 10000 || threshold != 10000 || controller.algorithmName() != CongestionControlCUBIC {
 		t.Fatalf("Eifel restore = cwnd %d ssthresh %d controller %q", window, threshold, controller.algorithmName())
 	}
@@ -1692,7 +1693,7 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	}
 	var highThreshold tcpRecoveryUndo
 	highThreshold.begin(false, 4000, 12000, 18000, 10000, &controller, rtt)
-	_, threshold = highThreshold.restore(6000, 0, 1000, &controller, time.Unix(100, 0))
+	_, threshold = highThreshold.restore(1000, 6000, 0, 1000, &controller, time.Unix(100, 0), CongestionPhaseOpen)
 	if threshold != 18000 {
 		t.Fatalf("RFC 4015 pipe_prev = %d, want max(FlightSize, ssthresh) = 18000", threshold)
 	}
@@ -1706,6 +1707,23 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	}
 	if !dsack.observeDSACK(TCPSACKBlock{LeftEdge: 2000, RightEdge: 3000}, 3000, 1000, false) {
 		t.Fatal("DSACK undo did not complete after every retransmission was duplicated")
+	}
+	timeoutDSACKController := newTCPCongestionController(CongestionControlCUBIC)
+	timeoutDSACK := new(tcpRecoveryUndo)
+	timeoutDSACK.begin(true, 3000, 12000, 8000, 10000, &timeoutDSACKController, rtt)
+	timeoutDSACK.recordRetransmission(1000, 2000, 300, false)
+	if !timeoutDSACK.observeDSACK(TCPSACKBlock{LeftEdge: 1000, RightEdge: 2000}, 2000, 1000, false) {
+		t.Fatal("DSACK did not prove the timeout retransmission spurious")
+	}
+	state := tcpEstablishedState{
+		connection: &TCPConn{stack: new(Stack)}, controller: timeoutDSACKController,
+		undo: timeoutDSACK, peerMSS: 1000, congestionWindow: 1000, slowStartThreshold: 8000,
+	}
+	if !state.restoreSpuriousRecovery(time.Unix(100, 0), 1000) {
+		t.Fatal("DSACK evidence did not restore timeout recovery")
+	}
+	if state.eifelRTO == nil {
+		t.Fatal("DSACK evidence did not install the RFC 4015 spurious-timeout response")
 	}
 
 	var repeated tcpRecoveryUndo
@@ -1744,6 +1762,56 @@ func TestTCPRecoveryUndoEvidence(t *testing.T) {
 	overlappingHistory.record(1000, 2000)
 	if matched, repeatedRange := overlappingHistory.match(TCPSACKBlock{LeftEdge: 1000, RightEdge: 2000}); !matched || !repeatedRange {
 		t.Fatalf("overlapping retransmission history match = %t, %t", matched, repeatedRange)
+	}
+}
+
+func TestTCPRecoveryUndoRestoresNestedTransportState(t *testing.T) {
+	now := time.Unix(100, 0)
+	controller := newTCPCongestionController(CongestionControlCUBIC)
+	_, _ = controller.initialize(now, 10*time.Millisecond, 20*time.Millisecond, 20_000, 10_000, 1000, 1)
+	controller.setCongestionPhase(CongestionPhaseRecovery, now)
+	state := tcpEstablishedState{
+		connection: &TCPConn{stack: new(Stack)}, controller: controller,
+		peerMSS: 1000, congestionWindow: 10_000, slowStartThreshold: 8000,
+		fastRecovery: true, recoveryPoint: 9000,
+		prrPriorFlight: 7000, prrDelivered: 2000, prrOut: 1000,
+		ecnRecoveryActive: true, ecnRecoveryPoint: 12_000, rtoAttempts: 2,
+		undo: new(tcpRecoveryUndo),
+	}
+	transport := state.recoveryTransportState(false)
+	state.undo.begin(false, 9000, state.congestionWindow, state.slowStartThreshold, 7000, &state.controller, newRTTEstimator(20*time.Millisecond))
+	state.undo.setTransport(transport)
+	state.fastRecovery = false
+	state.recoveryPoint = 0
+	state.prrPriorFlight, state.prrDelivered, state.prrOut = 0, 0, 0
+	state.ecnRecoveryActive, state.ecnRecoveryPoint = false, 0
+	state.rtoAttempts = 0
+	state.controller.setCongestionPhase(CongestionPhaseLoss, now.Add(time.Millisecond))
+	if !state.restoreSpuriousRecovery(now.Add(2*time.Millisecond), 1000) {
+		t.Fatal("nested recovery was not restored")
+	}
+	if !state.fastRecovery || state.recoveryPoint != 9000 || state.prrPriorFlight != 7000 || state.prrDelivered != 2000 || state.prrOut != 1000 {
+		t.Fatalf("restored fast recovery = active %t point %d PRR %d/%d/%d", state.fastRecovery, state.recoveryPoint, state.prrPriorFlight, state.prrDelivered, state.prrOut)
+	}
+	if !state.ecnRecoveryActive || state.ecnRecoveryPoint != 12_000 || state.rtoAttempts != 0 {
+		t.Fatalf("restored congestion epoch = active %t point %d attempts %d", state.ecnRecoveryActive, state.ecnRecoveryPoint, state.rtoAttempts)
+	}
+	if phase := state.controller.state.Phase; phase != CongestionPhaseRecovery {
+		t.Fatalf("restored congestion phase = %v, want Recovery", phase)
+	}
+	state.sendUnacknowledged = state.recoveryPoint
+	transport = state.recoveryTransportState(false)
+	state.undo.begin(false, 12_000, state.congestionWindow, state.slowStartThreshold, 7000, &state.controller, state.rtt)
+	state.undo.setTransport(transport)
+	state.fastRecovery = true
+	if !state.restoreSpuriousRecovery(now.Add(3*time.Millisecond), 1000) {
+		t.Fatal("completed nested recovery was not undone")
+	}
+	if state.fastRecovery || state.prrPriorFlight != 0 || state.prrDelivered != 0 || state.prrOut != 0 {
+		t.Fatalf("completed prior recovery was resurrected: active %t PRR %d/%d/%d", state.fastRecovery, state.prrPriorFlight, state.prrDelivered, state.prrOut)
+	}
+	if phase := state.controller.state.Phase; phase != CongestionPhaseOpen {
+		t.Fatalf("completed prior recovery phase = %v, want Open", phase)
 	}
 }
 
@@ -2448,6 +2516,177 @@ func TestTCPRTOPartialACKAdvancesLossRecovery(t *testing.T) {
 	}
 }
 
+func TestTCPFRTORecoversSpuriousTimeout(t *testing.T) {
+	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
+		algorithm := algorithm
+		t.Run(algorithm, func(t *testing.T) {
+			link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
+			defer stack.Close()
+			link.echoTCP = true
+			connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8098))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			tcpConnection := connection.(*TCPConn)
+			if err = tcpConnection.SetCongestionControl(algorithm); err != nil {
+				t.Fatal(err)
+			}
+			link.armTCPDelaySpike(1)
+			_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
+			payload := bytes.Repeat([]byte{0x7b}, 128*1024)
+			writeAndReadTCPEcho(t, connection, payload)
+			deadline := time.Now().Add(5 * time.Second)
+			for tcpConnection.Info().SpuriousRecoveryUndos == 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if tcpConnection.Info().SpuriousRecoveryUndos == 0 {
+				triggered, released, held := link.tcpDelaySpikeStatus()
+				t.Fatalf("F-RTO did not undo recovery: triggered %t released %t held %d info=%+v stats=%+v", triggered, released, held, tcpConnection.Info(), stack.Stats())
+			}
+			triggered, released, held := link.tcpDelaySpikeStatus()
+			if !triggered || !released || held < 2 {
+				t.Fatalf("delay spike = triggered %t released %t held %d", triggered, released, held)
+			}
+			if err := link.releaseTCPDelayOriginal(); err != nil {
+				t.Fatal(err)
+			}
+			info := tcpConnection.Info()
+			if info.Retransmissions == 0 {
+				t.Fatalf("delay spike did not trigger a retransmission timeout: rto=%v state=%+v", info.RetransmissionTimeout, info)
+			}
+			if info.SpuriousRecoveryUndos == 0 {
+				t.Fatal("F-RTO did not undo the spurious timeout recovery")
+			}
+		})
+	}
+}
+
+func TestTCPFRTOFallsBackAfterRealLoss(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
+	defer stack.Close()
+	link.echoTCP = true
+	// Disable SACK so tail-loss probing cannot satisfy this transfer before the
+	// retransmission timer. The single-segment write then exercises F-RTO's
+	// no-new-data fallback after a genuine RTO loss.
+	link.disableTCPSACK = true
+	link.dropTCPData = 1
+	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8099))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	writeAndReadTCPEcho(t, connection, bytes.Repeat([]byte{0x39}, 512))
+	info := connection.(*TCPConn).Info()
+	if info.Retransmissions == 0 {
+		t.Fatal("real loss did not trigger retransmission recovery")
+	}
+	if info.SpuriousRecoveryUndos != 0 {
+		t.Fatalf("real loss produced %d spurious-recovery undos", info.SpuriousRecoveryUndos)
+	}
+}
+
+func TestTCPFRTOECNFeedbackRequiresNegotiation(t *testing.T) {
+	for _, negotiated := range []bool{false, true} {
+		t.Run(fmt.Sprintf("negotiated=%t", negotiated), func(t *testing.T) {
+			link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
+			defer stack.Close()
+			link.echoTCP = true
+			link.ecnTCP = negotiated
+			connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8103))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			tcpConnection := connection.(*TCPConn)
+			if tcpConnection.peerECN != negotiated {
+				t.Fatalf("ECN negotiation = %t, want %t", tcpConnection.peerECN, negotiated)
+			}
+			link.armTCPDelaySpike(1)
+			link.mu.Lock()
+			link.sendTCPECE = true
+			link.mu.Unlock()
+			_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
+			writeAndReadTCPEcho(t, connection, bytes.Repeat([]byte{0x4e}, 32*1024))
+			info := tcpConnection.Info()
+			if info.Retransmissions == 0 {
+				t.Fatal("delay spike did not trigger a retransmission timeout")
+			}
+			if negotiated && info.SpuriousRecoveryUndos != 0 {
+				t.Fatalf("negotiated ECE produced %d spurious-recovery undos", info.SpuriousRecoveryUndos)
+			}
+			if !negotiated && info.SpuriousRecoveryUndos == 0 {
+				t.Fatal("unnegotiated ECE prevented F-RTO undo")
+			}
+			if err = link.releaseTCPDelayOriginal(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestTCPFRTORestartsAfterRecurringTimeout(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
+	defer stack.Close()
+	link.echoTCP = true
+	link.disableTCPSACK = true
+	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	link.armTCPDelaySpike(2)
+	_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
+	writeAndReadTCPEcho(t, connection, bytes.Repeat([]byte{0x6d}, 128*1024))
+	info := connection.(*TCPConn).Info()
+	if info.Retransmissions < 2 {
+		t.Fatalf("recurring timeout retransmissions = %d, want at least 2", info.Retransmissions)
+	}
+	if info.SpuriousRecoveryUndos == 0 {
+		t.Fatal("recurring timeout did not restart F-RTO detection")
+	}
+	if err := link.releaseTCPDelayOriginal(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTCPFRTOSACKFallbackRetransmitsImmediately(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
+	defer stack.Close()
+	link.echoTCP = true
+	link.sackTCP = true
+	link.dropTCPOrdinals = make(map[int]bool, 10)
+	for ordinal := 1; ordinal <= 10; ordinal++ {
+		link.dropTCPOrdinals[ordinal] = true
+	}
+	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8101))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+	payload := bytes.Repeat([]byte{0xa7}, 32*1024)
+	if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, writeErr)
+	}
+	tcpConnection := connection.(*TCPConn)
+	waitFor(t, 2*time.Second, func() bool { return tcpConnection.Info().Retransmissions != 0 })
+	// The backed-off timer is at least 400 ms. A 300 ms bound proves that
+	// Step 3 ACK feedback, rather than another timeout, sent the next range.
+	waitFor(t, 300*time.Millisecond, func() bool { return tcpConnection.Info().Retransmissions > 1 })
+	received := make([]byte, len(payload))
+	if _, err = io.ReadFull(connection, received); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatal("F-RTO SACK fallback payload mismatch")
+	}
+	if undos := tcpConnection.Info().SpuriousRecoveryUndos; undos != 0 {
+		t.Fatalf("real SACK loss produced %d spurious-recovery undos", undos)
+	}
+}
+
 // TestTCPSACKRecoversMultipleSegments verifies that three duplicate SACK ACKs
 // recover a leading hole without waiting for the retransmission timeout.
 func TestTCPSACKRecoversMultipleSegments(t *testing.T) {
@@ -2478,6 +2717,41 @@ func TestTCPSACKRecoversMultipleSegments(t *testing.T) {
 	link.mu.Unlock()
 	if !recovered {
 		t.Fatal("peer did not observe selective-ack hole recovery")
+	}
+}
+
+func TestTCPSACKRenegingWaitsBeforeClearingScoreboard(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
+	defer stack.Close()
+	link.echoTCP = true
+	link.sackTCP = true
+	link.sackReneging = true
+	link.dropTCPOrdinals = map[int]bool{1: true}
+	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8102))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	payload := bytes.Repeat([]byte{0x42}, 16*1024)
+	writeAndReadTCPEcho(t, connection, payload)
+	link.mu.Lock()
+	delay := link.sackRenegingDelay
+	link.mu.Unlock()
+	if delay < 8*time.Millisecond || delay >= tcpMinimumRTO {
+		t.Fatalf("SACK reneging recovery delay = %v, want Linux grace interval before RTO", delay)
+	}
+	if undos := connection.(*TCPConn).Info().SpuriousRecoveryUndos; undos != 0 {
+		t.Fatalf("SACK reneging produced %d spurious-recovery undos", undos)
+	}
+}
+
+func TestTCPSACKRenegingDelay(t *testing.T) {
+	if delay := tcpSACKRenegingDelay(8 * time.Millisecond); delay != 10*time.Millisecond {
+		t.Fatalf("short-RTT reneging delay = %v, want 10ms", delay)
+	}
+	if delay := tcpSACKRenegingDelay(200 * time.Millisecond); delay != 100*time.Millisecond {
+		t.Fatalf("long-RTT reneging delay = %v, want 100ms", delay)
 	}
 }
 
@@ -3207,7 +3481,8 @@ func TestTCPConnectionMemoryLayout(t *testing.T) {
 		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1528},
 		{"tcpEstablishedLivenessState", unsafe.Sizeof(tcpEstablishedLivenessState{}), 72},
 		{"tcpEstablishedPathMTUState", unsafe.Sizeof(tcpEstablishedPathMTUState{}), 120},
-		{"tcpRecoveryUndo", unsafe.Sizeof(tcpRecoveryUndo{}), 176},
+		{"tcpRecoveryUndo", unsafe.Sizeof(tcpRecoveryUndo{}), 80},
+		{"tcpRecoveryTransportState", unsafe.Sizeof(tcpRecoveryTransportState{}), 56},
 		{"tcpCongestionController", unsafe.Sizeof(tcpCongestionController{}), 472},
 	} {
 		if test.got != test.want {
@@ -4852,6 +5127,151 @@ func TestTCPDelayedACK(t *testing.T) {
 	}
 	if err = tcpConnection.SetQuickACK(true); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("SetQuickACK after Close = %v, want net.ErrClosed", err)
+	}
+}
+
+func TestTCPCompressedSACKScheduling(t *testing.T) {
+	state := tcpEstablishedState{}
+	state.rtt.srtt = 900 * time.Microsecond
+	state.quickACKBudget = 1
+	if !state.scheduleSACKACK(time.Unix(0, 0)) {
+		t.Fatal("quick-ACK budget did not bypass SACK compression")
+	}
+	if state.sackACKs != 0 {
+		t.Fatalf("quick SACK ACK advanced duplicate counter to %d", state.sackACKs)
+	}
+	state.clearDelayedACK()
+	state.quickACKBudget = 0
+	for acknowledgement := 0; acknowledgement < tcpDuplicateACKThreshold; acknowledgement++ {
+		if !state.scheduleSACKACK(time.Unix(0, 0)) {
+			t.Fatalf("initial SACK ACK %d was compressed", acknowledgement+1)
+		}
+		state.clearDelayedACK()
+	}
+	receivedAt := time.Unix(1, 0)
+	if state.scheduleSACKACK(receivedAt) {
+		t.Fatal("fourth SACK ACK was not compressed")
+	}
+	if deadline := state.delayedACKDeadline; !deadline.Equal(receivedAt.Add(297 * time.Microsecond)) {
+		t.Fatalf("compressed SACK deadline = %v, want %v", deadline, receivedAt.Add(297*time.Microsecond))
+	}
+	for acknowledgement := 1; acknowledgement < tcpMaximumCompressedSACKs; acknowledgement++ {
+		if state.scheduleSACKACK(receivedAt) {
+			t.Fatalf("compressed SACK ACK %d flushed before the count limit", acknowledgement+1)
+		}
+	}
+	if !state.scheduleSACKACK(receivedAt) {
+		t.Fatal("SACK ACK beyond the compression count limit remained deferred")
+	}
+	state.clearDelayedACK()
+	if state.compressedSACKs != 0 {
+		t.Fatalf("sent ACK retained %d compressed SACKs", state.compressedSACKs)
+	}
+	if delay := tcpCompressedSACKDelay(30 * time.Millisecond); delay != time.Millisecond {
+		t.Fatalf("long-RTT compressed SACK delay = %v, want 1ms", delay)
+	}
+	if delay := tcpCompressedSACKDelay(0); delay != time.Millisecond {
+		t.Fatalf("unknown-RTT compressed SACK delay = %v, want 1ms", delay)
+	}
+}
+
+// TestTCPCompressedSACK verifies that a live receiver preserves the first
+// three duplicate ACKs needed for fast retransmit and coalesces the remaining
+// SACK updates without delaying the cumulative ACK that fills the hole.
+func TestTCPCompressedSACK(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.61"), netip.MustParseAddr("198.51.100.61"))
+	defer stack.Close()
+	link.echoTCP = true
+	link.sackTCP = true
+	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 9106))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	tcpConnection := connection.(*TCPConn)
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		defer link.mu.Unlock()
+		return link.clientACKs != 0 && link.tcp[tcpConnection.key.local.Port()] != nil
+	})
+	link.mu.Lock()
+	peer := link.tcp[tcpConnection.key.local.Port()]
+	sequence, acknowledgement := peer.serverNext, peer.clientNext
+	baseline := link.clientACKs
+	link.mu.Unlock()
+	for index := uint32(1); index <= 16; index++ {
+		if err = link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence+index, acknowledgement, TCPFlagACK, 65535, nil, []byte{byte(index)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		defer link.mu.Unlock()
+		return link.clientACKs >= baseline+4
+	})
+	time.Sleep(5 * time.Millisecond)
+	link.mu.Lock()
+	compressed := link.clientACKs - baseline
+	link.mu.Unlock()
+	if compressed != 4 {
+		t.Fatalf("ACKs for 16 out-of-order segments = %d, want 4", compressed)
+	}
+	if err = link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence, acknowledgement, TCPFlagACK, 65535, nil, []byte{0}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		defer link.mu.Unlock()
+		return link.clientACKs >= baseline+5
+	})
+	received := make([]byte, 17)
+	if _, err = io.ReadFull(connection, received); err != nil {
+		t.Fatal(err)
+	}
+	for index, value := range received {
+		if value != byte(index) {
+			t.Fatalf("reassembled byte %d = %d", index, value)
+		}
+	}
+
+	sequence += uint32(len(received))
+	link.mu.Lock()
+	baseline = link.clientACKs
+	link.mu.Unlock()
+	for index := uint32(1); index <= 3; index++ {
+		if err = link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence+index, acknowledgement, TCPFlagACK, 65535, nil, []byte{byte(index)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A duplicate out-of-order range creates DSACK feedback and must bypass
+	// compression even after the three ordinary SACK ACKs used by recovery.
+	if err = link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence+3, acknowledgement, TCPFlagACK, 65535, nil, []byte{3}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		defer link.mu.Unlock()
+		return link.clientACKs >= baseline+4
+	})
+	if err = link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence+4, acknowledgement, TCPFlagACK, 65535, nil, []byte{4}); err != nil {
+		t.Fatal(err)
+	}
+	// DSACK enters Linux-style quick-ACK mode, so the following new range and
+	// the out-of-order FIN both remain immediate rather than resuming compression.
+	if err = link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence+5, acknowledgement, TCPFlagACK|TCPFlagFIN, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		link.mu.Lock()
+		defer link.mu.Unlock()
+		return link.clientACKs >= baseline+5
+	})
+	time.Sleep(5 * time.Millisecond)
+	link.mu.Lock()
+	immediate := link.clientACKs - baseline
+	link.mu.Unlock()
+	if immediate != 6 {
+		t.Fatalf("SACK, DSACK, post-DSACK quick, and FIN ACKs = %d, want 6", immediate)
 	}
 }
 

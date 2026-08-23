@@ -408,11 +408,82 @@ func TestBBRECNPreservesModelWindowAndThreshold(t *testing.T) {
 func TestTCPRestartWindowAfterIdle(t *testing.T) {
 	const mss = 1200
 	initial := initialTCPWindow(mss)
-	if got := tcpRestartWindow(100*mss, mss); got != initial {
-		t.Fatalf("large idle window = %d, want restart window %d", got, initial)
+	if got := tcpRestartWindow(100*mss, mss, 1100*time.Millisecond, time.Second); got != 50*mss {
+		t.Fatalf("one-RTO idle window = %d, want %d", got, 50*mss)
 	}
-	if got := tcpRestartWindow(2*mss, mss); got != 2*mss {
+	if got := tcpRestartWindow(100*mss, mss, 10*time.Second, time.Second); got != initial {
+		t.Fatalf("long-idle window = %d, want restart window %d", got, initial)
+	}
+	if got := tcpRestartWindow(2*mss, mss, 10*time.Second, time.Second); got != 2*mss {
 		t.Fatalf("small idle window = %d, want unchanged %d", got, 2*mss)
+	}
+}
+
+func TestTCPCongestionWindowValidation(t *testing.T) {
+	const mss = 1000
+	state := tcpEstablishedState{
+		peerMSS: mss, peerWindow: 100 * mss,
+		congestionWindow: 100 * mss, slowStartThreshold: 20 * mss,
+		cwndUsageStamp: 1, rtt: newRTTEstimator(time.Second),
+		controller: newTCPCongestionController(CongestionControlCUBIC),
+	}
+	state.controller.state.Phase = CongestionPhaseOpen
+	state.validateCongestionWindow(monotonicStamp(time.Second)+1, 0, false)
+	if state.congestionWindow != 55*mss {
+		t.Fatalf("application-limited window = %d, want %d", state.congestionWindow, 55*mss)
+	}
+	if state.slowStartThreshold != 75*mss {
+		t.Fatalf("application-limited threshold = %d, want %d", state.slowStartThreshold, 75*mss)
+	}
+	state.congestionWindow = 100 * mss
+	state.cwndUsageStamp = 1
+	state.sendNext = 10 * mss
+	state.validateCongestionWindow(monotonicStamp(time.Second)+1, 10*mss, false)
+	if state.congestionWindow != 100*mss {
+		t.Fatalf("congestion-limited window = %d, want unchanged", state.congestionWindow)
+	}
+
+	bbr := state
+	bbr.controller = newTCPCongestionController(CongestionControlBBR)
+	bbr.controller.state.Phase = CongestionPhaseOpen
+	bbr.sendNext = 0
+	bbr.congestionWindow = 100 * mss
+	bbr.cwndUsageStamp = 1
+	bbr.validateCongestionWindow(monotonicStamp(time.Second)+1, 0, false)
+	if bbr.congestionWindow != 100*mss {
+		t.Fatalf("custom-validation window = %d, want unchanged", bbr.congestionWindow)
+	}
+
+	bufferLimited := state
+	bufferLimited.sendNext = 0
+	bufferLimited.congestionWindow = 100 * mss
+	bufferLimited.cwndUsageStamp = 1
+	bufferLimited.cwndUsed = 10 * mss
+	bufferLimited.validateCongestionWindow(monotonicStamp(time.Second)+1, 0, true)
+	if bufferLimited.congestionWindow != 100*mss {
+		t.Fatalf("send-buffer-limited window = %d, want unchanged", bufferLimited.congestionWindow)
+	}
+	if bufferLimited.cwndUsed != 0 || bufferLimited.cwndUsageStamp != monotonicStamp(time.Second)+1 {
+		t.Fatalf("send-buffer-limited observation = (%d, %d), want reset at current time", bufferLimited.cwndUsed, bufferLimited.cwndUsageStamp)
+	}
+}
+
+func TestBBRSpuriousRecoveryRestoresPriorWindow(t *testing.T) {
+	const (
+		mss         = 1000
+		priorWindow = 20 * mss
+	)
+	for _, algorithm := range []string{CongestionControlBBR, CongestionControlBBR3} {
+		t.Run(algorithm, func(t *testing.T) {
+			controller := newTCPCongestionController(algorithm)
+			now := time.Unix(100, 0)
+			_, _ = controller.initialize(now, 10*time.Millisecond, 20*time.Millisecond, priorWindow, ^uint32(0)>>1, mss, 1)
+			threshold := controller.onTimeout(priorWindow, priorWindow, ^uint32(0)>>1, mss, now)
+			window, _ := controller.undoRecovery(now.Add(time.Second), uint32(mss), 5*mss, threshold, 5*mss, mss, CongestionPhaseOpen)
+			if window != priorWindow {
+				t.Fatalf("spurious-recovery window = %d, want prior window %d", window, priorWindow)
+			}
+		})
 	}
 }
 

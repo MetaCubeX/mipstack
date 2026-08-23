@@ -584,6 +584,123 @@ func TestTCPImpairedLinkInterop(t *testing.T) {
 	}
 }
 
+// TestTCPCompressedSACKInterop withholds gVisor's first data segment and the
+// first four mipstack SACK acknowledgements. Releasing those acknowledgements
+// as one batch verifies that Linux-style compressed feedback still gives the
+// peer enough prompt loss evidence to recover without an RTO.
+func TestTCPCompressedSACKInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			var network *interopNetwork
+			var dropped, released atomic.Bool
+			var sackACKs atomic.Uint32
+			bridgeErrors := make(chan error, 1)
+			var heldACKs [][]byte
+			network = newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					_, data := tcpDataSequence(packet)
+					return !data || !dropped.CompareAndSwap(false, true)
+				},
+				mipstackToGVisor: func(packet []byte) bool {
+					if !dropped.Load() || released.Load() {
+						return true
+					}
+					tcpHeader, payloadLength, ok := tcpSegment(packet)
+					if !ok || payloadLength != 0 || tcpHeader.Flags() != header.TCPFlagAck || !tcpHasSACKOption(tcpHeader) {
+						return true
+					}
+					heldACKs = append(heldACKs, append([]byte(nil), packet...))
+					if sackACKs.Add(1) < 4 {
+						return false
+					}
+					released.Store(true)
+					for _, acknowledgement := range heldACKs {
+						if err := network.deliverToGVisor(acknowledgement); err != nil {
+							select {
+							case bridgeErrors <- err:
+							default:
+							}
+						}
+					}
+					return false
+				},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client, server, listener := openTCPPair(t, ctx, network, family, true)
+			defer listener.Close()
+			defer client.Close()
+			defer server.Close()
+			exchangeTCPPayload(t, client, server, patternedPayload(256*1024, 149))
+			if !dropped.Load() || !released.Load() || sackACKs.Load() != 4 {
+				t.Fatalf("compressed SACK coverage = dropped:%v released:%v ACKs:%d", dropped.Load(), released.Load(), sackACKs.Load())
+			}
+			select {
+			case err := <-bridgeErrors:
+				t.Fatal(err)
+			default:
+			}
+		})
+	}
+}
+
+// TestTCPFRTOInterop delays gVisor's first data acknowledgement past mipstack's
+// retransmission timer. A later forward ACK must let RFC 5682 undo the spurious
+// timeout without losing or duplicating application bytes.
+func TestTCPFRTOInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			var armed, delayed atomic.Bool
+			var delayNanos atomic.Int64
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					tcpHeader, payloadLength, ok := tcpSegment(packet)
+					if ok && payloadLength == 0 && tcpHeader.Flags() == header.TCPFlagAck && armed.Load() && delayed.CompareAndSwap(false, true) {
+						time.Sleep(time.Duration(delayNanos.Load()))
+					}
+					return true
+				},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			client, server, listener := openTCPPair(t, ctx, network, family, false)
+			defer listener.Close()
+			defer client.Close()
+			defer server.Close()
+			tcpConnection := client.(*mipstack.TCPConn)
+			delayNanos.Store(int64(4*tcpConnection.Info().RetransmissionTimeout + time.Second))
+			armed.Store(true)
+			deadline := time.Now().Add(6 * time.Second)
+			_ = client.SetDeadline(deadline)
+			_ = server.SetDeadline(deadline)
+			payload := patternedPayload(128*1024, 191)
+			result := make(chan error, 1)
+			go writeTCPPayload(client, payload, "mipstack F-RTO sender", result)
+			received := make([]byte, len(payload))
+			if _, err := io.ReadFull(server, received); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-result; err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(received, payload) {
+				t.Fatal("F-RTO interop payload mismatch")
+			}
+			if !delayed.Load() {
+				t.Fatal("gVisor ACK delay hook did not match")
+			}
+			info := tcpConnection.Info()
+			if info.Retransmissions == 0 || info.SpuriousRecoveryUndos == 0 {
+				t.Fatalf("mipstack F-RTO diagnostics = retransmissions:%d undos:%d", info.Retransmissions, info.SpuriousRecoveryUndos)
+			}
+		})
+	}
+}
+
 // TestTCPKeepAliveInterop verifies that gVisor acknowledges mipstack's idle
 // probes and that the connection remains usable afterward.
 func TestTCPKeepAliveInterop(t *testing.T) {
@@ -763,6 +880,33 @@ func tcpDataSequence(packet []byte) (uint32, bool) {
 		return 0, false
 	}
 	return tcpHeader.SequenceNumber(), true
+}
+
+// tcpHasSACKOption reports whether one validated gVisor TCP header carries a
+// well-formed SACK option. The bridge already excludes fragmented packets.
+func tcpHasSACKOption(tcpHeader header.TCP) bool {
+	headerLength := int(tcpHeader.DataOffset())
+	if headerLength < header.TCPMinimumSize || headerLength > len(tcpHeader) {
+		return false
+	}
+	for options := tcpHeader[header.TCPMinimumSize:headerLength]; len(options) != 0; {
+		kind := options[0]
+		if kind == mipstack.TCPHeaderOptionEnd {
+			return false
+		}
+		if kind == mipstack.TCPHeaderOptionNOP {
+			options = options[1:]
+			continue
+		}
+		if len(options) < 2 || int(options[1]) > len(options) || options[1] < 2 {
+			return false
+		}
+		if kind == mipstack.TCPHeaderOptionSACK && options[1] >= 10 && (options[1]-2)%8 == 0 {
+			return true
+		}
+		options = options[options[1]:]
+	}
+	return false
 }
 
 // tcpSegment returns one complete extension-free TCP header and its payload

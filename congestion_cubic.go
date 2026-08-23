@@ -25,8 +25,8 @@ type cubicCongestionControl struct {
 	recovery cubicRecoveryCheckpoint
 }
 
-// cubicRecoveryCheckpoint is the private CUBIC state restored after Eifel or
-// DSACK proves that a congestion episode was spurious.
+// cubicRecoveryCheckpoint is the private CUBIC state restored after Eifel,
+// DSACK, or F-RTO proves that a congestion episode was spurious.
 type cubicRecoveryCheckpoint struct {
 	epochStart         time.Time
 	lastSend           time.Time

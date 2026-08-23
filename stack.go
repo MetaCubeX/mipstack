@@ -399,8 +399,8 @@ type StackStats struct {
 	TCPRACKRetransmissions uint64
 	// TCPTailLossProbes counts probes sent before the ordinary RTO.
 	TCPTailLossProbes uint64
-	// TCPSpuriousRecoveryUndos counts Eifel or DSACK evidence that safely
-	// restored congestion state after an unnecessary retransmission.
+	// TCPSpuriousRecoveryUndos counts Eifel, DSACK, or F-RTO evidence that
+	// safely restored congestion state after an unnecessary retransmission.
 	TCPSpuriousRecoveryUndos uint64
 	// TCPZeroWindowProbes counts persist probes sent while the peer advertises
 	// a closed receive window.

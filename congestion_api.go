@@ -68,8 +68,8 @@ const (
 	// they can advance their clock only after an actual transmission.
 	CongestionControlFeatureTransmissionEvents
 	// CongestionControlFeatureCustomRecovery asks TCP to expose recovery-window
-	// selection, PRR, partial-ACK, duplicate-ACK, and exit decisions. TCP applies
-	// its RFC defaults when this feature is absent.
+	// selection, PRR, partial-ACK, duplicate-ACK, exit, and spurious-undo
+	// decisions. TCP applies its RFC defaults when this feature is absent.
 	CongestionControlFeatureCustomRecovery
 	// CongestionControlFeatureLossEvents asks TCP to retain the opaque packet
 	// state returned by transmission events and report each transmission
@@ -77,6 +77,11 @@ const (
 	// notifications. Transmission events are required so a controller can seed
 	// the state associated with each generation.
 	CongestionControlFeatureLossEvents
+	// CongestionControlFeatureCustomWindowValidation leaves RFC 2861 idle and
+	// under-utilization window validation to the controller. Controllers using
+	// it must request transmission events so they can observe the first send
+	// after an idle interval.
+	CongestionControlFeatureCustomWindowValidation
 )
 
 // congestionControlKnownFeatures is the complete transport-supported feature mask.
@@ -84,7 +89,8 @@ const congestionControlKnownFeatures = CongestionControlFeatureDeliveryRate |
 	CongestionControlFeatureCustomPacing |
 	CongestionControlFeatureTransmissionEvents |
 	CongestionControlFeatureCustomRecovery |
-	CongestionControlFeatureLossEvents
+	CongestionControlFeatureLossEvents |
+	CongestionControlFeatureCustomWindowValidation
 
 // CongestionControlDefinition describes a congestion-control implementation
 // before it is validated and frozen into a CongestionControlFactory. New may
@@ -155,6 +161,9 @@ func validateCongestionControlDefinition(definition CongestionControlDefinition)
 	if definition.Features&CongestionControlFeatureLossEvents != 0 && definition.Features&CongestionControlFeatureTransmissionEvents == 0 {
 		return fmt.Errorf("mipstack: congestion control %q loss events require transmission events", definition.Name)
 	}
+	if definition.Features&CongestionControlFeatureCustomWindowValidation != 0 && definition.Features&CongestionControlFeatureTransmissionEvents == 0 {
+		return fmt.Errorf("mipstack: congestion control %q custom window validation requires transmission events", definition.Name)
+	}
 	return nil
 }
 
@@ -178,7 +187,8 @@ var congestionControlRegistry = struct {
 		Features: CongestionControlFeatureDeliveryRate |
 			CongestionControlFeatureCustomPacing |
 			CongestionControlFeatureTransmissionEvents |
-			CongestionControlFeatureCustomRecovery,
+			CongestionControlFeatureCustomRecovery |
+			CongestionControlFeatureCustomWindowValidation,
 		SendBufferMultiplier: 3,
 	}),
 	CongestionControlBBR3: mustCongestionControlFactory(CongestionControlDefinition{
@@ -188,7 +198,8 @@ var congestionControlRegistry = struct {
 			CongestionControlFeatureCustomPacing |
 			CongestionControlFeatureTransmissionEvents |
 			CongestionControlFeatureCustomRecovery |
-			CongestionControlFeatureLossEvents,
+			CongestionControlFeatureLossEvents |
+			CongestionControlFeatureCustomWindowValidation,
 		SendBufferMultiplier: 3,
 	}),
 }}
@@ -387,13 +398,16 @@ const (
 	CongestionRecoveryPartialACK
 	// CongestionRecoveryDuplicateACK applies non-SACK duplicate-ACK inflation.
 	CongestionRecoveryDuplicateACK
-	// CongestionRecoveryUndo reports that recovery was proven spurious.
+	// CongestionRecoveryUndo reports that recovery was proven spurious. A
+	// custom-recovery controller may replace State.CongestionWindow and
+	// State.SlowStartThreshold; TCP otherwise retains its RFC response.
 	CongestionRecoveryUndo
 )
 
 // CongestionRecovery describes a transport-owned recovery transition. TCP
 // places its RFC-default result in State.CongestionWindow before dispatch;
 // controllers with CongestionControlFeatureCustomRecovery may replace it.
+// CongestionRecoveryUndo also permits replacing State.SlowStartThreshold.
 // Flight is initialized to the transport default during
 // CongestionRecoverySelectFlight and is the only mutable field of that stage.
 type CongestionRecovery struct {

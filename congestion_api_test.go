@@ -22,14 +22,16 @@ func nextCongestionAPITestName() string {
 }
 
 type congestionAPIRecorder struct {
-	events       []CongestionEventType
-	rateSample   CongestionRateSample
-	ackNumber    uint32
-	recovery     []CongestionRecoveryStage
-	recoveries   []CongestionRecovery
-	phases       []CongestionPhase
-	fixedRate    uint64
-	windowGrowth uint32
+	events        []CongestionEventType
+	rateSample    CongestionRateSample
+	ackNumber     uint32
+	recovery      []CongestionRecoveryStage
+	recoveries    []CongestionRecovery
+	phases        []CongestionPhase
+	fixedRate     uint64
+	windowGrowth  uint32
+	undoWindow    uint32
+	undoThreshold uint32
 }
 
 type congestionAPILifecycle struct {
@@ -145,6 +147,10 @@ func (c *congestionAPIRecorder) HandleCongestionEvent(event *CongestionEvent) {
 		if event.Recovery.Stage == CongestionRecoverySelectFlight {
 			event.Recovery.Flight = event.Recovery.OrdinaryFlight
 		}
+		if event.Recovery.Stage == CongestionRecoveryUndo && c.undoWindow != 0 {
+			event.State.CongestionWindow = c.undoWindow
+			event.State.SlowStartThreshold = c.undoThreshold
+		}
 		c.recovery = append(c.recovery, event.Recovery.Stage)
 		c.recoveries = append(c.recoveries, event.Recovery)
 	case CongestionEventStateChanged:
@@ -190,6 +196,13 @@ func TestCongestionControlRegistry(t *testing.T) {
 		Features: CongestionControlFeatureLossEvents,
 	}); err == nil {
 		t.Fatal("loss events without transmission events were accepted")
+	}
+	if _, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name:     nextCongestionAPITestName(),
+		New:      func(CongestionControlContext) CongestionController { return &congestionAPIRecorder{} },
+		Features: CongestionControlFeatureCustomWindowValidation,
+	}); err == nil {
+		t.Fatal("custom window validation without transmission events was accepted")
 	}
 	if err := RegisterCongestionControl(nil); err == nil {
 		t.Fatal("nil congestion-control factory was registered")
@@ -805,7 +818,7 @@ func TestCongestionControllerLifecycleAndMutableInitialState(t *testing.T) {
 }
 
 func TestCongestionRecoveryUsesStableEventStages(t *testing.T) {
-	recorder := &congestionAPIRecorder{}
+	recorder := &congestionAPIRecorder{undoWindow: 16_000, undoThreshold: 18_000}
 	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
 		Name: "recovery-events",
 		New:  func(CongestionControlContext) CongestionController { return recorder }, Features: CongestionControlFeatureCustomRecovery,
@@ -820,7 +833,10 @@ func TestCongestionRecoveryUsesStableEventStages(t *testing.T) {
 	_ = controller.exitRecoveryWindow(time.Unix(100, 0), 9000, 10_000, 7000, true)
 	_ = controller.partialACKWindow(time.Unix(100, 0), 9000, 1000, 7000, 1000)
 	_ = controller.duplicateACKWindow(time.Unix(100, 0), 9000, 7000, 1000)
-	controller.undoRecovery(time.Unix(101, 0), 9000, 10_000, 8000, 1000)
+	window, threshold := controller.undoRecovery(time.Unix(101, 0), 9000, 10_000, 10_000, 8000, 1000, CongestionPhaseOpen)
+	if window != recorder.undoWindow || threshold != recorder.undoThreshold {
+		t.Fatalf("custom recovery undo = window %d threshold %d, want %d %d", window, threshold, recorder.undoWindow, recorder.undoThreshold)
+	}
 	want := []CongestionRecoveryStage{
 		CongestionRecoveryCheckpoint, CongestionRecoverySelectFlight, CongestionRecoveryEnter,
 		CongestionRecoveryPRR, CongestionRecoveryExit, CongestionRecoveryPartialACK,
@@ -847,6 +863,7 @@ func TestCongestionRecoveryUsesStableEventStages(t *testing.T) {
 		{index: 4, previousWindow: 9000, flight: 7000, proposed: 10_000, sack: true},
 		{index: 5, previousWindow: 9000, flight: 7000, proposed: 9000},
 		{index: 6, previousWindow: 9000, flight: 7000, proposed: 10_000},
+		{index: 7, previousWindow: 9000, flight: 8000, proposed: 10_000},
 	}
 	for _, check := range checks {
 		recovery := recorder.recoveries[check.index]
@@ -860,7 +877,7 @@ func TestCongestionRecoveryUsesStableEventStages(t *testing.T) {
 }
 
 func TestCongestionControllerSkipsOptionalEventFamilies(t *testing.T) {
-	recorder := &congestionAPIRecorder{}
+	recorder := &congestionAPIRecorder{undoWindow: 16_000, undoThreshold: 18_000}
 	controller := newTCPCongestionControllerFromDefinition(CongestionControlDefinition{
 		Name: "default-events",
 		New:  func(CongestionControlContext) CongestionController { return recorder },
@@ -878,7 +895,10 @@ func TestCongestionControllerSkipsOptionalEventFamilies(t *testing.T) {
 	_ = controller.exitRecoveryWindow(start, 9000, 10_000, 7000, true)
 	_ = controller.partialACKWindow(start, 9000, 1000, 7000, 1000)
 	_ = controller.duplicateACKWindow(start, 9000, 7000, 1000)
-	controller.undoRecovery(start.Add(time.Second), 9000, 10_000, 8000, 1000)
+	window, threshold := controller.undoRecovery(start.Add(time.Second), 9000, 10_000, 10_000, 8000, 1000, CongestionPhaseOpen)
+	if window != 10_000 || threshold != 10_000 || controller.state.CongestionWindow != window || controller.state.SlowStartThreshold != threshold {
+		t.Fatalf("default recovery accepted undo override: returned %d/%d state %d/%d", window, threshold, controller.state.CongestionWindow, controller.state.SlowStartThreshold)
+	}
 
 	for _, eventType := range recorder.events {
 		if eventType == CongestionEventPacketSent || eventType == CongestionEventPacketRetransmitted {

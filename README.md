@@ -908,24 +908,34 @@ tail-loss-probe recovery events. `CongestionRateSample.TailLossProbeACK`
 identifies the Linux-style ambiguous ACK that exactly covers a retransmitted
 TLP range, allowing a model to preserve delivery signals until later ACK or
 DSACK evidence resolves the loss.
-`CongestionControlFeatureCustomRecovery` opts into PRR and recovery-window
-decisions. Without it TCP applies its RFC recovery defaults without dispatching
-those detailed stages; checkpoint and undo notifications remain available to
-every controller for restoring private state after spurious recovery.
+`CongestionControlFeatureCustomRecovery` opts into PRR, recovery-window, and
+spurious-undo window decisions. Without it TCP applies its RFC recovery
+defaults without dispatching those detailed stages; checkpoint and undo
+notifications remain available to every controller for restoring private state
+after spurious recovery.
+`CongestionControlFeatureCustomWindowValidation` leaves idle and
+application-limited cwnd validation to a controller that consumes transmission
+events, as required by model-based algorithms.
 
 Validated network- and host-unreachable feedback for `SND.UNA` applies RFC
 6069 TCP-LD one-step RTO backoff reversion without turning an established
 connection's soft network error into a hard failure.
 On a SACK-negotiated connection, only newly reported scoreboard information
 counts toward RFC 6675 `DupAcks`; repeated cumulative ACKs and window-probe
-responses without new SACK data cannot manufacture a loss episode.
-Initial Reno and CUBIC slow start uses RFC 9406 HyStart++ and Conservative Slow
+responses without new SACK data cannot manufacture a loss episode. The receive
+path preserves three prompt duplicate ACKs and then applies Linux-style bounded
+SACK compression; the sender gives apparent SACK reneging a short grace period
+before clearing contradictory scoreboard state and entering timeout recovery.
+Initial Reno and CUBIC slow start use RFC 9406 HyStart++ and Conservative Slow
 Start; BBR retains its own Startup model. Eifel timestamps and conservative
-DSACK accounting detect spurious fast retransmits and timeouts, while the RFC
-4015 response bounds the restored congestion window and makes the RTO more
-conservative after a spurious timeout. TCP also handles overlap-aware receive
-reassembly, data-bearing zero-window probes, reset validation, deadlines,
-half-close, FIN states, and TIME_WAIT.
+DSACK accounting detect spurious fast retransmits and timeouts, while RFC 5682
+F-RTO detects a spurious timeout without requiring either option. The RFC 4015
+response bounds the restored congestion window and makes the RTO more
+conservative after a spurious timeout is detected. Reno and CUBIC also apply
+Linux-style RFC 2861 idle and application-limited congestion-window validation;
+model-based controllers retain their own window policy. TCP also handles
+overlap-aware receive reassembly, data-bearing zero-window probes, reset
+validation, deadlines, half-close, FIN states, and TIME_WAIT.
 
 BBR is a byte-scaled implementation of Linux BBRv1. Each original or
 retransmitted range carries a Linux-style delivery snapshot; ACK processing
