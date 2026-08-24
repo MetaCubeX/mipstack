@@ -1841,18 +1841,22 @@ func TestIPv4RouterAlertValidation(t *testing.T) {
 }
 
 func BenchmarkChecksum(b *testing.B) {
-	data := make([]byte, 1500)
-	for index := range data {
-		data[index] = byte(index*37 + 11)
-	}
-	b.SetBytes(int64(len(data)))
-	b.ReportAllocs()
-	var result uint16
-	for index := 0; index < b.N; index++ {
-		result = checksum(data)
-	}
-	if result == 0 {
-		b.Fatal("unexpected zero checksum")
+	for _, size := range []int{20, 32, 40, 60, 576, 1280, 1500, 9000} {
+		b.Run(fmt.Sprintf("%d-byte", size), func(b *testing.B) {
+			data := make([]byte, size)
+			for index := range data {
+				data[index] = byte(index*37 + 11)
+			}
+			b.SetBytes(int64(len(data)))
+			b.ReportAllocs()
+			var result uint16
+			for index := 0; index < b.N; index++ {
+				result = checksum(data)
+			}
+			if result == 0 {
+				b.Fatal("unexpected zero checksum")
+			}
+		})
 	}
 }
 

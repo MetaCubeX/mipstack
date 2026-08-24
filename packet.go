@@ -2,7 +2,9 @@ package mipstack
 
 import (
 	"encoding/binary"
+	"math/bits"
 	"net/netip"
+	"runtime"
 	"syscall"
 )
 
@@ -1101,30 +1103,57 @@ func checksum(data []byte) uint16 {
 	return ^uint16(sum)
 }
 
-// checksumSum accumulates one contiguous Internet-checksum region. Grouping
-// adjacent 16-bit words into 32-bit halves is valid because 2^16 is congruent
-// to one modulo 2^16-1. A uint64 holds every half in a maximum IP packet, and
-// folding it to uint32 keeps separately accumulated pseudo-header regions
-// associative for the caller's final 16-bit fold.
+// checksumTargetBigEndian mirrors the Go compiler's big-endian architecture
+// set. Selection affects load efficiency only; either checksum formulation is
+// portable.
+const checksumTargetBigEndian = runtime.GOARCH == "armbe" || runtime.GOARCH == "arm64be" ||
+	runtime.GOARCH == "mips" || runtime.GOARCH == "mips64" ||
+	runtime.GOARCH == "ppc" || runtime.GOARCH == "ppc64" ||
+	runtime.GOARCH == "s390" || runtime.GOARCH == "s390x" ||
+	runtime.GOARCH == "sparc" || runtime.GOARCH == "sparc64"
+
+// checksumSum accumulates one contiguous Internet-checksum region. RFC 1071
+// one's-complement addition is byte-order independent, so wide words use the
+// target byte order and only the folded result is normalized to network order.
+// The compile-time byte-order selection adds no branch to the hot path. A
+// uint64 holds every 32-bit half in a maximum IP packet, and the result remains
+// associative with separately accumulated pseudo-header regions.
 func checksumSum(data []byte) uint32 {
 	var sum uint64
 	for len(data) >= 16 {
-		first := binary.BigEndian.Uint64(data[:8])
-		second := binary.BigEndian.Uint64(data[8:16])
+		var first, second uint64
+		if checksumTargetBigEndian {
+			first = binary.BigEndian.Uint64(data[:8])
+			second = binary.BigEndian.Uint64(data[8:16])
+		} else {
+			first = binary.LittleEndian.Uint64(data[:8])
+			second = binary.LittleEndian.Uint64(data[8:16])
+		}
 		sum += first>>32 + first&0xffffffff + second>>32 + second&0xffffffff
 		data = data[16:]
 	}
 	for len(data) >= 2 {
-		sum += uint64(binary.BigEndian.Uint16(data[:2]))
+		if checksumTargetBigEndian {
+			sum += uint64(binary.BigEndian.Uint16(data[:2]))
+		} else {
+			sum += uint64(binary.LittleEndian.Uint16(data[:2]))
+		}
 		data = data[2:]
 	}
 	if len(data) != 0 {
-		sum += uint64(data[0]) << 8
+		if checksumTargetBigEndian {
+			sum += uint64(data[0]) << 8
+		} else {
+			sum += uint64(data[0])
+		}
 	}
 	for sum>>16 != 0 {
 		sum = sum&0xffff + sum>>16
 	}
-	return uint32(sum)
+	if checksumTargetBigEndian {
+		return uint32(uint16(sum))
+	}
+	return uint32(bits.ReverseBytes16(uint16(sum)))
 }
 
 // checksumParts finishes an Internet checksum from an initial pseudo-header
