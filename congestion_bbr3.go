@@ -534,14 +534,24 @@ func (b *bbr3CongestionControl) resetFullBandwidth() {
 
 // checkDrain leaves Drain when inflight reaches the modeled path pipe.
 func (b *bbr3CongestionControl) checkDrain(sample *tcpDeliveryRateSample, mss int) uint32 {
-	inflight := b.packetsInNetwork(sample.inFlight, sample.ackTime, mss, b.pacingGain())
-	var threshold uint32
+	enteredDrain := false
+	var gain float64
 	if b.mode == bbrStartup && b.fullBandwidthReached {
-		threshold = clampCongestionUint32(b.quantizeWindowAt(b.modelWindowForBandwidth(b.maximumBandwidth(), 1, mss), mss, false))
+		gain = b.pacingGain()
 		b.mode = bbrDrain
 		b.resetCongestionSignals()
+		enteredDrain = true
+	} else if b.mode != bbrDrain {
+		return 0
+	} else {
+		gain = b.pacingGain()
 	}
 	drainTarget := b.quantizeWindowAt(b.modelWindowForBandwidth(b.maximumBandwidth(), 1, mss), mss, false)
+	var threshold uint32
+	if enteredDrain {
+		threshold = clampCongestionUint32(drainTarget)
+	}
+	inflight := b.packetsInNetwork(sample.inFlight, sample.ackTime, mss, gain)
 	if b.mode == bbrDrain && uint64(inflight) <= drainTarget {
 		b.mode = bbrProbeBandwidth
 		b.enterProbePhase(bbr3ProbeDown, sample.ackTime)
@@ -557,7 +567,6 @@ func (b *bbr3CongestionControl) updateProbeBandwidth(sample *tcpDeliveryRateSamp
 	if b.mode != bbrProbeBandwidth || b.minimumRTT <= 0 {
 		return
 	}
-	inflight := uint64(b.packetsInNetwork(sample.priorInFlight, sample.ackTime, mss, b.pacingGain()))
 	switch b.probePhase {
 	case bbr3ProbeCruise:
 		if b.probeDue(sample.ackTime, window, mss) {
@@ -574,7 +583,7 @@ func (b *bbr3CongestionControl) updateProbeBandwidth(sample *tcpDeliveryRateSamp
 		}
 	case bbr3ProbeUp:
 		done := false
-		if b.previousProbeTooHigh && b.inflightHigh != 0 && inflight >= uint64(b.inflightHigh) {
+		if b.previousProbeTooHigh && b.inflightHigh != 0 && uint64(b.packetsInNetwork(sample.priorInFlight, sample.ackTime, mss, b.pacingGain())) >= uint64(b.inflightHigh) {
 			b.stoppedRiskyProbe = true
 			done = true
 		} else if b.inflightHigh != 0 && congestionWindowLimited(window, sample.priorInFlight, mss) && window >= b.inflightHigh {
@@ -592,6 +601,7 @@ func (b *bbr3CongestionControl) updateProbeBandwidth(sample *tcpDeliveryRateSamp
 			b.enterProbePhase(bbr3ProbeRefill, sample.ackTime)
 			return
 		}
+		inflight := uint64(b.packetsInNetwork(sample.priorInFlight, sample.ackTime, mss, b.pacingGain()))
 		cruiseTarget := b.quantizeWindowAt(b.modelWindowForBandwidth(b.maximumBandwidth(), 1, mss), mss, false)
 		if inflight <= cruiseTarget && inflight <= b.inflightWithHeadroom(mss) {
 			b.enterProbePhase(bbr3ProbeCruise, sample.ackTime)
@@ -905,10 +915,6 @@ func (b *bbr3CongestionControl) exitProbeRTT(now time.Time) {
 // setCongestionWindow applies ACK growth, recovery conservation, and model bounds.
 func (b *bbr3CongestionControl) setCongestionWindow(window uint32, sample *tcpDeliveryRateSample, mss int) uint32 {
 	minimum := uint32(bbrMinimumCongestionMSS * mss)
-	probeTarget := clampCongestionUint32(b.modelWindowForBandwidth(b.effectiveBandwidth(), bbr3ProbeRTTWindowGain, mss))
-	if probeTarget < minimum {
-		probeTarget = minimum
-	}
 	if sample.acked != 0 {
 		if sample.losses != 0 {
 			if sample.losses >= uint64(window) {
@@ -961,8 +967,14 @@ func (b *bbr3CongestionControl) setCongestionWindow(window uint32, sample *tcpDe
 		window = minimum
 	}
 	window = clampCongestionUint32(b.boundWindow(uint64(window), mss))
-	if b.mode == bbrProbeRTT && window > probeTarget {
-		window = probeTarget
+	if b.mode == bbrProbeRTT {
+		probeTarget := clampCongestionUint32(b.modelWindowForBandwidth(b.effectiveBandwidth(), bbr3ProbeRTTWindowGain, mss))
+		if probeTarget < minimum {
+			probeTarget = minimum
+		}
+		if window > probeTarget {
+			window = probeTarget
+		}
 	}
 	return window
 }

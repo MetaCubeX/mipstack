@@ -245,6 +245,66 @@ func TestTCPCongestionControlInterop(t *testing.T) {
 	}
 }
 
+// TestTCPACKClockedFlightReplacementInterop keeps more data queued than the
+// initial congestion window so each gVisor cumulative ACK replaces old flight
+// with new flight. The final half-closes also verify that acknowledging the
+// last range leaves no stale retransmission or tail-probe work behind.
+func TestTCPACKClockedFlightReplacementInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			var dataSegments, acknowledgments atomic.Uint32
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				mipstackToGVisor: func(packet []byte) bool {
+					if _, data := tcpDataSequence(packet); data {
+						dataSegments.Add(1)
+					}
+					return true
+				},
+				gvisorToMipstack: func(packet []byte) bool {
+					tcpHeader, payloadLength, ok := tcpSegment(packet)
+					if ok && payloadLength == 0 && tcpHeader.Flags() == header.TCPFlagAck {
+						acknowledgments.Add(1)
+					}
+					return true
+				},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client, server, listener := openTCPPair(t, ctx, network, family, false)
+			defer listener.Close()
+			defer client.Close()
+			defer server.Close()
+			deadline := time.Now().Add(8 * time.Second)
+			_ = client.SetDeadline(deadline)
+			_ = server.SetDeadline(deadline)
+
+			exchangeTCPPayload(t, client, server, patternedPayload(256*1024, 211))
+			connection := client.(*mipstack.TCPConn)
+			for connection.Info().BytesAcknowledged < 256*1024 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			info := connection.Info()
+			if info.BytesAcknowledged < 256*1024 || info.Retransmissions != 0 || dataSegments.Load() <= 10 || acknowledgments.Load() <= 2 {
+				t.Fatalf("ACK-clocked flight = acknowledged:%d retransmissions:%d data-segments:%d ACKs:%d", info.BytesAcknowledged, info.Retransmissions, dataSegments.Load(), acknowledgments.Load())
+			}
+			if err := connection.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := server.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+				t.Fatalf("gVisor read after mipstack FIN = %d, %v", n, err)
+			}
+			if err := server.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := client.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+				t.Fatalf("mipstack read after gVisor FIN = %d, %v", n, err)
+			}
+		})
+	}
+}
+
 // TestTCPLocalCongestionControlFactoryInterop verifies that an unregistered
 // local factory receives the correct connection identity and interoperates
 // with gVisor after real data loss in both active and passive roles.

@@ -529,16 +529,25 @@ func (b *bbrCongestionControl) checkFullBandwidth(sample *tcpDeliveryRateSample)
 // checkDrain enters Drain after Startup and ProbeBW after the excess queue is
 // estimated to have left the network.
 func (b *bbrCongestionControl) checkDrain(sample *tcpDeliveryRateSample, mss int) uint32 {
-	gain := b.pacingGain()
-	inflight := b.packetsInNetwork(sample.inFlight, sample.ackTime, mss, gain)
-	var threshold uint32
+	enteredDrain := false
+	var gain float64
 	if b.mode == bbrStartup && b.fullBandwidthReached {
-		threshold = uint32(b.quantizeWindowAt(b.modelWindowForBandwidth(b.bandwidth, 1, mss), mss, false))
+		gain = b.pacingGain()
 		b.mode = bbrDrain
+		enteredDrain = true
+	} else if b.mode != bbrDrain {
+		return 0
+	} else {
+		gain = b.pacingGain()
 	}
 	// Linux drains against bbr_max_bw, even if its long-term policer estimate
 	// currently controls pacing and the normal model window.
 	drainTarget := b.quantizeWindowAt(b.modelWindowForBandwidth(b.bandwidth, 1, mss), mss, false)
+	var threshold uint32
+	if enteredDrain {
+		threshold = uint32(drainTarget)
+	}
+	inflight := b.packetsInNetwork(sample.inFlight, sample.ackTime, mss, gain)
 	if b.mode == bbrDrain && uint64(inflight) <= drainTarget {
 		b.resetProbeBandwidth(sample.ackTime)
 	}
@@ -554,12 +563,11 @@ func (b *bbrCongestionControl) updateCycle(sample *tcpDeliveryRateSample, mss in
 	fullLength := tcpDeliveryTimestampDuration(b.deliveredStamp, b.cycleStamp) > b.minimumRTT
 	gain := b.pacingGain()
 	advance := fullLength
-	inflight := uint64(b.packetsInNetwork(sample.priorInFlight, sample.ackTime, mss, gain))
 	switch {
 	case gain > 1:
-		advance = fullLength && (sample.losses != 0 || inflight >= b.inflightTarget(gain, mss))
+		advance = fullLength && (sample.losses != 0 || uint64(b.packetsInNetwork(sample.priorInFlight, sample.ackTime, mss, gain)) >= b.inflightTarget(gain, mss))
 	case gain < 1:
-		advance = fullLength || inflight <= b.inflightTarget(1, mss)
+		advance = fullLength || uint64(b.packetsInNetwork(sample.priorInFlight, sample.ackTime, mss, gain)) <= b.inflightTarget(1, mss)
 	}
 	if advance {
 		b.cycleIndex = (b.cycleIndex + 1) % len(bbrProbeBandwidthGains)

@@ -2960,6 +2960,74 @@ func TestTCPTailLossProbeAllowsRemoteDelayedACK(t *testing.T) {
 	}
 }
 
+func TestTCPStaleRetransmissionTimerClearsEmptyFlight(t *testing.T) {
+	for _, kind := range []tcpRetransmissionKind{
+		tcpRetransmissionRTO,
+		tcpRetransmissionProbe,
+		tcpRetransmissionRACK,
+		tcpRetransmissionSACKReneging,
+	} {
+		state := tcpEstablishedState{
+			retransmit:             true,
+			retransmissionKind:     kind,
+			retransmissionDeadline: time.Now(),
+		}
+		if index := state.retransmissionTarget(kind); index != -1 {
+			t.Fatalf("empty retransmission target for kind %d = %d, want none", kind, index)
+		}
+		if state.retransmit || state.retransmissionKind != tcpRetransmissionRTO || !state.retransmissionDeadline.IsZero() {
+			t.Fatalf("empty retransmission timer for kind %d = active:%v kind:%v deadline:%v, want cleared RTO state", kind, state.retransmit, state.retransmissionKind, state.retransmissionDeadline)
+		}
+	}
+}
+
+func TestTCPSendTimerOwnership(t *testing.T) {
+	t.Run("persist survives unrelated wakes", func(t *testing.T) {
+		deadline := time.Now().Add(time.Second)
+		for _, update := range []tcpRetransmissionUpdate{tcpRetransmissionPreserve, tcpRetransmissionReselect} {
+			state := tcpEstablishedState{
+				persist:   true,
+				sendTimer: tcpSendTimerState{baseDeadline: deadline},
+			}
+			state.updateRetransmissionTimer(update, time.Now())
+			if !state.persist || !state.sendTimer.baseDeadline.Equal(deadline) {
+				t.Fatalf("persist timer after update %d = active:%v deadline:%v, want %v", update, state.persist, state.sendTimer.baseDeadline, deadline)
+			}
+		}
+	})
+	t.Run("new flight replaces persist clock", func(t *testing.T) {
+		now := time.Now()
+		persistDeadline := now.Add(10 * time.Second)
+		state := tcpEstablishedState{
+			connection:  &TCPConn{stack: &Stack{timestampEpoch: now}},
+			outstanding: []sentTCPSegment{{}},
+			rtt:         rttEstimator{rto: time.Second},
+			persist:     true,
+			sendTimer:   tcpSendTimerState{baseDeadline: persistDeadline, persistRTO: 2 * time.Second, persistAttempts: 3},
+		}
+		state.updateRetransmissionTimer(tcpRetransmissionReselect, now)
+		if state.persist || !state.retransmit || state.sendTimer.baseDeadline.Equal(persistDeadline) {
+			t.Fatalf("send timer after new flight = persist:%v retransmit:%v deadline:%v", state.persist, state.retransmit, state.sendTimer.baseDeadline)
+		}
+		if state.sendTimer.persistRTO != time.Second || state.sendTimer.persistAttempts != 0 {
+			t.Fatalf("persist backoff after new flight = RTO:%v attempts:%d", state.sendTimer.persistRTO, state.sendTimer.persistAttempts)
+		}
+	})
+	t.Run("SACK reneging grace is not restarted", func(t *testing.T) {
+		state := tcpEstablishedState{
+			peerSACK:     true,
+			sackedRanges: 1,
+			outstanding:  []sentTCPSegment{{state: sentTCPSegmentSACKed}},
+		}
+		state.armSACKReneging()
+		deadline := state.retransmissionDeadline
+		state.selectRetransmission(time.Now().Add(time.Second), time.Time{}, time.Time{})
+		if state.retransmissionKind != tcpRetransmissionSACKReneging || !state.retransmissionDeadline.Equal(deadline) {
+			t.Fatalf("SACK reneging timer = kind:%v deadline:%v, want kind:%v deadline:%v", state.retransmissionKind, state.retransmissionDeadline, tcpRetransmissionSACKReneging, deadline)
+		}
+	})
+}
+
 // TestTCPPathMTUReduction verifies that Packet Too Big resegments outstanding
 // data and keeps an established stream alive.
 func TestTCPPathMTUReduction(t *testing.T) {
@@ -5601,6 +5669,57 @@ func TestTCPECNNegotiation(t *testing.T) {
 	}
 	if cwrPackets <= baselineCWR {
 		t.Fatal("client did not acknowledge ECE with CWR")
+	}
+}
+
+type minimumWindowCongestionControl struct{}
+
+func (*minimumWindowCongestionControl) HandleCongestionEvent(event *CongestionEvent) {
+	if event.Type == CongestionEventInitialize {
+		event.State.CongestionWindow = uint32(event.State.MaximumSegmentSize)
+	}
+}
+
+// TestTCPECNMinimumWindowACKRestartsRTO verifies that the ECN hold applied at
+// one MSS does not bypass RFC 6298 timer restart after a partial cumulative
+// ACK. The test derives both delays from the connection RTO, leaving the old
+// deadline inside the observation interval and the restarted deadline beyond
+// it without relying on a fixed scheduler-latency threshold.
+func TestTCPECNMinimumWindowACKRestartsRTO(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
+	defer stack.Close()
+	link.echoTCP = true
+	link.ecnTCP = true
+	link.disableTCPSACK = true
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: "minimum-window-test",
+		New:  func(CongestionControlContext) CongestionController { return new(minimumWindowCongestionControl) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := Dialer{Options: []SocketOption{SocketOptions.CongestionControlFactory(factory)}}
+	connection, err := dialer.DialTCP(context.Background(), stack, "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 9109))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	tcpConnection := connection.(*TCPConn)
+	rto := tcpConnection.Info().RetransmissionTimeout
+	link.mu.Lock()
+	link.sendTCPECE = true
+	link.partialTCPACK = 1
+	link.delayTCPACK = rto / 2
+	link.mu.Unlock()
+	_ = connection.SetDeadline(time.Now().Add(4 * rto))
+	writeAndReadTCPEcho(t, connection, bytes.Repeat([]byte{0x5e}, 1200))
+	baseline := tcpConnection.Info().Retransmissions
+	if baseline != 0 {
+		t.Fatalf("pre-ACK retransmissions = %d, want 0", baseline)
+	}
+	time.Sleep(3 * rto / 4)
+	if retransmissions := tcpConnection.Info().Retransmissions; retransmissions != baseline {
+		t.Fatalf("pre-deadline ECN hold caused retransmissions = %d, want %d", retransmissions, baseline)
 	}
 }
 
