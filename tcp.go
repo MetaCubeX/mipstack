@@ -114,6 +114,12 @@ const (
 	// tcpMetadataQueueRetain keeps metadata after an observed short actor burst
 	// while releasing larger arrays after they drain.
 	tcpMetadataQueueRetain = 4
+	// tcpActorReceiveBatch bounds queued receive work before the actor observes
+	// timers and concurrent socket operations again. Eight is a scheduling
+	// quantum, not a protocol limit: longer repeated benchmarks favored it over
+	// four, while 16 and 32 showed no repeatable gain. It also returns to the
+	// selector well before one maximum device batch can be consumed by one flow.
+	tcpActorReceiveBatch = 8
 	// tcpMaximumOutOfOrder bounds retained receive-range metadata. The limit
 	// accommodates a full default window split near IPv6's minimum MTU while
 	// still bounding adversarial sparse one-byte ranges.
@@ -1133,6 +1139,23 @@ func (b *tcpTimerBacklog) consumed() {
 	if b.remaining > 0 {
 		b.remaining--
 	}
+}
+
+// receiveBatchLength limits one actor turn without extending an expired
+// timer's fixed receive snapshot to packets that arrived later. A concurrent
+// state wake retains the previous single-packet precedence at the snapshot
+// boundary.
+func (b *tcpTimerBacklog) receiveBatchLength(queueLength int, forceTimer bool) int {
+	if queueLength > tcpActorReceiveBatch {
+		queueLength = tcpActorReceiveBatch
+	}
+	if b.remaining != 0 && queueLength > b.remaining {
+		return b.remaining
+	}
+	if forceTimer && queueLength > 1 {
+		return 1
+	}
+	return queueLength
 }
 
 // tcpZeroWindowProbe is an allocation-free acknowledged byte used to elicit
@@ -2507,8 +2530,12 @@ func (s *tcpEstablishedState) armLiveness() {
 	if options.idleTimeout > 0 {
 		deadline = s.lastActivity.Add(options.idleTimeout)
 	}
-	if userDeadline := s.userTimeoutDeadline(time.Now(), options.userTimeout); !userDeadline.IsZero() && (deadline.IsZero() || userDeadline.Before(deadline)) {
-		deadline = userDeadline
+	if options.userTimeout > 0 {
+		if userDeadline := s.userTimeoutDeadline(time.Now(), options.userTimeout); !userDeadline.IsZero() && (deadline.IsZero() || userDeadline.Before(deadline)) {
+			deadline = userDeadline
+		}
+	} else if s.livenessState != nil {
+		s.livenessState.zeroWindowSince = time.Time{}
 	}
 	if options.userTimeout > 0 && s.livenessState != nil && s.livenessState.keepAliveProbes != 0 {
 		keepAliveUserDeadline := s.lastActivity.Add(options.userTimeout)
@@ -6793,6 +6820,9 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialReceive tcpInitialReceive) error {
 	state := newTCPEstablishedState(c, sendNext)
 	defer state.finish()
+	// Coalesce liveness recalculation after receive batches, send-window
+	// reevaluation, and direct recovery paths that consume new sequence space.
+	livenessDirty := false
 	var sendNextData func(uint32, bool) (bool, error)
 	sendNextData = func(congestionAllowance uint32, limitedTransmit bool) (bool, error) {
 		windowFlight := state.sendNext - state.sendUnacknowledged
@@ -6919,6 +6949,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		}
 		state.sendNext = next
 		state.lastDataSent = hostQueue.queuedAt
+		livenessDirty = true
 		return true, nil
 	}
 	flushACK := func() error {
@@ -6934,7 +6965,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		return nil
 	}
 	fillWindow := func() error {
-		defer state.armLiveness()
+		livenessDirty = true
 		if state.localFINSent {
 			state.armPersist(time.Time{})
 			return nil
@@ -7412,6 +7443,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 	}
 	state.armPathMTUProbe()
 	state.armLiveness()
+	livenessDirty = false
 	var timerBacklog tcpTimerBacklog
 	const (
 		actorTimerNone = iota
@@ -7423,6 +7455,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		actorTimerPacing
 	)
 	for {
+		if livenessDirty {
+			state.armLiveness()
+			livenessDirty = false
+		}
 		var activeRetransmit, activePersist, activeDelayedACK <-chan time.Time
 		var activeLiveness, activePathMTUProbe, activePacing <-chan time.Time
 		inboundNotify := c.inbound.notify
@@ -7472,7 +7508,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		case actorTimerPacing:
 			activePacing = state.actorTimerChannel
 		}
-		drainBacklog, forceTimer := timerBacklog.order(c.inbound.len(), earliestTimer, time.Now())
+		queuedSegments := c.inbound.len()
+		drainBacklog, forceTimer := timerBacklog.order(queuedSegments, earliestTimer, time.Now())
 		if drainBacklog {
 			activeRetransmit, activePersist, activeDelayedACK = nil, nil, nil
 			activeLiveness, activePathMTUProbe, activePacing = nil, nil, nil
@@ -7572,204 +7609,208 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				c.respondTCPConnInfo(c.takeInfoRequests(), state.tcpInfo())
 			}
 
-			segment, ok := c.inbound.dequeue()
-			if !ok {
-				continue
+			if queuedSegments == 0 {
+				queuedSegments = c.inbound.len()
 			}
-			timerBacklog.consumed()
-			processedAt := time.Now()
-			receivedAt := tcpSegmentEventTime(segment, processedAt, state.eventTime, c.stack.timestampEpoch)
-			// Device receive functions may call Stack.Write concurrently. Keep
-			// the actor's protocol clock monotonic even if lock acquisition puts
-			// two batches into its FIFO in the opposite timestamp order.
-			state.eventTime = receivedAt
-			segmentLength := uint32(len(segment.payload))
-			if segment.flags&TCPFlagSYN != 0 {
-				segmentLength++
-			}
-			if segment.flags&TCPFlagFIN != 0 {
-				segmentLength++
-			}
-			receiveWindow := state.receiveWindowState.size(state.receiveNext)
-			retransmittedTimeWaitFIN := state.timeWaitArmed && segment.flags&(TCPFlagRST|TCPFlagSYN) == 0 &&
-				segment.flags&(TCPFlagACK|TCPFlagFIN) == TCPFlagACK|TCPFlagFIN &&
-				segment.sequence+uint32(len(segment.payload))+1 == state.receiveNext
-			if !tcpSegmentAcceptable(segment.sequence, segmentLength, state.receiveNext, receiveWindow) {
-				if retransmittedTimeWaitFIN {
-					if err := state.sendACK(); err != nil {
-						return err
+			batchLength := timerBacklog.receiveBatchLength(queuedSegments, forceTimer)
+			for batchIndex := 0; batchIndex < batchLength; batchIndex++ {
+				segment, ok := c.inbound.dequeue()
+				if !ok {
+					break
+				}
+				timerBacklog.consumed()
+				receivedAt := tcpQueuedSegmentEventTime(segment, state.eventTime, c.stack.timestampEpoch)
+				// Device receive functions may call Stack.Write concurrently. Keep
+				// the actor's protocol clock monotonic even if lock acquisition puts
+				// two batches into its FIFO in the opposite timestamp order.
+				state.eventTime = receivedAt
+				segmentLength := uint32(len(segment.payload))
+				if segment.flags&TCPFlagSYN != 0 {
+					segmentLength++
+				}
+				if segment.flags&TCPFlagFIN != 0 {
+					segmentLength++
+				}
+				receiveWindow := state.receiveWindowState.size(state.receiveNext)
+				retransmittedTimeWaitFIN := state.timeWaitArmed && segment.flags&(TCPFlagRST|TCPFlagSYN) == 0 &&
+					segment.flags&(TCPFlagACK|TCPFlagFIN) == TCPFlagACK|TCPFlagFIN &&
+					segment.sequence+uint32(len(segment.payload))+1 == state.receiveNext
+				if !tcpSegmentAcceptable(segment.sequence, segmentLength, state.receiveNext, receiveWindow) {
+					if retransmittedTimeWaitFIN {
+						if err := state.sendACK(); err != nil {
+							return err
+						}
+						state.armClose(time.Now(), tcpTimeWaitDuration)
+						continue
 					}
-					state.armClose(time.Now(), tcpTimeWaitDuration)
+					if segment.flags&TCPFlagRST == 0 {
+						var err error
+						if tcpKeepAliveOrWindowProbe(segment, segmentLength, state.receiveNext, receiveWindow) {
+							err = state.sendACK()
+						} else {
+							sequence := tcpChallengeACKSequence(segment, state.sendUnacknowledged, state.sendNext, state.peerWindow, state.peerScale)
+							err = state.sendChallengeACKAt(sequence)
+						}
+						if err != nil {
+							return err
+						}
+					}
 					continue
 				}
-				if segment.flags&TCPFlagRST == 0 {
-					var err error
-					if tcpKeepAliveOrWindowProbe(segment, segmentLength, state.receiveNext, receiveWindow) {
-						err = state.sendACK()
-					} else {
-						sequence := tcpChallengeACKSequence(segment, state.sendUnacknowledged, state.sendNext, state.peerWindow, state.peerScale)
-						err = state.sendChallengeACKAt(sequence)
+				timestampEcho := uint32(0)
+				if c.peerTimestamp && segment.flags&TCPFlagRST == 0 {
+					timestampValue, echo, present := parseTCPTimestamp(segment.optionBytes())
+					if !present {
+						continue
 					}
-					if err != nil {
-						return err
+					timestampEcho = echo
+					if receivedAt.Sub(state.lastTimestampUpdate) < 24*24*time.Hour && tcpSequenceLess(timestampValue, c.recentTimestamp) {
+						if err := state.sendChallengeACK(); err != nil {
+							return err
+						}
+						continue
+					}
+					if tcpSequenceLessEqual(segment.sequence, state.lastACKSent) {
+						c.recentTimestamp = timestampValue
+						state.lastTimestampUpdate = receivedAt
 					}
 				}
-				continue
-			}
-			timestampEcho := uint32(0)
-			if c.peerTimestamp && segment.flags&TCPFlagRST == 0 {
-				timestampValue, echo, present := parseTCPTimestamp(segment.optionBytes())
-				if !present {
-					continue
+				state.lastActivity = receivedAt
+				if state.livenessState != nil {
+					state.livenessState.lastKeepAlive = time.Time{}
+					state.livenessState.keepAliveProbes = 0
 				}
-				timestampEcho = echo
-				if receivedAt.Sub(state.lastTimestampUpdate) < 24*24*time.Hour && tcpSequenceLess(timestampValue, c.recentTimestamp) {
+				livenessDirty = true
+				if c.peerECN {
+					if segment.flags&TCPFlagCWR != 0 {
+						c.echoCongestion = false
+					}
+				}
+				if segment.flags&TCPFlagRST != 0 {
+					if segment.sequence == state.receiveNext {
+						return syscall.ECONNRESET
+					}
 					if err := state.sendChallengeACK(); err != nil {
 						return err
 					}
 					continue
 				}
-				if tcpSequenceLessEqual(segment.sequence, state.lastACKSent) {
-					c.recentTimestamp = timestampValue
-					state.lastTimestampUpdate = receivedAt
-				}
-			}
-			state.lastActivity = receivedAt
-			if state.livenessState != nil {
-				state.livenessState.lastKeepAlive = time.Time{}
-				state.livenessState.keepAliveProbes = 0
-			}
-			state.armLiveness()
-			if c.peerECN {
-				if segment.flags&TCPFlagCWR != 0 {
-					c.echoCongestion = false
-				}
-			}
-			if segment.flags&TCPFlagRST != 0 {
-				if segment.sequence == state.receiveNext {
-					return syscall.ECONNRESET
-				}
-				if err := state.sendChallengeACK(); err != nil {
-					return err
-				}
-				continue
-			}
-			if segment.flags&TCPFlagSYN != 0 {
-				if err := state.sendChallengeACK(); err != nil {
-					return err
-				}
-				continue
-			}
-			if segment.flags&TCPFlagACK == 0 {
-				continue
-			}
-			ack := segment.acknowledgement
-			if tcpSequenceGreater(ack, state.sendNext) {
-				if err := state.sendChallengeACK(); err != nil {
-					return err
-				}
-				continue
-			}
-			if tcpSequenceLess(ack, state.sendUnacknowledged) {
-				oldestAcceptable := state.maximumPeerWindow
-				if uint64(oldestAcceptable) > state.bytesAcknowledged {
-					oldestAcceptable = uint32(state.bytesAcknowledged)
-				}
-				// RFC 5961 section 5.2 and Linux reject an ACK older than both
-				// the largest observed send window and all bytes ever acknowledged.
-				// A merely reordered ACK may still carry valid receive data below.
-				if tcpSequenceLess(ack, state.sendUnacknowledged-oldestAcceptable) {
+				if segment.flags&TCPFlagSYN != 0 {
 					if err := state.sendChallengeACK(); err != nil {
 						return err
 					}
 					continue
 				}
-			} else if err := state.processAcknowledgment(&segment, receivedAt, timestampEcho, &ackOperations); err != nil {
-				return err
-			}
+				if segment.flags&TCPFlagACK == 0 {
+					continue
+				}
+				ack := segment.acknowledgement
+				if tcpSequenceGreater(ack, state.sendNext) {
+					if err := state.sendChallengeACK(); err != nil {
+						return err
+					}
+					continue
+				}
+				if tcpSequenceLess(ack, state.sendUnacknowledged) {
+					oldestAcceptable := state.maximumPeerWindow
+					if uint64(oldestAcceptable) > state.bytesAcknowledged {
+						oldestAcceptable = uint32(state.bytesAcknowledged)
+					}
+					// RFC 5961 section 5.2 and Linux reject an ACK older than both
+					// the largest observed send window and all bytes ever acknowledged.
+					// A merely reordered ACK may still carry valid receive data below.
+					if tcpSequenceLess(ack, state.sendUnacknowledged-oldestAcceptable) {
+						if err := state.sendChallengeACK(); err != nil {
+							return err
+						}
+						continue
+					}
+				} else if err := state.processAcknowledgment(&segment, receivedAt, timestampEcho, &ackOperations); err != nil {
+					return err
+				}
 
-			fin := segment.flags&TCPFlagFIN != 0
-			if len(segment.payload) != 0 || fin {
-				previousReceiveNext := state.receiveNext
-				newPayloadData := len(segment.payload) != 0 && tcpSequenceGreater(segment.sequence+uint32(len(segment.payload)), previousReceiveNext)
-				receivedData := false
-				quickECN := c.peerECN && len(segment.payload) != 0 && state.observeDataECN(segment.ecn)
-				hadOutOfOrder := len(state.outOfOrder) != 0
-				state.recentSACK = segment.sequence
-				if state.peerSACK {
-					if block, duplicate := tcpDuplicateSACKBlock(segment.sequence, len(segment.payload), fin, state.receiveNext, state.outOfOrder); duplicate {
-						state.recentDSACK, state.haveRecentDSACK = block, true
+				fin := segment.flags&TCPFlagFIN != 0
+				if len(segment.payload) != 0 || fin {
+					previousReceiveNext := state.receiveNext
+					newPayloadData := len(segment.payload) != 0 && tcpSequenceGreater(segment.sequence+uint32(len(segment.payload)), previousReceiveNext)
+					receivedData := false
+					quickECN := c.peerECN && len(segment.payload) != 0 && state.observeDataECN(segment.ecn)
+					hadOutOfOrder := len(state.outOfOrder) != 0
+					state.recentSACK = segment.sequence
+					if state.peerSACK {
+						if block, duplicate := tcpDuplicateSACKBlock(segment.sequence, len(segment.payload), fin, state.receiveNext, state.outOfOrder); duplicate {
+							state.recentDSACK, state.haveRecentDSACK = block, true
+						}
+					}
+					if !state.remoteFINReceived {
+						_, closed := c.receiveTCPData(segment.sequence, segment.payload, fin, receiveWindow, &state.receiveNext, &state.outOfOrder, &state.outOfOrderBytes)
+						advanced := state.receiveNext - previousReceiveNext
+						if closed && advanced != 0 {
+							advanced--
+						}
+						receivedData = advanced != 0
+						state.bytesReceived += uint64(advanced)
+						if closed {
+							state.remoteFINReceived = true
+							c.setReadEOF()
+						}
+					}
+					if newPayloadData && c.applicationReceiveClosed() {
+						sequence := tcpAcceptableSendSequence(state.sendUnacknowledged, state.sendNext, state.peerWindow, state.peerScale)
+						_ = c.sendSegment(sequence, state.receiveNext, TCPFlagRST|TCPFlagACK, state.advertisedReceiveWindow(), nil)
+						return net.ErrClosed
+					}
+					irregularData := len(segment.payload) != 0 && (segment.sequence != previousReceiveNext || hadOutOfOrder || len(state.outOfOrder) != 0 || !newPayloadData)
+					if newPayloadData {
+						state.measureReceiveMSS(&segment)
+					}
+					if receivedData {
+						state.observeReceivedData(receivedAt)
+					}
+					if state.receiveNext != previousReceiveNext {
+						state.sackACKs = 0
+					}
+					compressSACK := state.peerSACK && newPayloadData && !receivedData && !fin && !quickECN && !state.haveRecentDSACK && len(state.outOfOrder) != 0
+					if irregularData && !compressSACK {
+						state.enterQuickACK(tcpMaximumQuickACKs)
+					}
+					if quickECN {
+						state.enterQuickACK(2)
+					}
+					ackNow := false
+					if compressSACK {
+						ackNow = state.scheduleSACKACK(receivedAt)
+					} else {
+						ackNow = state.scheduleACK(fin || irregularData, newPayloadData, receivedAt)
+					}
+					if ackNow {
+						if err := flushACK(); err != nil {
+							return err
+						}
 					}
 				}
-				if !state.remoteFINReceived {
-					_, closed := c.receiveTCPData(segment.sequence, segment.payload, fin, receiveWindow, &state.receiveNext, &state.outOfOrder, &state.outOfOrderBytes)
-					advanced := state.receiveNext - previousReceiveNext
-					if closed && advanced != 0 {
-						advanced--
+				if state.localFINAcked && state.remoteFINReceived {
+					if !state.timeWaitRequired {
+						return nil
 					}
-					receivedData = advanced != 0
-					state.bytesReceived += uint64(advanced)
-					if closed {
-						state.remoteFINReceived = true
-						c.setReadEOF()
+					// RFC 9293 restarts 2MSL for a retransmitted FIN, not for
+					// every acceptable ACK received while the tuple is retained.
+					if !state.timeWaitArmed || fin {
+						startedAt := receivedAt
+						if fin {
+							// TIME-WAIT starts after acknowledging the peer's FIN.
+							startedAt = time.Now()
+						}
+						state.armClose(startedAt, tcpTimeWaitDuration)
+						state.timeWaitArmed = true
 					}
+				} else if state.localFINAcked && !state.finWaitArmed && c.applicationReceiveClosed() {
+					state.armClose(receivedAt, tcpFINWaitDuration)
+					state.finWaitArmed = true
 				}
-				if newPayloadData && c.applicationReceiveClosed() {
-					sequence := tcpAcceptableSendSequence(state.sendUnacknowledged, state.sendNext, state.peerWindow, state.peerScale)
-					_ = c.sendSegment(sequence, state.receiveNext, TCPFlagRST|TCPFlagACK, state.advertisedReceiveWindow(), nil)
-					return net.ErrClosed
+				if err := fillWindow(); err != nil {
+					return err
 				}
-				irregularData := len(segment.payload) != 0 && (segment.sequence != previousReceiveNext || hadOutOfOrder || len(state.outOfOrder) != 0 || !newPayloadData)
-				if newPayloadData {
-					state.measureReceiveMSS(&segment)
-				}
-				if receivedData {
-					state.observeReceivedData(receivedAt)
-				}
-				if state.receiveNext != previousReceiveNext {
-					state.sackACKs = 0
-				}
-				compressSACK := state.peerSACK && newPayloadData && !receivedData && !fin && !quickECN && !state.haveRecentDSACK && len(state.outOfOrder) != 0
-				if irregularData && !compressSACK {
-					state.enterQuickACK(tcpMaximumQuickACKs)
-				}
-				if quickECN {
-					state.enterQuickACK(2)
-				}
-				ackNow := false
-				if compressSACK {
-					ackNow = state.scheduleSACKACK(receivedAt)
-				} else {
-					ackNow = state.scheduleACK(fin || irregularData, newPayloadData, receivedAt)
-				}
-				if ackNow {
-					if err := flushACK(); err != nil {
-						return err
-					}
-				}
-			}
-			if state.localFINAcked && state.remoteFINReceived {
-				if !state.timeWaitRequired {
-					return nil
-				}
-				// RFC 9293 restarts 2MSL for a retransmitted FIN, not for
-				// every acceptable ACK received while the tuple is retained.
-				if !state.timeWaitArmed || fin {
-					startedAt := receivedAt
-					if fin {
-						// TIME-WAIT starts after acknowledging the peer's FIN.
-						startedAt = time.Now()
-					}
-					state.armClose(startedAt, tcpTimeWaitDuration)
-					state.timeWaitArmed = true
-				}
-			} else if state.localFINAcked && !state.finWaitArmed && c.applicationReceiveClosed() {
-				state.armClose(receivedAt, tcpFINWaitDuration)
-				state.finWaitArmed = true
-			}
-			state.armLiveness()
-			if err := fillWindow(); err != nil {
-				return err
 			}
 
 		case <-activeRetransmit:
@@ -8318,6 +8359,21 @@ func tcpSegmentEventTime(segment tcpSegment, now, previous, epoch time.Time) tim
 	result := segment.receivedAt.time(epoch)
 	if result.IsZero() || result.After(now) {
 		result = now
+	}
+	if result.Before(previous) {
+		result = previous
+	}
+	return result
+}
+
+// tcpQueuedSegmentEventTime returns the trusted arrival time recorded by
+// packet input without reading the clock again for every established segment.
+// Synthetic internal segments without an arrival stamp use their processing
+// time, while concurrent Write calls remain ordered by the actor clock.
+func tcpQueuedSegmentEventTime(segment tcpSegment, previous, epoch time.Time) time.Time {
+	result := segment.receivedAt.time(epoch)
+	if result.IsZero() {
+		result = time.Now()
 	}
 	if result.Before(previous) {
 		result = previous

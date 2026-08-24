@@ -701,16 +701,19 @@ func TestTCPFRTOInterop(t *testing.T) {
 	}
 }
 
-// TestTCPKeepAliveInterop verifies that gVisor acknowledges mipstack's idle
-// probes and that the connection remains usable afterward.
+// TestTCPKeepAliveInterop verifies that receive activity restarts the idle
+// period and that the connection remains usable after the following probe.
 func TestTCPKeepAliveInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
 		t.Run(family.name, func(t *testing.T) {
-			keepAlive := mipstack.KeepAliveConfig{Idle: 50 * time.Millisecond, Interval: 50 * time.Millisecond, Count: 3}
+			keepAlive := mipstack.KeepAliveConfig{Idle: 200 * time.Millisecond, Interval: 20 * time.Millisecond, Count: 20}
+			observer := newTCPKeepAliveObserver()
 			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
 				families: []interopFamily{family}, mtu: 1500,
-				tcp: mipstack.TCPSocketDefaults{KeepAlive: true, KeepAliveConfig: keepAlive},
+				tcp:              mipstack.TCPSocketDefaults{KeepAlive: true, KeepAliveConfig: keepAlive},
+				mipstackToGVisor: observer.observeOutbound,
+				gvisorToMipstack: observer.observeInbound,
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -719,12 +722,38 @@ func TestTCPKeepAliveInterop(t *testing.T) {
 			defer client.Close()
 			defer server.Close()
 
-			deadline := time.Now().Add(2 * time.Second)
-			for network.mipstack.Stats().TCPKeepAliveProbes == 0 && time.Now().Before(deadline) {
-				time.Sleep(5 * time.Millisecond)
+			select {
+			case <-observer.probes:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("mipstack did not emit the initial TCP keepalive probe; info=%+v", client.(*mipstack.TCPConn).Info())
 			}
-			if probes := network.mipstack.Stats().TCPKeepAliveProbes; probes == 0 {
-				t.Fatal("mipstack did not emit a TCP keepalive probe")
+			activityStartedAt := observer.elapsed()
+			exchangeTCPPayload(t, client, server, patternedPayload(32*1024, 29))
+			exchangeTCPPayload(t, server, client, patternedPayload(32*1024, 71))
+			lastActivity := time.Duration(observer.lastInboundData.Load())
+			if lastActivity < activityStartedAt {
+				t.Fatalf("bidirectional transfer produced no inbound TCP data after %v; last inbound data at %v", activityStartedAt, lastActivity)
+			}
+
+			var laterProbe tcpKeepAliveObservation
+			probeDeadline := time.NewTimer(2 * time.Second)
+			defer probeDeadline.Stop()
+			for laterProbe.lastInbound < lastActivity {
+				select {
+				case observation := <-observer.probes:
+					laterProbe = observation
+				case <-probeDeadline.C:
+					t.Fatalf("mipstack did not emit a TCP keepalive probe after bidirectional activity; info=%+v", client.(*mipstack.TCPConn).Info())
+				}
+			}
+			// A reset probe series waits Idle; an unreset series continues after
+			// Interval. Their midpoint avoids depending on timer granularity.
+			minimumRestart := (keepAlive.Idle + keepAlive.Interval) / 2
+			if elapsed := laterProbe.sentAt - laterProbe.lastInbound; elapsed < minimumRestart {
+				t.Fatalf("mipstack emitted a TCP keepalive probe %v after inbound activity; want the restarted idle period (at least %v)", elapsed, minimumRestart)
+			}
+			if observer.dropped.Load() {
+				t.Fatal("TCP keepalive observation queue overflowed")
 			}
 			info := client.(*mipstack.TCPConn).Info()
 			if !info.KeepAlive || info.KeepAliveConfig != keepAlive || info.State != mipstack.TCPStateEstablished {
@@ -880,6 +909,78 @@ func tcpDataSequence(packet []byte) (uint32, bool) {
 		return 0, false
 	}
 	return tcpHeader.SequenceNumber(), true
+}
+
+// tcpKeepAliveObservation records one keepalive probe and the most recent
+// inbound TCP data observed before it on the bridge's monotonic clock.
+type tcpKeepAliveObservation struct {
+	sentAt, lastInbound time.Duration
+}
+
+// tcpKeepAliveObserver recognizes wire keepalive probes without depending on
+// when the test goroutine is scheduled. The outbound hook alone owns sendNext.
+type tcpKeepAliveObserver struct {
+	origin       time.Time
+	haveSendNext bool
+	sendNext     uint32
+	// lastInboundData is an event the established connection necessarily
+	// accepts as activity; a later duplicate control packet need not be.
+	lastInboundData atomic.Int64
+	probes          chan tcpKeepAliveObservation
+	dropped         atomic.Bool
+}
+
+func newTCPKeepAliveObserver() *tcpKeepAliveObserver {
+	return &tcpKeepAliveObserver{origin: time.Now(), probes: make(chan tcpKeepAliveObservation, 16)}
+}
+
+// elapsed returns a positive monotonic offset suitable for atomic storage.
+func (o *tcpKeepAliveObserver) elapsed() time.Duration {
+	elapsed := time.Since(o.origin)
+	if elapsed <= 0 {
+		return 1
+	}
+	return elapsed
+}
+
+// observeInbound records TCP data immediately before bridge delivery.
+func (o *tcpKeepAliveObserver) observeInbound(packet []byte) bool {
+	if _, payloadLength, ok := tcpSegment(packet); ok && payloadLength != 0 {
+		o.lastInboundData.Store(int64(o.elapsed()))
+	}
+	return true
+}
+
+// observeOutbound tracks transmitted sequence space and recognizes the RFC
+// keepalive form: a payload-free ACK at SND.NXT-1.
+func (o *tcpKeepAliveObserver) observeOutbound(packet []byte) bool {
+	tcpHeader, payloadLength, ok := tcpSegment(packet)
+	if !ok {
+		return true
+	}
+	flags := tcpHeader.Flags()
+	sequence := tcpHeader.SequenceNumber()
+	if flags.Contains(header.TCPFlagSyn) {
+		o.sendNext = sequence + 1
+		o.haveSendNext = true
+	} else if o.haveSendNext && sequence == o.sendNext {
+		o.sendNext += uint32(payloadLength)
+		if flags.Contains(header.TCPFlagFin) {
+			o.sendNext++
+		}
+	}
+	control := header.TCPFlagSyn | header.TCPFlagFin | header.TCPFlagRst
+	if o.haveSendNext && payloadLength == 0 && flags.Contains(header.TCPFlagAck) && flags&control == 0 && sequence == o.sendNext-1 {
+		observation := tcpKeepAliveObservation{
+			sentAt: o.elapsed(), lastInbound: time.Duration(o.lastInboundData.Load()),
+		}
+		select {
+		case o.probes <- observation:
+		default:
+			o.dropped.Store(true)
+		}
+	}
+	return true
 }
 
 // tcpHasSACKOption reports whether one validated gVisor TCP header carries a

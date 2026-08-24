@@ -3784,6 +3784,58 @@ func TestTCPSegmentEventTime(t *testing.T) {
 	}
 }
 
+func TestTCPQueuedSegmentEventTime(t *testing.T) {
+	epoch := time.Now().Add(-time.Second)
+	previous := epoch.Add(500 * time.Millisecond)
+	arrival := previous.Add(100 * time.Millisecond)
+	if got := tcpQueuedSegmentEventTime(tcpSegment{receivedAt: monotonicStampAt(epoch, arrival)}, previous, epoch); got != arrival {
+		t.Fatalf("queued segment event time = %v, want %v", got, arrival)
+	}
+	older := previous.Add(-time.Millisecond)
+	if got := tcpQueuedSegmentEventTime(tcpSegment{receivedAt: monotonicStampAt(epoch, older)}, previous, epoch); got != previous {
+		t.Fatalf("reordered queued segment event time = %v, want %v", got, previous)
+	}
+	before := time.Now()
+	got := tcpQueuedSegmentEventTime(tcpSegment{}, previous, epoch)
+	after := time.Now()
+	if got.Before(before) || got.After(after) {
+		t.Fatalf("unstamped queued segment event time = %v, processing interval [%v, %v]", got, before, after)
+	}
+}
+
+func TestTCPLivenessClearsDisabledUserTimeoutState(t *testing.T) {
+	zeroWindowSince := time.Now().Add(-time.Minute)
+	state := tcpEstablishedState{
+		connection:    new(TCPConn),
+		livenessState: &tcpEstablishedLivenessState{zeroWindowSince: zeroWindowSince},
+	}
+	state.armLiveness()
+	if !state.livenessState.zeroWindowSince.IsZero() {
+		t.Fatalf("disabled user timeout retained zero-window start %v", state.livenessState.zeroWindowSince)
+	}
+}
+
+func TestTCPLivenessDeadlineTracksActivity(t *testing.T) {
+	idle := time.Second
+	connection := &TCPConn{
+		keepAlive:       true,
+		keepAliveConfig: KeepAliveConfig{Idle: idle, Interval: time.Second, Count: 3},
+	}
+	firstActivity := time.Now().Add(-time.Hour)
+	state := tcpEstablishedState{connection: connection, lastActivity: firstActivity}
+	state.armLiveness()
+	if want := firstActivity.Add(idle); !state.liveness || state.livenessDeadline != want {
+		t.Fatalf("initial liveness = %t at %v, want true at %v", state.liveness, state.livenessDeadline, want)
+	}
+
+	secondActivity := firstActivity.Add(10 * time.Minute)
+	state.lastActivity = secondActivity
+	state.armLiveness()
+	if want := secondActivity.Add(idle); !state.liveness || state.livenessDeadline != want {
+		t.Fatalf("rearmed liveness = %t at %v, want true at %v", state.liveness, state.livenessDeadline, want)
+	}
+}
+
 func TestTCPDispatchPreservesPacketArrivalTime(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.1")
 	remote := netip.MustParseAddr("192.0.2.2")
@@ -4808,16 +4860,26 @@ func TestTCPTimerBacklogSnapshotDoesNotGrow(t *testing.T) {
 	if !drain || forceTimer {
 		t.Fatalf("initial backlog = drain %t force %t", drain, forceTimer)
 	}
+	if batchLength := backlog.receiveBatchLength(4096, forceTimer); batchLength != tcpActorReceiveBatch {
+		t.Fatalf("initial receive batch = %d, want %d", batchLength, tcpActorReceiveBatch)
+	}
 	backlog.consumed()
 	for remaining := 2047; remaining > 0; remaining-- {
 		drain, forceTimer := backlog.order(4096, deadline, time.Now())
 		if !drain || forceTimer {
 			t.Fatalf("backlog with %d snapshot events = drain %t force %t", remaining, drain, forceTimer)
 		}
+		if remaining < tcpActorReceiveBatch {
+			if batchLength := backlog.receiveBatchLength(4096, forceTimer); batchLength != remaining {
+				t.Fatalf("receive batch with %d snapshot events = %d", remaining, batchLength)
+			}
+		}
 		backlog.consumed()
 	}
 	if drain, forceTimer := backlog.order(4096, deadline, time.Now()); drain || !forceTimer {
 		t.Fatalf("drained snapshot = drain %t force %t, want false/true", drain, forceTimer)
+	} else if batchLength := backlog.receiveBatchLength(4096, forceTimer); batchLength != 1 {
+		t.Fatalf("receive batch at timer boundary = %d, want 1", batchLength)
 	}
 	if drain, forceTimer := backlog.order(4096, time.Now().Add(time.Second), time.Now()); drain || forceTimer {
 		t.Fatalf("future deadline = drain %t force %t, want false/false", drain, forceTimer)
@@ -5326,9 +5388,7 @@ func TestTCPZeroWindowProbePreservesSequenceSpace(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for persist probe")
 	}
-	if probes := stack.Stats().TCPZeroWindowProbes; probes != 1 {
-		t.Fatalf("zero-window probes = %d, want 1", probes)
-	}
+	waitFor(t, time.Second, func() bool { return stack.Stats().TCPZeroWindowProbes == 1 })
 	if err = link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
 		t.Fatal(err)
 	}

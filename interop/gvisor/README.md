@@ -15,9 +15,9 @@ The suite covers:
   1,420, 1,500, and 9,000;
 - IPv4 and IPv6 TCP with either stack listening, simultaneous streams,
   half-close processing, wildcard dual-stack listeners, closed-port and
-  established-connection resets, keepalive probes, receive-window closure and
-  reopening, and SYN, SYN-ACK, final-ACK, FIN, and data retransmission after
-  deterministic loss or reordering;
+  established-connection resets, keepalive restart after bidirectional data,
+  receive-window closure and reopening, SYN, SYN-ACK, final-ACK, FIN, and data
+  retransmission after deterministic loss or reordering;
 - Reno, CUBIC, BBR, and BBRv3 mipstack senders recovering from loss against
   both active and passive gVisor connections, plus an unregistered local
   congestion-control factory receiving correct IPv4/IPv6 connection context;
