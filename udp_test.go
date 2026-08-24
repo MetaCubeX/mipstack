@@ -345,6 +345,18 @@ func TestUDPBatchWrite(t *testing.T) {
 		t.Fatalf("connected WriteBatch = %d, %v", n, err)
 	}
 	_ = readOutboundPacket(t, stack)
+	if err = connected.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err = connected.WriteBatch(connectedMessage, 0); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expired connected WriteBatch = %d, %v", n, err)
+	}
+	if operationError := checkNetOpError(t, err, "write", "udp4"); operationError.Addr == nil || operationError.Addr.String() != "198.51.100.235:5352" {
+		t.Fatalf("expired connected WriteBatch address = %v", operationError.Addr)
+	}
+	if err = connected.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
 	connectedMessage[0].Addr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5352))
 	if n, err = connected.WriteBatch(connectedMessage, 0); n != 0 || !errors.Is(err, net.ErrWriteToConnected) {
 		t.Fatalf("addressed connected WriteBatch = %d, %v", n, err)

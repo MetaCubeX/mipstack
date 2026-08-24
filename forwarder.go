@@ -2030,11 +2030,7 @@ func (f *forwarderRuntime) replyIPPayload(packet ipPacket, payload []byte) error
 		flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
 	}
 	mtu, fragmentation := f.stack.pathMTUOutputPolicy(packet.source, defaults.PathMTUDiscovery)
-	packets, err := f.stack.ipPayloadPacketsForMTU(packet.target, packet.source, packet.protocol, payload, fragmentation, options, mtu)
-	if err != nil {
-		return err
-	}
-	return f.stack.tryWritePackets(packets)
+	return f.stack.tryWriteIPPayloadForMTU(packet.target, packet.source, packet.protocol, payload, fragmentation, options, mtu)
 }
 
 // Message returns the detached IP metadata and independently owned payload.

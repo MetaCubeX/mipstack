@@ -190,9 +190,12 @@ const (
 	// tcpInitialCongestionMSS is the RFC 6928 upper initial-window bound.
 	tcpInitialCongestionMSS = 10
 	// tcpInitialOutstandingCapacity covers the initial window plus Limited
-	// Transmit without repeated sent-segment slice growth. It is allocated only
-	// when a connection first sends application data.
+	// Transmit without repeated sent-segment slice growth. It is selected for a
+	// known multi-segment write or when a short live flight outgrows two slots.
 	tcpInitialOutstandingCapacity = 16
+	// tcpSmallOutstandingCapacity covers short data flights without retaining a
+	// full initial window for a single-segment request or response.
+	tcpSmallOutstandingCapacity = 2
 	// tcpDuplicateACKThreshold is the RFC 5681 fast-retransmit threshold and
 	// RFC 6675 packet-count loss threshold.
 	tcpDuplicateACKThreshold = 3
@@ -2118,19 +2121,32 @@ func (s *tcpEstablishedState) compactOutstanding() {
 	s.outstandingHead = 0
 }
 
-// appendOutstanding adds one transmitted sequence range while retaining a
-// small initial capacity for ordinary windows and control-only traffic.
-func (s *tcpEstablishedState) appendOutstanding(segment sentTCPSegment) {
+// appendOutstanding starts a short flight with two slots, but reserves the
+// ordinary-window capacity when more buffered data is already available. A
+// later append can still expand a short flight when writes arrive separately.
+func (s *tcpEstablishedState) appendOutstanding(segment sentTCPSegment, moreDataAvailable bool) {
 	if s.outstanding == nil {
 		capacity := 1
 		if segment.dataSize() != 0 {
-			capacity = tcpInitialOutstandingCapacity
+			capacity = tcpSmallOutstandingCapacity
+			if moreDataAvailable {
+				capacity = tcpInitialOutstandingCapacity
+			}
 		}
 		s.outstandingBase = make([]sentTCPSegment, 0, capacity)
 		s.outstanding = s.outstandingBase
 	}
-	if len(s.outstanding) == cap(s.outstanding) && s.outstandingHead != 0 {
-		s.compactOutstanding()
+	if len(s.outstanding) == cap(s.outstanding) {
+		if s.outstandingHead != 0 {
+			s.compactOutstanding()
+		}
+		if len(s.outstanding) == cap(s.outstanding) && cap(s.outstanding) == tcpSmallOutstandingCapacity {
+			storage := make([]sentTCPSegment, len(s.outstanding), tcpInitialOutstandingCapacity)
+			copy(storage, s.outstanding)
+			s.outstandingBase = storage[:0]
+			s.outstanding = storage
+			s.outstandingHead = 0
+		}
 	}
 	priorCapacity := cap(s.outstanding)
 	s.outstanding = append(s.outstanding, segment)
@@ -7046,7 +7062,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		// argument even when it is no longer congestion flight.
 		rate, updatedWindow := state.controller.onDataSend(payload.size, state.peerMSS, sentAt, hostQueue.queuedAt, windowFlight, state.congestionWindow, congestionFlight, state.rtt.srtt, state.slowStartThreshold)
 		state.congestionWindow = updatedWindow
-		state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: next, flags: flags, timestamp: timestamp, state: sentTCPSegmentInitialState(limitedTransmit, carriesCWR, probe, state.processingDeliveryACK, state.controller.schedulerLimited()), firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, congestionPacketState: state.controller.transmissionState(), delivery: rate})
+		state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: next, flags: flags, timestamp: timestamp, state: sentTCPSegmentInitialState(limitedTransmit, carriesCWR, probe, state.processingDeliveryACK, state.controller.schedulerLimited()), firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, congestionPacketState: state.controller.transmissionState(), delivery: rate}, offset+payload.size < total)
 		if state.processingDeliveryACK {
 			state.deliveryACKAddedFlight = growCongestionWindow(state.deliveryACKAddedFlight, uint32(payload.size))
 			state.deliveryACKPendingSnapshots = true
@@ -7130,7 +7146,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					state.haveRecentDSACK = false
 				}
 				state.commitAcknowledgment(window, len(options) != 0)
-				state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: state.sendNext + 1, flags: TCPFlagACK | TCPFlagFIN, timestamp: timestamp, state: sentTCPSegmentTransmitted, firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue})
+				state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: state.sendNext + 1, flags: TCPFlagACK | TCPFlagFIN, timestamp: timestamp, state: sentTCPSegmentTransmitted, firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue}, false)
 				state.sendNext++
 				// Only the endpoint that closes first, or closes simultaneously,
 				// enters TIME-WAIT. A FIN sent after the peer's FIN is LAST-ACK.
@@ -8116,7 +8132,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				}
 				continue
 			}
-			if state.pathMTUState != nil && !state.pathMTUState.blackHoleExpiry.IsZero() && !time.Now().Before(state.pathMTUState.blackHoleExpiry) {
+			if state.pathMTUState != nil && !state.pathMTUState.blackHoleExpiry.IsZero() && !now.Before(state.pathMTUState.blackHoleExpiry) {
 				state.pathMTUState.blackHoleMTU = 0
 				state.pathMTUState.blackHoleExpiry = time.Time{}
 			}

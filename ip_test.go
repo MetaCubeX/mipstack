@@ -1639,6 +1639,43 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 		t.Fatalf("connected IP WriteBatch = %d, %v", n, err)
 	}
 	_ = readOutboundPacket(t, stack)
+	if err = connected.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err = connected.WriteBatch(connectedMessage, 0); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expired connected IP WriteBatch = %d, %v", n, err)
+	}
+	if operationError := checkNetOpError(t, err, "write", "ip4:99"); operationError.Addr == nil || operationError.Addr.String() != remote.String() {
+		t.Fatalf("expired connected IP WriteBatch address = %v", operationError.Addr)
+	}
+	if err = connected.SetIPHeaderIncludedOnWrite(true); err != nil {
+		t.Fatal(err)
+	}
+	if n, err = connected.WriteBatch(connectedMessage, 0); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expired header-included connected IP WriteBatch = %d, %v", n, err)
+	}
+	if operationError := checkNetOpError(t, err, "write", "ip4:99"); operationError.Addr == nil || operationError.Addr.String() != remote.String() {
+		t.Fatalf("expired header-included connected IP WriteBatch address = %v", operationError.Addr)
+	}
+	if err = connected.SetIPHeaderIncludedOnWrite(false); err != nil {
+		t.Fatal(err)
+	}
+	if err = connected.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if err = connected.SetIPHeaderIncludedOnWrite(true); err != nil {
+		t.Fatal(err)
+	}
+	emptyMessage := []SocketMessage{{}}
+	if n, err = connected.WriteBatch(emptyMessage, 0); n != 0 || !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("empty header-included connected IP WriteBatch = %d, %v", n, err)
+	}
+	if operationError := checkNetOpError(t, err, "write", "ip4:99"); operationError.Addr == nil || operationError.Addr.String() != remote.String() {
+		t.Fatalf("empty header-included connected IP WriteBatch address = %v", operationError.Addr)
+	}
+	if err = connected.SetIPHeaderIncludedOnWrite(false); err != nil {
+		t.Fatal(err)
+	}
 	connectedMessage[0].Addr = ipNetAddr(remote)
 	if n, err = connected.WriteBatch(connectedMessage, 0); n != 0 || !errors.Is(err, net.ErrWriteToConnected) {
 		t.Fatalf("addressed connected IP WriteBatch = %d, %v", n, err)

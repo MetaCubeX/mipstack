@@ -4840,9 +4840,9 @@ func BenchmarkUDPForwarderReply(b *testing.B) {
 		if replyErr != nil {
 			b.Fatal(replyErr)
 		}
-		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+		entry, ok := stack.outbound.tryDequeue()
 		if !ok {
-			b.Fatal("timed out waiting for UDP forwarder reply")
+			b.Fatal("missing UDP forwarder reply")
 		}
 		stack.outbound.release(entry)
 	}
@@ -4885,9 +4885,9 @@ func BenchmarkUDPForwarderReplyFrom(b *testing.B) {
 		if replyErr != nil {
 			b.Fatal(replyErr)
 		}
-		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+		entry, ok := stack.outbound.tryDequeue()
 		if !ok {
-			b.Fatal("timed out waiting for UDP forwarder ReplyFrom")
+			b.Fatal("missing UDP forwarder ReplyFrom")
 		}
 		stack.outbound.release(entry)
 	}
@@ -4932,9 +4932,9 @@ func BenchmarkICMPForwarderReplyEcho(b *testing.B) {
 		if replyErr != nil {
 			b.Fatal(replyErr)
 		}
-		entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+		entry, ok := stack.outbound.tryDequeue()
 		if !ok {
-			b.Fatal("timed out waiting for ICMP forwarder reply")
+			b.Fatal("missing ICMP forwarder reply")
 		}
 		stack.outbound.release(entry)
 	}
@@ -4989,9 +4989,9 @@ func BenchmarkICMPForwarderReplyIPPacket(b *testing.B) {
 					b.Fatal(replyErr)
 				}
 				for fragment := 0; fragment < fragments; fragment++ {
-					entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+					entry, ok := stack.outbound.tryDequeue()
 					if !ok {
-						b.Fatal("timed out waiting for ICMP forwarder ReplyIPPacket")
+						b.Fatal("missing ICMP forwarder ReplyIPPacket")
 					}
 					stack.outbound.release(entry)
 				}

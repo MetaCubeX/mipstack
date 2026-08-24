@@ -1277,7 +1277,7 @@ func (c *UDPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int,
 		if message.Addr != nil {
 			return 0, 0, c.operationError("write", message.Addr, net.ErrWriteToConnected)
 		}
-		target, address = c.remote, c.remoteAddr()
+		target = c.remote
 	} else {
 		address = message.Addr
 		var err error
@@ -1289,7 +1289,7 @@ func (c *UDPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int,
 	}
 	validated, err := c.validateWriteTarget(target)
 	if err != nil {
-		return 0, 0, c.operationError("write", address, err)
+		return 0, 0, c.operationError("write", c.writeBatchErrorAddress(address), err)
 	}
 	maximum := 65535 - udpHeaderSize
 	if validated.Addr().Is4() {
@@ -1297,37 +1297,46 @@ func (c *UDPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int,
 	}
 	payloadSize, err := messageBufferLength(message.Buffers)
 	if err != nil {
-		return 0, 0, c.operationError("write", address, err)
+		return 0, 0, c.operationError("write", c.writeBatchErrorAddress(address), err)
 	}
 	if payloadSize > maximum {
-		return 0, 0, c.operationError("write", address, syscall.EMSGSIZE)
+		return 0, 0, c.operationError("write", c.writeBatchErrorAddress(address), syscall.EMSGSIZE)
 	}
 	if len(message.Buffers) == 1 {
 		if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
-			return 0, 0, c.operationError("write", address, err)
+			return 0, 0, c.operationError("write", c.writeBatchErrorAddress(address), err)
 		}
 		source, options, parseErr := parseControlMessageForWrite(message.OOB, validated.Addr().Is6())
 		if parseErr != nil {
-			return 0, 0, c.operationError("write", address, parseErr)
+			return 0, 0, c.operationError("write", c.writeBatchErrorAddress(address), parseErr)
 		}
 		n, err := c.writeToFromWith(message.Buffers[0], validated, source, options, c.writeDatagram, dontWait)
 		if err != nil {
-			return n, 0, c.operationError("write", address, err)
+			return n, 0, c.operationError("write", c.writeBatchErrorAddress(address), err)
 		}
 		return n, len(message.OOB), nil
 	}
 	if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
-		return 0, 0, c.operationError("write", address, err)
+		return 0, 0, c.operationError("write", c.writeBatchErrorAddress(address), err)
 	}
 	source, options, err := parseControlMessageForWrite(message.OOB, validated.Addr().Is6())
 	if err != nil {
-		return 0, 0, c.operationError("write", address, err)
+		return 0, 0, c.operationError("write", c.writeBatchErrorAddress(address), err)
 	}
 	n, err := c.writeBuffersToFrom(message.Buffers, payloadSize, validated, source, options, dontWait)
 	if err != nil {
-		return n, 0, c.operationError("write", address, err)
+		return n, 0, c.operationError("write", c.writeBatchErrorAddress(address), err)
 	}
 	return n, len(message.OOB), nil
+}
+
+// writeBatchErrorAddress constructs the connected peer only on an error path;
+// unconnected writes preserve the caller's original net.Addr value.
+func (c *UDPConn) writeBatchErrorAddress(address net.Addr) net.Addr {
+	if address != nil {
+		return address
+	}
+	return c.remoteAddr()
 }
 
 // writeMsgUDPAddrPort parses packet-info source selection and sends one
@@ -1493,9 +1502,40 @@ func (s *Stack) tryWriteUDPDatagram(source, target netip.Addr, sourcePort, targe
 	if udpSize > 65535 {
 		return syscall.EMSGSIZE
 	}
+	mtu, fragmentation := s.pathMTUOutputPolicy(target, pathMTUDiscovery)
+	ipSize := ipHeaderSize(source, target, udpSize)
+	if ipSize == 0 {
+		return syscall.EMSGSIZE
+	}
+	if ipSize+udpSize <= mtu {
+		if source.Is6() && !options.flowLabelSet {
+			options.flowLabel = s.automaticTransportFlowLabel(source, target, ProtocolUDP, sourcePort, targetPort)
+			options.flowLabelSet = true
+		}
+		var identification uint16
+		if source.Is4() && fragmentation.requiresIPv4ID() {
+			identification = uint16(s.ipv4ID.Add(1))
+		}
+		queue, loopback := s.outputQueueFor(target)
+		slot, err := s.tryReservePacket(queue)
+		if err != nil {
+			return err
+		}
+		packet, reusable := queue.acquireBuffer(ipSize + udpSize)
+		if !marshalIPHeader(packet, source, target, ProtocolUDP, identification, fragmentation.dontFragment, options) {
+			queue.releaseBuffer(packet, reusable)
+			queue.releaseReserved(slot)
+			return syscall.EMSGSIZE
+		}
+		marshalUDPDatagram(packet[ipSize:], source, target, sourcePort, targetPort, payload)
+		if !queue.enqueueReservedPacket(slot, packet, reusable) {
+			return ErrClosed
+		}
+		s.recordOutput(loopback)
+		return nil
+	}
 	datagram := make([]byte, udpSize)
 	marshalUDPDatagram(datagram, source, target, sourcePort, targetPort, payload)
-	mtu, fragmentation := s.pathMTUOutputPolicy(target, pathMTUDiscovery)
 	packets, err := s.ipPayloadPacketsForMTU(source, target, ProtocolUDP, datagram, fragmentation, options, mtu)
 	if err != nil {
 		return err

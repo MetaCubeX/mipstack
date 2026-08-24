@@ -7270,3 +7270,39 @@ func TestTCPConnectionChurnUnderImpairment(t *testing.T) {
 		t.Fatalf("churn link loss was not exercised: client=%+v server=%+v", clientStats, serverStats)
 	}
 }
+
+// TestTCPOutstandingSmallFlightReuse verifies that control-only flights retain
+// one slot and cumulative ACK compaction reuses short data-flight storage
+// before a larger live flight expands it.
+func TestTCPOutstandingSmallFlightReuse(t *testing.T) {
+	var control tcpEstablishedState
+	control.appendOutstanding(sentTCPSegment{sequence: 1, end: 2, flags: TCPFlagFIN, state: sentTCPSegmentTransmitted}, false)
+	if len(control.outstanding) != 1 || cap(control.outstanding) != 1 {
+		t.Fatalf("control outstanding length/capacity = %d/%d", len(control.outstanding), cap(control.outstanding))
+	}
+
+	var state tcpEstablishedState
+	segment := sentTCPSegment{sequence: 1, end: 2, state: sentTCPSegmentTransmitted}
+	var multiSegment tcpEstablishedState
+	multiSegment.appendOutstanding(segment, true)
+	if len(multiSegment.outstanding) != 1 || cap(multiSegment.outstanding) != tcpInitialOutstandingCapacity {
+		t.Fatalf("known multi-segment outstanding length/capacity = %d/%d", len(multiSegment.outstanding), cap(multiSegment.outstanding))
+	}
+
+	state.appendOutstanding(segment, false)
+	state.appendOutstanding(segment, false)
+	if len(state.outstanding) != 2 || cap(state.outstanding) != tcpSmallOutstandingCapacity {
+		t.Fatalf("initial outstanding length/capacity = %d/%d", len(state.outstanding), cap(state.outstanding))
+	}
+	state.outstanding[0] = sentTCPSegment{}
+	state.outstanding = state.outstanding[1:]
+	state.outstandingHead++
+	state.appendOutstanding(segment, false)
+	if len(state.outstanding) != 2 || cap(state.outstanding) != tcpSmallOutstandingCapacity || state.outstandingHead != 0 {
+		t.Fatalf("compacted outstanding length/capacity/head = %d/%d/%d", len(state.outstanding), cap(state.outstanding), state.outstandingHead)
+	}
+	state.appendOutstanding(segment, false)
+	if len(state.outstanding) != 3 || cap(state.outstanding) != tcpInitialOutstandingCapacity {
+		t.Fatalf("expanded outstanding length/capacity = %d/%d", len(state.outstanding), cap(state.outstanding))
+	}
+}

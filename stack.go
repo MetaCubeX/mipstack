@@ -2921,6 +2921,26 @@ func (s *Stack) tryWritePacket(packet []byte) error {
 	return nil
 }
 
+// tryReservePacket acquires one output slot without waiting. It checks closure
+// before admission and again after a failed reservation so Close wins over a
+// temporary resource-limit result.
+func (s *Stack) tryReservePacket(queue *packetQueue) (uint16, error) {
+	select {
+	case <-s.closeCh:
+		return 0, ErrClosed
+	default:
+	}
+	if slot, ok := queue.tryReserve(); ok {
+		return slot, nil
+	}
+	select {
+	case <-s.closeCh:
+		return 0, ErrClosed
+	default:
+		return 0, ErrResourceLimit
+	}
+}
+
 // tryWritePackets atomically queues packets that all select the same output
 // queue. It reserves every required slot before publishing any packet, so a
 // fragmented datagram is either accepted in full or not emitted at all.

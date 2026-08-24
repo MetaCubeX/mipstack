@@ -49,6 +49,55 @@ func TestUDPInterop(t *testing.T) {
 	}
 }
 
+// TestUDPConnectedWriteBatchInterop verifies that connected scatter/gather
+// batches preserve tuple, payload, and fragmentation semantics at every link
+// MTU when received by gVisor's native UDP endpoint.
+func TestUDPConnectedWriteBatchInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mtu := range interopMTUsForFamily(family) {
+			mtu := mtu
+			t.Run(family.name+"/"+interopMTUName(mtu), func(t *testing.T) {
+				network := newFamilyInteropNetwork(t, family, mtu)
+				ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+				defer cancel()
+				connected, peer := openUDPPair(t, ctx, network, family, true)
+				defer connected.Close()
+				defer peer.Close()
+				if err := connected.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				if err := peer.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+
+				payloads := [][]byte{
+					patternedPayload(37, 0x31),
+					patternedPayload(fragmentedInteropPayloadSize(mtu, 12_000), 0x51),
+				}
+				messages := []mipstack.SocketMessage{
+					{Buffers: [][]byte{payloads[0]}},
+					{Buffers: [][]byte{payloads[1][:17], payloads[1][17:]}},
+				}
+				count, err := connected.(*mipstack.UDPConn).WriteBatch(messages, 0)
+				if err != nil || count != len(messages) {
+					t.Fatalf("connected UDP WriteBatch = %d, %v", count, err)
+				}
+				buffer := make([]byte, 65535)
+				for index, payload := range payloads {
+					read, source, readErr := peer.ReadFrom(buffer)
+					if readErr != nil || !bytes.Equal(buffer[:read], payload) || source.String() != connected.LocalAddr().String() {
+						t.Fatalf("gVisor UDP batch message %d = n=%d source=%v error=%v", index, read, source, readErr)
+					}
+					if messages[index].N != len(payload) || messages[index].NN != 0 || messages[index].Flags != 0 {
+						t.Fatalf("connected UDP batch result %d = %+v", index, messages[index])
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestPublicUDPDatagramCodecInterop verifies native gVisor UDP receive from a
 // public-codec datagram and public decoding of gVisor's native UDP output.
 func TestPublicUDPDatagramCodecInterop(t *testing.T) {

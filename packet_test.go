@@ -2191,7 +2191,7 @@ func TestIPv6FlowLabelEncodingAndFragmentation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fragments, err := stack.ipPayloadPackets(source, target, ProtocolUDP, make([]byte, 2000), true)
+	fragments, err := stack.ipPayloadPacketsForMTU(source, target, ProtocolUDP, make([]byte, 2000), sourceFragmentation{allow: true}, ipPacketOptions{}, stack.mtuFor(target))
 	if err != nil || len(fragments) < 2 {
 		t.Fatalf("IPv6 flow fragmentation = %d packets, %v", len(fragments), err)
 	}

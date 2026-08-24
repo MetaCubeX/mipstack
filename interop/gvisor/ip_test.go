@@ -35,6 +35,74 @@ func TestRawIPInterop(t *testing.T) {
 	}
 }
 
+// TestIPConnectedWriteBatchInterop verifies connected raw-IP batches against
+// gVisor's native endpoint with single- and multi-buffer payloads across the
+// MTU matrix. Low-MTU IPv4 cases also exercise source fragmentation. gVisor's
+// IPv6 raw fan-out does not follow a Fragment header to protocol 99, so UDP and
+// public fragment interop tests cover IPv6 source fragmentation instead.
+func TestIPConnectedWriteBatchInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mtu := range interopMTUsForFamily(family) {
+			mtu := mtu
+			t.Run(family.name+"/"+interopMTUName(mtu), func(t *testing.T) {
+				network := newFamilyInteropNetwork(t, family, mtu)
+				ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+				defer cancel()
+				connection, err := network.mipstack.DialIP(ctx, family.rawNetwork, family.mipstackAddress, family.gvisorAddress)
+				if err != nil {
+					t.Fatalf("dial connected mipstack IP socket: %v", err)
+				}
+				defer connection.Close()
+				if err = connection.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+
+				var queue waiter.Queue
+				peer, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, interopRawIPProtocol, &queue)
+				if tcpipErr != nil {
+					t.Fatalf("create gVisor raw endpoint: %s", tcpipErr.String())
+				}
+				defer peer.Close()
+				if tcpipErr = peer.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+					t.Fatalf("bind gVisor raw endpoint: %s", tcpipErr.String())
+				}
+				if tcpipErr = peer.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+					t.Fatalf("connect gVisor raw endpoint: %s", tcpipErr.String())
+				}
+				entry, notifications := registerReadable(&queue)
+				defer queue.EventUnregister(&entry)
+
+				payloads := [][]byte{
+					patternedPayload(29, 0x71),
+					patternedPayload(911, 0x91),
+				}
+				messages := []mipstack.SocketMessage{
+					{Buffers: [][]byte{payloads[0]}},
+					{Buffers: [][]byte{payloads[1][:19], payloads[1][19:]}},
+				}
+				count, err := connection.(*mipstack.IPConn).WriteBatch(messages, 0)
+				if err != nil || count != len(messages) {
+					t.Fatalf("connected IP WriteBatch = %d, %v", count, err)
+				}
+				for index, payload := range payloads {
+					wire, remote, readErr := readGVisorEndpoint(ctx, peer, notifications, 65535)
+					if readErr != nil {
+						t.Fatalf("read gVisor IP batch message %d: %v", index, readErr)
+					}
+					wire, readErr = stripGVisorRawHeader(family, wire)
+					if readErr != nil || remote.Addr != gvisorAddress(family.mipstackAddress) || !bytes.Equal(wire, payload) {
+						t.Fatalf("gVisor IP batch message %d = n=%d source=%v error=%v", index, len(wire), remote, readErr)
+					}
+					if messages[index].N != len(payload) || messages[index].NN != 0 || messages[index].Flags != 0 {
+						t.Fatalf("connected IP batch result %d = %+v", index, messages[index])
+					}
+				}
+			})
+		}
+	}
+}
+
 // TestPublicIPPacketCodecInterop sends a public-codec packet through gVisor's
 // native raw endpoint and decodes gVisor's native response with the same API.
 func TestPublicIPPacketCodecInterop(t *testing.T) {

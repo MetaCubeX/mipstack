@@ -512,11 +512,11 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 		t.Fatal(err)
 	}
 	stack4.ipv4ID.Store(100)
-	first, err := stack4.ipPayloadPackets(local4, remote4, ProtocolUDP, make([]byte, 96), true)
+	first, err := stack4.ipPayloadPacketsForMTU(local4, remote4, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
 	if err != nil || len(first) < 2 {
 		t.Fatalf("first IPv4 fragments = %d, %v", len(first), err)
 	}
-	second, err := stack4.ipPayloadPackets(local4, remote4, ProtocolUDP, make([]byte, 96), true)
+	second, err := stack4.ipPayloadPacketsForMTU(local4, remote4, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
 	if err != nil || len(second) < 2 {
 		t.Fatalf("second IPv4 fragments = %d, %v", len(second), err)
 	}
@@ -536,7 +536,7 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 	if got := stack4.ipv4ID.Load(); got != 102 {
 		t.Fatalf("invalid IPv4 fragment MTU consumed Identification: %d", got)
 	}
-	atomic4, err := stack4.ipPayloadPackets(local4, remote4, ProtocolICMPv4, make([]byte, 8), false)
+	atomic4, err := stack4.ipPayloadPacketsForMTU(local4, remote4, ProtocolICMPv4, make([]byte, 8), sourceFragmentation{dontFragment: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
 	if err != nil || len(atomic4) != 1 {
 		t.Fatalf("atomic IPv4 packets = %d, %v", len(atomic4), err)
 	}
@@ -554,13 +554,13 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 		t.Fatal(err)
 	}
 	stack6.ipv6FragmentID.Store(1000)
-	if _, err = stack6.ipPayloadPackets(local6, remote6, ProtocolUDP, make([]byte, 8), true); err != nil {
+	if _, err = stack6.ipPayloadPacketsForMTU(local6, remote6, ProtocolUDP, make([]byte, 8), sourceFragmentation{allow: true}, ipPacketOptions{}, stack6.mtuFor(remote6)); err != nil {
 		t.Fatal(err)
 	}
 	if got := stack6.ipv6FragmentID.Load(); got != 1000 {
 		t.Fatalf("unfragmented IPv6 consumed Fragment ID: %d", got)
 	}
-	fragments6, err := stack6.ipPayloadPackets(local6, remote6, ProtocolUDP, make([]byte, 1300), true)
+	fragments6, err := stack6.ipPayloadPacketsForMTU(local6, remote6, ProtocolUDP, make([]byte, 1300), sourceFragmentation{allow: true}, ipPacketOptions{}, stack6.mtuFor(remote6))
 	if err != nil || len(fragments6) < 2 {
 		t.Fatalf("IPv6 fragments = %d, %v", len(fragments6), err)
 	}

@@ -136,18 +136,26 @@ func BenchmarkTCPControllerThroughput(b *testing.B) {
 func BenchmarkTCPControllerLatency(b *testing.B) {
 	for _, algorithm := range []string{CongestionControlReno, CongestionControlCUBIC, CongestionControlBBR, CongestionControlBBR3} {
 		b.Run(string(algorithm), func(b *testing.B) {
-			connection, _, _ := benchmarkTCPControllerConnection(b, algorithm)
-			_ = connection.SetDeadline(time.Now().Add(time.Minute))
-			request := []byte{0x5a}
-			response := make([]byte, 1)
-			b.ResetTimer()
-			for iteration := 0; iteration < b.N; iteration++ {
-				if _, err := connection.Write(request); err != nil {
-					b.Fatal(err)
-				}
-				if _, err := io.ReadFull(connection, response); err != nil {
-					b.Fatal(err)
-				}
+			// Cover sub-MSS control and request traffic, a near-MTU segment,
+			// and progressively larger multi-segment requests.
+			for _, requestSize := range []int{64, 512, 1200, 2400, 16 * 1024} {
+				b.Run(fmt.Sprintf("%dB", requestSize), func(b *testing.B) {
+					connection, _, _ := benchmarkTCPControllerConnection(b, algorithm)
+					_ = connection.SetDeadline(time.Now().Add(time.Minute))
+					request := bytes.Repeat([]byte{0x5a}, requestSize)
+					response := make([]byte, requestSize)
+					b.SetBytes(int64(2 * requestSize))
+					b.ReportAllocs()
+					b.ResetTimer()
+					for iteration := 0; iteration < b.N; iteration++ {
+						if _, err := connection.Write(request); err != nil {
+							b.Fatal(err)
+						}
+						if _, err := io.ReadFull(connection, response); err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
 			}
 		})
 	}

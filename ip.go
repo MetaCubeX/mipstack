@@ -1206,7 +1206,7 @@ func (c *IPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int, 
 		if message.Addr != nil {
 			return 0, 0, c.operationErrorTo("write", message.Addr, net.ErrWriteToConnected)
 		}
-		target, address = c.remote, c.remoteAddr()
+		target = c.remote
 	} else {
 		address = message.Addr
 		ipAddress, ok := address.(*net.IPAddr)
@@ -1221,7 +1221,7 @@ func (c *IPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int, 
 	}
 	validated, err := c.validateWriteTarget(target)
 	if err != nil {
-		return 0, 0, c.operationErrorTo("write", address, err)
+		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	maximum := 65535
 	if validated.Is4() {
@@ -1229,35 +1229,35 @@ func (c *IPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int, 
 	}
 	payloadSize, err := messageBufferLength(message.Buffers)
 	if err != nil {
-		return 0, 0, c.operationErrorTo("write", address, err)
+		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	if payloadSize > maximum {
-		return 0, 0, c.operationErrorTo("write", address, syscall.EMSGSIZE)
+		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), syscall.EMSGSIZE)
 	}
 	if len(message.Buffers) == 1 {
 		if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
-			return 0, 0, c.operationErrorTo("write", address, err)
+			return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 		}
 		source, options, parseErr := parseControlMessageForWrite(message.OOB, validated.Is6())
 		if parseErr != nil {
-			return 0, 0, c.operationErrorTo("write", address, parseErr)
+			return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), parseErr)
 		}
 		n, writeErr := c.writeToWith(message.Buffers[0], validated, source, options, c.writePayload, dontWait)
 		if writeErr != nil {
-			return n, 0, c.operationErrorTo("write", address, writeErr)
+			return n, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), writeErr)
 		}
 		return n, len(message.OOB), nil
 	}
 	if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
-		return 0, 0, c.operationErrorTo("write", address, err)
+		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	source, options, err := parseControlMessageForWrite(message.OOB, validated.Is6())
 	if err != nil {
-		return 0, 0, c.operationErrorTo("write", address, err)
+		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	n, err := c.writeBuffersTo(message.Buffers, payloadSize, validated, source, options, dontWait)
 	if err != nil {
-		return n, 0, c.operationErrorTo("write", address, err)
+		return n, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	return n, len(message.OOB), nil
 }
@@ -1287,7 +1287,7 @@ func (c *IPConn) writeHeaderIncludedBatchMessage(message *SocketMessage, dontWai
 		if message.Addr != nil {
 			return 0, 0, c.operationErrorTo("write", message.Addr, net.ErrWriteToConnected)
 		}
-		target, address = c.remote, c.remoteAddr()
+		target = c.remote
 	} else {
 		address = message.Addr
 		ipAddress, ok := address.(*net.IPAddr)
@@ -1302,34 +1302,45 @@ func (c *IPConn) writeHeaderIncludedBatchMessage(message *SocketMessage, dontWai
 	}
 	validated, err := c.validateWriteTarget(target)
 	if err != nil {
-		return 0, 0, c.operationErrorTo("write", address, err)
+		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	payloadSize, err := messageBufferLength(message.Buffers)
 	if err != nil {
-		return 0, 0, c.operationErrorTo("write", address, err)
+		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	if payloadSize > 65535 {
-		return 0, 0, c.operationErrorTo("write", address, syscall.EMSGSIZE)
+		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), syscall.EMSGSIZE)
 	}
 	if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
-		return 0, 0, c.operationErrorTo("write", address, err)
+		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	source, options, err := parseControlMessageForWrite(message.OOB, validated.Is6())
 	if err != nil {
-		return 0, 0, c.operationErrorTo("write", address, err)
+		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
-	payload := message.Buffers[0]
-	if len(message.Buffers) != 1 {
+	var payload []byte
+	if len(message.Buffers) == 1 {
+		payload = message.Buffers[0]
+	} else {
 		payload, err = gatherMessagePayload(message.Buffers, 65535)
 		if err != nil {
-			return 0, 0, c.operationErrorTo("write", address, err)
+			return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 		}
 	}
 	n, err := c.writeHeaderIncluded(payload, validated, source, options, dontWait)
 	if err != nil {
-		return n, 0, c.operationErrorTo("write", address, err)
+		return n, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	return n, len(message.OOB), nil
+}
+
+// writeBatchErrorAddress constructs the connected peer only on an error path;
+// unconnected writes preserve the caller's original net.Addr value.
+func (c *IPConn) writeBatchErrorAddress(address net.Addr) net.Addr {
+	if address != nil {
+		return address
+	}
+	return c.remoteAddr()
 }
 
 // writeTo selects a source, repairs ICMPv6 checksum, and emits one ordinary
