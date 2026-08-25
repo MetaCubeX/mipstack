@@ -348,19 +348,19 @@ func TestSYNCookieValidationIPv4AndIPv6(t *testing.T) {
 			_, data := encodeSYNCookieOptions(syn, test.remote)
 			cookie := synCookieSequence(state.cookieKey, key, syn.sequence, synCookiePeriodNumber(now, state.cookieEpoch), data, data)
 			ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: cookie + 1, flags: TCPFlagACK, window: 4096}
-			if _, _, valid := state.validateSYNCookie(key, ack, now); !valid {
+			if _, _, valid, _ := state.validateSYNCookie(key, ack, now); !valid {
 				t.Fatal("valid SYN cookie was rejected")
 			}
 			forged := ack
 			forged.acknowledgement ^= 1 << synCookieDataBits
-			if _, _, valid := state.validateSYNCookie(key, forged, now); valid {
+			if _, _, valid, _ := state.validateSYNCookie(key, forged, now); valid {
 				t.Fatal("forged SYN cookie was accepted")
 			}
-			if _, _, valid := state.validateSYNCookie(key, ack, now.Add(2*synCookiePeriod)); valid {
+			if _, _, valid, _ := state.validateSYNCookie(key, ack, now.Add(2*synCookiePeriod)); valid {
 				t.Fatal("expired SYN cookie was accepted")
 			}
 			state.cookieActive = false
-			if _, _, valid := state.validateSYNCookie(key, ack, now); valid {
+			if _, _, valid, _ := state.validateSYNCookie(key, ack, now); valid {
 				t.Fatal("cookie ACK was accepted without recent cookie issuance")
 			}
 		})
@@ -404,7 +404,7 @@ func TestSYNCookieWindowScaleRotatesByPeriod(t *testing.T) {
 	if nextPeriod != period+1 || nextScale != 7 {
 		t.Fatalf("next-period SYN-cookie scale = period %d scale %d, want %d/7", nextPeriod, nextScale, period+1)
 	}
-	_, options, valid := state.validateSYNCookie(key, ack, next)
+	_, options, valid, _ := state.validateSYNCookie(key, ack, next)
 	if !valid || options.localWindowScale != 2 {
 		t.Fatalf("previous-period cookie = valid %t scale %d, want true/2", valid, options.localWindowScale)
 	}

@@ -1514,15 +1514,6 @@ func (q *packetQueue) tryReserve() (uint16, bool) {
 // releaseReserved returns a slot that was acquired but not published.
 func (q *packetQueue) releaseReserved(slot uint16) { q.free <- slot }
 
-// enqueueReserved publishes a packet after its caller has acquired slot.
-// Since the packet channel and slot semaphore have equal capacities, a
-// reserved slot always has a corresponding channel position.
-func (q *packetQueue) enqueueReserved(slot uint16, packet []byte, reusable bool) packetQueueTicket {
-	queuedAt := monotonicStampAt(q.epoch, time.Now())
-	generation, _ := q.publishReserved(slot, packet, reusable, 0)
-	return packetQueueTicket{token: packetQueueTicketToken(slot, generation, false), queuedAt: queuedAt}
-}
-
 // enqueueReservedTCP publishes a connection-owned packet without hashing its
 // serialized headers to rediscover an identity TCP already has. loopback must
 // be true exactly when q is stack.loopback because the returned ticket uses
@@ -2858,47 +2849,6 @@ func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 	return count, nil
 }
 
-// writePacket queues one complete outbound IP packet for Read.
-func (s *Stack) writePacket(packet []byte) error {
-	select {
-	case <-s.closeCh:
-		return ErrClosed
-	default:
-	}
-	queue, loopback := s.outputQueue(packet)
-	if loopback {
-		if queue.tryEnqueue(packet) {
-			s.recordOutput(true)
-			return nil
-		}
-		select {
-		case <-s.closeCh:
-			return ErrClosed
-		default:
-			// runLoopback is the sole consumer and may itself be emitting a
-			// reply. Blocking it on its own full queue would deadlock all local
-			// traffic, so overload is reported to the producing socket.
-			return ErrResourceLimit
-		}
-	}
-	for {
-		if queue.tryEnqueue(packet) {
-			s.recordOutput(false)
-			return nil
-		}
-		select {
-		case slot := <-queue.free:
-			if !queue.enqueueReservedPacket(slot, packet, false) {
-				return ErrClosed
-			}
-			s.recordOutput(false)
-			return nil
-		case <-s.closeCh:
-			return ErrClosed
-		}
-	}
-}
-
 // tryWritePacket queues one already-built best-effort packet without waiting
 // for device space.
 func (s *Stack) tryWritePacket(packet []byte) error {
@@ -3042,7 +2992,7 @@ func (s *Stack) writeCompletePacketUntil(packet []byte, routeTarget netip.Addr, 
 
 // reservePacketUntil acquires one queue slot while observing a socket's
 // mutable write deadline. Callers must release the slot if packet construction
-// fails before enqueueReserved publishes it.
+// fails before publishing it.
 func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, state socketWriteState) (uint16, error) {
 	if err := state.err(); err != nil {
 		return 0, err
@@ -3528,7 +3478,7 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 	switch parsed.protocol {
 	case ProtocolTCP:
 		if destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast {
-			return s.handleTCPForDestination(parsed, receivedAt, destination == inboundDestinationLocalUnicast)
+			return s.handleTCP(parsed, receivedAt, destination == inboundDestinationLocalUnicast)
 		}
 		return nil
 	case ProtocolUDP:

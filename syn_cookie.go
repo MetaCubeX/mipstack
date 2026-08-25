@@ -135,15 +135,8 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, listener *TCPListener,
 }
 
 // validateSYNCookie authenticates a final ACK against the current or previous
-// time period and reconstructs its negotiated options.
-func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now time.Time) (uint32, synCookieOptions, bool) {
-	sequence, options, valid, _ := state.validateSYNCookieCandidate(key, ack, now)
-	return sequence, options, valid
-}
-
-// validateSYNCookieCandidate additionally reports whether a recent cookie
-// made this ACK eligible for authentication diagnostics.
-func (state *tcpPassiveState) validateSYNCookieCandidate(key tcpKey, ack tcpSegment, now time.Time) (uint32, synCookieOptions, bool, bool) {
+// cookie period. attempted reports eligibility for authentication diagnostics.
+func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now time.Time) (uint32, synCookieOptions, bool, bool) {
 	if ack.flags&TCPFlagACK == 0 || ack.flags&(TCPFlagSYN|TCPFlagRST) != 0 {
 		return 0, synCookieOptions{}, false, false
 	}

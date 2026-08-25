@@ -131,10 +131,22 @@ historic NS bit remains explicitly available. IPv6 encoding similarly clears
 PadN data and Fragment reserved fields without hiding the received bytes from
 a parsed `IPPacket`.
 
+`IPPacket.MarshalRawBinary` and `AppendRawBinary` instead encode a valid fixed
+IP header while treating IPv4 options and the IPv6 Protocol and Payload as
+opaque wire data. They preserve IPv4 End padding and IPv6 extension-header
+reserved fields, and allow malformed IPv4 option framing and representable but
+semantically invalid fragment payloads for protocol testing. The corresponding
+`SetRawIPv6ExtensionHeaders` links recognized extension descriptors without
+enforcing their framing, order, uniqueness, option, or Fragment semantics.
+These opt-in methods do not produce malformed fixed headers; callers testing
+such fields can mutate the owned result. They also do not perform automatic raw
+fragmentation: `MarshalFragments` remains the strict source-fragmentation
+planner, while callers can encode or mutate each deliberately invalid fragment.
+
 IPv4 option parsing likewise follows Linux's tolerant EOL behavior: received
 bytes after End remain available in `IPPacket.IPv4Options`, while structured
-option traversal stops at End and packet encoding writes canonical zero
-padding.
+option traversal stops at End. Strict packet encoding writes canonical zero
+padding, while raw encoding preserves the complete supplied option area.
 
 `ICMPMessage.IsEchoRequest` and `IsEchoReply` identify complete IPv4 and IPv6
 Echo messages, while `Echo` returns their identifier, sequence, and a borrowed

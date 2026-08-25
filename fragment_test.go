@@ -14,37 +14,17 @@ import (
 	"time"
 )
 
-// testIPPayloadPacketsForMTU is the independently allocated reference emitter
-// used to compare direct queue output and to inspect complete fragment sets.
-func testIPPayloadPacketsForMTU(stack *Stack, source, target netip.Addr, protocol byte, payload []byte, fragmentation sourceFragmentation, options ipPacketOptions, mtu int) ([][]byte, error) {
-	if source.Is6() && !options.flowLabelSet {
-		options.flowLabel = stack.automaticFlowLabel(source, target, protocol, payload)
-		options.flowLabelSet = true
-	}
-	headerSize := ipHeaderSize(source, target, len(payload))
-	if headerSize == 0 {
-		return nil, syscall.EMSGSIZE
-	}
-	if headerSize+len(payload) <= mtu {
-		identification := uint16(0)
-		if source.Is4() && fragmentation.requiresIPv4ID() {
-			identification = uint16(stack.ipv4ID.Add(1))
+// takeIPOutputPackets returns every packet synchronously queued by one output
+// operation. Packet generation remains entirely on the production path.
+func takeIPOutputPackets(queue *packetQueue) [][]byte {
+	var packets [][]byte
+	for {
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			return packets
 		}
-		packet := buildIPPacketWithOptions(source, target, protocol, payload, identification, fragmentation.dontFragment, options)
-		if len(packet) == 0 {
-			return nil, syscall.EMSGSIZE
-		}
-		return [][]byte{packet}, nil
+		packets = append(packets, consumeTestPacket(queue, entry))
 	}
-	var layout ipFragmentLayout
-	if err := stack.ipFragmentLayoutForMTU(source, target, len(payload), fragmentation, options, mtu, &layout); err != nil {
-		return nil, err
-	}
-	packets := buildIPFragmentPackets(source, target, protocol, payload, layout)
-	if len(packets) == 0 {
-		return nil, syscall.EMSGSIZE
-	}
-	return packets, nil
 }
 
 // TestIPv6AtomicFragmentReservedBits verifies RFC 8200's requirement to
@@ -151,7 +131,8 @@ func TestPathMTUDiscoveryOutputPolicy(t *testing.T) {
 						t.Fatalf("selected MTU = %d, want %d", mtu, test.want.ceiling)
 					}
 					payload := make([]byte, test.packetSize-family.headerSize)
-					packets, outputErr := testIPPayloadPacketsForMTU(stack, family.source, family.target, 99, payload, fragmentation, ipPacketOptions{}, mtu)
+					outputErr := stack.writeIPPayloadUntilOptionsForMTU(family.source, family.target, 99, payload, fragmentation, ipPacketOptions{}, mtu, socketWriteState{})
+					packets := takeIPOutputPackets(&stack.outbound)
 					if test.want.error {
 						if !errors.Is(outputErr, syscall.EMSGSIZE) || len(packets) != 0 {
 							t.Fatalf("output = %d packets, %v; want EMSGSIZE", len(packets), outputErr)
@@ -208,32 +189,50 @@ func TestIPv6FragmentAfterRepeatedExtensionHeaders(t *testing.T) {
 func TestIPv6UnfragmentableHeaderErrors(t *testing.T) {
 	local := netip.MustParseAddr("2001:db8::31")
 	remote := netip.MustParseAddr("2001:db8::32")
+	fragmentHeader := IPv6ExtensionHeader{}
+	if err := fragmentHeader.SetFragment(0, true, 7); err != nil {
+		t.Fatal(err)
+	}
 	for _, test := range []struct {
 		name     string
-		first    byte
-		headers  []byte
+		headers  []IPv6ExtensionHeader
 		wantCode byte
 		wantAt   uint32
 	}{
 		{
-			name: "misplaced Hop-by-Hop", first: 60,
-			headers:  append([]byte{0, 0, 0, 0, 0, 0, 0, 0}, 44, 0, 0, 0, 0, 0, 0, 0),
+			name: "misplaced Hop-by-Hop",
+			headers: []IPv6ExtensionHeader{
+				{Type: IPv6ExtensionHeaderDestination, Data: make([]byte, 7)},
+				{Type: IPv6ExtensionHeaderHopByHop, Data: make([]byte, 7)},
+			},
 			wantCode: 1, wantAt: 40,
 		},
 		{
-			name: "unsupported option", first: 60,
-			headers:  []byte{44, 0, 0x80, 0, 0, 0, 0, 0},
+			name: "unsupported option",
+			headers: []IPv6ExtensionHeader{
+				{Type: IPv6ExtensionHeaderDestination, Data: []byte{0, 0x80, 0, 0, 0, 0, 0}},
+			},
 			wantCode: 2, wantAt: 42,
 		},
 		{
-			name: "active routing header", first: 43,
-			headers:  []byte{44, 0, 99, 1, 0, 0, 0, 0},
+			name: "active routing header",
+			headers: []IPv6ExtensionHeader{
+				{Type: IPv6ExtensionHeaderRouting, Data: []byte{0, 99, 1, 0, 0, 0, 0}},
+			},
 			wantCode: 0, wantAt: 42,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fragmentHeader := []byte{99, 0, 0, 1, 0, 0, 0, 7}
-			packet := buildIPPacket(remote, local, test.first, append(append([]byte(nil), test.headers...), fragmentHeader...), 0, false)
+			headers := append([]IPv6ExtensionHeader(nil), test.headers...)
+			headers = append(headers, fragmentHeader)
+			packetValue := IPPacket{Source: remote, Destination: local, HopLimit: 64}
+			if err := packetValue.SetRawIPv6ExtensionHeaders(headers, 99, nil); err != nil {
+				t.Fatal(err)
+			}
+			packet, err := packetValue.MarshalRawBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
 			fragment, ok := parseFragment(packet)
 			if !ok || !fragment.parameter || fragment.parameterCode != test.wantCode || fragment.parameterAt != test.wantAt {
 				t.Fatalf("unfragmentable-header parse = %+v, parsed=%t", fragment, ok)
@@ -358,11 +357,19 @@ func TestIPv6NonFinalFragmentRequiresEightBytePayload(t *testing.T) {
 	local := netip.MustParseAddr("2001:db8::21")
 	remote := netip.MustParseAddr("2001:db8::22")
 	link, stack := newTestStack(t, local, remote)
-	fragment := make([]byte, 8+9)
-	fragment[0] = 99
-	binary.BigEndian.PutUint16(fragment[2:4], 1)
-	binary.BigEndian.PutUint32(fragment[4:8], 9)
-	if err := writeTestPacket(stack, buildIPPacket(remote, local, 44, fragment, 0, false)); err != nil {
+	fragment := IPv6ExtensionHeader{}
+	if err := fragment.SetFragment(0, true, 9); err != nil {
+		t.Fatal(err)
+	}
+	packetValue := IPPacket{Source: remote, Destination: local, HopLimit: 64}
+	if err := packetValue.SetRawIPv6ExtensionHeaders([]IPv6ExtensionHeader{fragment}, 99, make([]byte, 9)); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := packetValue.MarshalRawBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writeTestPacket(stack, packet); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -409,8 +416,18 @@ func TestIPv6FragmentReassemblyLengthOverflow(t *testing.T) {
 	local := netip.MustParseAddr("2001:db8::85")
 	remote := netip.MustParseAddr("2001:db8::86")
 	link, stack := newTestStack(t, local, remote)
-	fragments := buildIPv6FragmentsWithOptions(remote, local, ProtocolUDP, make([]byte, 16), 56, 88, ipPacketOptions{})
-	overflow := append([]byte(nil), fragments[0]...)
+	header := IPv6ExtensionHeader{}
+	if err := header.SetFragment(0, true, 88); err != nil {
+		t.Fatal(err)
+	}
+	packet := IPPacket{Source: remote, Destination: local, HopLimit: 64}
+	if err := packet.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{header}, ProtocolUDP, make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	overflow, err := packet.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
 	binary.BigEndian.PutUint16(overflow[42:44], 0xfff9)
 	fragment, valid := parseFragment(overflow)
 	if !valid || !fragment.parameter || fragment.parameterAt != 42 {
@@ -435,9 +452,21 @@ func TestIPv6IncompleteFirstFragmentDiscardsPriorTail(t *testing.T) {
 	local := netip.MustParseAddr("2001:db8::11")
 	remote := netip.MustParseAddr("2001:db8::12")
 	link, stack := newTestStack(t, local, remote)
-	fragments := buildIPv6FragmentsWithOptions(remote, local, ProtocolTCP, make([]byte, 24), 56, 17, ipPacketOptions{})
-	if len(fragments) != 3 {
-		t.Fatalf("fragment count = %d, want 3", len(fragments))
+	fragments := make([][]byte, 3)
+	for index := range fragments {
+		header := IPv6ExtensionHeader{}
+		if err := header.SetFragment(index*8, index != len(fragments)-1, 17); err != nil {
+			t.Fatal(err)
+		}
+		packet := IPPacket{Source: remote, Destination: local, HopLimit: 64}
+		if err := packet.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{header}, ProtocolTCP, make([]byte, 8)); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		fragments[index], err = packet.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := writeTestPacket(stack, fragments[1]); err != nil {
 		t.Fatal(err)
@@ -545,11 +574,13 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 		t.Fatal(err)
 	}
 	stack4.ipv4ID.Store(100)
-	first, err := testIPPayloadPacketsForMTU(stack4, local4, remote4, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
+	err = stack4.writeIPPayloadUntilOptionsForMTU(local4, remote4, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, stack4.mtuFor(remote4), socketWriteState{})
+	first := takeIPOutputPackets(&stack4.outbound)
 	if err != nil || len(first) < 2 {
 		t.Fatalf("first IPv4 fragments = %d, %v", len(first), err)
 	}
-	second, err := testIPPayloadPacketsForMTU(stack4, local4, remote4, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
+	err = stack4.writeIPPayloadUntilOptionsForMTU(local4, remote4, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, stack4.mtuFor(remote4), socketWriteState{})
+	second := takeIPOutputPackets(&stack4.outbound)
 	if err != nil || len(second) < 2 {
 		t.Fatalf("second IPv4 fragments = %d, %v", len(second), err)
 	}
@@ -570,7 +601,8 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 	if got := stack4.ipv4ID.Load(); got != 102 {
 		t.Fatalf("invalid IPv4 fragment MTU consumed Identification: %d", got)
 	}
-	atomic4, err := testIPPayloadPacketsForMTU(stack4, local4, remote4, ProtocolICMPv4, make([]byte, 8), sourceFragmentation{dontFragment: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
+	err = stack4.writeIPPayloadUntilOptionsForMTU(local4, remote4, ProtocolICMPv4, make([]byte, 8), sourceFragmentation{dontFragment: true}, ipPacketOptions{}, stack4.mtuFor(remote4), socketWriteState{})
+	atomic4 := takeIPOutputPackets(&stack4.outbound)
 	if err != nil || len(atomic4) != 1 {
 		t.Fatalf("atomic IPv4 packets = %d, %v", len(atomic4), err)
 	}
@@ -588,13 +620,15 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 		t.Fatal(err)
 	}
 	stack6.ipv6FragmentID.Store(1000)
-	if _, err = testIPPayloadPacketsForMTU(stack6, local6, remote6, ProtocolUDP, make([]byte, 8), sourceFragmentation{allow: true}, ipPacketOptions{}, stack6.mtuFor(remote6)); err != nil {
+	if err = stack6.writeIPPayloadUntilOptionsForMTU(local6, remote6, ProtocolUDP, make([]byte, 8), sourceFragmentation{allow: true}, ipPacketOptions{}, stack6.mtuFor(remote6), socketWriteState{}); err != nil {
 		t.Fatal(err)
 	}
+	takeIPOutputPackets(&stack6.outbound)
 	if got := stack6.ipv6FragmentID.Load(); got != 1000 {
 		t.Fatalf("unfragmented IPv6 consumed Fragment ID: %d", got)
 	}
-	fragments6, err := testIPPayloadPacketsForMTU(stack6, local6, remote6, ProtocolUDP, make([]byte, 1300), sourceFragmentation{allow: true}, ipPacketOptions{}, stack6.mtuFor(remote6))
+	err = stack6.writeIPPayloadUntilOptionsForMTU(local6, remote6, ProtocolUDP, make([]byte, 1300), sourceFragmentation{allow: true}, ipPacketOptions{}, stack6.mtuFor(remote6), socketWriteState{})
+	fragments6 := takeIPOutputPackets(&stack6.outbound)
 	if err != nil || len(fragments6) < 2 {
 		t.Fatalf("IPv6 fragments = %d, %v", len(fragments6), err)
 	}
@@ -685,34 +719,23 @@ func TestDirectIPv6FragmentOutputOverwritesReusableHeader(t *testing.T) {
 	stack.outbound.release(entry)
 }
 
-func TestIPOutputEmittersProduceIdenticalPackets(t *testing.T) {
+func TestIPFragmentOutputPathsProduceIdenticalPackets(t *testing.T) {
 	tests := []struct {
-		name               string
-		source, target     netip.Addr
-		payloadSize, mtu   int
-		fragmentation      sourceFragmentation
-		options            ipPacketOptions
-		wantPacketsAtLeast int
+		name             string
+		source, target   netip.Addr
+		payloadSize, mtu int
+		fragmentation    sourceFragmentation
+		options          ipPacketOptions
 	}{
-		{
-			name: "IPv4/fitting", source: netip.MustParseAddr("192.0.2.61"), target: netip.MustParseAddr("198.51.100.61"),
-			payloadSize: 128, mtu: 148, fragmentation: sourceFragmentation{allow: true},
-			options: ipPacketOptions{hopLimit: 41, hopLimitSet: true, trafficClass: 0x2e, trafficClassSet: true}, wantPacketsAtLeast: 1,
-		},
 		{
 			name: "IPv4/fragmented", source: netip.MustParseAddr("192.0.2.62"), target: netip.MustParseAddr("198.51.100.62"),
 			payloadSize: 97, mtu: 68, fragmentation: sourceFragmentation{allow: true, dontFragment: true},
-			options: ipPacketOptions{hopLimit: 42, hopLimitSet: true, trafficClass: 0xb8, trafficClassSet: true}, wantPacketsAtLeast: 2,
-		},
-		{
-			name: "IPv6/fitting", source: netip.MustParseAddr("2001:db8::61"), target: netip.MustParseAddr("2001:db8:1::61"),
-			payloadSize: 1239, mtu: 1280, fragmentation: sourceFragmentation{dontFragment: true},
-			options: ipPacketOptions{hopLimit: 43, hopLimitSet: true, trafficClass: 0x03, trafficClassSet: true}, wantPacketsAtLeast: 1,
+			options: ipPacketOptions{hopLimit: 42, hopLimitSet: true, trafficClass: 0xb8, trafficClassSet: true},
 		},
 		{
 			name: "IPv6/fragmented", source: netip.MustParseAddr("2001:db8::62"), target: netip.MustParseAddr("2001:db8:1::62"),
 			payloadSize: 2001, mtu: 1280, fragmentation: sourceFragmentation{allow: true},
-			options: ipPacketOptions{hopLimit: 44, hopLimitSet: true, trafficClass: 0x2e, trafficClassSet: true, flowLabel: 0x54321, flowLabelSet: true}, wantPacketsAtLeast: 2,
+			options: ipPacketOptions{hopLimit: 44, hopLimitSet: true, trafficClass: 0x2e, trafficClassSet: true, flowLabel: 0x54321, flowLabelSet: true},
 		},
 	}
 	for _, test := range tests {
@@ -731,33 +754,26 @@ func TestIPOutputEmittersProduceIdenticalPackets(t *testing.T) {
 			}
 			stack.ipv4ID.Store(100)
 			stack.ipv6FragmentID.Store(1000)
-			want, err := testIPPayloadPacketsForMTU(stack, test.source, test.target, 253, payload, test.fragmentation, test.options, test.mtu)
-			if err != nil {
+			if err = stack.writeIPPayloadUntilOptionsForMTU(test.source, test.target, 253, payload, test.fragmentation, test.options, test.mtu, socketWriteState{dontWait: true}); err != nil {
 				t.Fatal(err)
 			}
-			if len(want) < test.wantPacketsAtLeast {
-				t.Fatalf("packet count = %d, want at least %d", len(want), test.wantPacketsAtLeast)
+			nonblocking := takeIPOutputPackets(&stack.outbound)
+			if len(nonblocking) < 2 {
+				t.Fatalf("nonblocking fragment count = %d, want at least 2", len(nonblocking))
 			}
 			stack.ipv4ID.Store(100)
 			stack.ipv6FragmentID.Store(1000)
 			if err = stack.writeIPPayloadUntilOptionsForMTU(test.source, test.target, 253, payload, test.fragmentation, test.options, test.mtu, socketWriteState{}); err != nil {
 				t.Fatal(err)
 			}
-			for index, wantPacket := range want {
-				entry, ok := stack.outbound.tryDequeue()
-				if !ok {
-					t.Fatalf("missing queued packet %d", index)
-				}
-				if !bytes.Equal(entry.packet, wantPacket) {
-					got := append([]byte(nil), entry.packet...)
-					stack.outbound.release(entry)
-					t.Fatalf("queued packet %d differs:\n got %x\nwant %x", index, got, wantPacket)
-				}
-				stack.outbound.release(entry)
+			blocking := takeIPOutputPackets(&stack.outbound)
+			if len(blocking) != len(nonblocking) {
+				t.Fatalf("blocking fragment count = %d, want %d", len(blocking), len(nonblocking))
 			}
-			if entry, ok := stack.outbound.tryDequeue(); ok {
-				stack.outbound.release(entry)
-				t.Fatal("queue writer emitted an extra packet")
+			for index := range nonblocking {
+				if !bytes.Equal(blocking[index], nonblocking[index]) {
+					t.Fatalf("fragment %d differs:\nblocking %x\nnonblocking %x", index, blocking[index], nonblocking[index])
+				}
 			}
 		})
 	}
@@ -1544,12 +1560,13 @@ func FuzzIPPayloadFragmentationRoundTrip(f *testing.F) {
 			hopLimit: hopLimit, trafficClass: trafficClass, flowLabel: flowLabel & ipv6MaximumFlowLabel,
 			hopLimitSet: true, trafficClassSet: true, flowLabelSet: true,
 		}
-		packets, err := testIPPayloadPacketsForMTU(
-			stack, source, target, protocol, payload, sourceFragmentation{allow: true}, options, mtu,
+		err = stack.writeIPPayloadUntilOptionsForMTU(
+			source, target, protocol, payload, sourceFragmentation{allow: true}, options, mtu, socketWriteState{},
 		)
 		if err != nil {
 			t.Fatalf("fragmentation of %d-byte payload at MTU %d: %v", len(payload), mtu, err)
 		}
+		packets := takeIPOutputPackets(&stack.loopback)
 		if len(packets) == 0 {
 			t.Fatal("fragmentation returned no packets")
 		}

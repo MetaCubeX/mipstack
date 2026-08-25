@@ -2545,7 +2545,7 @@ func (s *multicastState) sendIGMPPacket(target netip.Addr, payload []byte, route
 		packetValue.IPv4Options = routerAlertOption[:]
 	}
 	packet := make([]byte, headerSize+len(payload))
-	marshalPublicIPPacket(packet, packetValue, headerSize)
+	marshalPublicIPPacket(packet, packetValue, headerSize, true)
 	_ = s.stack.writePacketUntil(packet, socketWriteState{closed: cancel})
 }
 

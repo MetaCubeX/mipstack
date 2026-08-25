@@ -3919,7 +3919,7 @@ func TestTCPDispatchPreservesPacketArrivalTime(t *testing.T) {
 		t.Fatal("test TCP packet did not parse")
 	}
 	receivedAt := stack.timestampEpoch.Add(250 * time.Millisecond)
-	if err = stack.handleTCP(packet, receivedAt); err != nil {
+	if err = stack.handleTCP(packet, receivedAt, true); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -4129,10 +4129,15 @@ func TestTCPSACKIsLostAndPipe(t *testing.T) {
 	if pipe := sackRecoveryPipe(lost, 100); pipe != 100 {
 		t.Fatalf("retransmitted RACK loss pipe = %d, want 100", pipe)
 	}
-	if flight := tcpCongestionFlight(speculative, true, true, 100); flight != 200 {
+	flightState := tcpEstablishedState{
+		outstanding: speculative, sendNext: 100,
+		peerSACK: true, fastRecovery: true, peerMSS: 100,
+	}
+	if flight := flightState.congestionFlight(); flight != 200 {
 		t.Fatalf("SACK recovery congestion flight = %d, want 200", flight)
 	}
-	if flight := tcpCongestionFlight(speculative, true, false, 100); flight != 100 {
+	flightState.fastRecovery = false
+	if flight := flightState.congestionFlight(); flight != 100 {
 		t.Fatalf("ordinary congestion flight = %d, want 100", flight)
 	}
 	if !sackRecoveryCanSend(false, 1000, 100, 1000) {
@@ -4750,7 +4755,7 @@ func BenchmarkTCPHandlePureACK(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {
-		if err := stack.handleTCP(packet, receivedAt); err != nil {
+		if err := stack.handleTCP(packet, receivedAt, true); err != nil {
 			b.Fatal(err)
 		}
 		if _, ok = connection.inbound.dequeue(); !ok {

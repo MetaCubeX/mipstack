@@ -4294,16 +4294,9 @@ func (s *Stack) tcpInitialSequence(key tcpKey, now time.Time) uint32 {
 	return timer + uint32(sipHash24(s.tcpISNSecret, connectionID[:]))
 }
 
-// handleTCP validates a segment, dispatches it by four-tuple, or emits RST for
-// an unbound local destination. Stack packet input uses
-// handleTCPForDestination after computing destination ownership once.
-func (s *Stack) handleTCP(packet ipPacket, receivedAt time.Time) error {
-	return s.handleTCPForDestination(packet, receivedAt, true)
-}
-
-// handleTCPForDestination preserves ordinary listener ownership while
-// allowing established forwarded tuples to use nonlocal destinations.
-func (s *Stack) handleTCPForDestination(packet ipPacket, receivedAt time.Time, localDestination bool) error {
+// handleTCP preserves ordinary listener ownership while allowing established
+// forwarded tuples to use nonlocal destinations.
+func (s *Stack) handleTCP(packet ipPacket, receivedAt time.Time, localDestination bool) error {
 	tcp := packet.payload
 	if len(tcp) < tcpHeaderSize || transportChecksum(packet.source, packet.target, ProtocolTCP, tcp) != 0 {
 		s.stats.inboundDroppedPackets.Add(1)
@@ -4529,7 +4522,7 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 	if listener == nil {
 		return false, nil
 	}
-	initialSequence, options, valid, attempted := state.validateSYNCookieCandidate(key, segment, tcpSegmentEventTime(segment, time.Now(), time.Time{}, stack.timestampEpoch))
+	initialSequence, options, valid, attempted := state.validateSYNCookie(key, segment, tcpSegmentEventTime(segment, time.Now(), time.Time{}, stack.timestampEpoch))
 	if !valid {
 		if attempted {
 			listener.synCookiesRejected.Add(1)
@@ -9476,15 +9469,6 @@ func prrCongestionWindow(pipe, threshold, priorFlight uint32, delivered, sent ui
 		allowance = uint64(tcpMaximumScaledWindow)
 	}
 	return growCongestionWindow(pipe, uint32(allowance))
-}
-
-// tcpCongestionFlight selects RFC 6675 SetPipe while SACK recovery is active.
-// Outside recovery, one copy of each unSACKed range is ordinary flight.
-func tcpCongestionFlight(outstanding []sentTCPSegment, sack, recovery bool, mss int) uint32 {
-	if sack && recovery {
-		return sackRecoveryPipe(outstanding, mss)
-	}
-	return outstandingBytes(outstanding, false)
 }
 
 // rackReorderingWindow returns RFC 8985's initial min_RTT/4 settling

@@ -179,6 +179,67 @@ func TestPublicIPPacketCodecInterop(t *testing.T) {
 	}
 }
 
+// TestPublicRawIPPacketCodecInterop verifies that raw serialization preserves
+// explicitly supplied IPv6 Fragment reserved fields while gVisor applies RFC
+// 8200's rule to ignore those fields on reception.
+func TestPublicRawIPPacketCodecInterop(t *testing.T) {
+	const (
+		mipstackPort = 44091
+		gvisorPort   = 44092
+	)
+	family := interopFamilies[1]
+	network := newFamilyInteropNetwork(t, family, 1500)
+	peer := newGVisorUDPSocket(t, network, family.networkProtocol, gvisorFullAddress(family.gvisorAddress, gvisorPort), func(tcpip.Endpoint) {})
+	defer peer.Close()
+	if err := peer.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := []byte("public-raw-ip-codec-request")
+	udpWire, err := (mipstack.UDPDatagram{
+		Source:      netipAddrPort(family.mipstackAddress, mipstackPort),
+		Destination: netipAddrPort(family.gvisorAddress, gvisorPort),
+		Payload:     payload,
+	}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragment := mipstack.IPv6ExtensionHeader{
+		Type: mipstack.IPv6ExtensionHeaderFragment,
+		Data: []byte{0x7f, 0, 0x06, 0x12, 0x34, 0x56, 0x78},
+	}
+	packet := mipstack.IPPacket{
+		Source: family.mipstackAddress, Destination: family.gvisorAddress,
+		HopLimit: 37, TrafficClass: 0x2e,
+	}
+	if err = packet.SetRawIPv6ExtensionHeaders([]mipstack.IPv6ExtensionHeader{fragment}, mipstack.ProtocolUDP, udpWire); err != nil {
+		t.Fatal(err)
+	}
+	strictWire, err := packet.AppendBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strictWire[41] != 0 || binary.BigEndian.Uint16(strictWire[42:44]) != 0 {
+		t.Fatalf("strict IPv6 Fragment reserved fields = %x", strictWire[40:48])
+	}
+	wire, err := packet.AppendRawBinary(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire[6] != mipstack.IPv6ExtensionHeaderFragment || wire[40] != mipstack.ProtocolUDP ||
+		wire[41] != 0x7f || binary.BigEndian.Uint16(wire[42:44]) != 0x0006 {
+		t.Fatalf("raw IPv6 Fragment fields = %x", wire[40:48])
+	}
+	if err = network.deliverToGVisor(wire); err != nil {
+		t.Fatalf("deliver public raw IP packet: %v", err)
+	}
+	storage := make([]byte, len(payload)+64)
+	read, source, err := peer.ReadFrom(storage)
+	if err != nil || !bytes.Equal(storage[:read], payload) || source.String() != netipAddrPort(family.mipstackAddress, mipstackPort).String() {
+		t.Fatalf("gVisor raw IPv6 delivery = n=%d source=%v error=%v", read, source, err)
+	}
+}
+
 // TestPublicIPFragmentCodecInterop verifies public stateless fragmentation
 // against gVisor's native source fragmentation and reassembly in both address
 // families across the complete interop MTU matrix.

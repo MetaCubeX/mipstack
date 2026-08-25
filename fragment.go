@@ -386,7 +386,7 @@ func (r *IPPacketReassembly) Reset() {
 // fragment needs a complete owned wire image: later fragments contribute no
 // header fields to the reassembled packet.
 func publicReassemblyFragment(packet IPPacket) (ipPacketReassemblyFragment, error) {
-	packet, headerSize, totalSize, err := packet.wireLayout()
+	packet, headerSize, totalSize, err := packet.wireLayout(true)
 	if err != nil {
 		return ipPacketReassemblyFragment{}, err
 	}
@@ -404,7 +404,7 @@ func publicReassemblyFragment(packet IPPacket) (ipPacketReassemblyFragment, erro
 		}
 		if view.Offset == 0 {
 			wire := make([]byte, totalSize)
-			marshalPublicIPPacket(wire, packet, headerSize)
+			marshalPublicIPPacket(wire, packet, headerSize, true)
 			fragment.payload = wire[headerSize:]
 			fragment.header = wire[:headerSize]
 			fragment.original = wire
@@ -432,7 +432,7 @@ func publicReassemblyFragment(packet IPPacket) (ipPacketReassemblyFragment, erro
 	}
 	if view.Offset == 0 {
 		wire := make([]byte, totalSize)
-		marshalPublicIPPacket(wire, packet, headerSize)
+		marshalPublicIPPacket(wire, packet, headerSize, true)
 		wireOffset := 40 + fragmentOffset
 		fragment.original = wire
 		fragment.header = wire[:wireOffset]
@@ -1366,7 +1366,7 @@ func marshalPublicIPv4Fragments(packet IPPacket, mtu int) ([][]byte, error) {
 		fragment.Payload = packet.Payload[offset : offset+size]
 		fragmentHeaderSize := 20 + (len(options)+3)&^3
 		wire := make([]byte, fragmentHeaderSize+size)
-		marshalPublicIPPacket(wire, fragment, fragmentHeaderSize)
+		marshalPublicIPPacket(wire, fragment, fragmentHeaderSize, true)
 		fragments = append(fragments, wire)
 	}
 	return fragments, nil
@@ -1380,7 +1380,7 @@ func marshalPublicIPv6Fragments(packet IPPacket, totalSize, mtu int, identificat
 		return marshalPublicIPv6PayloadFragments(packet, mtu, identification)
 	}
 	wire := make([]byte, totalSize)
-	marshalPublicIPPacket(wire, packet, 40)
+	marshalPublicIPPacket(wire, packet, 40, true)
 	point, valid := inspectIPv6FragmentPoint(wire, false)
 	if !valid {
 		return nil, syscall.EINVAL

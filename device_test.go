@@ -135,7 +135,7 @@ func TestPacketDeviceCloseDiscardsOutput(t *testing.T) {
 	if !available || !inFlight.reusable {
 		t.Fatal("failed to retain reusable packet across Close")
 	}
-	if err = stack.writePacket(packet); err != nil {
+	if err = stack.writePacketUntil(packet, socketWriteState{}); err != nil {
 		t.Fatal(err)
 	}
 	lateSlot, reserved := stack.outbound.tryReserve()

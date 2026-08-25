@@ -270,7 +270,7 @@ func TestPacketQueueWaitDoesNotSerializeWriteDeadlines(t *testing.T) {
 	t.Cleanup(func() { _ = stack.Close() })
 	packet := buildIPPacket(local, remote, 99, []byte{1}, 0, true)
 	for index := 0; index < outboundPacketQueue; index++ {
-		if err = stack.writePacket(packet); err != nil {
+		if err = stack.writePacketUntil(packet, socketWriteState{}); err != nil {
 			t.Fatalf("fill packet %d: %v", index, err)
 		}
 
@@ -568,10 +568,10 @@ func TestFullLoopbackQueueDoesNotBlock(t *testing.T) {
 	defer stack.Close()
 	fillTestPacketQueue(t, &stack.loopback, []byte{0})
 	packet := buildIPPacket(local, local, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
-	if err = stack.writePacket(packet); !errors.Is(err, ErrResourceLimit) {
-		t.Fatalf("writePacket to full loopback queue = %v, want ErrResourceLimit", err)
+	if err = stack.tryWritePacket(packet); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("tryWritePacket to full loopback queue = %v, want ErrResourceLimit", err)
 	}
-	if err = stack.writePacketUntil(packet, socketWriteState{closed: make(chan struct{})}); !errors.Is(err, ErrResourceLimit) {
+	if err = stack.writePacketUntil(packet, socketWriteState{}); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("writePacketUntil to full loopback queue = %v, want ErrResourceLimit", err)
 	}
 }
@@ -596,7 +596,10 @@ func TestPacketQueueTicketTracksDeviceDequeue(t *testing.T) {
 	if !reserved {
 		t.Fatal("packet queue slot was not available")
 	}
-	ticket := queue.enqueueReserved(slot, packet, false)
+	ticket, published := queue.enqueueReservedTCP(slot, packet, false, 1, false)
+	if !published {
+		t.Fatal("packet queue ticket was not published")
+	}
 	stack.recordOutput(false)
 	if !ticket.pendingIn(queue) {
 		t.Fatal("new packet queue ticket is not pending")
@@ -617,7 +620,10 @@ func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
 	if !reserved {
 		t.Fatal("first queue slot was not available")
 	}
-	first := queue.enqueueReserved(firstSlot, []byte{1}, false)
+	first, published := queue.enqueueReservedTCP(firstSlot, []byte{1}, false, 1, false)
+	if !published {
+		t.Fatal("first queue ticket was not published")
+	}
 	if !first.pendingIn(&queue) {
 		t.Fatal("first queue ticket was not pending")
 	}
@@ -630,7 +636,10 @@ func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
 	if !reserved {
 		t.Fatal("reused queue slot was not available")
 	}
-	second := queue.enqueueReserved(secondSlot, []byte{2}, false)
+	second, published := queue.enqueueReservedTCP(secondSlot, []byte{2}, false, 1, false)
+	if !published {
+		t.Fatal("second queue ticket was not published")
+	}
 	if !second.pendingIn(&queue) {
 		t.Fatal("reused queue slot was not pending")
 	}
@@ -691,7 +700,7 @@ func TestPacketQueueConcurrentWritersMakeBoundedProgress(t *testing.T) {
 	for index := 0; index < writers; index++ {
 		go func() {
 			<-start
-			errorsCh <- stack.writePacket(packet)
+			errorsCh <- stack.writePacketUntil(packet, socketWriteState{})
 		}()
 	}
 	close(start)

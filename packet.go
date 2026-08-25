@@ -98,8 +98,9 @@ type IPPacket struct {
 	// IPv6. A nonzero value must be aligned to eight bytes.
 	FragmentOffset int
 	// IPv4Options contains the exact IPv4 option area, including received padding.
-	// Construction also accepts an unpadded option sequence; encoding adds final
-	// alignment and normalizes every byte after End to zero.
+	// Construction also accepts an unpadded option sequence. AppendBinary adds
+	// final alignment and normalizes every byte after End to zero;
+	// AppendRawBinary preserves supplied bytes and only adds alignment padding.
 	IPv4Options []byte
 	// Payload is the complete IP payload. It includes IPv6 extension headers.
 	Payload []byte
@@ -379,6 +380,21 @@ func (p IPPacket) IPv6ExtensionHeaders() (headers []IPv6ExtensionHeader, protoco
 // the final descriptor; only in that case may protocol itself identify a
 // traversable extension header whose bytes begin in payload.
 func (p *IPPacket) SetIPv6ExtensionHeaders(headers []IPv6ExtensionHeader, protocol int, payload []byte) error {
+	return p.setIPv6ExtensionHeaders(headers, protocol, payload, true)
+}
+
+// SetRawIPv6ExtensionHeaders replaces Protocol and Payload with an explicitly
+// ordered extension chain and final payload. It links recognized extension
+// header descriptors and copies all caller storage, but deliberately does not
+// validate header framing, ordering, duplication, options, or Fragment
+// semantics. AppendRawBinary preserves the resulting bytes; AppendBinary still
+// applies the ordinary validation and sender normalization rules. The method
+// leaves p unchanged on failure.
+func (p *IPPacket) SetRawIPv6ExtensionHeaders(headers []IPv6ExtensionHeader, protocol int, payload []byte) error {
+	return p.setIPv6ExtensionHeaders(headers, protocol, payload, false)
+}
+
+func (p *IPPacket) setIPv6ExtensionHeaders(headers []IPv6ExtensionHeader, protocol int, payload []byte, strict bool) error {
 	if p == nil {
 		return syscall.EINVAL
 	}
@@ -397,44 +413,46 @@ func (p *IPPacket) SetIPv6ExtensionHeaders(headers []IPv6ExtensionHeader, protoc
 		if !isTraversableIPv6ExtensionHeader(header.Type) {
 			return syscall.EPROTONOSUPPORT
 		}
-		if header.Type == IPv6ExtensionHeaderHopByHop {
-			if index != 0 || seenHop {
+		if strict {
+			if header.Type == IPv6ExtensionHeaderHopByHop {
+				if index != 0 || seenHop {
+					return syscall.EINVAL
+				}
+				seenHop = true
+			}
+			length, valid := ipv6ExtensionHeaderDataLength(header.Type, header.Data)
+			if !valid || length != 1+len(header.Data) {
 				return syscall.EINVAL
 			}
-			seenHop = true
-		}
-		length, valid := ipv6ExtensionHeaderDataLength(header.Type, header.Data)
-		if !valid || length != 1+len(header.Data) {
-			return syscall.EINVAL
-		}
-		if header.Type == IPv6ExtensionHeaderHopByHop || header.Type == IPv6ExtensionHeaderDestination {
-			validOptions, _, jumboPayload := inspectIPv6OptionBytesForCodec(header.Data[1:])
-			if !validOptions || jumboPayload {
-				return syscall.EINVAL
-			}
-		}
-		if header.Type == IPv6ExtensionHeaderFragment {
-			if seenFragment {
-				return syscall.EINVAL
-			}
-			seenFragment = true
-			fragmentOffset, more, _, valid := header.Fragment()
-			if !valid {
-				return syscall.EINVAL
-			}
-			nonAtomicFragment = fragmentOffset != 0 || more
-			if nonAtomicFragment {
-				if index != len(headers)-1 || !validFragmentPayload(fragmentOffset, more, len(payload), 65535) {
+			if header.Type == IPv6ExtensionHeaderHopByHop || header.Type == IPv6ExtensionHeaderDestination {
+				validOptions, _, jumboPayload := inspectIPv6OptionBytesForCodec(header.Data[1:])
+				if !validOptions || jumboPayload {
 					return syscall.EINVAL
 				}
 			}
+			if header.Type == IPv6ExtensionHeaderFragment {
+				if seenFragment {
+					return syscall.EINVAL
+				}
+				seenFragment = true
+				fragmentOffset, more, _, valid := header.Fragment()
+				if !valid {
+					return syscall.EINVAL
+				}
+				nonAtomicFragment = fragmentOffset != 0 || more
+				if nonAtomicFragment {
+					if index != len(headers)-1 || !validFragmentPayload(fragmentOffset, more, len(payload), 65535) {
+						return syscall.EINVAL
+					}
+				}
+			}
 		}
-		total += length
-		if total > 65535 {
+		if len(header.Data) >= 65535-total {
 			return syscall.EMSGSIZE
 		}
+		total += 1 + len(header.Data)
 	}
-	if isTraversableIPv6ExtensionHeader(byte(protocol)) && !nonAtomicFragment {
+	if strict && isTraversableIPv6ExtensionHeader(byte(protocol)) && !nonAtomicFragment {
 		return syscall.EINVAL
 	}
 	encoded := make([]byte, 0, total)
@@ -739,6 +757,10 @@ func (p IPPacket) upperLayerForProtocol(protocol byte) ([]byte, bool, error) {
 // identical to AppendBinary(nil).
 func (p IPPacket) MarshalBinary() ([]byte, error) { return p.AppendBinary(nil) }
 
+// MarshalRawBinary returns the complete packet wire encoding produced by
+// AppendRawBinary(nil).
+func (p IPPacket) MarshalRawBinary() ([]byte, error) { return p.AppendRawBinary(nil) }
+
 // AppendBinary appends the complete packet wire encoding to dst. It validates
 // every field and the extension chain before changing dst and does not retain
 // any input slice. The destination may share backing storage with IPv4Options
@@ -747,13 +769,34 @@ func (p IPPacket) MarshalBinary() ([]byte, error) { return p.AppendBinary(nil) }
 // assigning it to Payload. On validation failure it returns the original dst
 // unchanged.
 func (p IPPacket) AppendBinary(dst []byte) ([]byte, error) {
-	normalized, headerSize, totalSize, err := p.wireLayout()
+	normalized, headerSize, totalSize, err := p.wireLayout(true)
 	if err != nil {
 		return dst, err
 	}
 	start := len(dst)
 	dst = extendForAppend(dst, totalSize)
-	marshalPublicIPPacket(dst[start:], normalized, headerSize)
+	marshalPublicIPPacket(dst[start:], normalized, headerSize, true)
+	return dst, nil
+}
+
+// AppendRawBinary appends a packet with a valid IPv4 or IPv6 fixed header while
+// treating IPv4Options and the IPv6 Protocol and Payload fields as opaque wire
+// data. For IPv4, it also permits malformed option framing and fragment payload
+// sizes or reconstructed bounds that violate fragment semantics, while still
+// requiring an exactly representable fragment offset. Unlike AppendBinary, it
+// preserves every supplied option and payload byte, including IPv4 End padding
+// and IPv6 extension reserved fields and PadN contents. It calculates the IPv4
+// header checksum but no upper-layer checksum, does not retain input storage,
+// and supports output overlapping Payload or IPv4Options. On failure it returns
+// dst unchanged.
+func (p IPPacket) AppendRawBinary(dst []byte) ([]byte, error) {
+	normalized, headerSize, totalSize, err := p.wireLayout(false)
+	if err != nil {
+		return dst, err
+	}
+	start := len(dst)
+	dst = extendForAppend(dst, totalSize)
+	marshalPublicIPPacket(dst[start:], normalized, headerSize, false)
 	return dst, nil
 }
 
@@ -771,7 +814,7 @@ func (p IPPacket) AppendBinary(dst []byte) ([]byte, error) {
 // The IPv6 identification argument is ignored for IPv4 and fitting packets. No
 // partial result is returned on failure.
 func (p IPPacket) MarshalFragments(mtu int, ipv6Identification uint32) ([][]byte, error) {
-	normalized, headerSize, totalSize, err := p.wireLayout()
+	normalized, headerSize, totalSize, err := p.wireLayout(true)
 	if err != nil {
 		return nil, err
 	}
@@ -780,7 +823,7 @@ func (p IPPacket) MarshalFragments(mtu int, ipv6Identification uint32) ([][]byte
 	}
 	if totalSize <= mtu {
 		packet := make([]byte, totalSize)
-		marshalPublicIPPacket(packet, normalized, headerSize)
+		marshalPublicIPPacket(packet, normalized, headerSize, true)
 		return [][]byte{packet}, nil
 	}
 	if normalized.Source.Is4() {
@@ -804,9 +847,11 @@ func extendForAppend(dst []byte, size int) []byte {
 	return append(dst, make([]byte, size)...)
 }
 
-// wireLayout validates p, normalizes IPv4-mapped addresses, and returns its
-// exact base-header and packet lengths.
-func (p IPPacket) wireLayout() (IPPacket, int, int, error) {
+// wireLayout validates fields needed to encode a well-formed base header,
+// normalizes IPv4-mapped addresses, and returns exact wire lengths. Strict
+// layout additionally validates the IPv6 extension chain and IP fragment
+// semantics.
+func (p IPPacket) wireLayout(strict bool) (IPPacket, int, int, error) {
 	if p.Source.Zone() != "" || p.Destination.Zone() != "" {
 		return IPPacket{}, 0, 0, syscall.EINVAL
 	}
@@ -817,17 +862,21 @@ func (p IPPacket) wireLayout() (IPPacket, int, int, error) {
 		return IPPacket{}, 0, 0, syscall.EINVAL
 	}
 	if p.Source.Is4() {
-		if p.FlowLabel != 0 || len(p.IPv4Options) > 40 || !validIPv4OptionsForCodec(p.IPv4Options) {
+		if p.FlowLabel != 0 || len(p.IPv4Options) > 40 || (strict && !validIPv4OptionsForCodec(p.IPv4Options)) {
 			return IPPacket{}, 0, 0, syscall.EINVAL
 		}
 		headerSize := 20 + (len(p.IPv4Options)+3)&^3
 		if len(p.Payload) > 65535-headerSize {
 			return IPPacket{}, 0, 0, syscall.EMSGSIZE
 		}
-		// A non-initial fragment cannot reveal the header size retained from
-		// fragment zero. Validate the largest possible IPv4 data range here;
-		// reassembly applies the actual first-header length.
-		if !validFragmentPayload(p.FragmentOffset, p.MoreFragments, len(p.Payload), 65535-20) {
+		if strict {
+			// A non-initial fragment cannot reveal the header size retained from
+			// fragment zero. Validate the largest possible IPv4 data range here;
+			// reassembly applies the actual first-header length.
+			if !validFragmentPayload(p.FragmentOffset, p.MoreFragments, len(p.Payload), 65535-20) {
+				return IPPacket{}, 0, 0, syscall.EINVAL
+			}
+		} else if p.FragmentOffset < 0 || p.FragmentOffset > 65528 || p.FragmentOffset&7 != 0 {
 			return IPPacket{}, 0, 0, syscall.EINVAL
 		}
 		return p, headerSize, headerSize + len(p.Payload), nil
@@ -839,8 +888,10 @@ func (p IPPacket) wireLayout() (IPPacket, int, int, error) {
 	if len(p.Payload) > 65535 {
 		return IPPacket{}, 0, 0, syscall.EMSGSIZE
 	}
-	if _, _, _, _, valid := walkIPv6UpperLayer(byte(p.Protocol), p.Payload); !valid {
-		return IPPacket{}, 0, 0, syscall.EINVAL
+	if strict {
+		if _, _, _, _, valid := walkIPv6UpperLayer(byte(p.Protocol), p.Payload); !valid {
+			return IPPacket{}, 0, 0, syscall.EINVAL
+		}
 	}
 	return p, 40, 40 + len(p.Payload), nil
 }
@@ -861,13 +912,18 @@ func validFragmentPayload(offset int, more bool, payloadSize, maximum int) bool 
 }
 
 // marshalPublicIPPacket writes one already validated public packet. Payload is
-// copied before its header so an in-place AppendBinary can reuse a payload
-// suffix.
-func marshalPublicIPPacket(dst []byte, p IPPacket, headerSize int) {
+// copied before its header so an in-place append can reuse a payload suffix.
+// normalize selects strict sender normalization for IPv4 options and the IPv6
+// payload.
+func marshalPublicIPPacket(dst []byte, p IPPacket, headerSize int, normalize bool) {
 	if p.Source.Is4() {
 		var options [40]byte
-		contentSize, _ := ipv4OptionsContentLength(p.IPv4Options)
-		copy(options[:], p.IPv4Options[:contentSize])
+		if normalize {
+			contentSize, _ := ipv4OptionsContentLength(p.IPv4Options)
+			copy(options[:], p.IPv4Options[:contentSize])
+		} else {
+			copy(options[:], p.IPv4Options)
+		}
 		copy(dst[headerSize:], p.Payload)
 		copy(dst[20:headerSize], options[:len(p.IPv4Options)])
 		for index := 20 + len(p.IPv4Options); index < headerSize; index++ {
@@ -892,7 +948,9 @@ func marshalPublicIPPacket(dst []byte, p IPPacket, headerSize int) {
 		return
 	}
 	copy(dst[headerSize:], p.Payload)
-	normalizeIPv6ExtensionFields(byte(p.Protocol), dst[headerSize:])
+	if normalize {
+		normalizeIPv6ExtensionFields(byte(p.Protocol), dst[headerSize:])
+	}
 	marshalPublicIPv6BaseHeader(dst, p, byte(p.Protocol), len(dst)-40)
 }
 
@@ -1931,18 +1989,4 @@ func marshalIPHeader(packet []byte, source, target netip.Addr, protocol byte, id
 	copy(packet[8:24], sourceBytes[:])
 	copy(packet[24:40], targetBytes[:])
 	return true
-}
-
-// buildIPPacketWithOptions wraps payload and applies raw IP output fields.
-func buildIPPacketWithOptions(source, target netip.Addr, protocol byte, payload []byte, identification uint16, dontFragment bool, options ipPacketOptions) []byte {
-	headerSize := ipHeaderSize(source, target, len(payload))
-	if headerSize == 0 {
-		return nil
-	}
-	packet := make([]byte, headerSize+len(payload))
-	if !marshalIPHeader(packet, source, target, protocol, identification, dontFragment, options) {
-		return nil
-	}
-	copy(packet[headerSize:], payload)
-	return packet
 }
