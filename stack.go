@@ -2899,9 +2899,8 @@ func (s *Stack) writePacket(packet []byte) error {
 	}
 }
 
-// tryWritePacket queues one best-effort control packet without waiting for
-// device space. It is used when an already aborted TCP actor emits its final
-// reset and must not retain connection state behind a stalled embedding link.
+// tryWritePacket queues one already-built best-effort packet without waiting
+// for device space.
 func (s *Stack) tryWritePacket(packet []byte) error {
 	select {
 	case <-s.closeCh:

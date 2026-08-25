@@ -131,7 +131,7 @@ func (state *tcpPassiveState) sendSYNCookie(stack *Stack, listener *TCPListener,
 	}
 	state.noteSYNCookie(period)
 	flowLabelSet := listener != nil && listener.options.flowLabel.set
-	return stack.tryWriteTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, uint16(receiveWindow), tcpOptions, nil, stack.mtuFor(key.remote.Addr()), defaults.TrafficClass, 0, defaults.FlowLabel, flowLabelSet)
+	return stack.tryWriteTCPControl(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, syn.sequence+1, flags, uint16(receiveWindow), tcpOptions, nil, stack.mtuFor(key.remote.Addr()), defaults.TrafficClass, 0, defaults.FlowLabel, flowLabelSet)
 }
 
 // validateSYNCookie authenticates a final ACK against the current or previous

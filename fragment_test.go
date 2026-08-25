@@ -14,6 +14,39 @@ import (
 	"time"
 )
 
+// testIPPayloadPacketsForMTU is the independently allocated reference emitter
+// used to compare direct queue output and to inspect complete fragment sets.
+func testIPPayloadPacketsForMTU(stack *Stack, source, target netip.Addr, protocol byte, payload []byte, fragmentation sourceFragmentation, options ipPacketOptions, mtu int) ([][]byte, error) {
+	if source.Is6() && !options.flowLabelSet {
+		options.flowLabel = stack.automaticFlowLabel(source, target, protocol, payload)
+		options.flowLabelSet = true
+	}
+	headerSize := ipHeaderSize(source, target, len(payload))
+	if headerSize == 0 {
+		return nil, syscall.EMSGSIZE
+	}
+	if headerSize+len(payload) <= mtu {
+		identification := uint16(0)
+		if source.Is4() && fragmentation.requiresIPv4ID() {
+			identification = uint16(stack.ipv4ID.Add(1))
+		}
+		packet := buildIPPacketWithOptions(source, target, protocol, payload, identification, fragmentation.dontFragment, options)
+		if len(packet) == 0 {
+			return nil, syscall.EMSGSIZE
+		}
+		return [][]byte{packet}, nil
+	}
+	var layout ipFragmentLayout
+	if err := stack.ipFragmentLayoutForMTU(source, target, len(payload), fragmentation, options, mtu, &layout); err != nil {
+		return nil, err
+	}
+	packets := buildIPFragmentPackets(source, target, protocol, payload, layout)
+	if len(packets) == 0 {
+		return nil, syscall.EMSGSIZE
+	}
+	return packets, nil
+}
+
 // TestIPv6AtomicFragmentReservedBits verifies RFC 8200's requirement to
 // ignore reserved fragment-header bits on reception.
 func TestIPv6AtomicFragmentReservedBits(t *testing.T) {
@@ -118,7 +151,7 @@ func TestPathMTUDiscoveryOutputPolicy(t *testing.T) {
 						t.Fatalf("selected MTU = %d, want %d", mtu, test.want.ceiling)
 					}
 					payload := make([]byte, test.packetSize-family.headerSize)
-					packets, outputErr := stack.ipPayloadPacketsForMTU(family.source, family.target, 99, payload, fragmentation, ipPacketOptions{}, mtu)
+					packets, outputErr := testIPPayloadPacketsForMTU(stack, family.source, family.target, 99, payload, fragmentation, ipPacketOptions{}, mtu)
 					if test.want.error {
 						if !errors.Is(outputErr, syscall.EMSGSIZE) || len(packets) != 0 {
 							t.Fatalf("output = %d packets, %v; want EMSGSIZE", len(packets), outputErr)
@@ -512,11 +545,11 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 		t.Fatal(err)
 	}
 	stack4.ipv4ID.Store(100)
-	first, err := stack4.ipPayloadPacketsForMTU(local4, remote4, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
+	first, err := testIPPayloadPacketsForMTU(stack4, local4, remote4, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
 	if err != nil || len(first) < 2 {
 		t.Fatalf("first IPv4 fragments = %d, %v", len(first), err)
 	}
-	second, err := stack4.ipPayloadPacketsForMTU(local4, remote4, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
+	second, err := testIPPayloadPacketsForMTU(stack4, local4, remote4, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
 	if err != nil || len(second) < 2 {
 		t.Fatalf("second IPv4 fragments = %d, %v", len(second), err)
 	}
@@ -530,13 +563,14 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 			t.Fatalf("second IPv4 fragment %d ID = %d, want 102", index, id)
 		}
 	}
-	if err = stack4.writeIPFragmentsUntilOptionsForMTU(local4, remote4, ProtocolUDP, make([]byte, 16), nil, ipPacketOptions{}, 27, socketWriteState{}); !errors.Is(err, syscall.EMSGSIZE) {
+	var invalidLayout ipFragmentLayout
+	if err = stack4.ipFragmentLayoutForMTU(local4, remote4, 16, sourceFragmentation{allow: true}, ipPacketOptions{}, 27, &invalidLayout); !errors.Is(err, syscall.EMSGSIZE) {
 		t.Fatalf("invalid IPv4 fragment MTU = %v, want EMSGSIZE", err)
 	}
 	if got := stack4.ipv4ID.Load(); got != 102 {
 		t.Fatalf("invalid IPv4 fragment MTU consumed Identification: %d", got)
 	}
-	atomic4, err := stack4.ipPayloadPacketsForMTU(local4, remote4, ProtocolICMPv4, make([]byte, 8), sourceFragmentation{dontFragment: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
+	atomic4, err := testIPPayloadPacketsForMTU(stack4, local4, remote4, ProtocolICMPv4, make([]byte, 8), sourceFragmentation{dontFragment: true}, ipPacketOptions{}, stack4.mtuFor(remote4))
 	if err != nil || len(atomic4) != 1 {
 		t.Fatalf("atomic IPv4 packets = %d, %v", len(atomic4), err)
 	}
@@ -554,13 +588,13 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 		t.Fatal(err)
 	}
 	stack6.ipv6FragmentID.Store(1000)
-	if _, err = stack6.ipPayloadPacketsForMTU(local6, remote6, ProtocolUDP, make([]byte, 8), sourceFragmentation{allow: true}, ipPacketOptions{}, stack6.mtuFor(remote6)); err != nil {
+	if _, err = testIPPayloadPacketsForMTU(stack6, local6, remote6, ProtocolUDP, make([]byte, 8), sourceFragmentation{allow: true}, ipPacketOptions{}, stack6.mtuFor(remote6)); err != nil {
 		t.Fatal(err)
 	}
 	if got := stack6.ipv6FragmentID.Load(); got != 1000 {
 		t.Fatalf("unfragmented IPv6 consumed Fragment ID: %d", got)
 	}
-	fragments6, err := stack6.ipPayloadPacketsForMTU(local6, remote6, ProtocolUDP, make([]byte, 1300), sourceFragmentation{allow: true}, ipPacketOptions{}, stack6.mtuFor(remote6))
+	fragments6, err := testIPPayloadPacketsForMTU(stack6, local6, remote6, ProtocolUDP, make([]byte, 1300), sourceFragmentation{allow: true}, ipPacketOptions{}, stack6.mtuFor(remote6))
 	if err != nil || len(fragments6) < 2 {
 		t.Fatalf("IPv6 fragments = %d, %v", len(fragments6), err)
 	}
@@ -569,11 +603,54 @@ func TestFragmentIdentificationSequences(t *testing.T) {
 			t.Fatalf("IPv6 fragment %d ID = %d, want 1001", index, id)
 		}
 	}
-	if err = stack6.writeIPFragmentsUntilOptionsForMTU(local6, remote6, ProtocolUDP, make([]byte, 16), nil, ipPacketOptions{}, 55, socketWriteState{}); !errors.Is(err, syscall.EMSGSIZE) {
+	if err = stack6.ipFragmentLayoutForMTU(local6, remote6, 16, sourceFragmentation{allow: true}, ipPacketOptions{}, 55, &invalidLayout); !errors.Is(err, syscall.EMSGSIZE) {
 		t.Fatalf("invalid IPv6 fragment MTU = %v, want EMSGSIZE", err)
 	}
 	if got := stack6.ipv6FragmentID.Load(); got != 1001 {
 		t.Fatalf("invalid IPv6 fragment MTU consumed Identification: %d", got)
+	}
+}
+
+func TestIPFragmentLayoutRejectsInvalidBounds(t *testing.T) {
+	local4 := netip.MustParseAddr("192.0.2.63")
+	remote4 := netip.MustParseAddr("198.51.100.63")
+	remote6 := netip.MustParseAddr("2001:db8:1::63")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local4, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stack.ipv4ID.Store(100)
+	stack.ipv6FragmentID.Store(1000)
+	for _, test := range []struct {
+		name           string
+		source, target netip.Addr
+		payloadSize    int
+		mtu            int
+	}{
+		{name: "mixed address family", source: local4, target: remote6, payloadSize: 64, mtu: 68},
+		{name: "fitting payload", source: local4, target: remote4, payloadSize: 64, mtu: 1500},
+		{name: "IPv4 payload overflow", source: local4, target: remote4, payloadSize: 65516, mtu: 1280},
+		{name: "IPv6 payload overflow", source: remote6, target: netip.MustParseAddr("2001:db8:2::63"), payloadSize: 65536, mtu: 1280},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var layout ipFragmentLayout
+			if err := stack.ipFragmentLayoutForMTU(test.source, test.target, test.payloadSize, sourceFragmentation{allow: true}, ipPacketOptions{}, test.mtu, &layout); !errors.Is(err, syscall.EMSGSIZE) {
+				t.Fatalf("layout error = %v, want EMSGSIZE", err)
+			}
+		})
+	}
+	if got := stack.ipv4ID.Load(); got != 100 {
+		t.Fatalf("invalid layouts consumed IPv4 Identification: %d", got)
+	}
+	if got := stack.ipv6FragmentID.Load(); got != 1000 {
+		t.Fatalf("invalid layouts consumed IPv6 Identification: %d", got)
+	}
+	var layout ipFragmentLayout
+	if err = stack.ipFragmentLayoutForMTU(local4, remote4, 64, sourceFragmentation{allow: true}, ipPacketOptions{}, 68, &layout); err != nil {
+		t.Fatal(err)
+	}
+	if packets := buildIPFragmentPackets(local4, remote4, ProtocolUDP, make([]byte, 63), layout); len(packets) != 0 {
+		t.Fatalf("mismatched payload produced %d packets", len(packets))
 	}
 }
 
@@ -606,6 +683,84 @@ func TestDirectIPv6FragmentOutputOverwritesReusableHeader(t *testing.T) {
 		t.Fatal("missing second IPv6 fragment")
 	}
 	stack.outbound.release(entry)
+}
+
+func TestIPOutputEmittersProduceIdenticalPackets(t *testing.T) {
+	tests := []struct {
+		name               string
+		source, target     netip.Addr
+		payloadSize, mtu   int
+		fragmentation      sourceFragmentation
+		options            ipPacketOptions
+		wantPacketsAtLeast int
+	}{
+		{
+			name: "IPv4/fitting", source: netip.MustParseAddr("192.0.2.61"), target: netip.MustParseAddr("198.51.100.61"),
+			payloadSize: 128, mtu: 148, fragmentation: sourceFragmentation{allow: true},
+			options: ipPacketOptions{hopLimit: 41, hopLimitSet: true, trafficClass: 0x2e, trafficClassSet: true}, wantPacketsAtLeast: 1,
+		},
+		{
+			name: "IPv4/fragmented", source: netip.MustParseAddr("192.0.2.62"), target: netip.MustParseAddr("198.51.100.62"),
+			payloadSize: 97, mtu: 68, fragmentation: sourceFragmentation{allow: true, dontFragment: true},
+			options: ipPacketOptions{hopLimit: 42, hopLimitSet: true, trafficClass: 0xb8, trafficClassSet: true}, wantPacketsAtLeast: 2,
+		},
+		{
+			name: "IPv6/fitting", source: netip.MustParseAddr("2001:db8::61"), target: netip.MustParseAddr("2001:db8:1::61"),
+			payloadSize: 1239, mtu: 1280, fragmentation: sourceFragmentation{dontFragment: true},
+			options: ipPacketOptions{hopLimit: 43, hopLimitSet: true, trafficClass: 0x03, trafficClassSet: true}, wantPacketsAtLeast: 1,
+		},
+		{
+			name: "IPv6/fragmented", source: netip.MustParseAddr("2001:db8::62"), target: netip.MustParseAddr("2001:db8:1::62"),
+			payloadSize: 2001, mtu: 1280, fragmentation: sourceFragmentation{allow: true},
+			options: ipPacketOptions{hopLimit: 44, hopLimitSet: true, trafficClass: 0x2e, trafficClassSet: true, flowLabel: 0x54321, flowLabelSet: true}, wantPacketsAtLeast: 2,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.source, test.source.BitLen())}, MTU: 1500})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			payload := make([]byte, test.payloadSize)
+			for index := range payload {
+				payload[index] = byte(index*37 + 11)
+			}
+			stack.ipv4ID.Store(100)
+			stack.ipv6FragmentID.Store(1000)
+			want, err := testIPPayloadPacketsForMTU(stack, test.source, test.target, 253, payload, test.fragmentation, test.options, test.mtu)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(want) < test.wantPacketsAtLeast {
+				t.Fatalf("packet count = %d, want at least %d", len(want), test.wantPacketsAtLeast)
+			}
+			stack.ipv4ID.Store(100)
+			stack.ipv6FragmentID.Store(1000)
+			if err = stack.writeIPPayloadUntilOptionsForMTU(test.source, test.target, 253, payload, test.fragmentation, test.options, test.mtu, socketWriteState{}); err != nil {
+				t.Fatal(err)
+			}
+			for index, wantPacket := range want {
+				entry, ok := stack.outbound.tryDequeue()
+				if !ok {
+					t.Fatalf("missing queued packet %d", index)
+				}
+				if !bytes.Equal(entry.packet, wantPacket) {
+					got := append([]byte(nil), entry.packet...)
+					stack.outbound.release(entry)
+					t.Fatalf("queued packet %d differs:\n got %x\nwant %x", index, got, wantPacket)
+				}
+				stack.outbound.release(entry)
+			}
+			if entry, ok := stack.outbound.tryDequeue(); ok {
+				stack.outbound.release(entry)
+				t.Fatal("queue writer emitted an extra packet")
+			}
+		})
+	}
 }
 
 func TestDirectFragmentOutputPreservesPartialDeadlineEmission(t *testing.T) {
@@ -1389,8 +1544,8 @@ func FuzzIPPayloadFragmentationRoundTrip(f *testing.F) {
 			hopLimit: hopLimit, trafficClass: trafficClass, flowLabel: flowLabel & ipv6MaximumFlowLabel,
 			hopLimitSet: true, trafficClassSet: true, flowLabelSet: true,
 		}
-		packets, err := stack.ipPayloadPacketsForMTU(
-			source, target, protocol, payload, sourceFragmentation{allow: true}, options, mtu,
+		packets, err := testIPPayloadPacketsForMTU(
+			stack, source, target, protocol, payload, sourceFragmentation{allow: true}, options, mtu,
 		)
 		if err != nil {
 			t.Fatalf("fragmentation of %d-byte payload at MTU %d: %v", len(payload), mtu, err)

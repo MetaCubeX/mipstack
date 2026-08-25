@@ -1492,15 +1492,13 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 			return true
 		})
 	}
-	if !fragmentation.allow {
-		return syscall.EMSGSIZE
+	var layout ipFragmentLayout
+	if err := c.stack.ipFragmentLayoutForMTU(source, target, udpSize, fragmentation, options, mtu, &layout); err != nil {
+		return err
 	}
 	datagram := make([]byte, udpSize)
 	marshalUDPDatagram(datagram, source, target, sourcePort, targetPort, payload)
-	packets, err := c.stack.ipPayloadPacketsForMTU(source, target, ProtocolUDP, datagram, fragmentation, options, mtu)
-	if err != nil {
-		return err
-	}
+	packets := buildIPFragmentPackets(source, target, ProtocolUDP, datagram, layout)
 	return c.stack.writeNonUnicastPacketsUntil(packets, external, loopback, state)
 }
 
@@ -1544,13 +1542,11 @@ func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byt
 			return true
 		})
 	}
-	if !fragmentation.allow {
-		return syscall.EMSGSIZE
-	}
-	packets, err := c.stack.ipPayloadPacketsForMTU(source, target, c.protocol, payload, fragmentation, options, mtu)
-	if err != nil {
+	var layout ipFragmentLayout
+	if err := c.stack.ipFragmentLayoutForMTU(source, target, len(payload), fragmentation, options, mtu, &layout); err != nil {
 		return err
 	}
+	packets := buildIPFragmentPackets(source, target, c.protocol, payload, layout)
 	return c.stack.writeNonUnicastPacketsUntil(packets, external, loopback, state)
 }
 

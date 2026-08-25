@@ -4395,7 +4395,7 @@ func (s *Stack) rejectTCPSegment(key tcpKey, segment tcpSegment) error {
 		}
 		flags |= TCPFlagACK
 	}
-	return s.tryWriteTCP(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, acknowledgement, flags, 0, nil, nil, s.mtuFor(key.remote.Addr()), 0, 0, 0, false)
+	return s.tryWriteTCPControl(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, acknowledgement, flags, 0, nil, nil, s.mtuFor(key.remote.Addr()), 0, 0, 0, false)
 }
 
 // acceptTCP creates and starts one forwarded passive connection after the
@@ -4590,16 +4590,6 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 	return true, nil
 }
 
-// buildTCPPacket constructs one non-fragmented TCP segment using explicit path
-// and IP-header policy.
-func buildTCPPacket(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte, flowLabel uint32) ([]byte, error) {
-	_, _, packetSize, err := tcpPacketLayout(source, target, options, len(payload), mtu)
-	if err != nil {
-		return nil, err
-	}
-	return buildTCPPacketInto(make([]byte, packetSize), source, target, sourcePort, targetPort, sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, flowLabel)
-}
-
 // tcpPacketLayout validates option and path bounds and returns exact header
 // and complete packet sizes.
 func tcpPacketLayout(source, target netip.Addr, options []byte, payloadSize, mtu int) (ipSize, headerSize, packetSize int, err error) {
@@ -4653,20 +4643,36 @@ func buildTCPPacketViewInto(packet []byte, source, target netip.Addr, sourcePort
 	return packet, nil
 }
 
-// tryWriteTCP emits one best-effort stack-owned control segment without
-// waiting for device capacity.
-func (s *Stack) tryWriteTCP(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte, flowLabel uint32, flowLabelSet bool) error {
+// tryWriteTCPControl builds one best-effort stack-owned control segment in its
+// final queue buffer without waiting for device capacity.
+func (s *Stack) tryWriteTCPControl(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte, flowLabel uint32, flowLabelSet bool) error {
 	if source.Is6() && !flowLabelSet {
 		flowLabel = s.network.Load().tcpDefaults.FlowLabel
 		if flowLabel == 0 {
 			flowLabel = s.automaticTransportFlowLabel(source, target, ProtocolTCP, sourcePort, targetPort)
 		}
 	}
-	packet, err := buildTCPPacket(source, target, sourcePort, targetPort, sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, flowLabel)
+	_, _, packetSize, err := tcpPacketLayout(source, target, options, len(payload), mtu)
 	if err != nil {
 		return err
 	}
-	return s.tryWritePacket(packet)
+	queue, loopback := s.outputQueueFor(target)
+	slot, err := s.tryReservePacket(queue)
+	if err != nil {
+		return err
+	}
+	packet, reusable := queue.acquireBuffer(packetSize)
+	built, err := buildTCPPacketInto(packet, source, target, sourcePort, targetPort, sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, flowLabel)
+	if err != nil {
+		queue.releaseBuffer(packet, reusable)
+		queue.releaseReserved(slot)
+		return err
+	}
+	if !queue.enqueueReservedPacket(slot, built, reusable) {
+		return ErrClosed
+	}
+	s.recordOutput(loopback)
+	return nil
 }
 
 // deliverError queues a matching ICMP error without blocking packet input.
@@ -8233,14 +8239,10 @@ func (c *TCPConn) sendAbortReset(sequence, acknowledgement uint32, window uint16
 	if c.echoCongestion {
 		flags |= TCPFlagECE
 	}
-	packet, err := buildTCPPacket(
+	return c.stack.tryWriteTCPControl(
 		c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(),
-		sequence, acknowledgement, flags, window, options, nil, c.mtu, uint8(c.trafficClass.Load()), 0, c.flowLabel,
+		sequence, acknowledgement, flags, window, options, nil, c.mtu, uint8(c.trafficClass.Load()), 0, c.flowLabel, true,
 	)
-	if err != nil {
-		return err
-	}
-	return c.stack.tryWritePacket(packet)
 }
 
 // writeTCPControlWithMTU applies the socket DSCP policy to handshake and

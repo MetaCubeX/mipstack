@@ -37,6 +37,44 @@ func buildIPv4Fragments(source, target netip.Addr, protocol byte, payload []byte
 	return buildIPv4FragmentsWithOptions(source, target, protocol, payload, mtu, identification, ipPacketOptions{})
 }
 
+// buildIPv4FragmentsWithOptions constructs IPv4 fragments with explicit
+// output fields for tests.
+func buildIPv4FragmentsWithOptions(source, target netip.Addr, protocol byte, payload []byte, mtu int, identification uint16, options ipPacketOptions) [][]byte {
+	ranges, valid := newFragmentRangeCursor(len(payload), mtu-20)
+	if !valid || len(payload) > 65515 {
+		return nil
+	}
+	result := make([][]byte, 0, (len(payload)+ranges.alignedCapacity-1)/ranges.alignedCapacity)
+	for offset, size, more, ok := ranges.next(); ok; offset, size, more, ok = ranges.next() {
+		packet := make([]byte, 20+size)
+		if !marshalIPFragmentHeader(packet, source, target, protocol, uint32(identification), offset, more, options) {
+			return nil
+		}
+		copy(packet[20:], payload[offset:offset+size])
+		result = append(result, packet)
+	}
+	return result
+}
+
+// buildIPv6FragmentsWithOptions constructs IPv6 fragments with explicit
+// output fields for tests.
+func buildIPv6FragmentsWithOptions(source, target netip.Addr, protocol byte, payload []byte, mtu int, identification uint32, options ipPacketOptions) [][]byte {
+	ranges, valid := newFragmentRangeCursor(len(payload), mtu-48)
+	if !valid || len(payload) > 65535 {
+		return nil
+	}
+	result := make([][]byte, 0, (len(payload)+ranges.alignedCapacity-1)/ranges.alignedCapacity)
+	for offset, size, more, ok := ranges.next(); ok; offset, size, more, ok = ranges.next() {
+		packet := make([]byte, 48+size)
+		if !marshalIPFragmentHeader(packet, source, target, protocol, identification, offset, more, options) {
+			return nil
+		}
+		copy(packet[48:], payload[offset:offset+size])
+		result = append(result, packet)
+	}
+	return result
+}
+
 // reassemblePacket hides pending-state bookkeeping in tests concerned only
 // with completed reassembly.
 func (s *Stack) reassemblePacket(packet []byte, now time.Time) []byte {

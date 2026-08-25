@@ -492,27 +492,30 @@ func TestTCPDualStackWildcardInterop(t *testing.T) {
 func TestTCPClosedPortInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
-		t.Run(family.name, func(t *testing.T) {
-			network := newFamilyInteropNetwork(t, family, 1500)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
+		for _, mtu := range interopMTUsForFamily(family) {
+			mtu := mtu
+			t.Run(family.name+"/"+interopMTUName(mtu), func(t *testing.T) {
+				network := newFamilyInteropNetwork(t, family, mtu)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
 
-			connection, err := gonet.DialContextTCP(ctx, network.gvisor, gvisorFullAddress(family.mipstackAddress, 44991), family.networkProtocol)
-			if connection != nil {
-				_ = connection.Close()
-			}
-			if !errors.Is(err, syscall.ECONNREFUSED) {
-				t.Fatalf("gVisor dial to closed mipstack port = %v, want ECONNREFUSED", err)
-			}
+				connection, err := gonet.DialContextTCP(ctx, network.gvisor, gvisorFullAddress(family.mipstackAddress, 44991), family.networkProtocol)
+				if connection != nil {
+					_ = connection.Close()
+				}
+				if !errors.Is(err, syscall.ECONNREFUSED) {
+					t.Fatalf("gVisor dial to closed mipstack port = %v, want ECONNREFUSED", err)
+				}
 
-			mipstackConnection, err := network.mipstack.DialTCP(ctx, family.tcpNetwork, netip.AddrPort{}, netipAddrPort(family.gvisorAddress, 44992))
-			if mipstackConnection != nil {
-				_ = mipstackConnection.Close()
-			}
-			if !errors.Is(err, syscall.ECONNREFUSED) {
-				t.Fatalf("mipstack dial to closed gVisor port = %v, want ECONNREFUSED", err)
-			}
-		})
+				mipstackConnection, err := network.mipstack.DialTCP(ctx, family.tcpNetwork, netip.AddrPort{}, netipAddrPort(family.gvisorAddress, 44992))
+				if mipstackConnection != nil {
+					_ = mipstackConnection.Close()
+				}
+				if !errors.Is(err, syscall.ECONNREFUSED) {
+					t.Fatalf("mipstack dial to closed gVisor port = %v, want ECONNREFUSED", err)
+				}
+			})
+		}
 	}
 }
 
@@ -521,76 +524,79 @@ func TestTCPClosedPortInterop(t *testing.T) {
 func TestTCPEstablishedResetInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
-		t.Run(family.name+"/mipstack-resets", func(t *testing.T) {
-			network := newFamilyInteropNetwork(t, family, 1500)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			client, server, listener := openTCPPair(t, ctx, network, family, true)
-			defer listener.Close()
-			defer client.Close()
-			connection := server.(*mipstack.TCPConn)
-			if err := connection.SetLinger(0); err != nil {
-				t.Fatalf("set mipstack abortive linger: %v", err)
-			}
-			if err := client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
-				t.Fatalf("set gVisor reset deadline: %v", err)
-			}
-			if err := connection.Close(); err != nil {
-				t.Fatalf("abort mipstack TCP connection: %v", err)
-			}
-			if _, err := client.Read(make([]byte, 1)); !errors.Is(err, syscall.ECONNRESET) {
-				t.Fatalf("gVisor read after mipstack abort = %v, want ECONNRESET", err)
-			}
-		})
+		for _, mtu := range interopMTUsForFamily(family) {
+			mtu := mtu
+			t.Run(family.name+"/"+interopMTUName(mtu)+"/mipstack-resets", func(t *testing.T) {
+				network := newFamilyInteropNetwork(t, family, mtu)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				client, server, listener := openTCPPair(t, ctx, network, family, true)
+				defer listener.Close()
+				defer client.Close()
+				connection := server.(*mipstack.TCPConn)
+				if err := connection.SetLinger(0); err != nil {
+					t.Fatalf("set mipstack abortive linger: %v", err)
+				}
+				if err := client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+					t.Fatalf("set gVisor reset deadline: %v", err)
+				}
+				if err := connection.Close(); err != nil {
+					t.Fatalf("abort mipstack TCP connection: %v", err)
+				}
+				if _, err := client.Read(make([]byte, 1)); !errors.Is(err, syscall.ECONNRESET) {
+					t.Fatalf("gVisor read after mipstack abort = %v, want ECONNRESET", err)
+				}
+			})
 
-		t.Run(family.name+"/gvisor-resets", func(t *testing.T) {
-			network := newFamilyInteropNetwork(t, family, 1500)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			const port = 44981
-			var queue waiter.Queue
-			listener, tcpipErr := network.gvisor.NewEndpoint(tcp.ProtocolNumber, family.networkProtocol, &queue)
-			if tcpipErr != nil {
-				t.Fatalf("create native gVisor TCP listener: %s", tcpipErr.String())
-			}
-			defer listener.Close()
-			if tcpipErr = listener.Bind(gvisorFullAddress(family.gvisorAddress, port)); tcpipErr != nil {
-				t.Fatalf("bind native gVisor TCP listener: %s", tcpipErr.String())
-			}
-			if tcpipErr = listener.Listen(1); tcpipErr != nil {
-				t.Fatalf("listen with native gVisor TCP endpoint: %s", tcpipErr.String())
-			}
-			entry, notifications := registerReadable(&queue)
-			defer queue.EventUnregister(&entry)
-			type dialResult struct {
-				connection net.Conn
-				err        error
-			}
-			dialed := make(chan dialResult, 1)
-			go func() {
-				connection, err := network.mipstack.DialTCP(ctx, family.tcpNetwork, netip.AddrPort{}, netipAddrPort(family.gvisorAddress, port))
-				dialed <- dialResult{connection: connection, err: err}
-			}()
-			accepted, _, err := acceptGVisorTCP(ctx, listener, notifications)
-			if err != nil {
-				t.Fatalf("accept native gVisor TCP connection: %v", err)
-			}
-			defer accepted.Close()
-			result := <-dialed
-			if result.err != nil {
-				t.Fatalf("dial native gVisor TCP listener: %v", result.err)
-			}
-			connection := result.connection.(*mipstack.TCPConn)
-			defer connection.Close()
-			if err = connection.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
-				t.Fatalf("set mipstack reset deadline: %v", err)
-			}
-			accepted.SocketOptions().SetLinger(tcpip.LingerOption{Enabled: true})
-			accepted.Close()
-			if _, err = connection.Read(make([]byte, 1)); !errors.Is(err, syscall.ECONNRESET) {
-				t.Fatalf("mipstack read after gVisor abort = %v, want ECONNRESET", err)
-			}
-		})
+			t.Run(family.name+"/"+interopMTUName(mtu)+"/gvisor-resets", func(t *testing.T) {
+				network := newFamilyInteropNetwork(t, family, mtu)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				const port = 44981
+				var queue waiter.Queue
+				listener, tcpipErr := network.gvisor.NewEndpoint(tcp.ProtocolNumber, family.networkProtocol, &queue)
+				if tcpipErr != nil {
+					t.Fatalf("create native gVisor TCP listener: %s", tcpipErr.String())
+				}
+				defer listener.Close()
+				if tcpipErr = listener.Bind(gvisorFullAddress(family.gvisorAddress, port)); tcpipErr != nil {
+					t.Fatalf("bind native gVisor TCP listener: %s", tcpipErr.String())
+				}
+				if tcpipErr = listener.Listen(1); tcpipErr != nil {
+					t.Fatalf("listen with native gVisor TCP endpoint: %s", tcpipErr.String())
+				}
+				entry, notifications := registerReadable(&queue)
+				defer queue.EventUnregister(&entry)
+				type dialResult struct {
+					connection net.Conn
+					err        error
+				}
+				dialed := make(chan dialResult, 1)
+				go func() {
+					connection, err := network.mipstack.DialTCP(ctx, family.tcpNetwork, netip.AddrPort{}, netipAddrPort(family.gvisorAddress, port))
+					dialed <- dialResult{connection: connection, err: err}
+				}()
+				accepted, _, err := acceptGVisorTCP(ctx, listener, notifications)
+				if err != nil {
+					t.Fatalf("accept native gVisor TCP connection: %v", err)
+				}
+				defer accepted.Close()
+				result := <-dialed
+				if result.err != nil {
+					t.Fatalf("dial native gVisor TCP listener: %v", result.err)
+				}
+				connection := result.connection.(*mipstack.TCPConn)
+				defer connection.Close()
+				if err = connection.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+					t.Fatalf("set mipstack reset deadline: %v", err)
+				}
+				accepted.SocketOptions().SetLinger(tcpip.LingerOption{Enabled: true})
+				accepted.Close()
+				if _, err = connection.Read(make([]byte, 1)); !errors.Is(err, syscall.ECONNRESET) {
+					t.Fatalf("mipstack read after gVisor abort = %v, want ECONNRESET", err)
+				}
+			})
+		}
 	}
 }
 

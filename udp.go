@@ -1507,11 +1507,11 @@ func (s *Stack) tryWriteUDPDatagram(source, target netip.Addr, sourcePort, targe
 	if ipSize == 0 {
 		return syscall.EMSGSIZE
 	}
+	if source.Is6() && !options.flowLabelSet {
+		options.flowLabel = s.automaticTransportFlowLabel(source, target, ProtocolUDP, sourcePort, targetPort)
+		options.flowLabelSet = true
+	}
 	if ipSize+udpSize <= mtu {
-		if source.Is6() && !options.flowLabelSet {
-			options.flowLabel = s.automaticTransportFlowLabel(source, target, ProtocolUDP, sourcePort, targetPort)
-			options.flowLabelSet = true
-		}
 		var identification uint16
 		if source.Is4() && fragmentation.requiresIPv4ID() {
 			identification = uint16(s.ipv4ID.Add(1))
@@ -1534,12 +1534,13 @@ func (s *Stack) tryWriteUDPDatagram(source, target netip.Addr, sourcePort, targe
 		s.recordOutput(loopback)
 		return nil
 	}
-	datagram := make([]byte, udpSize)
-	marshalUDPDatagram(datagram, source, target, sourcePort, targetPort, payload)
-	packets, err := s.ipPayloadPacketsForMTU(source, target, ProtocolUDP, datagram, fragmentation, options, mtu)
-	if err != nil {
+	var layout ipFragmentLayout
+	if err := s.ipFragmentLayoutForMTU(source, target, udpSize, fragmentation, options, mtu, &layout); err != nil {
 		return err
 	}
+	datagram := make([]byte, udpSize)
+	marshalUDPDatagram(datagram, source, target, sourcePort, targetPort, payload)
+	packets := buildIPFragmentPackets(source, target, ProtocolUDP, datagram, layout)
 	return s.tryWritePackets(packets)
 }
 
@@ -1590,14 +1591,15 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 		c.stack.recordOutput(loopback)
 		return nil
 	}
-	if !fragmentation.allow {
-		return syscall.EMSGSIZE
+	var layout ipFragmentLayout
+	if err := c.stack.ipFragmentLayoutForMTU(source, target, udpSize, fragmentation, options, mtu, &layout); err != nil {
+		return err
 	}
 	var udpHeader [udpHeaderSize]byte
 	marshalUDPHeaderFields(udpHeader[:], sourcePort, targetPort, udpSize)
 	writeUDPChecksumValue(udpHeader[:], transportChecksumParts(source, target, ProtocolUDP, udpSize, udpHeader[:], payload))
 	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
-	return c.stack.writeIPFragmentsUntilOptionsForMTU(source, target, ProtocolUDP, udpHeader[:], payload, options, mtu, state)
+	return c.stack.writeIPFragmentsUntilLayout(source, target, ProtocolUDP, udpHeader[:], payload, layout, state)
 }
 
 // writeDatagramBuffersForMTU is the allocation-free scatter/gather form of

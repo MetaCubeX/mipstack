@@ -734,9 +734,9 @@ func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
 			fragments := (udpHeaderSize + len(payload) + maximum - 1) / maximum
 			drain := func() {
 				for index := 0; index < fragments; index++ {
-					entry, ok := waitTestPacketEntry(&stack.outbound, time.Second)
+					entry, ok := stack.outbound.tryDequeue()
 					if !ok {
-						b.Fatal("timed out waiting for UDP fragment")
+						b.Fatal("missing UDP fragment")
 					}
 					stack.outbound.release(entry)
 				}

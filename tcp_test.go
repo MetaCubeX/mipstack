@@ -4764,11 +4764,15 @@ func TestBuildTCPPacketIntoOverwritesReusedBuffer(t *testing.T) {
 	target := netip.MustParseAddr("198.51.100.242")
 	options := tcpTimestampOptions(123, 456)
 	payload := []byte("reused TCP packet")
-	want, err := buildTCPPacket(source, target, 49152, 8443, 100, 200, TCPFlagACK|TCPFlagPSH, 32768, options, payload, 1500, 0x28, 2, 0)
+	_, _, packetSize, err := tcpPacketLayout(source, target, options, len(payload), 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dirty := make([]byte, len(want))
+	want, err := buildTCPPacketInto(make([]byte, packetSize), source, target, 49152, 8443, 100, 200, TCPFlagACK|TCPFlagPSH, 32768, options, payload, 1500, 0x28, 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirty := make([]byte, packetSize)
 	for index := range dirty {
 		dirty[index] = 0xff
 	}
