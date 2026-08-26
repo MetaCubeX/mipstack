@@ -778,7 +778,7 @@ func TestUDPForwarderEndpointSurvivesInitialQueueDrop(t *testing.T) {
 			remote := netip.MustParseAddr("192.0.2.59")
 			stack, err := New(Config{
 				LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400,
-				UDP: DatagramSocketDefaults{ReceiveBuffer: udpDatagramMetadataSize},
+				UDP: UDPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{ReceiveBuffer: udpDatagramMetadataSize}},
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -1849,7 +1849,7 @@ func TestUDPForwarderReplyUsesSocketDefaults(t *testing.T) {
 	target := netip.MustParseAddr("2001:db8:1::108")
 	stack, err := New(Config{
 		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}, Promiscuous: true, MTU: 1400,
-		UDP: DatagramSocketDefaults{HopLimit: 37, TrafficClass: 0x2e, FlowLabel: 0x54321},
+		UDP: UDPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{HopLimit: 37, TrafficClass: 0x2e, FlowLabel: 0x54321}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -3913,9 +3913,9 @@ func TestIPForwarderReplyAndMetadata(t *testing.T) {
 			stack, err := New(Config{
 				LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.owned, test.owned.BitLen())},
 				Promiscuous:    true,
-				IP: DatagramSocketDefaults{
+				IP: IPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{
 					HopLimit: 41, TrafficClass: 0x2e, FlowLabel: 0x34567,
-				},
+				}},
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -4004,8 +4004,8 @@ func TestForwarderRepliesUseDatagramPathMTUDefaults(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			stack, err := New(Config{
 				LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, Promiscuous: true, MTU: 1400,
-				UDP: DatagramSocketDefaults{PathMTUDiscovery: PathMTUDiscoveryDo},
-				IP:  DatagramSocketDefaults{PathMTUDiscovery: PathMTUDiscoveryDo},
+				UDP: UDPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{PathMTUDiscovery: PathMTUDiscoveryDo}},
+				IP:  IPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{PathMTUDiscovery: PathMTUDiscoveryDo}},
 			})
 			if err != nil {
 				t.Fatal(err)

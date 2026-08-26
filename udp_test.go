@@ -1863,7 +1863,7 @@ func TestUDPDefaultsAndDiagnostics(t *testing.T) {
 	remote := netip.MustParseAddr("192.0.2.135")
 	stack, err := New(Config{
 		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400,
-		UDP: DatagramSocketDefaults{ReceiveBuffer: 2048, HopLimit: 31, TrafficClass: 0xb8},
+		UDP: UDPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{ReceiveBuffer: 2048, HopLimit: 31, TrafficClass: 0xb8}},
 	})
 	if err != nil {
 		t.Fatal(err)

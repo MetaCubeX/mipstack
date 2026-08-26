@@ -705,7 +705,8 @@ one bounded group may be credited ahead of the pacing clock.
 
 `Config.UDP` and `Config.IP` define the receive-buffer capacity, path-MTU
 policy, default TTL/Hop Limit, default TOS/Traffic Class, and IPv6 Flow Label
-policy inherited by new datagram sockets. `SetReadBuffer`,
+policy inherited by new datagram sockets. `Config.IP` additionally selects
+whether new IP protocol sockets read or write complete IP packets. `SetReadBuffer`,
 `SetPathMTUDiscovery`, `SetHopLimit`, `SetTrafficClass`, and `SetFlowLabel`
 provide per-socket overrides. A zero configured Flow Label uses a stable keyed
 label for each flow; explicitly setting a socket label to zero disables

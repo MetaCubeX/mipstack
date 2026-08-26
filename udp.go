@@ -349,7 +349,7 @@ type udpDatagramWriter func(source, target netip.Addr, sourcePort, targetPort ui
 func newUDPConn(stack *Stack, network string, port uint16, v6 bool, local netip.Addr, remote netip.AddrPort, options datagramSocketOptionSet) *UDPConn {
 	defaults := DatagramSocketDefaults{ReceiveBuffer: udpDefaultReceiveCapacity, HopLimit: 64, MulticastHopLimit: 1}
 	if stack != nil {
-		defaults = stack.network.Load().udpDefaults
+		defaults = stack.network.Load().udpDefaults.DatagramSocketDefaults
 	}
 	defaults = applyDatagramSocketOptions(defaults, options, udpDatagramMetadataSize)
 	connection := &UDPConn{
@@ -664,7 +664,7 @@ func (f *forwarderRuntime) replyUDPFlow(flow ForwarderFlow, payload []byte, sour
 	if _, routed := state.routeFor(remote.Addr()); !routed {
 		return 0, syscall.ENETUNREACH
 	}
-	defaults := state.udpDefaults
+	defaults := state.udpDefaults.DatagramSocketDefaults
 	options := ipPacketOptions{
 		hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
 		flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,

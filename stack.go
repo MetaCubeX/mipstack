@@ -215,8 +215,8 @@ const (
 	MessageFlagErrorQueue = 0x2000
 )
 
-// DatagramSocketDefaults configures policies inherited by newly created UDP
-// or IP protocol sockets. Zero fields retain the package defaults.
+// DatagramSocketDefaults configures policies shared by newly created UDP and
+// IP protocol sockets. Zero fields retain the package defaults.
 type DatagramSocketDefaults struct {
 	// ReceiveBuffer is the approximate retained-memory receive capacity.
 	ReceiveBuffer int
@@ -244,6 +244,25 @@ type DatagramSocketDefaults struct {
 	// FlowLabel is the default IPv6 Flow Label. Zero selects a stable automatic
 	// label for each destination flow.
 	FlowLabel uint32
+}
+
+// UDPSocketDefaults configures policies inherited by newly created UDP
+// sockets. Zero fields retain the package defaults.
+type UDPSocketDefaults struct {
+	DatagramSocketDefaults
+}
+
+// IPSocketDefaults configures policies inherited by newly created IP protocol
+// sockets. Zero fields retain the package defaults.
+type IPSocketDefaults struct {
+	DatagramSocketDefaults
+
+	// IPHeaderIncludedOnWrite makes new IPConn writes contain a complete IPv4
+	// or IPv6 packet instead of only the upper-layer protocol payload.
+	IPHeaderIncludedOnWrite bool
+	// IPHeaderIncludedOnRead makes new IPConn reads return the complete,
+	// reassembled IP packet instead of only the upper-layer protocol payload.
+	IPHeaderIncludedOnRead bool
 }
 
 // Config configures a Stack.
@@ -280,9 +299,9 @@ type Config struct {
 	// TCP supplies default socket and listener policies.
 	TCP TCPSocketDefaults
 	// UDP supplies defaults inherited by new UDP sockets.
-	UDP DatagramSocketDefaults
+	UDP UDPSocketDefaults
 	// IP supplies defaults inherited by new IP protocol sockets.
-	IP DatagramSocketDefaults
+	IP IPSocketDefaults
 }
 
 // Stack converts raw IPv4/IPv6 packets to application TCP, UDP, and IP

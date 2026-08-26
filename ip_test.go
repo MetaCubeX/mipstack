@@ -2003,7 +2003,7 @@ func TestIPDefaultsAndDiagnostics(t *testing.T) {
 	remote := netip.MustParseAddr("2001:db8::137")
 	stack, err := New(Config{
 		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}, MTU: 1400,
-		IP: DatagramSocketDefaults{ReceiveBuffer: 2048, HopLimit: 29, TrafficClass: 0x28},
+		IP: IPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{ReceiveBuffer: 2048, HopLimit: 29, TrafficClass: 0x28}},
 	})
 	if err != nil {
 		t.Fatal(err)

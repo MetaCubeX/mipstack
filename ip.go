@@ -464,11 +464,21 @@ func validateIPProtocol(protocol byte) error {
 // newIPConn allocates one unregistered protocol socket after applying explicit
 // creation policies to the latest Stack defaults.
 func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.Addr, options socketOptionSet) *IPConn {
-	defaults := DatagramSocketDefaults{ReceiveBuffer: ipDefaultReceiveCapacity, HopLimit: 64, MulticastHopLimit: 1}
+	defaults := IPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{
+		ReceiveBuffer: ipDefaultReceiveCapacity, HopLimit: 64, MulticastHopLimit: 1,
+	}}
 	if stack != nil {
 		defaults = stack.network.Load().ipDefaults
 	}
-	defaults = applyDatagramSocketOptions(defaults, options.datagram, ipDatagramMetadataSize)
+	datagramDefaults := applyDatagramSocketOptions(defaults.DatagramSocketDefaults, options.datagram, ipDatagramMetadataSize)
+	headerIncludedOnWrite := defaults.IPHeaderIncludedOnWrite
+	if options.ip.headerIncludedOnWrite != socketOptionBoolOverrideUnset {
+		headerIncludedOnWrite = options.ip.headerIncludedOnWrite == socketOptionBoolOverrideEnabled
+	}
+	headerIncludedOnRead := defaults.IPHeaderIncludedOnRead
+	if options.ip.headerIncludedOnRead != socketOptionBoolOverrideUnset {
+		headerIncludedOnRead = options.ip.headerIncludedOnRead == socketOptionBoolOverrideEnabled
+	}
 	checksumOffset := -1
 	if local.Is6() && protocol == ProtocolICMPv6 {
 		checksumOffset = 2
@@ -483,17 +493,17 @@ func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.
 	connection := &IPConn{
 		stack: stack, net: network, protocol: protocol, v6: local.Is6(), local: local, remote: remote,
 		datagramSocketWriteControl: datagramSocketWriteControl{closed: make(chan struct{})},
-		receiveCapacity:            defaults.ReceiveBuffer,
-		ipHeaderIncludedOnRead:     options.ip.headerIncludedOnRead,
+		receiveCapacity:            datagramDefaults.ReceiveBuffer,
+		ipHeaderIncludedOnRead:     headerIncludedOnRead,
 		defaultOptions: ipPacketOptions{
-			hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
-			flowLabel: defaults.FlowLabel, hopLimitSet: options.datagram.hopLimit.set,
-			trafficClassSet: options.datagram.trafficClass.set, flowLabelSet: defaults.FlowLabel != 0 || options.datagram.flowLabel.set,
+			hopLimit: byte(datagramDefaults.HopLimit), trafficClass: datagramDefaults.TrafficClass,
+			flowLabel: datagramDefaults.FlowLabel, hopLimitSet: options.datagram.hopLimit.set,
+			trafficClassSet: options.datagram.trafficClass.set, flowLabelSet: datagramDefaults.FlowLabel != 0 || options.datagram.flowLabel.set,
 		},
-		receiveErrors:     defaults.ReceiveErrors,
-		pathMTUDiscovery:  defaults.PathMTUDiscovery,
-		multicastHopLimit: byte(defaults.MulticastHopLimit), multicastLoopback: !defaults.DisableMulticastLoopback,
-		broadcast: !defaults.DisableBroadcast, ipv6ChecksumOffset: checksumOffset,
+		receiveErrors:     datagramDefaults.ReceiveErrors,
+		pathMTUDiscovery:  datagramDefaults.PathMTUDiscovery,
+		multicastHopLimit: byte(datagramDefaults.MulticastHopLimit), multicastLoopback: !datagramDefaults.DisableMulticastLoopback,
+		broadcast: !datagramDefaults.DisableBroadcast, ipv6ChecksumOffset: checksumOffset,
 	}
 	if filter := options.ip.icmpV4Filter.value; protocol == ProtocolICMPv4 && filter != (ICMPv4Filter{}) {
 		connection.icmpFilter = &ipConnICMPFilter{}
@@ -501,7 +511,7 @@ func newIPConn(stack *Stack, network string, protocol byte, local, remote netip.
 	} else if filter := options.ip.icmpV6Filter.value; protocol == ProtocolICMPv6 && filter != (ICMPv6Filter{}) {
 		connection.icmpFilter = &ipConnICMPFilter{blocked: filter.blocked}
 	}
-	connection.ipHeaderIncludedOnWrite.Store(options.ip.headerIncludedOnWrite)
+	connection.ipHeaderIncludedOnWrite.Store(headerIncludedOnWrite)
 	return connection
 }
 

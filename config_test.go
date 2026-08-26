@@ -384,12 +384,12 @@ func TestTCPSocketDefaultConfiguration(t *testing.T) {
 func TestDatagramSocketDefaultConfiguration(t *testing.T) {
 	local := netip.MustParsePrefix("192.0.2.131/32")
 	for _, config := range []Config{
-		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{ReceiveBuffer: -1}},
-		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{HopLimit: 256}},
-		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{FlowLabel: ipv6MaximumFlowLabel + 1}},
-		{LocalAddresses: []netip.Prefix{local}, UDP: DatagramSocketDefaults{PathMTUDiscovery: PathMTUDiscovery(99)}},
-		{LocalAddresses: []netip.Prefix{local}, IP: DatagramSocketDefaults{HopLimit: -1}},
-		{LocalAddresses: []netip.Prefix{local}, IP: DatagramSocketDefaults{FlowLabel: ipv6MaximumFlowLabel + 1}},
+		{LocalAddresses: []netip.Prefix{local}, UDP: UDPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{ReceiveBuffer: -1}}},
+		{LocalAddresses: []netip.Prefix{local}, UDP: UDPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{HopLimit: 256}}},
+		{LocalAddresses: []netip.Prefix{local}, UDP: UDPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{FlowLabel: ipv6MaximumFlowLabel + 1}}},
+		{LocalAddresses: []netip.Prefix{local}, UDP: UDPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{PathMTUDiscovery: PathMTUDiscovery(99)}}},
+		{LocalAddresses: []netip.Prefix{local}, IP: IPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{HopLimit: -1}}},
+		{LocalAddresses: []netip.Prefix{local}, IP: IPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{FlowLabel: ipv6MaximumFlowLabel + 1}}},
 	} {
 		if _, err := New(config); err == nil {
 			t.Fatalf("invalid datagram defaults were accepted: %+v", config)
@@ -397,8 +397,11 @@ func TestDatagramSocketDefaultConfiguration(t *testing.T) {
 	}
 	stack, err := New(Config{
 		LocalAddresses: []netip.Prefix{local},
-		UDP:            DatagramSocketDefaults{ReceiveBuffer: 2048, ReceiveErrors: true, HopLimit: 31, TrafficClass: 0xb8, PathMTUDiscovery: PathMTUDiscoveryProbe},
-		IP:             DatagramSocketDefaults{ReceiveBuffer: 4096, ReceiveErrors: true, HopLimit: 29, TrafficClass: 0x2e, PathMTUDiscovery: PathMTUDiscoveryOmit},
+		UDP:            UDPSocketDefaults{DatagramSocketDefaults: DatagramSocketDefaults{ReceiveBuffer: 2048, ReceiveErrors: true, HopLimit: 31, TrafficClass: 0xb8, PathMTUDiscovery: PathMTUDiscoveryProbe}},
+		IP: IPSocketDefaults{
+			DatagramSocketDefaults:  DatagramSocketDefaults{ReceiveBuffer: 4096, ReceiveErrors: true, HopLimit: 29, TrafficClass: 0x2e, PathMTUDiscovery: PathMTUDiscoveryOmit},
+			IPHeaderIncludedOnWrite: true, IPHeaderIncludedOnRead: true,
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -408,7 +411,8 @@ func TestDatagramSocketDefaultConfiguration(t *testing.T) {
 		t.Fatalf("UDP defaults = %d, %+v, PMTU mode %d", udp.receiveCapacity, udp.defaultOptions, udp.pathMTUDiscovery)
 	}
 	ip := newIPConn(stack, "ip4:99", 99, local.Addr(), netip.Addr{}, socketOptionSet{})
-	if ip.receiveCapacity != 4096 || !ip.receiveErrors || ip.defaultOptions != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e}) || ip.pathMTUDiscovery != PathMTUDiscoveryOmit {
+	if ip.receiveCapacity != 4096 || !ip.receiveErrors || ip.defaultOptions != (ipPacketOptions{hopLimit: 29, trafficClass: 0x2e}) ||
+		ip.pathMTUDiscovery != PathMTUDiscoveryOmit || !ip.ipHeaderIncludedOnWrite.Load() || !ip.ipHeaderIncludedOnRead {
 		t.Fatalf("IP defaults = %d, %+v, PMTU mode %d", ip.receiveCapacity, ip.defaultOptions, ip.pathMTUDiscovery)
 	}
 }

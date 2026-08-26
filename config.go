@@ -36,8 +36,8 @@ type networkState struct {
 	maxTCPConnections int
 	promiscuous       bool
 	tcpDefaults       TCPSocketDefaults
-	udpDefaults       DatagramSocketDefaults
-	ipDefaults        DatagramSocketDefaults
+	udpDefaults       UDPSocketDefaults
+	ipDefaults        IPSocketDefaults
 	local             map[netip.Addr]struct{}
 	broadcast         map[netip.Addr]struct{}
 	sources           []netip.Addr
@@ -127,11 +127,11 @@ func buildNetworkState(config Config) (*networkState, error) {
 	if err != nil {
 		return nil, err
 	}
-	udpDefaults, err := normalizeDatagramSocketDefaults(config.UDP, udpDefaultReceiveCapacity, udpDatagramMetadataSize)
+	udpDefaults, err := normalizeUDPSocketDefaults(config.UDP)
 	if err != nil {
 		return nil, errors.New("mipstack: invalid UDP socket defaults: " + err.Error())
 	}
-	ipDefaults, err := normalizeDatagramSocketDefaults(config.IP, ipDefaultReceiveCapacity, ipDatagramMetadataSize)
+	ipDefaults, err := normalizeIPSocketDefaults(config.IP)
 	if err != nil {
 		return nil, errors.New("mipstack: invalid IP socket defaults: " + err.Error())
 	}
@@ -271,6 +271,28 @@ func buildNetworkState(config Config) (*networkState, error) {
 		}
 	}
 	return state, nil
+}
+
+// normalizeUDPSocketDefaults validates and normalizes the shared datagram
+// policies inherited by UDP sockets.
+func normalizeUDPSocketDefaults(value UDPSocketDefaults) (UDPSocketDefaults, error) {
+	defaults, err := normalizeDatagramSocketDefaults(value.DatagramSocketDefaults, udpDefaultReceiveCapacity, udpDatagramMetadataSize)
+	if err != nil {
+		return UDPSocketDefaults{}, err
+	}
+	value.DatagramSocketDefaults = defaults
+	return value, nil
+}
+
+// normalizeIPSocketDefaults validates the shared datagram policies while
+// preserving the IP-specific representation defaults.
+func normalizeIPSocketDefaults(value IPSocketDefaults) (IPSocketDefaults, error) {
+	defaults, err := normalizeDatagramSocketDefaults(value.DatagramSocketDefaults, ipDefaultReceiveCapacity, ipDatagramMetadataSize)
+	if err != nil {
+		return IPSocketDefaults{}, err
+	}
+	value.DatagramSocketDefaults = defaults
+	return value, nil
 }
 
 // acceptsInboundDestination reports whether one unicast destination may enter

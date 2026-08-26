@@ -895,8 +895,9 @@ func (r *UDPForwarderRequest) Listen(options ...SocketOption) (*UDPConn, error) 
 // retaining a UDP endpoint. Use ReplyFrom to select a different source. The
 // method may be called repeatedly or concurrently, including before a later
 // terminal action, but every call must finish before the handler returns. Each
-// call atomically queues the complete datagram or all of its fragments without
-// waiting for outbound capacity and may be retried after any error.
+// call uses the current Config.UDP output defaults and atomically queues the
+// complete datagram or all of its fragments without waiting for outbound
+// capacity. It may be retried after any error.
 func (r *UDPForwarderRequest) Reply(payload []byte) (int, error) {
 	return r.replyFrom(payload, r.flow.Destination)
 }
@@ -967,7 +968,8 @@ func (r *IPForwarderRequest) Message() IPForwarderMessage {
 // Reply sends one payload with the triggering protocol number from Destination
 // to Source. Calls may be repeated or concurrent before a later terminal action
 // and must finish before the handler returns. Each reply atomically queues all
-// required fragments without waiting for capacity and may be retried on error.
+// required fragments using the current Config.IP output defaults without
+// waiting for capacity and may be retried on error.
 func (r *IPForwarderRequest) Reply(payload []byte) error {
 	if err := r.beginReply(); err != nil {
 		return err
@@ -1887,8 +1889,9 @@ func (r *UDPForwarderResponder) RestrictToReplies() error {
 // is active or restricted to replies, with no ordering guarantee between
 // concurrent calls. Any call may be retried after failure; each call
 // revalidates the forwarder and current destination policy and copies payload
-// before returning. It reports net.ErrClosed after a terminal action or when
-// the originating forwarder is closed.
+// before returning. It uses the current Config.UDP output defaults and reports
+// net.ErrClosed after a terminal action or when the originating forwarder is
+// closed.
 func (r *UDPForwarderResponder) Reply(payload []byte) (int, error) {
 	return r.replyFrom(payload, r.flow.Destination)
 }
@@ -2024,7 +2027,7 @@ func (f *forwarderRuntime) replyIPPayload(packet ipPacket, payload []byte) error
 	if _, routed := network.routeFor(packet.source); !routed {
 		return syscall.ENETUNREACH
 	}
-	defaults := network.ipDefaults
+	defaults := network.ipDefaults.DatagramSocketDefaults
 	options := ipPacketOptions{
 		hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
 		flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
@@ -2061,9 +2064,9 @@ func (r *IPForwarderResponder) RestrictToReplies() error {
 // outbound capacity. Calls may be repeated or concurrent until a terminal
 // action or while restricted to replies, with no ordering guarantee between
 // concurrent calls. Failed calls may be retried, and Drop or Reject may follow
-// any number of replies while the responder remains active. It reports
-// net.ErrClosed after a terminal action or when the originating forwarder is
-// closed.
+// any number of replies while the responder remains active. Each call uses the
+// current Config.IP output defaults. It reports net.ErrClosed after a terminal
+// action or when the originating forwarder is closed.
 func (r *IPForwarderResponder) Reply(payload []byte) error {
 	if err := r.beginReply(); err != nil {
 		return err

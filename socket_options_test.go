@@ -244,7 +244,7 @@ func TestDatagramCreationOptionsAndConfiguredDefaults(t *testing.T) {
 	}
 	stack, err := New(Config{
 		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local4, 32), netip.PrefixFrom(local6, 128)}, MTU: 1400,
-		UDP: defaults, IP: defaults,
+		UDP: UDPSocketDefaults{DatagramSocketDefaults: defaults}, IP: IPSocketDefaults{DatagramSocketDefaults: defaults},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -297,6 +297,75 @@ func TestDatagramCreationOptionsAndConfiguredDefaults(t *testing.T) {
 		info.MulticastHopLimit != 0 || !info.MulticastLoopback || info.TrafficClass != 0 || info.FlowLabel != 0 ||
 		!info.IPHeaderIncludedOnWrite || !info.IPHeaderIncludedOnRead {
 		t.Fatalf("IP creation policy = %+v", info)
+	}
+}
+
+func TestIPSocketConfiguredRepresentationDefaults(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.243")
+	configuration := Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+		IP: IPSocketDefaults{
+			IPHeaderIncludedOnWrite: true,
+			IPHeaderIncludedOnRead:  true,
+		},
+	}
+	stack, err := New(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	inherited, err := stack.ListenIP(context.Background(), "ip4:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inherited.Close()
+	if info := inherited.(*IPConn).Info(); !info.IPHeaderIncludedOnWrite || !info.IPHeaderIncludedOnRead {
+		t.Fatalf("configured IP representation defaults = %+v", info)
+	}
+
+	overridden, err := (&ListenConfig{Options: []SocketOption{
+		SocketOptions.IPHeaderIncludedOnWrite(false),
+		SocketOptions.IPHeaderIncludedOnRead(false),
+	}}).ListenIP(context.Background(), stack, "ip4:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer overridden.Close()
+	if info := overridden.(*IPConn).Info(); info.IPHeaderIncludedOnWrite || info.IPHeaderIncludedOnRead {
+		t.Fatalf("explicit IP representation overrides = %+v", info)
+	}
+
+	unset, err := (&ListenConfig{Options: []SocketOption{
+		SocketOptions.IPHeaderIncludedOnWrite(false), SocketOptions.UnsetIPHeaderIncludedOnWrite(),
+		SocketOptions.IPHeaderIncludedOnRead(false), SocketOptions.UnsetIPHeaderIncludedOnRead(),
+	}}).ListenIP(context.Background(), stack, "ip4:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unset.Close()
+	if info := unset.(*IPConn).Info(); !info.IPHeaderIncludedOnWrite || !info.IPHeaderIncludedOnRead {
+		t.Fatalf("unset IP representation defaults = %+v", info)
+	}
+
+	configuration.IP.IPHeaderIncludedOnWrite = false
+	configuration.IP.IPHeaderIncludedOnRead = false
+	if err = stack.UpdateConfig(configuration); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := stack.ListenIP(context.Background(), "ip4:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer updated.Close()
+	if info := updated.(*IPConn).Info(); info.IPHeaderIncludedOnWrite || info.IPHeaderIncludedOnRead {
+		t.Fatalf("updated IP representation defaults = %+v", info)
+	}
+	if info := inherited.(*IPConn).Info(); !info.IPHeaderIncludedOnWrite || !info.IPHeaderIncludedOnRead {
+		t.Fatalf("existing IP socket changed with Config = %+v", info)
 	}
 }
 
@@ -508,20 +577,24 @@ func TestSocketOptionApplicabilityMatrix(t *testing.T) {
 			setExpected: func(set *socketOptionSet, enabled bool) { set.reusePort = enabled },
 		},
 		{
-			name:        "IPHeaderIncludedOnWrite",
-			enabled:     SocketOptions.IPHeaderIncludedOnWrite(true),
-			disabled:    SocketOptions.IPHeaderIncludedOnWrite(false),
-			unset:       SocketOptions.UnsetIPHeaderIncludedOnWrite(),
-			valid:       func(use socketOptionUse) bool { return use == socketOptionIPListen || use == socketOptionIPDial },
-			setExpected: func(set *socketOptionSet, enabled bool) { set.ip.headerIncludedOnWrite = enabled },
+			name:     "IPHeaderIncludedOnWrite",
+			enabled:  SocketOptions.IPHeaderIncludedOnWrite(true),
+			disabled: SocketOptions.IPHeaderIncludedOnWrite(false),
+			unset:    SocketOptions.UnsetIPHeaderIncludedOnWrite(),
+			valid:    func(use socketOptionUse) bool { return use == socketOptionIPListen || use == socketOptionIPDial },
+			setExpected: func(set *socketOptionSet, enabled bool) {
+				set.ip.headerIncludedOnWrite = newSocketOptionBoolOverride(enabled)
+			},
 		},
 		{
-			name:        "IPHeaderIncludedOnRead",
-			enabled:     SocketOptions.IPHeaderIncludedOnRead(true),
-			disabled:    SocketOptions.IPHeaderIncludedOnRead(false),
-			unset:       SocketOptions.UnsetIPHeaderIncludedOnRead(),
-			valid:       func(use socketOptionUse) bool { return use == socketOptionIPListen || use == socketOptionIPDial },
-			setExpected: func(set *socketOptionSet, enabled bool) { set.ip.headerIncludedOnRead = enabled },
+			name:     "IPHeaderIncludedOnRead",
+			enabled:  SocketOptions.IPHeaderIncludedOnRead(true),
+			disabled: SocketOptions.IPHeaderIncludedOnRead(false),
+			unset:    SocketOptions.UnsetIPHeaderIncludedOnRead(),
+			valid:    func(use socketOptionUse) bool { return use == socketOptionIPListen || use == socketOptionIPDial },
+			setExpected: func(set *socketOptionSet, enabled bool) {
+				set.ip.headerIncludedOnRead = newSocketOptionBoolOverride(enabled)
+			},
 		},
 	}
 	for _, option := range options {

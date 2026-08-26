@@ -878,9 +878,9 @@ func (SocketOptionFactory) IPHeaderIncludedOnWrite(enabled bool) SocketOption {
 	return ipHeaderIncludedOnWriteSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
-// UnsetIPHeaderIncludedOnWrite restores protocol-payload writes, overriding
-// earlier IPHeaderIncludedOnWrite options in the same list. The unset marker
-// is valid for every socket creation operation.
+// UnsetIPHeaderIncludedOnWrite restores the current Stack IP write default,
+// overriding earlier IPHeaderIncludedOnWrite options in the same list. The
+// unset marker is valid for every socket creation operation.
 func (SocketOptionFactory) UnsetIPHeaderIncludedOnWrite() SocketOption {
 	return ipHeaderIncludedOnWriteSocketOption(socketOptionBoolOverrideUnset)
 }
@@ -892,13 +892,13 @@ func (option ipHeaderIncludedOnWriteSocketOption) apply(set socketOptionSet, use
 		return set, syscall.EINVAL
 	}
 	if override == socketOptionBoolOverrideUnset {
-		set.ip.headerIncludedOnWrite = false
+		set.ip.headerIncludedOnWrite = override
 		return set, nil
 	}
 	if use != socketOptionIPListen && use != socketOptionIPDial {
 		return set, syscall.ENOPROTOOPT
 	}
-	set.ip.headerIncludedOnWrite = override == socketOptionBoolOverrideEnabled
+	set.ip.headerIncludedOnWrite = override
 	return set, nil
 }
 
@@ -911,9 +911,9 @@ func (SocketOptionFactory) IPHeaderIncludedOnRead(enabled bool) SocketOption {
 	return ipHeaderIncludedOnReadSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
-// UnsetIPHeaderIncludedOnRead restores protocol-payload reads, overriding
-// earlier IPHeaderIncludedOnRead options in the same list. The unset marker is
-// valid for every socket creation operation.
+// UnsetIPHeaderIncludedOnRead restores the current Stack IP read default,
+// overriding earlier IPHeaderIncludedOnRead options in the same list. The
+// unset marker is valid for every socket creation operation.
 func (SocketOptionFactory) UnsetIPHeaderIncludedOnRead() SocketOption {
 	return ipHeaderIncludedOnReadSocketOption(socketOptionBoolOverrideUnset)
 }
@@ -925,13 +925,13 @@ func (option ipHeaderIncludedOnReadSocketOption) apply(set socketOptionSet, use 
 		return set, syscall.EINVAL
 	}
 	if override == socketOptionBoolOverrideUnset {
-		set.ip.headerIncludedOnRead = false
+		set.ip.headerIncludedOnRead = override
 		return set, nil
 	}
 	if use != socketOptionIPListen && use != socketOptionIPDial {
 		return set, syscall.ENOPROTOOPT
 	}
-	set.ip.headerIncludedOnRead = override == socketOptionBoolOverrideEnabled
+	set.ip.headerIncludedOnRead = override
 	return set, nil
 }
 
@@ -1065,8 +1065,8 @@ type datagramSocketOptionSet struct {
 
 // ipSocketOptionSet contains policies meaningful only to raw IP sockets.
 type ipSocketOptionSet struct {
-	headerIncludedOnWrite bool
-	headerIncludedOnRead  bool
+	headerIncludedOnWrite socketOptionBoolOverride
+	headerIncludedOnRead  socketOptionBoolOverride
 	icmpV4Filter          socketOptionOverride[ICMPv4Filter]
 	icmpV6Filter          socketOptionOverride[ICMPv6Filter]
 	ipv6Checksum          socketOptionOverride[ipv6ChecksumPolicy]
