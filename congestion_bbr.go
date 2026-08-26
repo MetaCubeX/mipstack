@@ -394,28 +394,6 @@ func (b *bbrCongestionControl) handlePacingEvent(event *CongestionEvent) {
 	}
 }
 
-// onACK is retained for controller-level tests and callers without packet
-// metadata. Established TCP uses finishRateSample and onRateSample instead.
-func (b *bbrCongestionControl) onACK(window, acknowledged uint32, mss int, now time.Time, smoothedRTT, sampleRTT time.Duration, flight uint32, applicationLimited bool) uint32 {
-	sample := tcpDeliveryRateSample{
-		priorDelivered: uint32(b.delivered) & tcpDeliveryDeliveredMask, delivered: acknowledged, acked: acknowledged,
-		priorInFlight: flight, inFlight: flight, interval: smoothedRTT, rtt: sampleRTT,
-		smoothedRTT: smoothedRTT, ackTime: now, applicationLimited: applicationLimited, valid: smoothedRTT > 0,
-	}
-	if acknowledged < sample.inFlight {
-		sample.inFlight -= acknowledged
-	} else {
-		sample.inFlight = 0
-	}
-	b.delivered += uint64(acknowledged)
-	if acknowledged != 0 {
-		b.deliveredStamp = tcpDeliveryTimestampAt(monotonicStamp(now.UnixNano()) + 1)
-	}
-	sample.ackStamp = b.deliveredStamp
-	window, _ = b.onRateSample(window, mss, &sample)
-	return window
-}
-
 // onRateSample updates BBR's path model, pacing rate, and congestion window.
 func (b *bbrCongestionControl) onRateSample(window uint32, mss int, sample *tcpDeliveryRateSample) (uint32, uint32) {
 	b.updateBandwidth(sample)

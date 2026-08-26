@@ -141,6 +141,7 @@ func buildNetworkState(config Config) (*networkState, error) {
 		local: make(map[netip.Addr]struct{}, len(config.LocalAddresses)), sources: make([]netip.Addr, 0, len(config.LocalAddresses)),
 		preferTemporary: config.PreferTemporaryAddresses,
 	}
+	configuredPrefixes := make(map[netip.Prefix]struct{}, len(config.LocalAddresses))
 	for _, prefix := range config.LocalAddresses {
 		address := prefix.Addr().Unmap()
 		if !prefix.IsValid() || !address.IsValid() || address.IsUnspecified() || address.IsMulticast() || address.Zone() != "" {
@@ -156,10 +157,28 @@ func buildNetworkState(config Config) (*networkState, error) {
 		if address.Is4() && isIPv4Broadcast(prefix, address, bits) {
 			return nil, errors.New("mipstack: IPv4 broadcast address cannot be local")
 		}
+		// LocalAddresses describes final state rather than a sequence of address
+		// additions, so repeated identical entries are idempotent.
+		configuredPrefix := netip.PrefixFrom(address, bits)
+		if _, duplicate := configuredPrefixes[configuredPrefix]; duplicate {
+			continue
+		}
+		configuredPrefixes[configuredPrefix] = struct{}{}
 		if _, exists := state.local[address]; !exists {
 			state.local[address] = struct{}{}
 			state.sources = append(state.sources, address)
 			state.sourcePrefixBits = append(state.sourcePrefixBits, bits)
+		} else {
+			// One source candidate represents every prefix of an address. Retaining
+			// the longest makes RFC 6724 rule 8 independent of prefix order.
+			for index, source := range state.sources {
+				if source == address {
+					if bits > state.sourcePrefixBits[index] {
+						state.sourcePrefixBits[index] = bits
+					}
+					break
+				}
+			}
 		}
 		masked := netip.PrefixFrom(address, bits).Masked()
 		state.localPrefixes = append(state.localPrefixes, masked)

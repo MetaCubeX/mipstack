@@ -579,6 +579,14 @@ func TestIPConnTypedWritesAndDeadlines(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
+	if err = writeTestPacket(stack, buildIPPacket(remote, local, 99, []byte("typed-read"), 1, true)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 16)
+	n, source, err := connection.(*IPConn).ReadFromIP(buffer)
+	if err != nil || string(buffer[:n]) != "typed-read" || source == nil || !source.IP.Equal(net.IP(remote.AsSlice())) {
+		t.Fatalf("ReadFromIP = %q from %v, %v", buffer[:n], source, err)
+	}
 	if connection.(*IPConn).RemoteAddr() != nil {
 		t.Fatalf("unconnected remote address = %v", connection.(*IPConn).RemoteAddr())
 	}

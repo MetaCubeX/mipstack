@@ -59,6 +59,39 @@ func TestMTUAndRouteFamilyValidation(t *testing.T) {
 	}
 }
 
+func TestLocalAddressNormalization(t *testing.T) {
+	ipv4 := netip.MustParsePrefix("192.0.2.15/32")
+	for _, duplicate := range []netip.Prefix{ipv4, netip.MustParsePrefix("2001:db8::15/64")} {
+		stack, duplicateErr := New(Config{LocalAddresses: []netip.Prefix{duplicate, duplicate}})
+		if duplicateErr != nil {
+			t.Fatalf("idempotent duplicate %s prefix was rejected: %v", duplicate.Addr(), duplicateErr)
+		}
+		if addresses := stack.LocalAddresses(); len(addresses) != 1 || addresses[0] != duplicate.Addr() || len(stack.network.Load().localPrefixes) != 1 {
+			t.Fatalf("duplicate %s prefix was not normalized: addresses %v, prefixes %v", duplicate.Addr(), addresses, stack.network.Load().localPrefixes)
+		}
+	}
+	sharedIPv4, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.MustParsePrefix("192.0.2.15/24"),
+		netip.MustParsePrefix("192.0.2.15/32"),
+	}})
+	if err != nil {
+		t.Fatalf("IPv4 address with two prefixes was rejected: %v", err)
+	}
+	if addresses := sharedIPv4.LocalAddresses(); len(addresses) != 1 || addresses[0] != ipv4.Addr() {
+		t.Fatalf("shared IPv4 local addresses = %v, want [%s]", addresses, ipv4.Addr())
+	}
+	sharedIPv6, err := New(Config{LocalAddresses: []netip.Prefix{
+		netip.MustParsePrefix("2001:db8::15/64"),
+		netip.MustParsePrefix("2001:db8::15/128"),
+	}})
+	if err != nil {
+		t.Fatalf("IPv6 address with two prefixes was rejected: %v", err)
+	}
+	if addresses := sharedIPv6.LocalAddresses(); len(addresses) != 1 || addresses[0] != netip.MustParseAddr("2001:db8::15") {
+		t.Fatalf("shared IPv6 local addresses = %v, want [2001:db8::15]", addresses)
+	}
+}
+
 func TestIPv4BroadcastPrefixBoundaries(t *testing.T) {
 	tests := []struct {
 		prefix    string
@@ -565,6 +598,9 @@ func TestRFC6724SourceScopePreference(t *testing.T) {
 			t.Fatalf("insufficient-scope source for %s = %v, %v, want %v", destination, source, sourceErr, linkLocal)
 		}
 	}
+	if _, sourceErr := limited.sourceForRequested(netip.MustParseAddr("ff0e::123"), linkLocal); !errors.Is(sourceErr, syscall.ENETUNREACH) {
+		t.Fatalf("explicit insufficient-scope multicast source = %v, want ENETUNREACH", sourceErr)
+	}
 
 	siteLocal := netip.MustParseAddr("fec0::10")
 	scoped, err := New(Config{LocalAddresses: []netip.Prefix{
@@ -722,6 +758,42 @@ func TestRFC6724CommonPrefixUsesSourcePrefixLength(t *testing.T) {
 	}
 }
 
+func TestRFC6724CommonPrefixUsesLongestRepeatedAddressPrefix(t *testing.T) {
+	for _, test := range []struct {
+		name                      string
+		other, repeated, target   netip.Addr
+		otherBits, short, longest int
+	}{
+		{"IPv4", netip.MustParseAddr("192.0.2.129"), netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"), 25, 24, 32},
+		{"IPv6", netip.MustParseAddr("2001:db8:1:8000::1"), netip.MustParseAddr("2001:db8:1::1"), netip.MustParseAddr("2001:db8:1::2"), 64, 32, 128},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, order := range []struct {
+				name        string
+				first, last int
+			}{
+				{"short-first", test.short, test.longest},
+				{"longest-first", test.longest, test.short},
+			} {
+				t.Run(order.name, func(t *testing.T) {
+					stack, err := New(Config{LocalAddresses: []netip.Prefix{
+						netip.PrefixFrom(test.other, test.otherBits),
+						netip.PrefixFrom(test.repeated, order.first),
+						netip.PrefixFrom(test.repeated, order.last),
+					}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					source, err := stack.sourceForRequested(test.target, netip.Addr{})
+					if err != nil || source != test.repeated {
+						t.Fatalf("repeated address longest-prefix source = %v, %v, want %v", source, err, test.repeated)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestUpdateConfigClosesInvalidBindings(t *testing.T) {
 	ipv4 := netip.MustParseAddr("192.0.2.40")
 	ipv6 := netip.MustParseAddr("2001:db8::40")
@@ -772,5 +844,47 @@ func TestUpdateConfigClosesInvalidBindings(t *testing.T) {
 	}
 	if _, err = stack.RouteFor(netip.MustParseAddr("198.51.100.1")); !errors.Is(err, syscall.ENETUNREACH) {
 		t.Fatalf("removed IPv4 route = %v, want ENETUNREACH", err)
+	}
+}
+
+func TestUpdateConfigClosesConnectedUnicastWithoutRoute(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.41")
+	remote := netip.MustParseAddr("198.51.100.41")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+
+	udpConnection, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 53))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ipConnection, err := stack.DialIP(context.Background(), "ip4:99", netip.Addr{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	multicast, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.MustParseAddrPort("224.0.0.251:5353"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)},
+		Routes:         []Route{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = udpConnection.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("connected UDP Read after route removal = %v, want net.ErrClosed", err)
+	}
+	if _, err = ipConnection.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("connected IP Read after route removal = %v, want net.ErrClosed", err)
+	}
+	if _, err = multicast.Write([]byte("still attached")); err != nil {
+		t.Fatalf("multicast Write without a unicast route = %v", err)
 	}
 }

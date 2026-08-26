@@ -1119,6 +1119,33 @@ func TestICMPForwarderDetachFailureCleansRequest(t *testing.T) {
 	}
 }
 
+func TestIPForwarderDetachFailureCleansRequest(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.70")
+	stack := newForwarderTestStack(t, local, false)
+	forwarder := &IPForwarder{
+		forwarderRuntime: &forwarderRuntime{stack: stack, done: make(chan struct{})},
+		requests:         make(map[*IPForwarderRequest]struct{}),
+	}
+	forwarder.closed.Store(true)
+	request := &IPForwarderRequest{
+		forwarder: forwarder,
+		packet: ipPacket{
+			source: netip.MustParseAddr("198.51.100.70"), target: local,
+			protocol: 99, payload: []byte("payload"), original: make([]byte, 27),
+		},
+	}
+	forwarder.requests[request] = struct{}{}
+	if responder, err := request.Detach(); responder != nil || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Detach on closed IP forwarder = %v, %v", responder, err)
+	}
+	if state := forwarderRequestState(request.state.Load()); state != forwarderRequestDropped {
+		t.Fatalf("failed Detach request state = %v, want dropped", state)
+	}
+	if info := forwarder.Info(); info.Pending != 0 || info.Dropped != 1 {
+		t.Fatalf("failed Detach forwarder info = %+v", info)
+	}
+}
+
 func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 	t.Run("TCP reject", func(t *testing.T) {
 		owned := netip.MustParseAddr("192.0.2.70")

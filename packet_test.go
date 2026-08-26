@@ -1894,6 +1894,113 @@ func FuzzPublicIPPacketCodec(f *testing.F) {
 	})
 }
 
+// FuzzPublicRawIPPacketCodec verifies the fixed-header guarantees and opaque
+// byte preservation that distinguish raw encoding from strict encoding.
+func FuzzPublicRawIPPacketCodec(f *testing.F) {
+	f.Add(false, []byte(nil), []byte("ipv4"), uint16(0), false, false, byte(99))
+	f.Add(false, []byte{IPv4HeaderOptionEnd, 0xaa, 0xbb}, []byte{1, 2, 3}, uint16(8191), true, true, byte(ProtocolUDP))
+	f.Add(true, []byte(nil), []byte("ipv6"), uint16(0), false, false, byte(253))
+	f.Add(true, []byte{0xff, 1, 2, 3}, []byte("extension"), uint16(3), true, false, byte(ProtocolUDP))
+	f.Add(true, make([]byte, 64), []byte("long-extension"), uint16(1), true, false, byte(ProtocolUDP))
+	ipv4Source := netip.MustParseAddr("192.0.2.1")
+	ipv4Destination := netip.MustParseAddr("198.51.100.1")
+	ipv6Source := netip.MustParseAddr("2001:db8::1")
+	ipv6Destination := netip.MustParseAddr("2001:db8:1::1")
+	extensionHeaderTypes := [...]uint8{
+		IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting, IPv6ExtensionHeaderFragment,
+		IPv6ExtensionHeaderAuthentication, IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderMobility,
+	}
+	f.Fuzz(func(t *testing.T, ipv6 bool, options, payload []byte, rawOffset uint16, more, dontFragment bool, protocol byte) {
+		if len(payload) > 4096 {
+			payload = payload[:4096]
+		}
+		ipv4Options := options
+		if len(ipv4Options) > 40 {
+			ipv4Options = ipv4Options[:40]
+		}
+		packet := IPPacket{
+			Source: ipv4Source, Destination: ipv4Destination,
+			Protocol: int(protocol), HopLimit: 64, DontFragment: dontFragment, MoreFragments: more,
+			FragmentOffset: int(rawOffset&0x1fff) * 8, IPv4Options: ipv4Options, Payload: payload,
+		}
+		expectedProtocol, expectedPayload := protocol, payload
+		if ipv6 {
+			packet.Source, packet.Destination = ipv6Source, ipv6Destination
+			packet.DontFragment, packet.MoreFragments, packet.FragmentOffset, packet.IPv4Options = false, false, 0, nil
+			if more {
+				extensionData := options
+				if len(extensionData) > 4096 {
+					extensionData = extensionData[:4096]
+				}
+				headerType := extensionHeaderTypes[int(rawOffset)%len(extensionHeaderTypes)]
+				if err := packet.SetRawIPv6ExtensionHeaders([]IPv6ExtensionHeader{{Type: headerType, Data: extensionData}}, int(protocol), payload); err != nil {
+					t.Fatal(err)
+				}
+				expectedProtocol = headerType
+				expectedPayload = append([]byte{protocol}, extensionData...)
+				expectedPayload = append(expectedPayload, payload...)
+			}
+		}
+		prefix := []byte{0xaa, 0xbb, 0xcc}
+		wire, err := packet.AppendRawBinary(append([]byte(nil), prefix...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(wire[:len(prefix)], prefix) {
+			t.Fatal("AppendRawBinary changed the destination prefix")
+		}
+		wire = wire[len(prefix):]
+		headerSize := 40
+		if !ipv6 {
+			headerSize = 20 + (len(ipv4Options)+3)&^3
+			if len(wire) != headerSize+len(payload) || wire[0] != 0x40|byte(headerSize/4) ||
+				binary.BigEndian.Uint16(wire[2:4]) != uint16(len(wire)) || wire[9] != protocol {
+				t.Fatalf("invalid raw IPv4 fixed header: %x", wire[:20])
+			}
+			if !bytes.Equal(wire[20:20+len(ipv4Options)], ipv4Options) || !bytes.Equal(wire[headerSize:], payload) {
+				t.Fatal("raw IPv4 encoding did not preserve options or payload")
+			}
+			fragment := uint16(packet.FragmentOffset / 8)
+			if packet.DontFragment {
+				fragment |= 0x4000
+			}
+			if packet.MoreFragments {
+				fragment |= 0x2000
+			}
+			if binary.BigEndian.Uint16(wire[6:8]) != fragment {
+				t.Fatal("raw IPv4 encoding did not preserve fragment fields")
+			}
+			for _, value := range wire[20+len(ipv4Options) : headerSize] {
+				if value != 0 {
+					t.Fatal("raw IPv4 alignment padding is not zero")
+				}
+			}
+			if referenceChecksum(wire[:headerSize]) != 0 {
+				t.Fatal("raw IPv4 header checksum is invalid")
+			}
+		} else {
+			if len(wire) != headerSize+len(expectedPayload) || wire[0]>>4 != 6 ||
+				binary.BigEndian.Uint16(wire[4:6]) != uint16(len(expectedPayload)) || wire[6] != expectedProtocol ||
+				!bytes.Equal(wire[headerSize:], expectedPayload) {
+				t.Fatalf("invalid raw IPv6 encoding: %x", wire)
+			}
+		}
+
+		overlap := packet
+		if ipv6 {
+			overlap.Payload = wire[40:]
+		} else {
+			overlap.IPv4Options = wire[20:headerSize]
+			overlap.Payload = wire[headerSize:]
+		}
+		expected := append([]byte(nil), wire...)
+		inPlace, err := overlap.AppendRawBinary(wire[:0])
+		if err != nil || !bytes.Equal(inPlace, expected) {
+			t.Fatalf("in-place raw packet append: error=%v\n got %x\nwant %x", err, inPlace, expected)
+		}
+	})
+}
+
 func FuzzPublicIPPacketMarshalFragments(f *testing.F) {
 	for _, seed := range []IPPacket{
 		{
@@ -2753,7 +2860,9 @@ func TestIPv4MappedIPv6WireDestinationIsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	packet := buildIPPacket(remote6, netip.MustParseAddr("::ffff:192.0.2.62"), 99, []byte{1}, 0, true)
+	packet := buildIPPacket(remote6, netip.MustParseAddr("2001:db8::62"), 99, []byte{1}, 0, true)
+	mapped := netip.MustParseAddr("::ffff:192.0.2.62").As16()
+	copy(packet[24:40], mapped[:])
 	before := stack.Stats().InboundDroppedPackets
 	if err = writeTestPacket(stack, packet); err != nil {
 		t.Fatal(err)

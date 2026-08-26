@@ -271,6 +271,33 @@ func TestBBR3TailLossProbeACKIsSampleScoped(t *testing.T) {
 	}
 }
 
+func TestBBR3TailLossProbeRecoveryBoundsRiskyProbe(t *testing.T) {
+	const mss = 1000
+	now := time.Unix(100, 0)
+	bbr := newBBR3CongestionControl()
+	bbr.mode = bbrProbeBandwidth
+	bbr.probePhase = bbr3ProbeUp
+	bbr.probeSamples = true
+	bbr.latestInflight = 20_000
+	bbr.bandwidthHigh[1] = 1_000_000
+	bbr.minimumRTT = 10 * time.Millisecond
+	state := CongestionState{
+		CongestionWindow: 20_000, MaximumSegmentSize: mss,
+		DeliveredBytes: 100_000,
+	}
+	packetState := bbr3EncodePacketState(&CongestionState{BytesInFlight: 19_000}, mss)
+	bbr.HandleCongestionEvent(&CongestionEvent{
+		Type: CongestionEventTailLossProbeRecovered, Time: now, State: &state,
+		PacketBytes: mss, PacketState: packetState,
+	})
+	if bbr.lossRoundDelivered != 100_000 {
+		t.Fatalf("TLP loss-round boundary = %d, want 100000", bbr.lossRoundDelivered)
+	}
+	if bbr.inflightHigh == 0 || bbr.probeSamples || bbr.probePhase != bbr3ProbeDown {
+		t.Fatalf("TLP probe response = inflight_hi %d samples %t phase %s", bbr.inflightHigh, bbr.probeSamples, bbr.probePhase.String())
+	}
+}
+
 func TestTCPBBR3ObservesAmbiguousTailLossProbeACK(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.190")
 	remote := netip.MustParseAddr("192.0.2.191")

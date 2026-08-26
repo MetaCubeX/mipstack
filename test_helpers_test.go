@@ -27,6 +27,15 @@ func testTCPReadBufferBytes(buffer *tcpReadBuffer) []byte {
 	return payload
 }
 
+// mustTestWire turns a production codec failure into an immediate fixture
+// failure. Callers use it only after supplying fields that the test controls.
+func mustTestWire(wire []byte, err error) []byte {
+	if err != nil {
+		panic("mipstack: invalid test wire fixture: " + err.Error())
+	}
+	return wire
+}
+
 // buildIPPacket constructs a packet with default output fields for tests.
 func buildIPPacket(source, target netip.Addr, protocol byte, payload []byte, identification uint16, dontFragment bool) []byte {
 	return buildIPPacketWithOptions(source, target, protocol, payload, identification, dontFragment, ipPacketOptions{})
@@ -46,8 +55,7 @@ func buildIPPacketWithOptions(source, target netip.Addr, protocol byte, payload 
 		packet.DontFragment = dontFragment
 		packet.FlowLabel = 0
 	}
-	wire, _ := packet.MarshalBinary()
-	return wire
+	return mustTestWire(packet.MarshalBinary())
 }
 
 // buildIPv4Fragments constructs default-field IPv4 fragments for tests.
@@ -59,11 +67,14 @@ func buildIPv4Fragments(source, target netip.Addr, protocol byte, payload []byte
 // public fragment codec with explicit output fields.
 func buildIPv4FragmentsWithOptions(source, target netip.Addr, protocol byte, payload []byte, mtu int, identification uint16, options ipPacketOptions) [][]byte {
 	options = options.normalized()
-	packets, _ := (IPPacket{
+	packets, err := (IPPacket{
 		Source: source, Destination: target, Protocol: int(protocol),
 		HopLimit: int(options.hopLimit), TrafficClass: int(options.trafficClass),
 		Identification: identification, Payload: payload,
 	}).MarshalFragments(mtu, 0)
+	if err != nil {
+		panic("mipstack: invalid IPv4 fragment fixture: " + err.Error())
+	}
 	return packets
 }
 
@@ -71,11 +82,14 @@ func buildIPv4FragmentsWithOptions(source, target netip.Addr, protocol byte, pay
 // public fragment codec with explicit output fields.
 func buildIPv6FragmentsWithOptions(source, target netip.Addr, protocol byte, payload []byte, mtu int, identification uint32, options ipPacketOptions) [][]byte {
 	options = options.normalized()
-	packets, _ := (IPPacket{
+	packets, err := (IPPacket{
 		Source: source, Destination: target, Protocol: int(protocol),
 		HopLimit: int(options.hopLimit), TrafficClass: int(options.trafficClass),
 		FlowLabel: options.flowLabel, Payload: payload,
 	}).MarshalFragments(mtu, identification)
+	if err != nil {
+		panic("mipstack: invalid IPv6 fragment fixture: " + err.Error())
+	}
 	return packets
 }
 
@@ -825,25 +839,14 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 
 // hasTCPOption reports whether a well-formed option list contains kind.
 func hasTCPOption(options []byte, kind byte) bool {
-	for offset := 0; offset < len(options); {
-		if options[offset] == kind {
+	parsed, err := (TCPSegment{Options: options}).HeaderOptions()
+	if err != nil {
+		return false
+	}
+	for _, option := range parsed {
+		if option.Kind == kind {
 			return true
 		}
-		if options[offset] == 0 {
-			return false
-		}
-		if options[offset] == 1 {
-			offset++
-			continue
-		}
-		if len(options)-offset < 2 {
-			return false
-		}
-		length := int(options[offset+1])
-		if length < 2 || length > len(options)-offset {
-			return false
-		}
-		offset += length
 	}
 	return false
 }
@@ -858,14 +861,19 @@ func testSACKOptions(outOfOrder map[uint32][]byte) []byte {
 	if len(sequences) > 4 {
 		sequences = sequences[len(sequences)-4:]
 	}
-	options := make([]byte, 2+8*len(sequences))
-	options[0], options[1] = 5, byte(len(options))
+	blocks := make([]TCPSACKBlock, len(sequences))
 	for index, sequence := range sequences {
-		offset := 2 + index*8
-		binary.BigEndian.PutUint32(options[offset:offset+4], sequence)
-		binary.BigEndian.PutUint32(options[offset+4:offset+8], sequence+uint32(len(outOfOrder[sequence])))
+		blocks[index] = TCPSACKBlock{LeftEdge: sequence, RightEdge: sequence + uint32(len(outOfOrder[sequence]))}
 	}
-	return options
+	var option TCPHeaderOption
+	if err := option.SetSACKBlocks(blocks); err != nil {
+		panic("mipstack: invalid SACK fixture: " + err.Error())
+	}
+	segment := TCPSegment{}
+	if err := segment.SetHeaderOptions([]TCPHeaderOption{option}); err != nil {
+		panic("mipstack: invalid TCP option fixture: " + err.Error())
+	}
+	return segment.Options
 }
 
 // waitFor polls a test-owned condition until it succeeds or its deadline
@@ -916,18 +924,7 @@ func (l *testPacketLink) deliverTCP(sourcePort, targetPort uint16, sequence, ack
 		flags |= TCPFlagECE
 	}
 	l.mu.Unlock()
-	headerSize := tcpHeaderSize + (len(options)+3)&^3
-	tcp := make([]byte, headerSize+len(payload))
-	binary.BigEndian.PutUint16(tcp[0:2], sourcePort)
-	binary.BigEndian.PutUint16(tcp[2:4], targetPort)
-	binary.BigEndian.PutUint32(tcp[4:8], sequence)
-	binary.BigEndian.PutUint32(tcp[8:12], acknowledgement)
-	tcp[12], tcp[13] = byte(headerSize/4)<<4, flags
-	binary.BigEndian.PutUint16(tcp[14:16], window)
-	copy(tcp[tcpHeaderSize:headerSize], options)
-	copy(tcp[headerSize:], payload)
-	binary.BigEndian.PutUint16(tcp[16:18], transportChecksum(l.remote, l.local, ProtocolTCP, tcp))
-	packet := buildIPPacket(l.remote, l.local, ProtocolTCP, tcp, 1, true)
+	packet := buildTestTCP(l.remote, l.local, sourcePort, targetPort, sequence, acknowledgement, flags, window, options, payload)
 	if markCE {
 		setPacketECN(packet, 3)
 	}
@@ -977,74 +974,47 @@ func fillTestPacketQueue(t *testing.T, queue *packetQueue, packet []byte) {
 // buildTestPacketTooBig quotes an emitted packet in an IPv4 fragmentation-
 // needed or IPv6 Packet Too Big error.
 func buildTestPacketTooBig(reporter, target netip.Addr, quoted []byte, mtu uint32) []byte {
-	icmp := make([]byte, 8+len(quoted))
-	copy(icmp[8:], quoted)
-	protocol := byte(ProtocolICMPv6)
+	messageType, code, protocol := byte(ICMPv6TypePacketTooBig), byte(ICMPCodeNone), byte(ProtocolICMPv6)
 	if reporter.Is4() {
-		protocol = ProtocolICMPv4
-		icmp[0], icmp[1] = 3, 4
-		binary.BigEndian.PutUint16(icmp[6:8], uint16(mtu))
-		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	} else {
-		icmp[0] = 2
-		binary.BigEndian.PutUint32(icmp[4:8], mtu)
-		binary.BigEndian.PutUint16(icmp[2:4], transportChecksum(reporter, target, protocol, icmp))
+		messageType, code, protocol = ICMPv4TypeDestinationUnreachable, ICMPv4DestinationUnreachableCodeFragmentationNeeded, ProtocolICMPv4
 	}
+	message, err := (ICMPError{Reporter: reporter, Type: messageType, Code: code, MTU: mtu, QuotedPacket: quoted}).ICMPMessage(target)
+	if err != nil {
+		panic("mipstack: invalid ICMP error fixture: " + err.Error())
+	}
+	icmp := mustTestWire(message.MarshalBinary())
 	return buildIPPacket(reporter, target, protocol, icmp, 1, true)
 }
 
 // buildTestUDP constructs one checksummed test datagram.
 func buildTestUDP(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte) []byte {
-	udp := make([]byte, udpHeaderSize+len(payload))
-	binary.BigEndian.PutUint16(udp[0:2], sourcePort)
-	binary.BigEndian.PutUint16(udp[2:4], targetPort)
-	binary.BigEndian.PutUint16(udp[4:6], uint16(len(udp)))
-	copy(udp[udpHeaderSize:], payload)
-	value := transportChecksum(source, target, ProtocolUDP, udp)
-	if value == 0 {
-		value = 0xffff
-	}
-	binary.BigEndian.PutUint16(udp[6:8], value)
+	udp := mustTestWire((UDPDatagram{
+		Source: netip.AddrPortFrom(source, sourcePort), Destination: netip.AddrPortFrom(target, targetPort), Payload: payload,
+	}).MarshalBinary())
 	return buildIPPacket(source, target, ProtocolUDP, udp, 1, false)
 }
 
 // buildTestTCP constructs one checksummed test segment.
 func buildTestTCP(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte) []byte {
-	headerSize := tcpHeaderSize + (len(options)+3)&^3
-	tcp := make([]byte, headerSize+len(payload))
-	binary.BigEndian.PutUint16(tcp[0:2], sourcePort)
-	binary.BigEndian.PutUint16(tcp[2:4], targetPort)
-	binary.BigEndian.PutUint32(tcp[4:8], sequence)
-	binary.BigEndian.PutUint32(tcp[8:12], acknowledgement)
-	tcp[12], tcp[13] = byte(headerSize/4)<<4, flags
-	binary.BigEndian.PutUint16(tcp[14:16], window)
-	copy(tcp[tcpHeaderSize:headerSize], options)
-	copy(tcp[headerSize:], payload)
-	binary.BigEndian.PutUint16(tcp[16:18], transportChecksum(source, target, ProtocolTCP, tcp))
+	tcp := mustTestWire((TCPSegment{
+		Source: netip.AddrPortFrom(source, sourcePort), Destination: netip.AddrPortFrom(target, targetPort),
+		SequenceNumber: sequence, AcknowledgmentNumber: acknowledgement, Flags: uint16(flags), WindowSize: window,
+		Options: options, Payload: payload,
+	}).MarshalBinary())
 	return buildIPPacket(source, target, ProtocolTCP, tcp, 1, true)
 }
 
 func buildTestIPv4Options(source, target netip.Addr, options []byte) []byte {
-	packet := make([]byte, 20+len(options)+8)
-	packet[0] = 0x40 | byte((20+len(options))/4)
-	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
-	packet[8], packet[9] = 64, ProtocolUDP
-	copy(packet[12:16], source.AsSlice())
-	copy(packet[16:20], target.AsSlice())
-	copy(packet[20:], options)
-	binary.BigEndian.PutUint16(packet[20+len(options):22+len(options)], 1)
-	binary.BigEndian.PutUint16(packet[22+len(options):24+len(options)], 1)
-	binary.BigEndian.PutUint16(packet[24+len(options):26+len(options)], 8)
-	binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:20+len(options)]))
-	return packet
+	udp := mustTestWire((UDPDatagram{
+		Source: netip.AddrPortFrom(source, 1), Destination: netip.AddrPortFrom(target, 1), ChecksumDisabled: true,
+	}).MarshalBinary())
+	return mustTestWire((IPPacket{
+		Source: source, Destination: target, Protocol: ProtocolUDP, HopLimit: 64, IPv4Options: options, Payload: udp,
+	}).MarshalRawBinary())
 }
 
 func buildTestIPv6Extension(source, target netip.Addr, extensionType byte, extension []byte) []byte {
-	packet := make([]byte, 40+len(extension))
-	packet[0], packet[6], packet[7] = 0x60, extensionType, 64
-	binary.BigEndian.PutUint16(packet[4:6], uint16(len(extension)))
-	copy(packet[8:24], source.AsSlice())
-	copy(packet[24:40], target.AsSlice())
-	copy(packet[40:], extension)
-	return packet
+	return mustTestWire((IPPacket{
+		Source: source, Destination: target, Protocol: int(extensionType), HopLimit: 64, Payload: extension,
+	}).MarshalRawBinary())
 }

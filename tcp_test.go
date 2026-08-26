@@ -4569,6 +4569,19 @@ func TestTCPNetworkErrorQueueIsLazyBoundedAndOrdered(t *testing.T) {
 	if got, ok := connection.takeNetworkError(); ok || got != nil {
 		t.Fatalf("empty network-error queue returned %v, %v", got, ok)
 	}
+	for index := 0; index < 2; index++ {
+		connection.deliverError(errorsByIndex[index])
+	}
+	retainedCapacity := cap(connection.pending.networkErrors)
+	connection.discardNetworkErrors()
+	if got := len(connection.pending.networkErrors); got != 0 || cap(connection.pending.networkErrors) != retainedCapacity {
+		t.Fatalf("discarded network-error queue = len %d cap %d, want len 0 cap %d", got, cap(connection.pending.networkErrors), retainedCapacity)
+	}
+	for _, retained := range connection.pending.networkErrors[:retainedCapacity] {
+		if retained != nil {
+			t.Fatalf("discarded network-error queue retained %v", retained)
+		}
+	}
 }
 
 func TestTCPReadNotificationIsLazyAndCannotMissWake(t *testing.T) {
@@ -6571,7 +6584,7 @@ func FuzzTCPEstablishedSegmentSequence(f *testing.F) {
 			}
 			window := binary.BigEndian.Uint16(event[3:5])
 			payload := bytes.Repeat(event[7:8], int(event[5]&15))
-			var options []byte
+			var options, rawOptions []byte
 			switch event[6] & 3 {
 			case 1:
 				options = tcpTimestampOptions(uint32(event[7])<<24|uint32(event[0]), uint32(event[1]))
@@ -6583,9 +6596,19 @@ func FuzzTCPEstablishedSegmentSequence(f *testing.F) {
 				binary.BigEndian.PutUint32(options[4:8], left)
 				binary.BigEndian.PutUint32(options[8:12], right)
 			case 3:
-				options = append([]byte(nil), event[4:8]...)
+				rawOptions = event[4:8]
+				options = []byte{TCPHeaderOptionEnd, 0, 0, 0}
 			}
 			packet := buildTestTCP(remote, local, 8080, connection.key.local.Port(), sequence, acknowledgement, flags, window, options, payload)
+			if rawOptions != nil {
+				parsed, parseErr := ParseIPPacket(packet)
+				if parseErr != nil {
+					t.Fatal(parseErr)
+				}
+				copy(parsed.Payload[tcpHeaderSize:tcpHeaderSize+len(rawOptions)], rawOptions)
+				binary.BigEndian.PutUint16(parsed.Payload[16:18], 0)
+				binary.BigEndian.PutUint16(parsed.Payload[16:18], transportChecksum(remote, local, ProtocolTCP, parsed.Payload))
+			}
 			if event[6]&0x10 != 0 {
 				setPacketECN(packet, 3)
 			}
@@ -6999,6 +7022,28 @@ func TestTCPSetLingerWaitsAndTimesOut(t *testing.T) {
 		peer := link.tcp[port]
 		return peer != nil && peer.resetSeen
 	})
+}
+
+func TestTCPSetLingerStopsAfterOrderlyClose(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.73"), netip.MustParseAddr("198.51.100.73"))
+	link.mu.Lock()
+	link.echoTCP = true
+	link.mu.Unlock()
+	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8093))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcpConnection := connection.(*TCPConn)
+	if err = tcpConnection.SetLinger(5); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	if err = tcpConnection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("orderly positive-linger Close duration = %v, want completion before timeout", elapsed)
+	}
 }
 
 func TestTCPLingerDurationSaturates(t *testing.T) {

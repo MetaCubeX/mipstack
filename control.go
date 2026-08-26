@@ -555,7 +555,7 @@ func parseControlMessageForWrite(control []byte, v6 bool) (netip.Addr, ipPacketO
 }
 
 // parseLinuxIPControlValues validates cmsghdr framing and extracts raw values.
-// Empty control data selects routing and default header values. receiving
+// Empty control data selects routing and default header values. Receiving
 // permits the zero hop value that can be observed at a local destination.
 func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPacketOptions, error) {
 	var address netip.Addr

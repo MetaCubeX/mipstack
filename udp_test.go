@@ -1229,6 +1229,11 @@ func TestUDPTypedMethods(t *testing.T) {
 	if packet, ok := parseIPPacket(readOutboundPacket(t, stack)); !ok || packet.source != local || string(packet.payload[udpHeaderSize:]) != "typed-port" {
 		t.Fatalf("WriteToUDPAddrPort packet = source %v payload %q, parsed = %v", packet.source, packet.payload, ok)
 	}
+	if _, err = connection.WriteToUDPAddrPort([]byte("invalid"), netip.AddrPort{}); err == nil {
+		t.Fatal("WriteToUDPAddrPort accepted an invalid address")
+	} else if operationError := checkNetOpError(t, err, "write", "udp"); operationError.Addr == nil || operationError.Addr.Network() != "udp" {
+		t.Fatalf("WriteToUDPAddrPort error address = %#v", operationError.Addr)
+	}
 }
 
 func TestUDPMessagePacketInfoRoundTrip(t *testing.T) {

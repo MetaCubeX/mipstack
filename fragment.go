@@ -1271,12 +1271,6 @@ func (s *Stack) writeIPPayload(source, target netip.Addr, protocol byte, payload
 	return s.tryWriteIPPayloadForMTU(source, target, protocol, payload, fragmentation, ipPacketOptions{}, s.mtuFor(target))
 }
 
-// writeIPPayloadUntilOptions emits raw IP output with mutable deadline state.
-func (s *Stack) writeIPPayloadUntilOptions(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool, options ipPacketOptions, state socketWriteState) error {
-	fragmentation := sourceFragmentation{allow: allowFragment, dontFragment: !allowFragment}
-	return s.writeIPPayloadUntilOptionsForMTU(source, target, protocol, payload, fragmentation, options, s.mtuFor(target), state)
-}
-
 // writeIPFragmentsUntilLayout writes a validated fragment layout directly into
 // reserved queue storage. first and second are adjacent logical payload regions;
 // this lets UDP prepend its virtual header without gathering the datagram.

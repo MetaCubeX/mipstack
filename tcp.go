@@ -7113,6 +7113,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		}
 		offset := int(state.sendNext - state.sendUnacknowledged)
 		total, writeClosed, sendBufferLimited := c.sendState()
+		// Keep the window-validation and ECN-hold clocks local to their
+		// decisions. Short-circuiting means only built-in window validation
+		// during an active hold reads both clocks; sharing one would optimize
+		// that uncommon overlap while making the hold expiry use an older time.
 		if !state.controller.customWindowValidation() {
 			state.validateCongestionWindow(monotonicStampAt(c.stack.timestampEpoch, time.Now()), total-offset, sendBufferLimited)
 		}
@@ -9345,17 +9349,6 @@ func isolatedPLPMTUProbeLoss(outstanding []sentTCPSegment, probeStart, highestSA
 		}
 	}
 	return true
-}
-
-// outstandingBytes returns bytes currently counted in the congestion pipe.
-func outstandingBytes(outstanding []sentTCPSegment, includeSACKed bool) uint32 {
-	var bytes uint32
-	for _, segment := range outstanding {
-		if includeSACKed || !segment.state.has(sentTCPSegmentSACKed) {
-			bytes += segment.end - segment.sequence
-		}
-	}
-	return bytes
 }
 
 // lossRecoveryFlightSize applies RFC 3042's exception: data sent by Limited

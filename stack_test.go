@@ -793,6 +793,29 @@ func TestDatagramQueueRetainsOnlySmallBacking(t *testing.T) {
 	if queue.values != nil || queue.head != 0 {
 		t.Fatalf("large drained queue retained len %d cap %d head %d", len(queue.values), cap(queue.values), queue.head)
 	}
+
+	values := [6]int{0, 1, 2, 3, 4, 5}
+	compacted := datagramQueue[*int]{values: make([]*int, 4, 4)}
+	for index := range compacted.values {
+		compacted.values[index] = &values[index]
+	}
+	for index := 0; index < 2; index++ {
+		if got, ok := compacted.pop(); !ok || got != &values[index] {
+			t.Fatalf("compaction prefix pop = %v, %v, want %v, true", got, ok, &values[index])
+		}
+	}
+	compacted.push(&values[4])
+	compacted.push(&values[5])
+	for index := 2; index < len(values); index++ {
+		if got, ok := compacted.pop(); !ok || got != &values[index] {
+			t.Fatalf("compacted queue pop = %v, %v, want %v, true", got, ok, &values[index])
+		}
+	}
+	for _, retained := range compacted.values[:cap(compacted.values)] {
+		if retained != nil {
+			t.Fatalf("drained compacted queue retained %v", retained)
+		}
+	}
 }
 
 // TestDatagramSocketLayouts locks the cold-state split to the intended 64-bit
