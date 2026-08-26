@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -19,6 +20,251 @@ import (
 	"time"
 	"unsafe"
 )
+
+func TestPublicTCPSegmentCodecKnownAnswers(t *testing.T) {
+	tests := []struct {
+		name    string
+		packet  string
+		segment TCPSegment
+	}{
+		{
+			name: "Linux IPv4 SYN",
+			packet: "4500003c5053400040066665c0000201c0000202" +
+				"b5fa01bbe3655ed100000000a002faf0e3b40000" +
+				"020405b40402080ad7fe1368000000000103030a",
+			segment: TCPSegment{
+				Source: netip.MustParseAddrPort("192.0.2.1:46586"), Destination: netip.MustParseAddrPort("192.0.2.2:443"),
+				SequenceNumber: 0xe3655ed1, Flags: TCPFlagSYN, WindowSize: 0xfaf0,
+				Options: mustCodecVector(t, "020405b40402080ad7fe1368000000000103030a"),
+			},
+		},
+		{
+			name: "IPv6 odd payload",
+			packet: "6ab543210025062520010db8000000000000000000000001" +
+				"20010db8000000000000000000000002" +
+				"5ba020fb01020304a0b0c0d080184567d9560000" +
+				"0101080a11223344556677880102030405",
+			segment: TCPSegment{
+				Source: netip.MustParseAddrPort("[2001:db8::1]:23456"), Destination: netip.MustParseAddrPort("[2001:db8::2]:8443"),
+				SequenceNumber: 0x01020304, AcknowledgmentNumber: 0xa0b0c0d0,
+				Flags: TCPFlagACK | TCPFlagPSH, WindowSize: 0x4567,
+				Options: mustCodecVector(t, "0101080a1122334455667788"), Payload: mustCodecVector(t, "0102030405"),
+			},
+		},
+		{
+			name: "IPv4 SACK",
+			packet: "45000048999940004006b4dfc6336402c0000201" +
+				"01bbb5fa1111111122222222d0101000562e0000" +
+				"0101080a01020304050607080101051200001000000020000000300000004000",
+			segment: TCPSegment{
+				Source: netip.MustParseAddrPort("198.51.100.2:443"), Destination: netip.MustParseAddrPort("192.0.2.1:46586"),
+				SequenceNumber: 0x11111111, AcknowledgmentNumber: 0x22222222,
+				Flags: TCPFlagACK, WindowSize: 0x1000,
+				Options: mustCodecVector(t, "0101080a01020304050607080101051200001000000020000000300000004000"),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			packet, err := ParseIPPacket(mustCodecVector(t, test.packet))
+			if err != nil {
+				t.Fatal(err)
+			}
+			segment, err := packet.TCPSegment()
+			if err != nil {
+				t.Fatalf("TCPSegment: %v", err)
+			}
+			if !equalTCPSegments(segment, test.segment) {
+				t.Fatalf("parsed segment = %+v, want %+v", segment, test.segment)
+			}
+			encoded, err := test.segment.MarshalBinary()
+			if err != nil || !bytes.Equal(encoded, packet.Payload) {
+				t.Fatalf("MarshalBinary: error=%v\n got %x\nwant %x", err, encoded, packet.Payload)
+			}
+			assertTCPSegmentWire(t, test.segment, encoded)
+		})
+	}
+
+	linuxPacket, err := ParseIPPacket(mustCodecVector(t, tests[0].packet))
+	if err != nil {
+		t.Fatal(err)
+	}
+	linuxSYN, err := linuxPacket.TCPSegment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, err := linuxSYN.HeaderOptions()
+	if err != nil || len(options) != 5 {
+		t.Fatalf("Linux SYN options = %+v, %v", options, err)
+	}
+	if mss, ok := options[0].MaximumSegmentSize(); !ok || mss != 1460 || !options[1].IsSACKPermitted() {
+		t.Fatalf("Linux SYN MSS/SACK = %d/%t, SACK=%t", mss, ok, options[1].IsSACKPermitted())
+	}
+	if value, echo, ok := options[2].Timestamp(); !ok || value != 0xd7fe1368 || echo != 0 {
+		t.Fatalf("Linux SYN Timestamp = %#x/%#x/%t", value, echo, ok)
+	}
+	if scale, ok := options[4].WindowScale(); !ok || scale != 10 || options[3].Kind != TCPHeaderOptionNOP {
+		t.Fatalf("Linux SYN NOP/Window Scale = %d/%t, NOP=%d", scale, ok, options[3].Kind)
+	}
+
+	sackPacket, err := ParseIPPacket(mustCodecVector(t, tests[2].packet))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sackSegment, err := sackPacket.TCPSegment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sackOptions, err := sackSegment.HeaderOptions()
+	if err != nil || len(sackOptions) != 6 {
+		t.Fatalf("SACK options = %+v, %v", sackOptions, err)
+	}
+	blocks, ok := sackOptions[5].SACKBlocks()
+	wantBlocks := []TCPSACKBlock{{LeftEdge: 0x1000, RightEdge: 0x2000}, {LeftEdge: 0x3000, RightEdge: 0x4000}}
+	if !ok || !reflect.DeepEqual(blocks, wantBlocks) {
+		t.Fatalf("SACK blocks = %+v/%t, want %+v", blocks, ok, wantBlocks)
+	}
+}
+
+func TestPublicTCPSegmentCodecKnownAnswerMutations(t *testing.T) {
+	base := mustCodecVector(t, "4500003c5053400040066665c0000201c0000202"+
+		"b5fa01bbe3655ed100000000a002faf0e3b40000020405b40402080ad7fe1368000000000103030a")
+	tests := []struct {
+		name   string
+		mutate func(IPPacket, []byte)
+	}{
+		{name: "checksum", mutate: func(_ IPPacket, payload []byte) { payload[16] ^= 1 }},
+		{name: "short data offset", mutate: func(packet IPPacket, payload []byte) {
+			payload[12] = payload[12]&0x0f | 4<<4
+			repairReferenceTransportChecksum(packet.Source, packet.Destination, ProtocolTCP, payload, 16)
+		}},
+		{name: "malformed option length", mutate: func(packet IPPacket, payload []byte) {
+			payload[21] = 1
+			repairReferenceTransportChecksum(packet.Source, packet.Destination, ProtocolTCP, payload, 16)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			packet, err := ParseIPPacket(base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := append([]byte(nil), packet.Payload...)
+			packet.Payload = payload
+			test.mutate(packet, payload)
+			before := append([]byte(nil), payload...)
+			if _, err = packet.TCPSegment(); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("TCPSegment error = %v, want EINVAL", err)
+			}
+			if !bytes.Equal(payload, before) {
+				t.Fatal("failed TCP parse modified its input")
+			}
+		})
+	}
+}
+
+// FuzzPublicTCPSegmentWireEncoding covers valid fixed fields, standard option
+// forms, padding, payload ownership, and both pseudo-header formats.
+func FuzzPublicTCPSegmentWireEncoding(f *testing.F) {
+	f.Add(false, uint16(12345), uint16(443), uint32(1), uint32(0), uint16(TCPFlagSYN),
+		uint16(65535), uint16(0), byte(1), []byte(nil))
+	f.Add(true, uint16(8443), uint16(49152), uint32(0xffffffff), uint32(7), uint16(TCPFlagACK|TCPFlagPSH),
+		uint16(4096), uint16(0), byte(2), []byte("odd"))
+	f.Fuzz(func(t *testing.T, ipv6 bool, sourcePort, destinationPort uint16, sequence, acknowledgement uint32,
+		flags, window, urgent uint16, optionForm byte, payload []byte) {
+		if len(payload) > 4096 {
+			payload = payload[:4096]
+		}
+		flags &= TCPFlagFIN | TCPFlagSYN | TCPFlagRST | TCPFlagPSH | TCPFlagACK | TCPFlagURG | TCPFlagECE | TCPFlagCWR | TCPFlagNS
+		segment := TCPSegment{
+			Source:         netip.AddrPortFrom(netip.MustParseAddr("192.0.2.102"), sourcePort),
+			Destination:    netip.AddrPortFrom(netip.MustParseAddr("198.51.100.102"), destinationPort),
+			SequenceNumber: sequence, AcknowledgmentNumber: acknowledgement,
+			Flags: flags, WindowSize: window, UrgentPointer: urgent, Payload: payload,
+		}
+		switch optionForm % 5 {
+		case 1:
+			segment.Options = []byte{TCPHeaderOptionMSS, 4, byte(window >> 8), byte(window)}
+		case 2:
+			segment.Options = []byte{TCPHeaderOptionNOP, TCPHeaderOptionNOP, TCPHeaderOptionTimestamp, 10,
+				byte(sequence >> 24), byte(sequence >> 16), byte(sequence >> 8), byte(sequence),
+				byte(acknowledgement >> 24), byte(acknowledgement >> 16), byte(acknowledgement >> 8), byte(acknowledgement)}
+		case 3:
+			segment.Options = []byte{TCPHeaderOptionEnd, 0xaa, 0xbb, 0xcc}
+		case 4:
+			segment.Options = []byte{TCPHeaderOptionSACK, 10,
+				byte(sequence >> 24), byte(sequence >> 16), byte(sequence >> 8), byte(sequence),
+				byte(acknowledgement >> 24), byte(acknowledgement >> 16), byte(acknowledgement >> 8), byte(acknowledgement)}
+		}
+		if ipv6 {
+			segment.Source = netip.AddrPortFrom(netip.MustParseAddr("2001:db8::102"), sourcePort)
+			segment.Destination = netip.AddrPortFrom(netip.MustParseAddr("2001:db8:1::102"), destinationPort)
+		}
+		wire, err := segment.AppendBinary(nil)
+		if err != nil {
+			t.Fatalf("AppendBinary: %v", err)
+		}
+		assertTCPSegmentWire(t, segment, wire)
+		packet := IPPacket{Source: segment.Source.Addr(), Destination: segment.Destination.Addr(), Protocol: ProtocolTCP, Payload: wire}
+		if _, err = packet.TCPSegment(); err != nil {
+			t.Fatalf("TCPSegment(encoded segment): %v", err)
+		}
+	})
+}
+
+// equalTCPSegments compares semantic slice contents rather than slice headers.
+func equalTCPSegments(left, right TCPSegment) bool {
+	return left.Source == right.Source && left.Destination == right.Destination &&
+		left.SequenceNumber == right.SequenceNumber && left.AcknowledgmentNumber == right.AcknowledgmentNumber &&
+		left.Flags == right.Flags && left.WindowSize == right.WindowSize && left.UrgentPointer == right.UrgentPointer &&
+		bytes.Equal(left.Options, right.Options) && bytes.Equal(left.Payload, right.Payload)
+}
+
+// assertTCPSegmentWire compares TCP fields, canonical options, payload, and
+// pseudo-header checksum without parsing through the production codec.
+func assertTCPSegmentWire(t testing.TB, segment TCPSegment, wire []byte) {
+	t.Helper()
+	headerSize := tcpHeaderSize + (len(segment.Options)+3)&^3
+	if len(wire) != headerSize+len(segment.Payload) || wire[12]>>4 != byte(headerSize/4) || wire[12]&0x0e != 0 {
+		t.Fatalf("TCP wire length/data offset/reserved bits = %d/%d/%#x", len(wire), wire[12]>>4, wire[12]&0x0e)
+	}
+	if binary.BigEndian.Uint16(wire[0:2]) != segment.Source.Port() ||
+		binary.BigEndian.Uint16(wire[2:4]) != segment.Destination.Port() ||
+		binary.BigEndian.Uint32(wire[4:8]) != segment.SequenceNumber ||
+		binary.BigEndian.Uint32(wire[8:12]) != segment.AcknowledgmentNumber ||
+		uint16(wire[13])|uint16(wire[12]&1)<<8 != segment.Flags ||
+		binary.BigEndian.Uint16(wire[14:16]) != segment.WindowSize ||
+		binary.BigEndian.Uint16(wire[18:20]) != segment.UrgentPointer {
+		t.Fatalf("TCP fixed fields do not match semantic value: %x", wire[:tcpHeaderSize])
+	}
+	contentSize := len(segment.Options)
+	for offset := 0; offset < len(segment.Options); {
+		kind := segment.Options[offset]
+		if kind == TCPHeaderOptionEnd {
+			contentSize = offset + 1
+			break
+		}
+		if kind == TCPHeaderOptionNOP {
+			offset++
+		} else {
+			offset += int(segment.Options[offset+1])
+		}
+	}
+	if !bytes.Equal(wire[tcpHeaderSize:tcpHeaderSize+contentSize], segment.Options[:contentSize]) {
+		t.Fatalf("TCP options = %x, want prefix %x", wire[tcpHeaderSize:headerSize], segment.Options[:contentSize])
+	}
+	for _, value := range wire[tcpHeaderSize+contentSize : headerSize] {
+		if value != 0 {
+			t.Fatalf("TCP option padding is nonzero: %x", wire[tcpHeaderSize:headerSize])
+		}
+	}
+	if !bytes.Equal(wire[headerSize:], segment.Payload) {
+		t.Fatalf("TCP payload = %x, want %x", wire[headerSize:], segment.Payload)
+	}
+	if got := referenceTransportChecksum(segment.Source.Addr(), segment.Destination.Addr(), ProtocolTCP, wire); got != 0 {
+		t.Fatalf("TCP reference checksum = %#x, want zero", got)
+	}
+}
 
 // TestTCPListenerAcceptAndClose verifies passive open, bidirectional stream
 // I/O, Accept deadlines, and listener ownership of only unaccepted flows.
@@ -6256,6 +6502,7 @@ func FuzzPublicTCPSegmentCodec(f *testing.F) {
 		if err != nil {
 			t.Fatalf("parsed TCP could not be encoded: %v", err)
 		}
+		assertTCPSegmentWire(t, segment, encoded)
 		packet.Payload = encoded
 		reparsed, err := packet.TCPSegment()
 		if err != nil {

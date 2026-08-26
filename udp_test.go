@@ -9,11 +9,157 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"reflect"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func TestPublicUDPDatagramCodecKnownAnswers(t *testing.T) {
+	tests := []struct {
+		name     string
+		packet   string
+		datagram UDPDatagram
+	}{
+		{
+			name: "IPv4 odd payload",
+			packet: "452e0023123440003711452dc0000203c6336404" +
+				"14e90035000ff26d00010203040506",
+			datagram: UDPDatagram{
+				Source: netip.MustParseAddrPort("192.0.2.3:5353"), Destination: netip.MustParseAddrPort("198.51.100.4:53"),
+				Payload: mustCodecVector(t, "00010203040506"),
+			},
+		},
+		{
+			name: "IPv4 zero checksum",
+			packet: "45000021abcd00004011e2bfc0000205c6336406" +
+				"30390035000d000068656c6c6f",
+			datagram: UDPDatagram{
+				Source: netip.MustParseAddrPort("192.0.2.5:12345"), Destination: netip.MustParseAddrPort("198.51.100.6:53"),
+				ChecksumDisabled: true, Payload: []byte("hello"),
+			},
+		},
+		{
+			name: "IPv6 odd payload",
+			packet: "67e123450011114020010db8000000000000000000000003" +
+				"20010db8000000000000000000000004" +
+				"ffff30390011600a000102030405060708",
+			datagram: UDPDatagram{
+				Source: netip.MustParseAddrPort("[2001:db8::3]:65535"), Destination: netip.MustParseAddrPort("[2001:db8::4]:12345"),
+				Payload: mustCodecVector(t, "000102030405060708"),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			packet, err := ParseIPPacket(mustCodecVector(t, test.packet))
+			if err != nil {
+				t.Fatal(err)
+			}
+			datagram, err := packet.UDPDatagram()
+			if err != nil {
+				t.Fatalf("UDPDatagram: %v", err)
+			}
+			if !reflect.DeepEqual(datagram, test.datagram) {
+				t.Fatalf("parsed datagram = %+v, want %+v", datagram, test.datagram)
+			}
+			encoded, err := test.datagram.MarshalBinary()
+			if err != nil || !bytes.Equal(encoded, packet.Payload) {
+				t.Fatalf("MarshalBinary: error=%v\n got %x\nwant %x", err, encoded, packet.Payload)
+			}
+			assertUDPDatagramWire(t, test.datagram, encoded)
+		})
+	}
+}
+
+func TestPublicUDPDatagramCodecKnownAnswerMutations(t *testing.T) {
+	base := mustCodecVector(t, "67e123450011114020010db800000000000000000000000320010db8000000000000000000000004"+
+		"ffff30390011600a000102030405060708")
+	tests := []struct {
+		name   string
+		mutate func(IPPacket, []byte)
+	}{
+		{name: "length below header", mutate: func(packet IPPacket, payload []byte) {
+			binary.BigEndian.PutUint16(payload[4:6], 7)
+			repairReferenceTransportChecksum(packet.Source, packet.Destination, ProtocolUDP, payload, 6)
+		}},
+		{name: "length beyond payload", mutate: func(packet IPPacket, payload []byte) {
+			binary.BigEndian.PutUint16(payload[4:6], uint16(len(payload)+1))
+			repairReferenceTransportChecksum(packet.Source, packet.Destination, ProtocolUDP, payload, 6)
+		}},
+		{name: "IPv6 zero checksum", mutate: func(_ IPPacket, payload []byte) { payload[6], payload[7] = 0, 0 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			packet, err := ParseIPPacket(base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := append([]byte(nil), packet.Payload...)
+			packet.Payload = payload
+			test.mutate(packet, payload)
+			before := append([]byte(nil), payload...)
+			if _, err = packet.UDPDatagram(); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("UDPDatagram error = %v, want EINVAL", err)
+			}
+			if !bytes.Equal(payload, before) {
+				t.Fatal("failed UDP parse modified its input")
+			}
+		})
+	}
+}
+
+// FuzzPublicUDPDatagramWireEncoding covers checked and IPv4 unchecked
+// datagrams without requiring a checksum-valid input seed to survive mutation.
+func FuzzPublicUDPDatagramWireEncoding(f *testing.F) {
+	f.Add(false, true, uint16(12345), uint16(53), []byte("IPv4 zero checksum"))
+	f.Add(true, false, uint16(65535), uint16(5353), []byte("IPv6 odd"))
+	f.Fuzz(func(t *testing.T, ipv6, disableChecksum bool, sourcePort, destinationPort uint16, payload []byte) {
+		if len(payload) > 4096 {
+			payload = payload[:4096]
+		}
+		datagram := UDPDatagram{
+			Source:           netip.AddrPortFrom(netip.MustParseAddr("192.0.2.103"), sourcePort),
+			Destination:      netip.AddrPortFrom(netip.MustParseAddr("198.51.100.103"), destinationPort),
+			ChecksumDisabled: disableChecksum, Payload: payload,
+		}
+		if ipv6 {
+			datagram.Source = netip.AddrPortFrom(netip.MustParseAddr("2001:db8::103"), sourcePort)
+			datagram.Destination = netip.AddrPortFrom(netip.MustParseAddr("2001:db8:1::103"), destinationPort)
+			datagram.ChecksumDisabled = false
+		}
+		wire, err := datagram.AppendBinary(nil)
+		if err != nil {
+			t.Fatalf("AppendBinary: %v", err)
+		}
+		assertUDPDatagramWire(t, datagram, wire)
+		packet := IPPacket{Source: datagram.Source.Addr(), Destination: datagram.Destination.Addr(), Protocol: ProtocolUDP, Payload: wire}
+		if _, err = packet.UDPDatagram(); err != nil {
+			t.Fatalf("UDPDatagram(encoded datagram): %v", err)
+		}
+	})
+}
+
+// assertUDPDatagramWire compares UDP fields, payload, and checksum policy
+// without parsing through the production codec.
+func assertUDPDatagramWire(t testing.TB, datagram UDPDatagram, wire []byte) {
+	t.Helper()
+	if len(wire) != udpHeaderSize+len(datagram.Payload) ||
+		binary.BigEndian.Uint16(wire[0:2]) != datagram.Source.Port() ||
+		binary.BigEndian.Uint16(wire[2:4]) != datagram.Destination.Port() ||
+		int(binary.BigEndian.Uint16(wire[4:6])) != len(wire) || !bytes.Equal(wire[udpHeaderSize:], datagram.Payload) {
+		t.Fatalf("UDP wire does not match semantic value: %x", wire)
+	}
+	value := binary.BigEndian.Uint16(wire[6:8])
+	if datagram.ChecksumDisabled {
+		if !datagram.Source.Addr().Unmap().Is4() || value != 0 {
+			t.Fatalf("disabled UDP checksum = %#x for %s", value, datagram.Source.Addr())
+		}
+	} else if value == 0 || referenceTransportChecksum(datagram.Source.Addr(), datagram.Destination.Addr(), ProtocolUDP, wire) != 0 {
+		t.Fatalf("UDP reference checksum = %#x, field=%#x", referenceTransportChecksum(datagram.Source.Addr(), datagram.Destination.Addr(), ProtocolUDP, wire), value)
+	}
+}
 
 type testUDPStringAddress string
 
@@ -647,6 +793,7 @@ func FuzzPublicUDPDatagramCodec(f *testing.F) {
 		if err != nil {
 			t.Fatalf("parsed UDP could not be encoded: %v", err)
 		}
+		assertUDPDatagramWire(t, datagram, encoded)
 		packet.Payload = encoded
 		reparsed, err := packet.UDPDatagram()
 		if err != nil {

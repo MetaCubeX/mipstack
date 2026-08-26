@@ -27,6 +27,81 @@ func takeIPOutputPackets(queue *packetQueue) [][]byte {
 	}
 }
 
+func TestPublicFragmentCodecKnownAnswers(t *testing.T) {
+	first4 := mustCodecVector(t, "45000024778820001ffd170dc000020ac633640a000102030405060708090a0b0c0d0e0f")
+	last4 := mustCodecVector(t, "45000019778800021ffd3716c000020ac633640a1011121314")
+	packet4 := IPPacket{
+		Source: netip.MustParseAddr("192.0.2.10"), Destination: netip.MustParseAddr("198.51.100.10"),
+		Protocol: 253, HopLimit: 31, Identification: 0x7788, Payload: mustCodecVector(t, "000102030405060708090a0b0c0d0e0f1011121314"),
+	}
+	fragments, err := packet4.MarshalFragments(36, 0)
+	if err != nil || len(fragments) != 2 || !bytes.Equal(fragments[0], first4) || !bytes.Equal(fragments[1], last4) {
+		t.Fatalf("IPv4 MarshalFragments: error=%v\n got %x\nwant [%x %x]", err, fragments, first4, last4)
+	}
+	for index, wire := range fragments {
+		packet, parseErr := ParseIPPacket(wire)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		fragment, ok := packet.Fragment()
+		end := (index + 1) * 16
+		if end > len(packet4.Payload) {
+			end = len(packet4.Payload)
+		}
+		if !ok || fragment.Identification != 0x7788 || fragment.Offset != index*16 ||
+			fragment.MoreFragments != (index == 0) || !bytes.Equal(fragment.Payload, packet4.Payload[index*16:end]) {
+			t.Fatalf("IPv4 fragment %d = %+v/%t", index, fragment, ok)
+		}
+	}
+
+	first6 := mustCodecVector(t, "622345670020003f20010db800000000000000000000000920010db800000000000000000000000a"+
+		"2c00050200000000fd00000110203040000102030405060708090a0b0c0d0e0f")
+	middle6 := mustCodecVector(t, "622345670020003f20010db800000000000000000000000920010db800000000000000000000000a"+
+		"2c00050200000000fd00001110203040101112131415161718191a1b1c1d1e1f")
+	last6 := mustCodecVector(t, "622345670015003f20010db800000000000000000000000920010db800000000000000000000000a"+
+		"2c00050200000000fd000020102030402021222324")
+	hopByHop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop, Data: mustCodecVector(t, "00050200000000")}
+	packet6 := IPPacket{
+		Source: netip.MustParseAddr("2001:db8::9"), Destination: netip.MustParseAddr("2001:db8::a"),
+		HopLimit: 63, TrafficClass: 0x22, FlowLabel: 0x34567,
+	}
+	if err = packet6.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{hopByHop}, 253,
+		mustCodecVector(t, "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324")); err != nil {
+		t.Fatal(err)
+	}
+	fragments, err = packet6.MarshalFragments(72, 0x10203040)
+	if err != nil || len(fragments) != 3 || !bytes.Equal(fragments[0], first6) ||
+		!bytes.Equal(fragments[1], middle6) || !bytes.Equal(fragments[2], last6) {
+		t.Fatalf("IPv6 MarshalFragments: error=%v\n got %x\nwant [%x %x %x]", err, fragments, first6, middle6, last6)
+	}
+	for index, wire := range fragments {
+		packet, parseErr := ParseIPPacket(wire)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		fragment, ok := packet.Fragment()
+		if !ok || fragment.Protocol != 253 || fragment.Identification != 0x10203040 ||
+			fragment.Offset != index*16 || fragment.MoreFragments != (index != len(fragments)-1) {
+			t.Fatalf("IPv6 fragment %d = %+v/%t", index, fragment, ok)
+		}
+	}
+
+	atomicWire := mustCodecVector(t, "655abcde00162c4020010db800000000000000000000000720010db8000000000000000000000008"+
+		"11000000deadbeef9c409c41000e318a61746f6d6963")
+	atomicPacket, err := ParseIPPacket(atomicWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	atomic, ok := atomicPacket.Fragment()
+	if !ok || !atomic.IsAtomic() || atomic.Protocol != ProtocolUDP || atomic.Identification != 0xdeadbeef {
+		t.Fatalf("atomic fragment = %+v/%t", atomic, ok)
+	}
+	datagram, err := atomicPacket.UDPDatagram()
+	if err != nil || string(datagram.Payload) != "atomic" {
+		t.Fatalf("UDP in atomic fragment = %+v, %v", datagram, err)
+	}
+}
+
 // TestIPv6AtomicFragmentReservedBits verifies RFC 8200's requirement to
 // ignore reserved fragment-header bits on reception.
 func TestIPv6AtomicFragmentReservedBits(t *testing.T) {

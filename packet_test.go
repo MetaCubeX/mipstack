@@ -42,6 +42,412 @@ func referenceChecksum(data []byte) uint16 {
 	return ^uint16(sum)
 }
 
+// referenceTransportChecksum constructs only the RFC pseudo-header around the
+// byte-at-a-time referenceChecksum oracle. It is independent of mipstack's
+// word-at-a-time checksum and transport encoders.
+func referenceTransportChecksum(source, destination netip.Addr, protocol byte, payload []byte) uint16 {
+	source, destination = source.Unmap(), destination.Unmap()
+	pseudoHeader := make([]byte, 0, 40+len(payload))
+	pseudoHeader = append(pseudoHeader, source.AsSlice()...)
+	pseudoHeader = append(pseudoHeader, destination.AsSlice()...)
+	if source.Is4() {
+		pseudoHeader = append(pseudoHeader, 0, protocol, byte(len(payload)>>8), byte(len(payload)))
+	} else {
+		length := uint32(len(payload))
+		pseudoHeader = append(pseudoHeader,
+			byte(length>>24), byte(length>>16), byte(length>>8), byte(length), 0, 0, 0, protocol)
+	}
+	pseudoHeader = append(pseudoHeader, payload...)
+	return referenceChecksum(pseudoHeader)
+}
+
+func TestChecksumRFC1071KnownAnswers(t *testing.T) {
+	data := mustCodecVector(t, "0001f203f4f5f6f7")
+	if got := referenceChecksum(data); got != 0x220d {
+		t.Fatalf("reference checksum = %#x, want %#x", got, uint16(0x220d))
+	}
+	if got := checksum(data); got != 0x220d {
+		t.Fatalf("checksum = %#x, want %#x", got, uint16(0x220d))
+	}
+	withChecksum := mustCodecVector(t, "0001f203f4f5f6f7220d")
+	if got := referenceChecksum(withChecksum); got != 0 {
+		t.Fatalf("reference checksum over checksummed RFC vector = %#x, want zero", got)
+	}
+	if got := checksum(withChecksum); got != 0 {
+		t.Fatalf("checksum over checksummed RFC vector = %#x, want zero", got)
+	}
+}
+
+func TestPublicIPPacketCodecKnownAnswerMutations(t *testing.T) {
+	tcp4 := mustCodecVector(t, "4500003c5053400040066665c0000201c0000202"+
+		"b5fa01bbe3655ed100000000a002faf0e3b40000020405b40402080ad7fe1368000000000103030a")
+	udp6 := mustCodecVector(t, "67e123450011114020010db800000000000000000000000320010db8000000000000000000000004"+
+		"ffff30390011600a000102030405060708")
+	fragment6 := mustCodecVector(t, "622345670020003f20010db800000000000000000000000920010db800000000000000000000000a"+
+		"2c000502000000000600000110203040000102030405060708090a0b0c0d0e0f")
+	tests := []struct {
+		name   string
+		base   []byte
+		mutate func([]byte)
+	}{
+		{name: "IPv4 version", base: tcp4, mutate: func(wire []byte) { wire[0] = 0x55 }},
+		{name: "IPv4 short IHL", base: tcp4, mutate: func(wire []byte) { wire[0] = 0x44 }},
+		{name: "IPv4 total length below header", base: tcp4, mutate: func(wire []byte) {
+			binary.BigEndian.PutUint16(wire[2:4], 19)
+			repairReferenceIPv4Checksum(wire)
+		}},
+		{name: "IPv4 reserved fragment bit", base: tcp4, mutate: func(wire []byte) {
+			wire[6] |= 0x80
+			repairReferenceIPv4Checksum(wire)
+		}},
+		{name: "IPv4 checksum", base: tcp4, mutate: func(wire []byte) { wire[8] ^= 1 }},
+		{name: "IPv6 declared length", base: udp6, mutate: func(wire []byte) {
+			binary.BigEndian.PutUint16(wire[4:6], binary.BigEndian.Uint16(wire[4:6])+1)
+		}},
+		{name: "IPv6 extension length", base: fragment6, mutate: func(wire []byte) { wire[41] = 0xff }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wire := append([]byte(nil), test.base...)
+			test.mutate(wire)
+			before := append([]byte(nil), wire...)
+			if _, err := ParseIPPacket(wire); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("ParseIPPacket error = %v, want EINVAL", err)
+			}
+			if !bytes.Equal(wire, before) {
+				t.Fatal("failed ParseIPPacket modified its input")
+			}
+		})
+	}
+}
+
+func TestPublicIPPacketCodecKnownAnswers(t *testing.T) {
+	tests := []struct {
+		name   string
+		wire   string
+		packet IPPacket
+	}{
+		{
+			name: "Linux IPv4 TCP SYN",
+			wire: "4500003c5053400040066665c0000201c0000202" +
+				"b5fa01bbe3655ed100000000a002faf0e3b40000" +
+				"020405b40402080ad7fe1368000000000103030a",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"),
+				Protocol: ProtocolTCP, HopLimit: 64, Identification: 0x5053, DontFragment: true,
+				Payload: mustCodecVector(t, "b5fa01bbe3655ed100000000a002faf0e3b40000"+
+					"020405b40402080ad7fe1368000000000103030a"),
+			},
+		},
+		{
+			name: "IPv6 TCP odd payload",
+			wire: "6ab543210025062520010db8000000000000000000000001" +
+				"20010db8000000000000000000000002" +
+				"5ba020fb01020304a0b0c0d080184567d9560000" +
+				"0101080a11223344556677880102030405",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("2001:db8::1"), Destination: netip.MustParseAddr("2001:db8::2"),
+				Protocol: ProtocolTCP, HopLimit: 37, TrafficClass: 0xab, FlowLabel: 0x54321,
+				Payload: mustCodecVector(t, "5ba020fb01020304a0b0c0d080184567d9560000"+
+					"0101080a11223344556677880102030405"),
+			},
+		},
+		{
+			name: "IPv4 TCP SACK",
+			wire: "45000048999940004006b4dfc6336402c0000201" +
+				"01bbb5fa1111111122222222d0101000562e0000" +
+				"0101080a01020304050607080101051200001000000020000000300000004000",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("198.51.100.2"), Destination: netip.MustParseAddr("192.0.2.1"),
+				Protocol: ProtocolTCP, HopLimit: 64, Identification: 0x9999, DontFragment: true,
+				Payload: mustCodecVector(t, "01bbb5fa1111111122222222d0101000562e0000"+
+					"0101080a01020304050607080101051200001000000020000000300000004000"),
+			},
+		},
+		{
+			name: "IPv4 UDP odd payload",
+			wire: "452e0023123440003711452dc0000203c6336404" + "14e90035000ff26d00010203040506",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("192.0.2.3"), Destination: netip.MustParseAddr("198.51.100.4"),
+				Protocol: ProtocolUDP, HopLimit: 55, TrafficClass: 0x2e, Identification: 0x1234, DontFragment: true,
+				Payload: mustCodecVector(t, "14e90035000ff26d00010203040506"),
+			},
+		},
+		{
+			name: "IPv4 UDP zero checksum",
+			wire: "45000021abcd00004011e2bfc0000205c6336406" + "30390035000d000068656c6c6f",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("192.0.2.5"), Destination: netip.MustParseAddr("198.51.100.6"),
+				Protocol: ProtocolUDP, HopLimit: 64, Identification: 0xabcd,
+				Payload: mustCodecVector(t, "30390035000d000068656c6c6f"),
+			},
+		},
+		{
+			name: "IPv4 options and odd payload",
+			wire: "47030021beef400011fd2a55cb007101cb007102" + "0194040000000000deadbeef01",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("203.0.113.1"), Destination: netip.MustParseAddr("203.0.113.2"),
+				Protocol: 253, HopLimit: 17, TrafficClass: 3, Identification: 0xbeef, DontFragment: true,
+				IPv4Options: mustCodecVector(t, "0194040000000000"), Payload: mustCodecVector(t, "deadbeef01"),
+			},
+		},
+		{
+			name: "IPv6 UDP odd payload",
+			wire: "67e123450011114020010db8000000000000000000000003" +
+				"20010db8000000000000000000000004" + "ffff30390011600a000102030405060708",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("2001:db8::3"), Destination: netip.MustParseAddr("2001:db8::4"),
+				Protocol: ProtocolUDP, HopLimit: 64, TrafficClass: 0x7e, FlowLabel: 0x12345,
+				Payload: mustCodecVector(t, "ffff30390011600a000102030405060708"),
+			},
+		},
+		{
+			name: "Linux IPv4 ICMP Echo",
+			wire: "45000025ff4740004001b78cc0000201c0000202" + "080039bfaa2f0001000102030405060708",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"),
+				Protocol: ProtocolICMPv4, HopLimit: 64, Identification: 0xff47, DontFragment: true,
+				Payload: mustCodecVector(t, "080039bfaa2f0001000102030405060708"),
+			},
+		},
+		{
+			name: "IPv6 ICMP Echo odd payload",
+			wire: "6000000000113aff20010db8000000000000000000000005" +
+				"20010db8000000000000000000000006" + "8000a77a12345678000102030405060708",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("2001:db8::5"), Destination: netip.MustParseAddr("2001:db8::6"),
+				Protocol: ProtocolICMPv6, HopLimit: 255,
+				Payload: mustCodecVector(t, "8000a77a12345678000102030405060708"),
+			},
+		},
+		{
+			name: "IPv4 first fragment",
+			wire: "45000024778820001ffd170dc000020ac633640a" + "000102030405060708090a0b0c0d0e0f",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("192.0.2.10"), Destination: netip.MustParseAddr("198.51.100.10"),
+				Protocol: 253, HopLimit: 31, Identification: 0x7788, MoreFragments: true,
+				Payload: mustCodecVector(t, "000102030405060708090a0b0c0d0e0f"),
+			},
+		},
+		{
+			name: "IPv4 last fragment",
+			wire: "45000019778800021ffd3716c000020ac633640a1011121314",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("192.0.2.10"), Destination: netip.MustParseAddr("198.51.100.10"),
+				Protocol: 253, HopLimit: 31, Identification: 0x7788, FragmentOffset: 16,
+				Payload: mustCodecVector(t, "1011121314"),
+			},
+		},
+		{
+			name: "IPv6 atomic fragment",
+			wire: "655abcde00162c4020010db8000000000000000000000007" +
+				"20010db8000000000000000000000008" + "11000000deadbeef9c409c41000e318a61746f6d6963",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("2001:db8::7"), Destination: netip.MustParseAddr("2001:db8::8"),
+				Protocol: IPv6ExtensionHeaderFragment, HopLimit: 64, TrafficClass: 0x55, FlowLabel: 0xabcde,
+				Payload: mustCodecVector(t, "11000000deadbeef9c409c41000e318a61746f6d6963"),
+			},
+		},
+		{
+			name: "IPv6 Hop-by-Hop first fragment",
+			wire: "622345670020003f20010db8000000000000000000000009" +
+				"20010db800000000000000000000000a" +
+				"2c000502000000000600000110203040000102030405060708090a0b0c0d0e0f",
+			packet: IPPacket{
+				Source: netip.MustParseAddr("2001:db8::9"), Destination: netip.MustParseAddr("2001:db8::a"),
+				Protocol: IPv6ExtensionHeaderHopByHop, HopLimit: 63, TrafficClass: 0x22, FlowLabel: 0x34567,
+				Payload: mustCodecVector(t, "2c000502000000000600000110203040000102030405060708090a0b0c0d0e0f"),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wire := mustCodecVector(t, test.wire)
+			before := append([]byte(nil), wire...)
+			packet, err := ParseIPPacket(wire)
+			if err != nil {
+				t.Fatalf("ParseIPPacket: %v", err)
+			}
+			if !bytes.Equal(wire, before) {
+				t.Fatal("ParseIPPacket modified the known-answer input")
+			}
+			if !equalIPPackets(packet, test.packet) {
+				t.Fatalf("parsed packet = %+v, want %+v", packet, test.packet)
+			}
+			encoded, err := test.packet.MarshalBinary()
+			if err != nil || !bytes.Equal(encoded, wire) {
+				t.Fatalf("MarshalBinary: error=%v\n got %x\nwant %x", err, encoded, wire)
+			}
+			if packet.Source.Is4() {
+				headerSize := int(wire[0]&0x0f) * 4
+				if got := referenceChecksum(wire[:headerSize]); got != 0 {
+					t.Fatalf("IPv4 header reference checksum = %#x, want zero", got)
+				}
+			}
+		})
+	}
+
+	optionPacket, err := ParseIPPacket(mustCodecVector(t,
+		"47030021beef400011fd2a55cb007101cb0071020194040000000000deadbeef01"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	options, err := optionPacket.IPv4HeaderOptions()
+	if err != nil || len(options) != 3 || options[0].Type != IPv4HeaderOptionNOP ||
+		options[1].Type != IPv4HeaderOptionRouterAlert || options[2].Type != IPv4HeaderOptionEnd {
+		t.Fatalf("IPv4HeaderOptions = %+v, %v", options, err)
+	}
+	if alert, ok := options[1].RouterAlert(); !ok || alert != 0 {
+		t.Fatalf("IPv4 Router Alert = %d/%t", alert, ok)
+	}
+}
+
+// repairReferenceIPv4Checksum isolates one malformed field from the IPv4
+// checksum gate in mutation tests.
+func repairReferenceIPv4Checksum(wire []byte) {
+	headerSize := int(wire[0]&0x0f) * 4
+	wire[10], wire[11] = 0, 0
+	binary.BigEndian.PutUint16(wire[10:12], referenceChecksum(wire[:headerSize]))
+}
+
+// repairReferenceTransportChecksum isolates a transport mutation from its
+// pseudo-header checksum gate.
+func repairReferenceTransportChecksum(source, destination netip.Addr, protocol byte, payload []byte, offset int) {
+	payload[offset], payload[offset+1] = 0, 0
+	value := referenceTransportChecksum(source, destination, protocol, payload)
+	if protocol == ProtocolUDP && value == 0 {
+		value = 0xffff
+	}
+	binary.BigEndian.PutUint16(payload[offset:offset+2], value)
+}
+
+// FuzzPublicIPPacketWireEncoding drives valid semantic fields into both fixed
+// IP header formats and checks the resulting wire fields independently.
+func FuzzPublicIPPacketWireEncoding(f *testing.F) {
+	f.Add(false, byte(99), byte(64), byte(0x2e), uint32(0), uint16(0x1234), true, byte(0), []byte("IPv4 payload"))
+	f.Add(true, byte(253), byte(1), byte(0xab), uint32(0x54321), uint16(0), false, byte(0), []byte("IPv6 payload"))
+	f.Fuzz(func(t *testing.T, ipv6 bool, protocol, hopLimit, trafficClass byte, flowLabel uint32,
+		identification uint16, dontFragment bool, optionForm byte, payload []byte) {
+		if len(payload) > 4096 {
+			payload = payload[:4096]
+		}
+		packet := IPPacket{
+			Source: netip.MustParseAddr("192.0.2.101"), Destination: netip.MustParseAddr("198.51.100.101"),
+			Protocol: int(protocol), HopLimit: int(hopLimit), TrafficClass: int(trafficClass),
+			Identification: identification, DontFragment: dontFragment, Payload: payload,
+		}
+		switch optionForm % 4 {
+		case 1:
+			packet.IPv4Options = []byte{IPv4HeaderOptionNOP}
+		case 2:
+			packet.IPv4Options = []byte{IPv4HeaderOptionRouterAlert, 4, 0, 0}
+		case 3:
+			packet.IPv4Options = []byte{IPv4HeaderOptionEnd, 0xaa, 0xbb}
+		}
+		if ipv6 {
+			packet.Source = netip.MustParseAddr("2001:db8::101")
+			packet.Destination = netip.MustParseAddr("2001:db8:1::101")
+			packet.FlowLabel = flowLabel & ipv6MaximumFlowLabel
+			packet.Identification, packet.DontFragment, packet.IPv4Options = 0, false, nil
+			switch packet.Protocol {
+			case IPv6ExtensionHeaderHopByHop, IPv6ExtensionHeaderRouting, IPv6ExtensionHeaderFragment,
+				IPv6ExtensionHeaderAuthentication, IPv6ExtensionHeaderDestination, IPv6ExtensionHeaderMobility:
+				// Arbitrary bytes do not form a valid extension header. Dedicated
+				// extension fuzzers cover those protocol values with framed input.
+				packet.Protocol = 253
+			}
+		}
+		wire, err := packet.AppendBinary(nil)
+		if err != nil {
+			t.Fatalf("AppendBinary: %v (IPv6=%t protocol=%d hop=%d traffic=%d flow=%#x identification=%d DF=%t optionForm=%d options=%x payload=%d)",
+				err, ipv6, protocol, hopLimit, trafficClass, flowLabel, identification, dontFragment,
+				optionForm, packet.IPv4Options, len(payload))
+		}
+		assertIPPacketWire(t, packet, wire)
+		parsed, err := ParseIPPacket(wire)
+		if err != nil {
+			t.Fatalf("ParseIPPacket(encoded packet): %v", err)
+		}
+		if parsed.Source != packet.Source || parsed.Destination != packet.Destination ||
+			parsed.Protocol != packet.Protocol || parsed.HopLimit != packet.HopLimit ||
+			parsed.TrafficClass != packet.TrafficClass || parsed.FlowLabel != packet.FlowLabel ||
+			parsed.Identification != packet.Identification || parsed.DontFragment != packet.DontFragment ||
+			!bytes.Equal(parsed.Payload, packet.Payload) {
+			t.Fatalf("parsed encoded packet = %+v, want fields from %+v", parsed, packet)
+		}
+	})
+}
+
+// equalIPPackets compares semantic slice contents, treating nil and empty
+// borrowed views alike.
+func equalIPPackets(left, right IPPacket) bool {
+	return left.Source == right.Source && left.Destination == right.Destination &&
+		left.Protocol == right.Protocol && left.HopLimit == right.HopLimit &&
+		left.TrafficClass == right.TrafficClass && left.FlowLabel == right.FlowLabel &&
+		left.Identification == right.Identification && left.DontFragment == right.DontFragment &&
+		left.MoreFragments == right.MoreFragments && left.FragmentOffset == right.FragmentOffset &&
+		bytes.Equal(left.IPv4Options, right.IPv4Options) && bytes.Equal(left.Payload, right.Payload)
+}
+
+// assertIPPacketWire compares every fixed IP field, canonical padding, payload,
+// and the IPv4 checksum without parsing through the production codec.
+func assertIPPacketWire(t testing.TB, packet IPPacket, wire []byte) {
+	t.Helper()
+	if packet.Source.Unmap().Is4() {
+		headerSize := 20 + (len(packet.IPv4Options)+3)&^3
+		if len(wire) != headerSize+len(packet.Payload) || wire[0] != 0x40|byte(headerSize/4) ||
+			wire[1] != byte(packet.TrafficClass) || int(binary.BigEndian.Uint16(wire[2:4])) != len(wire) ||
+			binary.BigEndian.Uint16(wire[4:6]) != packet.Identification || wire[8] != byte(packet.HopLimit) ||
+			wire[9] != byte(packet.Protocol) || !bytes.Equal(wire[12:16], packet.Source.Unmap().AsSlice()) ||
+			!bytes.Equal(wire[16:20], packet.Destination.Unmap().AsSlice()) {
+			t.Fatalf("IPv4 fixed header does not match semantic value: %x", wire[:20])
+		}
+		fragment := uint16(packet.FragmentOffset / 8)
+		if packet.DontFragment {
+			fragment |= 0x4000
+		}
+		if packet.MoreFragments {
+			fragment |= 0x2000
+		}
+		if binary.BigEndian.Uint16(wire[6:8]) != fragment || referenceChecksum(wire[:headerSize]) != 0 {
+			t.Fatalf("IPv4 fragment/checksum fields are invalid: %x", wire[:headerSize])
+		}
+		contentSize := len(packet.IPv4Options)
+		for offset := 0; offset < len(packet.IPv4Options); {
+			optionType := packet.IPv4Options[offset]
+			if optionType == IPv4HeaderOptionEnd {
+				contentSize = offset + 1
+				break
+			}
+			if optionType == IPv4HeaderOptionNOP {
+				offset++
+			} else {
+				offset += int(packet.IPv4Options[offset+1])
+			}
+		}
+		if !bytes.Equal(wire[20:20+contentSize], packet.IPv4Options[:contentSize]) {
+			t.Fatalf("IPv4 options = %x, want prefix %x", wire[20:headerSize], packet.IPv4Options[:contentSize])
+		}
+		for _, value := range wire[20+contentSize : headerSize] {
+			if value != 0 {
+				t.Fatalf("IPv4 option padding is nonzero: %x", wire[20:headerSize])
+			}
+		}
+		if !bytes.Equal(wire[headerSize:], packet.Payload) {
+			t.Fatalf("IPv4 payload = %x, want %x", wire[headerSize:], packet.Payload)
+		}
+		return
+	}
+	if len(wire) != 40+len(packet.Payload) || wire[0]>>4 != 6 ||
+		int(wire[0]&0x0f)<<4|int(wire[1]>>4) != packet.TrafficClass ||
+		uint32(wire[1]&0x0f)<<16|uint32(binary.BigEndian.Uint16(wire[2:4])) != packet.FlowLabel ||
+		int(binary.BigEndian.Uint16(wire[4:6])) != len(packet.Payload) || wire[6] != byte(packet.Protocol) ||
+		wire[7] != byte(packet.HopLimit) || !bytes.Equal(wire[8:24], packet.Source.AsSlice()) ||
+		!bytes.Equal(wire[24:40], packet.Destination.AsSlice()) || !bytes.Equal(wire[40:], packet.Payload) {
+		t.Fatalf("IPv6 wire does not match semantic value: %x", wire)
+	}
+}
+
 func TestChecksumMatchesReference(t *testing.T) {
 	data := make([]byte, 65535)
 	for index := range data {
@@ -67,16 +473,7 @@ func TestTransportChecksumMatchesReference(t *testing.T) {
 		{"IPv6", netip.MustParseAddr("2001:db8:ffff:1::abcd"), netip.MustParseAddr("fdff:ffff:ffff:ffff::1234")},
 	} {
 		for _, size := range []int{0, 1, 7, 8, 15, 16, 17, 1500, 65535} {
-			pseudoHeader := make([]byte, 0, 40+size)
-			pseudoHeader = append(pseudoHeader, test.source.AsSlice()...)
-			pseudoHeader = append(pseudoHeader, test.target.AsSlice()...)
-			if test.source.Is4() {
-				pseudoHeader = append(pseudoHeader, 0, ProtocolTCP, byte(size>>8), byte(size))
-			} else {
-				pseudoHeader = append(pseudoHeader, byte(size>>24), byte(size>>16), byte(size>>8), byte(size), 0, 0, 0, ProtocolTCP)
-			}
-			pseudoHeader = append(pseudoHeader, payload[:size]...)
-			if got, want := transportChecksum(test.source, test.target, ProtocolTCP, payload[:size]), referenceChecksum(pseudoHeader); got != want {
+			if got, want := transportChecksum(test.source, test.target, ProtocolTCP, payload[:size]), referenceTransportChecksum(test.source, test.target, ProtocolTCP, payload[:size]); got != want {
 				t.Fatalf("%s transport checksum at length %d = %#x, want %#x", test.name, size, got, want)
 			}
 		}

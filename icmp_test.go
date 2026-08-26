@@ -13,6 +13,208 @@ import (
 	"time"
 )
 
+func TestPublicICMPMessageCodecKnownAnswers(t *testing.T) {
+	tests := []struct {
+		name    string
+		packet  string
+		message ICMPMessage
+	}{
+		{
+			name: "Linux IPv4 Echo",
+			packet: "45000025ff4740004001b78cc0000201c0000202" +
+				"080039bfaa2f0001000102030405060708",
+			message: ICMPMessage{
+				Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("192.0.2.2"),
+				Type: ICMPv4TypeEchoRequest, Body: mustCodecVector(t, "aa2f0001000102030405060708"),
+			},
+		},
+		{
+			name: "IPv6 Echo odd payload",
+			packet: "6000000000113aff20010db8000000000000000000000005" +
+				"20010db8000000000000000000000006" +
+				"8000a77a12345678000102030405060708",
+			message: ICMPMessage{
+				Source: netip.MustParseAddr("2001:db8::5"), Destination: netip.MustParseAddr("2001:db8::6"),
+				Type: ICMPv6TypeEchoRequest, Body: mustCodecVector(t, "12345678000102030405060708"),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			packet, err := ParseIPPacket(mustCodecVector(t, test.packet))
+			if err != nil {
+				t.Fatal(err)
+			}
+			message, err := packet.ICMPMessage()
+			if err != nil {
+				t.Fatalf("ICMPMessage: %v", err)
+			}
+			if !reflect.DeepEqual(message, test.message) {
+				t.Fatalf("parsed message = %+v, want %+v", message, test.message)
+			}
+			identifier, sequence, payload, ok := message.Echo()
+			if !ok || identifier != binary.BigEndian.Uint16(message.Body[:2]) ||
+				sequence != binary.BigEndian.Uint16(message.Body[2:4]) || !bytes.Equal(payload, message.Body[4:]) {
+				t.Fatalf("Echo = %#x/%#x/%x/%t", identifier, sequence, payload, ok)
+			}
+			encoded, err := test.message.MarshalBinary()
+			if err != nil || !bytes.Equal(encoded, packet.Payload) {
+				t.Fatalf("MarshalBinary: error=%v\n got %x\nwant %x", err, encoded, packet.Payload)
+			}
+			assertICMPMessageWire(t, test.message, encoded)
+		})
+	}
+}
+
+func TestPublicICMPErrorExtensionKnownAnswer(t *testing.T) {
+	wire := mustCodecVector(t, "6000000000943a4020010db8ffff0000000000000000000120010db8000000000000000000000001"+
+		"0108fcfc10000000600000000008113f20010db800000000000000000000000120010db800010000"+
+		"0000000000000001c73801bb00080000000000000000000000000000000000000000000000000000"+
+		"00000000000000000000000000000000000000000000000000000000000000000000000000000000"+
+		"000000000000000000000000000000002000dbc60008040100000030")
+	packet, err := ParseIPPacket(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := packet.ICMPMessage()
+	if err != nil {
+		t.Fatalf("ICMPMessage: %v", err)
+	}
+	networkError, err := message.ICMPError()
+	if err != nil {
+		t.Fatalf("ICMPError: %v", err)
+	}
+	quote := mustCodecVector(t, "600000000008113f20010db800000000000000000000000120010db8000100000000000000000001c73801bb00080000")
+	if networkError.Reporter != netip.MustParseAddr("2001:db8:ffff::1") ||
+		networkError.Type != ICMPv6TypeDestinationUnreachable || networkError.Code != ICMPv6DestinationUnreachableCodeHeadersTooLong ||
+		networkError.QuotedSource != netip.MustParseAddr("2001:db8::1") ||
+		networkError.QuotedTarget != netip.MustParseAddr("2001:db8:1::1") ||
+		networkError.QuotedProtocol != ProtocolUDP || networkError.QuotedSourcePort != 51000 ||
+		networkError.QuotedTargetPort != 443 || !bytes.Equal(networkError.QuotedPacket, quote) {
+		t.Fatalf("parsed RFC 8883 error = %+v", networkError)
+	}
+	objects, err := networkError.ExtensionObjects()
+	if err != nil || len(objects) != 1 {
+		t.Fatalf("ExtensionObjects = %+v, %v", objects, err)
+	}
+	if pointer, ok := objects[0].Pointer(); !ok || pointer != 48 {
+		t.Fatalf("RFC 8883 Pointer = %d/%t", pointer, ok)
+	}
+	rebuilt, err := networkError.ICMPMessage(netip.MustParseAddr("2001:db8::1"))
+	if err != nil {
+		t.Fatalf("ICMPMessage construction: %v", err)
+	}
+	encoded, err := rebuilt.MarshalBinary()
+	if err != nil || !bytes.Equal(encoded, packet.Payload) {
+		t.Fatalf("RFC 4884/8883 encoding: error=%v\n got %x\nwant %x", err, encoded, packet.Payload)
+	}
+	if got := referenceTransportChecksum(packet.Source, packet.Destination, ProtocolICMPv6, packet.Payload); got != 0 {
+		t.Fatalf("ICMPv6 reference checksum = %#x, want zero", got)
+	}
+	structure := packet.Payload[len(packet.Payload)-12:]
+	if got := referenceChecksum(structure); got != 0 {
+		t.Fatalf("RFC 4884 Extension Structure checksum = %#x, want zero", got)
+	}
+
+	corrupted := append([]byte(nil), wire...)
+	corruptedPacket, err := ParseIPPacket(corrupted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corruptedPacket.Payload[len(corruptedPacket.Payload)-10] ^= 1
+	repairReferenceTransportChecksum(corruptedPacket.Source, corruptedPacket.Destination,
+		ProtocolICMPv6, corruptedPacket.Payload, 2)
+	corruptedMessage, err := corruptedPacket.ICMPMessage()
+	if err != nil {
+		t.Fatalf("ICMP envelope after extension mutation: %v", err)
+	}
+	if _, err = corruptedMessage.ICMPError(); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("ICMPError with bad RFC 4884 checksum error = %v, want EINVAL", err)
+	}
+}
+
+func TestPublicICMPMessageCodecKnownAnswerMutations(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		wire string
+	}{
+		{
+			name: "IPv4",
+			wire: "45000025ff4740004001b78cc0000201c0000202" +
+				"080039bfaa2f0001000102030405060708",
+		},
+		{
+			name: "IPv6",
+			wire: "6000000000113aff20010db8000000000000000000000005" +
+				"20010db8000000000000000000000006" +
+				"8000a77a12345678000102030405060708",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			packet, err := ParseIPPacket(mustCodecVector(t, test.wire))
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := append([]byte(nil), packet.Payload...)
+			payload[len(payload)-1] ^= 1
+			packet.Payload = payload
+			if _, err = packet.ICMPMessage(); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("ICMPMessage error = %v, want EINVAL", err)
+			}
+		})
+	}
+}
+
+// FuzzPublicICMPMessageWireEncoding checks arbitrary message fields and bodies
+// against the family-appropriate independent checksum oracle.
+func FuzzPublicICMPMessageWireEncoding(f *testing.F) {
+	f.Add(false, byte(ICMPv4TypeEchoRequest), byte(0), uint32(0x12340001), []byte("IPv4 ICMP"))
+	f.Add(true, byte(ICMPv6TypeEchoRequest), byte(0), uint32(0x56780002), []byte("IPv6 ICMP odd"))
+	f.Fuzz(func(t *testing.T, ipv6 bool, messageType, code byte, prefix uint32, payload []byte) {
+		if len(payload) > 4096 {
+			payload = payload[:4096]
+		}
+		body := make([]byte, 4+len(payload))
+		binary.BigEndian.PutUint32(body[:4], prefix)
+		copy(body[4:], payload)
+		message := ICMPMessage{
+			Source: netip.MustParseAddr("192.0.2.104"), Destination: netip.MustParseAddr("198.51.100.104"),
+			Type: messageType, Code: code, Body: body,
+		}
+		protocol := ProtocolICMPv4
+		if ipv6 {
+			message.Source = netip.MustParseAddr("2001:db8::104")
+			message.Destination = netip.MustParseAddr("2001:db8:1::104")
+			protocol = ProtocolICMPv6
+		}
+		wire, err := message.AppendBinary(nil)
+		if err != nil {
+			t.Fatalf("AppendBinary: %v", err)
+		}
+		assertICMPMessageWire(t, message, wire)
+		packet := IPPacket{Source: message.Source, Destination: message.Destination, Protocol: protocol, Payload: wire}
+		if _, err = packet.ICMPMessage(); err != nil {
+			t.Fatalf("ICMPMessage(encoded message): %v", err)
+		}
+	})
+}
+
+// assertICMPMessageWire compares ICMP fields, body, and family checksum without
+// parsing through the production codec.
+func assertICMPMessageWire(t testing.TB, message ICMPMessage, wire []byte) {
+	t.Helper()
+	if len(wire) != 4+len(message.Body) || wire[0] != message.Type || wire[1] != message.Code || !bytes.Equal(wire[4:], message.Body) {
+		t.Fatalf("ICMP wire does not match semantic value: %x", wire)
+	}
+	value := referenceChecksum(wire)
+	if message.Source.Unmap().Is6() {
+		value = referenceTransportChecksum(message.Source, message.Destination, ProtocolICMPv6, wire)
+	}
+	if value != 0 {
+		t.Fatalf("ICMP reference checksum = %#x, want zero", value)
+	}
+}
+
 // TestLegacyIPv4PathMTU verifies RFC 1191 plateau inference for routers that
 // leave the next-hop MTU field zero.
 func TestLegacyIPv4PathMTU(t *testing.T) {
@@ -1347,6 +1549,7 @@ func FuzzPublicICMPMessageCodec(f *testing.F) {
 		if err != nil {
 			t.Fatalf("parsed ICMP could not be encoded: %v", err)
 		}
+		assertICMPMessageWire(t, message, encoded)
 		packet.Payload = encoded
 		reparsed, err := packet.ICMPMessage()
 		if err != nil {
@@ -1398,6 +1601,7 @@ func FuzzPublicICMPEchoConstruction(f *testing.F) {
 		if err != nil {
 			t.Fatalf("encode Echo: %v", err)
 		}
+		assertICMPMessageWire(t, message, wire)
 		parsed, err := (IPPacket{
 			Source: message.Source, Destination: message.Destination,
 			Protocol: protocol, HopLimit: 64, Payload: wire,

@@ -3,6 +3,7 @@ package mipstack
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
@@ -12,6 +13,18 @@ import (
 	"testing"
 	"time"
 )
+
+// mustCodecVector decodes a literal known-answer wire image. These vectors are
+// deliberately not built through mipstack so parsing and encoding do not prove
+// each other correct.
+func mustCodecVector(t testing.TB, wire string) []byte {
+	t.Helper()
+	decoded, err := hex.DecodeString(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decoded
+}
 
 // testPacketQueueTicketAt constructs host-queue timing evidence without a
 // live packet queue.
