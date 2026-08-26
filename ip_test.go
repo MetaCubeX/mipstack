@@ -1102,6 +1102,88 @@ func TestIPConnIPv6ChecksumHeaderIncludedOwnership(t *testing.T) {
 	}
 }
 
+func TestIPHeaderIncludedLinuxKnownAnswers(t *testing.T) {
+	source4 := netip.MustParseAddr("192.0.2.154")
+	target4 := netip.MustParseAddr("198.51.100.154")
+	stack4, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(source4, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack4.Close()
+	stack4.ipv4ID.Store(0x4320)
+	connection4 := IPConn{stack: stack4}
+	input4 := mustCodecVector(t, "462e0001000040002563aabb00000000c633649a01010000deadbeef")
+	original4 := append([]byte(nil), input4...)
+	packet4, packetTarget4, hopLimit4, err := connection4.prepareHeaderIncludedPacket(input4, source4, target4)
+	want4 := mustCodecVector(t, "462e001c43214000256322c7c000029ac633649a01010000deadbeef")
+	if err != nil || packetTarget4 != target4 || hopLimit4 != 37 || !bytes.Equal(packet4, want4) {
+		t.Fatalf("Linux IPv4 IP_HDRINCL repair = target %s hop %d error %v\n got %x\nwant %x",
+			packetTarget4, hopLimit4, err, packet4, want4)
+	}
+	if !bytes.Equal(input4, original4) || referenceChecksum(packet4[:24]) != 0 || stack4.ipv4ID.Load() != 0x4321 {
+		t.Fatalf("Linux IPv4 IP_HDRINCL ownership/checksum/ID = input %x checksum %#x ID %#x",
+			input4, referenceChecksum(packet4[:24]), stack4.ipv4ID.Load())
+	}
+
+	explicit4 := mustCodecVector(t, "452e0001123440002563aabbcb007109c633649adeadbeef")
+	packet4, _, _, err = connection4.prepareHeaderIncludedPacket(explicit4, source4, target4)
+	if err != nil || !bytes.Equal(packet4[4:6], explicit4[4:6]) || !bytes.Equal(packet4[12:16], explicit4[12:16]) ||
+		binary.BigEndian.Uint16(packet4[2:4]) != uint16(len(packet4)) || referenceChecksum(packet4[:20]) != 0 {
+		t.Fatalf("Linux IPv4 explicit ID/source repair = %x, %v", packet4, err)
+	}
+	if stack4.ipv4ID.Load() != 0x4321 {
+		t.Fatalf("explicit IPv4 ID consumed allocator value: %#x", stack4.ipv4ID.Load())
+	}
+
+	source6 := netip.MustParseAddr("2001:db8::9a")
+	target6 := netip.MustParseAddr("2001:db8:1::9a")
+	stack6, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(source6, 128)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack6.Close()
+	connection6 := IPConn{stack: stack6}
+	input6 := mustCodecVector(t, "6a5543210004632520010db800000000000000000000009a20010db800010000000000000000009adeadbeef")
+	original6 := append([]byte(nil), input6...)
+	packet6, packetTarget6, hopLimit6, err := connection6.prepareHeaderIncludedPacket(input6, source6, target6)
+	if err != nil || packetTarget6 != target6 || hopLimit6 != 37 || !bytes.Equal(packet6, input6) {
+		t.Fatalf("IPv6 header-included packet = target %s hop %d error %v packet %x", packetTarget6, hopLimit6, err, packet6)
+	}
+	packet6[0] ^= 0xff
+	if !bytes.Equal(input6, original6) {
+		t.Fatal("IPv6 header-included result aliases caller storage")
+	}
+
+	invalid := []struct {
+		name                   string
+		connection             *IPConn
+		selectedSource, target netip.Addr
+		input                  []byte
+	}{
+		{name: "empty", connection: &connection4, selectedSource: source4, target: target4},
+		{name: "short IPv4", connection: &connection4, selectedSource: source4, target: target4,
+			input: mustCodecVector(t, "45")},
+		{name: "IPv4 IHL below minimum", connection: &connection4, selectedSource: source4, target: target4,
+			input: mustCodecVector(t, "440000140000000001630000c0000201c6336401")},
+		{name: "IPv4 IHL beyond input", connection: &connection4, selectedSource: source4, target: target4,
+			input: mustCodecVector(t, "4f0000140000000001630000c0000201c6336401")},
+		{name: "IPv6 over IPv4 route", connection: &connection4, selectedSource: source4, target: target4, input: input6},
+		{name: "short IPv6", connection: &connection6, selectedSource: source6, target: target6,
+			input: mustCodecVector(t, "600000000000632520010db800000000000000000000009a")},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			before := append([]byte(nil), test.input...)
+			if packet, _, _, prepareErr := test.connection.prepareHeaderIncludedPacket(test.input, test.selectedSource, test.target); prepareErr == nil || packet != nil {
+				t.Fatalf("invalid header-included packet = %x, %v", packet, prepareErr)
+			}
+			if !bytes.Equal(test.input, before) {
+				t.Fatal("invalid header-included packet modified caller storage")
+			}
+		})
+	}
+}
+
 // FuzzIPHeaderIncludedPreparation verifies the Linux IP_HDRINCL mutations,
 // result ownership, and family validation for arbitrary complete packets.
 func FuzzIPHeaderIncludedPreparation(f *testing.F) {

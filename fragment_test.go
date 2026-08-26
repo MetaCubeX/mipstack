@@ -100,6 +100,53 @@ func TestPublicFragmentCodecKnownAnswers(t *testing.T) {
 	if err != nil || string(datagram.Payload) != "atomic" {
 		t.Fatalf("UDP in atomic fragment = %+v, %v", datagram, err)
 	}
+
+	var reassembly4 IPPacketReassembly
+	for index, wire := range [][]byte{last4, first4} {
+		fragment, parseErr := ParseIPPacket(wire)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		packet, complete, addErr := reassembly4.Add(fragment)
+		if addErr != nil || complete != (index == 1) {
+			t.Fatalf("IPv4 known-answer reassembly %d = complete %t, %v", index, complete, addErr)
+		}
+		if complete {
+			want := mustCodecVector(t, "45000029778800001ffd3708c000020ac633640a"+
+				"000102030405060708090a0b0c0d0e0f1011121314")
+			encoded, encodeErr := packet.MarshalBinary()
+			if encodeErr != nil || !bytes.Equal(encoded, want) {
+				t.Fatalf("IPv4 known-answer reassembly: error=%v\n got %x\nwant %x", encodeErr, encoded, want)
+			}
+			if _, fragmented := packet.Fragment(); fragmented {
+				t.Fatal("IPv4 known-answer reassembly retained fragment metadata")
+			}
+		}
+	}
+
+	var reassembly6 IPPacketReassembly
+	for index, wire := range [][]byte{middle6, last6, first6} {
+		fragment, parseErr := ParseIPPacket(wire)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		packet, complete, addErr := reassembly6.Add(fragment)
+		if addErr != nil || complete != (index == 2) {
+			t.Fatalf("IPv6 known-answer reassembly %d = complete %t, %v", index, complete, addErr)
+		}
+		if complete {
+			want := mustCodecVector(t, "62234567002d003f20010db8000000000000000000000009"+
+				"20010db800000000000000000000000a"+
+				"fd00050200000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f2021222324")
+			encoded, encodeErr := packet.MarshalBinary()
+			if encodeErr != nil || !bytes.Equal(encoded, want) {
+				t.Fatalf("IPv6 known-answer reassembly: error=%v\n got %x\nwant %x", encodeErr, encoded, want)
+			}
+			if _, fragmented := packet.Fragment(); fragmented {
+				t.Fatal("IPv6 known-answer reassembly retained Fragment header")
+			}
+		}
+	}
 }
 
 // TestIPv6AtomicFragmentReservedBits verifies RFC 8200's requirement to

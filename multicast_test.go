@@ -199,6 +199,137 @@ func buildMulticastTestMLDQuery(source, target, group netip.Addr, responseCode u
 	return packet
 }
 
+func TestMulticastQueryKnownAnswerVectors(t *testing.T) {
+	network4, err := buildNetworkState(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/24")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	network6, err := buildNetworkState(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("fe80::1/64")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name     string
+		wire     string
+		built    []byte
+		network  *networkState
+		version  uint8
+		maximum  time.Duration
+		interval time.Duration
+		group    netip.Addr
+		sources  []netip.Addr
+		v6       bool
+	}{
+		{
+			name: "IGMPv1 general",
+			wire: "4500001c00000000010217ddc0000202e00000011100eeff00000000",
+			built: buildMulticastTestIGMPQuery(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("224.0.0.1"),
+				netip.IPv4Unspecified(), 0, nil, false),
+			network: network4, version: 1, maximum: multicastDefaultResponseInterval, group: netip.IPv4Unspecified(),
+		},
+		{
+			name: "IGMPv2 group",
+			wire: "4600002000000000010271d1c0000202ef010203940400001164fd96ef010203",
+			built: buildMulticastTestIGMPQuery(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("239.1.2.3"),
+				netip.MustParseAddr("239.1.2.3"), 100, nil, true),
+			network: network4, version: 2, maximum: 10 * time.Second, group: netip.MustParseAddr("239.1.2.3"),
+		},
+		{
+			name: "IGMPv3 source",
+			wire: "4600002800000000010278c9c0000202e8010203940400001196d7abe8010203027d0001c6336407",
+			built: buildMulticastTestIGMPQuery(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("232.1.2.3"),
+				netip.MustParseAddr("232.1.2.3"), 0x96, []netip.Addr{netip.MustParseAddr("198.51.100.7")}, true),
+			network: network4, version: 3, maximum: 35*time.Second + 200*time.Millisecond, interval: 125 * time.Second,
+			group: netip.MustParseAddr("232.1.2.3"), sources: []netip.Addr{netip.MustParseAddr("198.51.100.7")},
+		},
+		{
+			name: "MLDv1 general",
+			wire: "6000000000200001fe800000000000000000000000000002ff020000000000000000000000000001" +
+				"3a0005020000010082007c3e03e8000000000000000000000000000000000000",
+			built: buildMulticastTestMLDQuery(netip.MustParseAddr("fe80::2"), netip.MustParseAddr("ff02::1"),
+				netip.IPv6Unspecified(), 1000, nil),
+			network: network6, version: 1, maximum: time.Second, group: netip.IPv6Unspecified(), v6: true,
+		},
+		{
+			name: "MLDv2 source",
+			wire: "6000000000340001fe800000000000000000000000000002ff3e0000000000000000000000001234" +
+				"3a000502000001008200db2c80010000ff3e0000000000000000000000001234027d0001" +
+				"fe800000000000000000000000000003",
+			built: buildMulticastTestMLDQuery(netip.MustParseAddr("fe80::2"), netip.MustParseAddr("ff3e::1234"),
+				netip.MustParseAddr("ff3e::1234"), 0x8001, []netip.Addr{netip.MustParseAddr("fe80::3")}),
+			network: network6, version: 2, maximum: 32*time.Second + 776*time.Millisecond, interval: 125 * time.Second,
+			group: netip.MustParseAddr("ff3e::1234"), sources: []netip.Addr{netip.MustParseAddr("fe80::3")}, v6: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wire := mustCodecVector(t, test.wire)
+			if !bytes.Equal(test.built, wire) {
+				t.Fatalf("query helper output:\n got %x\nwant %x", test.built, wire)
+			}
+			packet, valid := parseIPPacket(wire)
+			if !valid {
+				t.Fatal("known-answer IP envelope did not parse")
+			}
+			if packet.source.Is4() {
+				headerLength := int(wire[0]&0xf) * 4
+				if referenceChecksum(wire[:headerLength]) != 0 || referenceChecksum(packet.payload) != 0 {
+					t.Fatal("known-answer IGMP checksums are invalid")
+				}
+			} else if referenceTransportChecksum(packet.source, packet.target, ProtocolICMPv6, packet.payload) != 0 {
+				t.Fatal("known-answer MLD checksum is invalid")
+			}
+			var query multicastQuery
+			if test.v6 {
+				query, _, valid = parseMLDQuery(packet, test.network)
+			} else {
+				query, _, valid = parseIGMPQuery(packet, test.network)
+			}
+			sourcesEqual := len(query.sources) == len(test.sources)
+			for index := range query.sources {
+				if !sourcesEqual || query.sources[index] != test.sources[index] {
+					sourcesEqual = false
+					break
+				}
+			}
+			if !valid || query.v6 != test.v6 || query.version != test.version || query.maximum != test.maximum ||
+				query.queryInterval != test.interval || query.group != test.group || !sourcesEqual {
+				t.Fatalf("known-answer query = %+v, valid %t", query, valid)
+			}
+		})
+	}
+}
+
+func TestMulticastTimeDecodingReference(t *testing.T) {
+	for code := 0; code <= 0xff; code++ {
+		linear := time.Duration(code) * 100 * time.Millisecond
+		if got := decodeIGMPv2Time(byte(code)); got != linear {
+			t.Fatalf("IGMPv2 code %#x = %v, want %v", code, got, linear)
+		}
+		value := code
+		if code >= 0x80 {
+			mantissa, exponent := code&0xf|0x10, code>>4&7
+			value = mantissa * (1 << (exponent + 3))
+		}
+		if got, want := decodeIGMPTime(byte(code)), time.Duration(value)*100*time.Millisecond; got != want {
+			t.Fatalf("IGMPv3 MRC %#x = %v, want %v", code, got, want)
+		}
+		if got, want := decodeIGMPQueryInterval(byte(code)), time.Duration(value)*time.Second; got != want {
+			t.Fatalf("IGMP/MLD QQIC %#x = %v, want %v", code, got, want)
+		}
+	}
+	for code := 0; code <= 0xffff; code++ {
+		value := code
+		if code >= 0x8000 {
+			mantissa, exponent := code&0xfff|0x1000, code>>12&7
+			value = mantissa * (1 << (exponent + 3))
+		}
+		if got, want := decodeMLDTime(uint16(code)), time.Duration(value)*time.Millisecond; got != want {
+			t.Fatalf("MLDv2 MRC %#x = %v, want %v", code, got, want)
+		}
+	}
+}
+
 // FuzzMulticastQueryParsing keeps IGMPv3 and MLDv2 Query parsing inside
 // checksum-valid envelopes while varying group and source forms, trailing
 // data, and Router Alert presence.
@@ -775,6 +906,61 @@ func TestMulticastReportWireFields(t *testing.T) {
 	}
 	if report.payload[8] != multicastRecordChangeToExcludeMode || netip.AddrFrom4([4]byte(report.payload[12:16])) != group {
 		t.Fatalf("IGMPv3 initial record = %x", report.payload[8:16])
+	}
+}
+
+func TestMulticastReportKnownAnswerVectors(t *testing.T) {
+	stack := newMulticastTestStack(t, []netip.Prefix{
+		netip.MustParsePrefix("192.0.2.40/24"),
+		netip.MustParsePrefix("fe80::40/64"),
+	}, 1400)
+	state := &multicastState{stack: stack}
+	group4 := netip.MustParseAddr("239.10.20.30")
+	group6 := netip.MustParseAddr("ff02::1234")
+	tests := []struct {
+		name   string
+		wire   string
+		target netip.Addr
+		send   func()
+	}{
+		{name: "IGMPv1 report", wire: "1200ead6ef0a141e", target: group4,
+			send: func() { state.sendIGMPLegacyReport(group4, 1, true, false, nil) }},
+		{name: "IGMPv2 report", wire: "1600e6d6ef0a141e", target: group4,
+			send: func() { state.sendIGMPLegacyReport(group4, 2, true, false, nil) }},
+		{name: "IGMPv2 leave", wire: "1700e5d6ef0a141e", target: netip.MustParseAddr("224.0.0.2"),
+			send: func() { state.sendIGMPLegacyReport(group4, 2, false, true, nil) }},
+		{name: "IGMPv3 report", wire: "2200d6d50000000104000000ef0a141e", target: netip.MustParseAddr("224.0.0.22"),
+			send: func() {
+				state.sendIGMPv3Records([]multicastReportRecord{{recordType: multicastRecordChangeToExcludeMode, group: group4}}, nil)
+			}},
+		{name: "MLDv1 report", wire: "83005b7e00000000ff020000000000000000000000001234", target: group6,
+			send: func() { state.sendMLDv1Report(group6, true, false, nil) }},
+		{name: "MLDv1 done", wire: "84006cb000000000ff020000000000000000000000001234", target: netip.MustParseAddr("ff02::2"),
+			send: func() { state.sendMLDv1Report(group6, false, true, nil) }},
+		{name: "MLDv2 report", wire: "8f005d970000000104000000ff020000000000000000000000001234", target: netip.MustParseAddr("ff02::16"),
+			send: func() {
+				state.sendMLDv2Records([]multicastReportRecord{{recordType: multicastRecordChangeToExcludeMode, group: group6}}, nil)
+			}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			test.send()
+			packet := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool { return packet.target == test.target })
+			want := mustCodecVector(t, test.wire)
+			if packet.hopLimit != 1 || !packet.hasRouterAlert() || !bytes.Equal(packet.payload, want) {
+				t.Fatalf("report = target %s hop-limit %d router-alert %t payload %x, want %s/1/true/%x",
+					packet.target, packet.hopLimit, packet.hasRouterAlert(), packet.payload, test.target, want)
+			}
+			if packet.source.Is4() {
+				if packet.source != netip.MustParseAddr("192.0.2.40") || referenceChecksum(packet.payload) != 0 {
+					t.Fatalf("IGMP report source/checksum = %s/%#x", packet.source, referenceChecksum(packet.payload))
+				}
+			} else if packet.source != netip.MustParseAddr("fe80::40") ||
+				referenceTransportChecksum(packet.source, packet.target, ProtocolICMPv6, packet.payload) != 0 {
+				t.Fatalf("MLD report source/checksum = %s/%#x", packet.source,
+					referenceTransportChecksum(packet.source, packet.target, ProtocolICMPv6, packet.payload))
+			}
+		})
 	}
 }
 

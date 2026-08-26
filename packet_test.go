@@ -660,6 +660,9 @@ func TestPublicIPv4HeaderOptions(t *testing.T) {
 		t.Fatalf("SetIPv4HeaderOptions: %v", err)
 	}
 	wantOptions := append([]byte(nil), packet.IPv4Options...)
+	if literal := mustCodecVector(t, "01940400001e04aabb1e03cc00"); !bytes.Equal(wantOptions, literal) {
+		t.Fatalf("structured IPv4 option wire = %x, want %x", wantOptions, literal)
+	}
 	data[0] ^= 0xff
 	if !bytes.Equal(packet.IPv4Options, wantOptions) {
 		t.Fatal("SetIPv4HeaderOptions retained caller storage")
@@ -892,6 +895,9 @@ func TestPublicIPv6ExtensionHeaders(t *testing.T) {
 		t.Fatalf("set Hop-by-Hop options: %v", err)
 	}
 	wantHop := append([]byte(nil), hop.Data...)
+	if literal := mustCodecVector(t, "0105020000e3030102030001020000"); !bytes.Equal(wantHop, literal) {
+		t.Fatalf("structured Hop-by-Hop option wire = %x, want %x", wantHop, literal)
+	}
 	unknownData[0] ^= 0xff
 	if !bytes.Equal(hop.Data, wantHop) {
 		t.Fatal("SetOptions retained caller storage")
@@ -930,7 +936,18 @@ func TestPublicIPv6ExtensionHeaders(t *testing.T) {
 	if err = packet.SetIPv6ExtensionHeaders(headers, 99, payload); err != nil {
 		t.Fatalf("SetIPv6ExtensionHeaders: %v", err)
 	}
-	wantPayload := append([]byte(nil), packet.Payload...)
+	wantPayload := mustCodecVector(t,
+		"2b0105020000e3030102030001020000"+
+			"2c00000000000000"+
+			"3300000012345678"+
+			"3c020000000000000000000000000000"+
+			"8700010400000000"+
+			"6300000000000000"+
+			"657874656e73696f6e2d7061796c6f6164")
+	if packet.Protocol != IPv6ExtensionHeaderHopByHop || !bytes.Equal(packet.Payload, wantPayload) {
+		t.Fatalf("structured IPv6 extension wire = protocol %d payload %x, want %d/%x",
+			packet.Protocol, packet.Payload, IPv6ExtensionHeaderHopByHop, wantPayload)
+	}
 	headers[1].Data[1] ^= 0xff
 	payload[0] ^= 0xff
 	if !bytes.Equal(packet.Payload, wantPayload) {
@@ -2483,6 +2500,36 @@ func FuzzPublicIPv4HeaderOptions(f *testing.F) {
 	})
 }
 
+func FuzzPublicIPv4HeaderOptionSetters(f *testing.F) {
+	f.Add(uint16(0), byte(30), []byte{1, 2, 3})
+	f.Add(uint16(0xffff), byte(0xff), []byte(nil))
+	f.Fuzz(func(t *testing.T, routerAlert uint16, rawType byte, data []byte) {
+		if len(data) > 24 {
+			data = data[:24]
+		}
+		unknownType := rawType | 0x1e
+		var alert IPv4HeaderOption
+		alert.SetRouterAlert(routerAlert)
+		packet := IPPacket{Source: netip.MustParseAddr("192.0.2.1"), Destination: netip.MustParseAddr("198.51.100.1")}
+		if err := packet.SetIPv4HeaderOptions([]IPv4HeaderOption{
+			{Type: IPv4HeaderOptionNOP}, alert, {Type: unknownType, Data: data}, {Type: IPv4HeaderOptionEnd},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		want := []byte{IPv4HeaderOptionNOP, IPv4HeaderOptionRouterAlert, 4, byte(routerAlert >> 8), byte(routerAlert),
+			unknownType, byte(2 + len(data))}
+		want = append(want, data...)
+		want = append(want, IPv4HeaderOptionEnd)
+		if !bytes.Equal(packet.IPv4Options, want) {
+			t.Fatalf("semantic IPv4 options = %x, want %x", packet.IPv4Options, want)
+		}
+		options, err := packet.IPv4HeaderOptions()
+		if err != nil || len(options) != 4 {
+			t.Fatalf("semantic IPv4 options parsed as %+v, %v", options, err)
+		}
+	})
+}
+
 func FuzzPublicIPv6ExtensionOptions(f *testing.F) {
 	f.Add(true, []byte{0, IPv6ExtensionOptionRouterAlert, 2, 0, 0, IPv6ExtensionOptionPadN, 0})
 	f.Add(false, []byte{0, 0xe3, 3, 1, 2, 3, IPv6ExtensionOptionPad1})
@@ -2517,6 +2564,49 @@ func FuzzPublicIPv6ExtensionOptions(f *testing.F) {
 		}
 		if _, err = rebuilt.Options(); err != nil {
 			t.Fatalf("rebuilt IPv6 options could not be parsed: %v", err)
+		}
+	})
+}
+
+func FuzzPublicIPv6ExtensionOptionSetters(f *testing.F) {
+	f.Add(true, uint16(0), byte(0xe3), []byte{1, 2, 3})
+	f.Add(false, uint16(0xffff), byte(0x80), []byte(nil))
+	f.Fuzz(func(t *testing.T, hopByHop bool, routerAlert uint16, rawType byte, data []byte) {
+		if len(data) > 64 {
+			data = data[:64]
+		}
+		headerType := uint8(IPv6ExtensionHeaderDestination)
+		if hopByHop {
+			headerType = IPv6ExtensionHeaderHopByHop
+		}
+		unknownType := rawType | 0x80
+		var alert IPv6ExtensionOption
+		alert.SetRouterAlert(routerAlert)
+		header := IPv6ExtensionHeader{Type: headerType}
+		if err := header.SetOptions([]IPv6ExtensionOption{alert, {Type: unknownType, Data: data}}); err != nil {
+			t.Fatal(err)
+		}
+		optionSize := 4 + 2 + len(data)
+		total := 2 + optionSize
+		padding := -total & 7
+		want := make([]byte, total+padding-1)
+		want[0] = byte((total+padding)/8 - 1)
+		want[1], want[2] = IPv6ExtensionOptionRouterAlert, 2
+		binary.BigEndian.PutUint16(want[3:5], routerAlert)
+		want[5], want[6] = unknownType, byte(len(data))
+		copy(want[7:], data)
+		offset := 7 + len(data)
+		if padding == 1 {
+			want[offset] = IPv6ExtensionOptionPad1
+		} else if padding > 1 {
+			want[offset], want[offset+1] = IPv6ExtensionOptionPadN, byte(padding-2)
+		}
+		if !bytes.Equal(header.Data, want) {
+			t.Fatalf("semantic IPv6 options = %x, want %x", header.Data, want)
+		}
+		options, err := header.Options()
+		if err != nil || len(options) < 2 {
+			t.Fatalf("semantic IPv6 options parsed as %+v, %v", options, err)
 		}
 	})
 }

@@ -6319,6 +6319,10 @@ func TestPublicTCPHeaderOptions(t *testing.T) {
 		t.Fatalf("SetHeaderOptions: %v", err)
 	}
 	wantWire := append([]byte(nil), segment.Options...)
+	if literal := mustCodecVector(t,
+		"01020405b40303ff0402080a1020304050607080050afffffff0000000201e04aabb1e04ccdd00"); !bytes.Equal(wantWire, literal) {
+		t.Fatalf("structured TCP option wire = %x, want %x", wantWire, literal)
+	}
 	if len(wantWire) != 39 {
 		t.Fatalf("encoded option length = %d, want 39", len(wantWire))
 	}
@@ -6586,6 +6590,62 @@ func FuzzPublicTCPHeaderOptions(f *testing.F) {
 		}
 		if _, err = rebuilt.HeaderOptions(); err != nil {
 			t.Fatalf("rebuilt options could not be parsed: %v", err)
+		}
+	})
+}
+
+func FuzzPublicTCPHeaderOptionSetters(f *testing.F) {
+	f.Add(uint16(1460), byte(7), uint32(0x10203040), uint32(0x50607080), []byte(nil))
+	f.Add(uint16(536), byte(14), uint32(1), uint32(2), []byte{0x80})
+	f.Add(uint16(1460), byte(7), uint32(0x10203040), uint32(0x50607080), []byte{0xff, 0xff, 0xff, 0, 0, 0, 0x20})
+	f.Fuzz(func(t *testing.T, mssValue uint16, scaleValue byte, timestampValue, timestampEcho uint32, sackSeed []byte) {
+		blockCount := len(sackSeed)%4 + 1
+		blocks := make([]TCPSACKBlock, blockCount)
+		for index := range blocks {
+			for offset := 0; offset < 8; offset++ {
+				value := byte(index*8 + offset)
+				if len(sackSeed) != 0 {
+					value = sackSeed[(index*8+offset)%len(sackSeed)]
+				}
+				if offset < 4 {
+					blocks[index].LeftEdge = blocks[index].LeftEdge<<8 | uint32(value)
+				} else {
+					blocks[index].RightEdge = blocks[index].RightEdge<<8 | uint32(value)
+				}
+			}
+		}
+		var mss, scale, permitted, timestamp, sack TCPHeaderOption
+		mss.SetMaximumSegmentSize(mssValue)
+		scale.SetWindowScale(scaleValue)
+		permitted.SetSACKPermitted()
+		timestamp.SetTimestamp(timestampValue, timestampEcho)
+		if err := sack.SetSACKBlocks(blocks); err != nil {
+			t.Fatal(err)
+		}
+		wantSACK := []byte{TCPHeaderOptionSACK, byte(2 + 8*len(blocks))}
+		for _, block := range blocks {
+			var encoded [8]byte
+			binary.BigEndian.PutUint32(encoded[:4], block.LeftEdge)
+			binary.BigEndian.PutUint32(encoded[4:], block.RightEdge)
+			wantSACK = append(wantSACK, encoded[:]...)
+		}
+		if !bytes.Equal(append([]byte{TCPHeaderOptionSACK, byte(2 + len(sack.Data))}, sack.Data...), wantSACK) {
+			t.Fatalf("semantic TCP SACK option = %x, want %x", sack.Data, wantSACK)
+		}
+		if blockCount > 2 {
+			return
+		}
+		var segment TCPSegment
+		if err := segment.SetHeaderOptions([]TCPHeaderOption{mss, scale, permitted, timestamp, sack}); err != nil {
+			t.Fatal(err)
+		}
+		want := []byte{TCPHeaderOptionMSS, 4, byte(mssValue >> 8), byte(mssValue),
+			TCPHeaderOptionWindowScale, 3, scaleValue, TCPHeaderOptionSACKPermitted, 2,
+			TCPHeaderOptionTimestamp, 10, byte(timestampValue >> 24), byte(timestampValue >> 16), byte(timestampValue >> 8), byte(timestampValue),
+			byte(timestampEcho >> 24), byte(timestampEcho >> 16), byte(timestampEcho >> 8), byte(timestampEcho)}
+		want = append(want, wantSACK...)
+		if !bytes.Equal(segment.Options, want) {
+			t.Fatalf("semantic TCP options = %x, want %x", segment.Options, want)
 		}
 	})
 }

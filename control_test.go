@@ -11,6 +11,47 @@ import (
 
 var _ encoding.BinaryMarshaler = SocketErrorControlMessage{}
 
+type testLinuxControlRecord struct {
+	level uint32
+	kind  uint32
+	data  []byte
+}
+
+// assertLinuxControlRecords independently reads the fixed MIPS ancillary ABI.
+// Literal Linux vectors below anchor this oracle before fuzzers reuse it.
+func assertLinuxControlRecords(t testing.TB, control []byte, records ...testLinuxControlRecord) {
+	t.Helper()
+	for index, record := range records {
+		if len(control) < linuxControlHeaderSize {
+			t.Fatalf("control record %d has only %d header bytes", index, len(control))
+		}
+		length := int(binary.LittleEndian.Uint64(control[:8]))
+		wantLength := linuxControlHeaderSize + len(record.data)
+		if length != wantLength || binary.LittleEndian.Uint32(control[8:12]) != record.level ||
+			binary.LittleEndian.Uint32(control[12:16]) != record.kind {
+			t.Fatalf("control record %d header = length %d level %d kind %d, want %d/%d/%d",
+				index, length, binary.LittleEndian.Uint32(control[8:12]), binary.LittleEndian.Uint32(control[12:16]),
+				wantLength, record.level, record.kind)
+		}
+		aligned := (length + linuxControlAlignment - 1) &^ (linuxControlAlignment - 1)
+		if aligned > len(control) || length > len(control) {
+			t.Fatalf("control record %d length %d exceeds %d available bytes", index, length, len(control))
+		}
+		if !bytes.Equal(control[linuxControlHeaderSize:length], record.data) {
+			t.Fatalf("control record %d data = %x, want %x", index, control[linuxControlHeaderSize:length], record.data)
+		}
+		for _, value := range control[length:aligned] {
+			if value != 0 {
+				t.Fatalf("control record %d has nonzero padding: %x", index, control[length:aligned])
+			}
+		}
+		control = control[aligned:]
+	}
+	if len(control) != 0 {
+		t.Fatalf("%d trailing ancillary bytes remain after %d records", len(control), len(records))
+	}
+}
+
 func TestSocketErrorControlMessageMarshalBinary(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -254,6 +295,131 @@ func TestSocketErrorControlMessageForRead(t *testing.T) {
 	}
 	if _, err := socketErrorControlForRead(ICMPError{Type: 3, Code: 3}); err == nil {
 		t.Fatal("socket error without reporter marshaled successfully")
+	}
+}
+
+func TestIPControlMessageLinuxFixtures(t *testing.T) {
+	address4 := netip.MustParseAddr("192.0.2.123")
+	packetInfo4 := mustCodecVector(t, "00000000c000027bc000027b")
+	send4 := mustCodecVector(t,
+		"1c00000000000000000000000800000000000000c000027bc000027b00000000"+
+			"140000000000000000000000020000001f00000000000000"+
+			"14000000000000000000000001000000b800000000000000")
+	assertLinuxControlRecords(t, send4,
+		testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPPacketInfo, data: packetInfo4},
+		testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPTimeToLive, data: mustCodecVector(t, "1f000000")},
+		testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPTypeOfService, data: mustCodecVector(t, "b8000000")},
+	)
+	outgoing4 := IPv4ControlMessage{TTL: 31, TOS: 0xb8, Src: address4}
+	encoded4, err := outgoing4.Marshal()
+	if err != nil || !bytes.Equal(encoded4, send4) {
+		t.Fatalf("IPv4 send control = %x, %v, want Linux fixture %x", encoded4, err, send4)
+	}
+	var parsed4 IPv4ControlMessage
+	options4, err := parsed4.parseForWrite(send4)
+	if err != nil || parsed4 != outgoing4 || !options4.hopLimitSet || !options4.trafficClassSet {
+		t.Fatalf("IPv4 send fixture = %+v options %+v, %v", parsed4, options4, err)
+	}
+
+	receive4 := mustCodecVector(t,
+		"1c00000000000000000000000800000000000000c000027bc000027b00000000"+
+			"140000000000000000000000020000001f00000000000000"+
+			"11000000000000000000000001000000b800000000000000")
+	assertLinuxControlRecords(t, receive4,
+		testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPPacketInfo, data: packetInfo4},
+		testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPTimeToLive, data: mustCodecVector(t, "1f000000")},
+		testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPTypeOfService, data: mustCodecVector(t, "b8")},
+	)
+	incoming4 := IPv4ControlMessage{TTL: 31, TOS: 0xb8, Dst: address4}
+	encoded4, err = incoming4.marshalForRead()
+	if err != nil || !bytes.Equal(encoded4, receive4) {
+		t.Fatalf("IPv4 receive control = %x, %v, want Linux fixture %x", encoded4, err, receive4)
+	}
+	parsed4 = IPv4ControlMessage{}
+	if err = parsed4.Parse(receive4); err != nil || parsed4 != incoming4 {
+		t.Fatalf("IPv4 receive fixture = %+v, %v, want %+v", parsed4, err, incoming4)
+	}
+
+	address6 := netip.MustParseAddr("2001:db8::123")
+	packetInfo6 := mustCodecVector(t, "20010db800000000000000000000012300000000")
+	control6 := mustCodecVector(t,
+		"2400000000000000290000003200000020010db80000000000000000000001230000000000000000"+
+			"140000000000000029000000340000001d00000000000000"+
+			"140000000000000029000000430000002e00000000000000"+
+			"1400000000000000290000000b00000002eabcde00000000")
+	assertLinuxControlRecords(t, control6,
+		testLinuxControlRecord{level: linuxLevelIPv6, kind: linuxIPv6PacketInfo, data: packetInfo6},
+		testLinuxControlRecord{level: linuxLevelIPv6, kind: linuxIPv6HopLimit, data: mustCodecVector(t, "1d000000")},
+		testLinuxControlRecord{level: linuxLevelIPv6, kind: linuxIPv6TrafficClass, data: mustCodecVector(t, "2e000000")},
+		testLinuxControlRecord{level: linuxLevelIPv6, kind: linuxIPv6FlowInfo, data: mustCodecVector(t, "02eabcde")},
+	)
+	outgoing6 := IPv6ControlMessage{TrafficClass: 0x2e, HopLimit: 29, FlowLabel: 0xabcde, Src: address6}
+	encoded6, err := outgoing6.Marshal()
+	if err != nil || !bytes.Equal(encoded6, control6) {
+		t.Fatalf("IPv6 send control = %x, %v, want Linux fixture %x", encoded6, err, control6)
+	}
+	var parsed6 IPv6ControlMessage
+	options6, err := parsed6.parseForWrite(control6)
+	if err != nil || parsed6 != outgoing6 || !options6.hopLimitSet || !options6.trafficClassSet || !options6.flowLabelSet {
+		t.Fatalf("IPv6 send fixture = %+v options %+v, %v", parsed6, options6, err)
+	}
+	incoming6 := IPv6ControlMessage{TrafficClass: 0x2e, HopLimit: 29, FlowLabel: 0xabcde, Dst: address6}
+	encoded6, err = incoming6.marshalForRead()
+	if err != nil || !bytes.Equal(encoded6, control6) {
+		t.Fatalf("IPv6 receive control = %x, %v, want Linux fixture %x", encoded6, err, control6)
+	}
+	parsed6 = IPv6ControlMessage{}
+	if err = parsed6.Parse(control6); err != nil || parsed6 != incoming6 {
+		t.Fatalf("IPv6 receive fixture = %+v, %v, want %+v", parsed6, err, incoming6)
+	}
+}
+
+func TestIPControlMessageKnownAnswerMutations(t *testing.T) {
+	receive4 := mustCodecVector(t,
+		"1c00000000000000000000000800000000000000c000027bc000027b00000000"+
+			"140000000000000000000000020000001f00000000000000"+
+			"11000000000000000000000001000000b800000000000000")
+	tests := []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{name: "short header", mutate: func(wire []byte) []byte { return wire[:15] }},
+		{name: "length below header", mutate: func(wire []byte) []byte {
+			binary.LittleEndian.PutUint64(wire[:8], 15)
+			return wire
+		}},
+		{name: "length beyond input", mutate: func(wire []byte) []byte {
+			binary.LittleEndian.PutUint64(wire[:8], uint64(len(wire)+1))
+			return wire
+		}},
+		{name: "cross-family packet info", mutate: func(wire []byte) []byte {
+			binary.LittleEndian.PutUint32(wire[8:12], linuxLevelIPv6)
+			return wire
+		}},
+		{name: "nonzero interface", mutate: func(wire []byte) []byte {
+			binary.LittleEndian.PutUint32(wire[16:20], 1)
+			return wire
+		}},
+		{name: "duplicate TTL", mutate: func(wire []byte) []byte { return append(wire, wire[32:56]...) }},
+		{name: "invalid TOS width", mutate: func(wire []byte) []byte {
+			binary.LittleEndian.PutUint64(wire[56:64], 18)
+			return wire
+		}},
+		{name: "truncated alignment", mutate: func(wire []byte) []byte { return wire[:len(wire)-1] }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wire := test.mutate(append([]byte(nil), receive4...))
+			before := append([]byte(nil), wire...)
+			initial := IPv4ControlMessage{TTL: 7, TOS: 9, Dst: netip.MustParseAddr("192.0.2.200")}
+			message := initial
+			if err := message.Parse(wire); err == nil {
+				t.Fatal("mutated control message parsed successfully")
+			}
+			if message != initial || !bytes.Equal(wire, before) {
+				t.Fatal("failed control parse modified its receiver or input")
+			}
+		})
 	}
 }
 
@@ -504,6 +670,83 @@ func FuzzSocketErrorControlMessageMarshalBinary(f *testing.F) {
 		}
 		if parsed != message {
 			t.Fatalf("round trip = %+v, want %+v", parsed, message)
+		}
+	})
+}
+
+// FuzzIPControlMessageMarshal verifies semantic fields against the fixed Linux
+// ancillary layout without using the public parser as the encoding oracle.
+func FuzzIPControlMessageMarshal(f *testing.F) {
+	f.Add(false, []byte{1, 2, 3}, byte(31), byte(0xb8), uint32(0))
+	f.Add(true, []byte{1, 2, 3, 4, 5}, byte(29), byte(0x2e), uint32(0xabcde))
+	f.Fuzz(func(t *testing.T, ipv6 bool, addressSeed []byte, hopLimit, trafficClass byte, rawFlowLabel uint32) {
+		flowLabel := rawFlowLabel & ipv6MaximumFlowLabel
+		var address netip.Addr
+		var packetInfo []byte
+		var records []testLinuxControlRecord
+		if ipv6 {
+			var value [16]byte
+			copy(value[:], addressSeed)
+			value[0] = 0x20
+			address = netip.AddrFrom16(value)
+			packetInfo = make([]byte, 20)
+			copy(packetInfo[:16], value[:])
+			records = append(records, testLinuxControlRecord{level: linuxLevelIPv6, kind: linuxIPv6PacketInfo, data: packetInfo})
+			if hopLimit != 0 {
+				data := make([]byte, 4)
+				binary.LittleEndian.PutUint32(data, uint32(hopLimit))
+				records = append(records, testLinuxControlRecord{level: linuxLevelIPv6, kind: linuxIPv6HopLimit, data: data})
+			}
+			if trafficClass != 0 {
+				data := make([]byte, 4)
+				binary.LittleEndian.PutUint32(data, uint32(trafficClass))
+				records = append(records, testLinuxControlRecord{level: linuxLevelIPv6, kind: linuxIPv6TrafficClass, data: data})
+			}
+			if flowLabel != 0 {
+				data := make([]byte, 4)
+				binary.BigEndian.PutUint32(data, uint32(trafficClass)<<20|flowLabel)
+				records = append(records, testLinuxControlRecord{level: linuxLevelIPv6, kind: linuxIPv6FlowInfo, data: data})
+			}
+			message := IPv6ControlMessage{TrafficClass: int(trafficClass), HopLimit: int(hopLimit), FlowLabel: flowLabel, Src: address}
+			control, err := message.Marshal()
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertLinuxControlRecords(t, control, records...)
+			var parsed IPv6ControlMessage
+			if _, err = parsed.parseForWrite(control); err != nil || parsed != message {
+				t.Fatalf("IPv6 control round trip = %+v, %v, want %+v", parsed, err, message)
+			}
+			return
+		}
+
+		var value [4]byte
+		copy(value[:], addressSeed)
+		value[0] = 192
+		address = netip.AddrFrom4(value)
+		packetInfo = make([]byte, 12)
+		copy(packetInfo[4:8], value[:])
+		copy(packetInfo[8:12], value[:])
+		records = append(records, testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPPacketInfo, data: packetInfo})
+		if hopLimit != 0 {
+			data := make([]byte, 4)
+			binary.LittleEndian.PutUint32(data, uint32(hopLimit))
+			records = append(records, testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPTimeToLive, data: data})
+		}
+		if trafficClass != 0 {
+			data := make([]byte, 4)
+			binary.LittleEndian.PutUint32(data, uint32(trafficClass))
+			records = append(records, testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPTypeOfService, data: data})
+		}
+		message := IPv4ControlMessage{TTL: int(hopLimit), TOS: int(trafficClass), Src: address}
+		control, err := message.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertLinuxControlRecords(t, control, records...)
+		var parsed IPv4ControlMessage
+		if _, err = parsed.parseForWrite(control); err != nil || parsed != message {
+			t.Fatalf("IPv4 control round trip = %+v, %v, want %+v", parsed, err, message)
 		}
 	})
 }

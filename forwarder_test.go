@@ -2551,6 +2551,61 @@ func makeNoncanonicalIPv6AtomicFragmentPacket(packet []byte, identification uint
 	return result
 }
 
+func TestICMPForwarderReplyIPPacketKnownAnswers(t *testing.T) {
+	tests := []struct {
+		name        string
+		destination netip.Addr
+		input       string
+		want        string
+		ipv4DF      bool
+	}{
+		{
+			name:        "IPv4 options",
+			destination: netip.MustParseAddr("192.0.2.10"),
+			input: "462e0001123440002501aabbc633640ac000020a00aabbcc" +
+				"000012340001000201020304",
+			want: "462e0024123440002501562fc633640ac000020a00000000" +
+				"0000fbf60001000201020304",
+			ipv4DF: true,
+		},
+		{
+			name:        "IPv6 atomic Fragment",
+			destination: netip.MustParseAddr("2001:db8::a"),
+			input: "62e0000000012c2520010db800010000000000000000000a20010db800000000000000000000000a" +
+				"3aa5000612345678810012340001000201020304",
+			want: "62e0000000142c2520010db800010000000000000000000a20010db800000000000000000000000a" +
+				"3a0000001234567881001f290001000201020304",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := mustCodecVector(t, test.input)
+			before := append([]byte(nil), input...)
+			reply, err := prepareICMPForwarderIPPacket(input, test.destination)
+			want := mustCodecVector(t, test.want)
+			if err != nil || !bytes.Equal(reply.packet, want) || reply.ipv4DF != test.ipv4DF {
+				t.Fatalf("ReplyIPPacket normalization = DF %t error %v\n got %x\nwant %x",
+					reply.ipv4DF, err, reply.packet, want)
+			}
+			if !bytes.Equal(input, before) {
+				t.Fatal("ReplyIPPacket normalization modified caller storage")
+			}
+			parsed, ok := parseIPPacket(reply.packet)
+			if !ok || parsed.parameterError || parsed.target != test.destination || parsed.protocol != ProtocolICMPv4 && parsed.protocol != ProtocolICMPv6 {
+				t.Fatalf("normalized ReplyIPPacket metadata = %+v, valid %t", parsed, ok)
+			}
+			if parsed.source.Is4() {
+				headerLength := int(reply.packet[0]&0xf) * 4
+				if referenceChecksum(reply.packet[:headerLength]) != 0 || referenceChecksum(parsed.payload) != 0 {
+					t.Fatal("normalized IPv4 ReplyIPPacket checksums are invalid")
+				}
+			} else if referenceTransportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0 {
+				t.Fatal("normalized IPv6 ReplyIPPacket checksum is invalid")
+			}
+		})
+	}
+}
+
 func TestICMPForwarderReplyIPPacketNormalization(t *testing.T) {
 	for _, test := range []struct {
 		name                  string
