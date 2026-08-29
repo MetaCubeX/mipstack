@@ -2862,6 +2862,1857 @@ func TestTCPEstablishedRTOStartsAfterDeviceDeparture(t *testing.T) {
 	}
 }
 
+func TestTCPEstablishedActorSurvivesStoppedDeviceRead(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	holdAllSlots := func() {
+		t.Helper()
+		for {
+			slot, reserved := stack.outbound.tryReserve()
+			if !reserved {
+				break
+			}
+			held = append(held, slot)
+		}
+		if len(held) != cap(stack.outbound.free) {
+			t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+		}
+	}
+	releaseOneSlot := func() {
+		t.Helper()
+		last := len(held) - 1
+		stack.outbound.releaseReserved(held[last])
+		held = held[:last]
+	}
+	checkResponsive := func(stage string) TCPConnInfo {
+		t.Helper()
+		result := make(chan TCPConnInfo, 1)
+		go func() { result <- connection.Info() }()
+		select {
+		case info := <-result:
+			return info
+		case <-time.After(time.Second):
+			t.Fatalf("Info blocked while Stack.Read was stopped during %s", stage)
+			return TCPConnInfo{}
+		}
+	}
+
+	before := connection.Info()
+	holdAllSlots()
+	payload := bytes.Repeat([]byte("ordinary-output-"), 256)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	blocked := checkResponsive("data output")
+	if blocked.BytesSent != before.BytesSent || blocked.Retransmissions != before.Retransmissions {
+		t.Fatalf("unpublished data changed send accounting: before=%+v blocked=%+v", before, blocked)
+	}
+	if blocked.SendBufferSize < len(payload) {
+		t.Fatalf("buffered bytes = %d, want at least %d", blocked.SendBufferSize, len(payload))
+	}
+
+	inbound := []byte("peer data while the packet device is not being read")
+	link.mu.Lock()
+	peer := link.tcp[connection.key.local.Port()]
+	serverSequence, clientAcknowledgement := peer.serverNext, peer.clientNext
+	peer.serverNext += uint32(len(inbound))
+	link.mu.Unlock()
+	if err := link.deliverTCP(connection.key.remote.Port(), connection.key.local.Port(), serverSequence, clientAcknowledgement, TCPFlagACK|TCPFlagPSH, 65535, nil, inbound); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	received := make([]byte, len(inbound))
+	if _, err := io.ReadFull(connection, received); err != nil {
+		t.Fatalf("Read with immediate ACK waiting for device capacity: %v", err)
+	}
+	if !bytes.Equal(received, inbound) {
+		t.Fatalf("received peer data = %q, want %q", received, inbound)
+	}
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	checkResponsive("acknowledgment output")
+
+	releaseOneSlot()
+	deadline := time.Now().Add(5 * time.Second)
+	for connection.Info().BytesAcknowledged-before.BytesAcknowledged != uint64(len(payload)) && time.Now().Before(deadline) {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			break
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if valid && packet.protocol == ProtocolTCP {
+			if err := link.handleOutboundPacket(wire); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if acknowledged := connection.Info().BytesAcknowledged - before.BytesAcknowledged; acknowledged != uint64(len(payload)) {
+		t.Fatalf("acknowledged bytes after capacity returned = %d, want %d", acknowledged, len(payload))
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(connection, echo); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatal("recovered TCP echo payload mismatch")
+	}
+
+	// Reacquire the circulating slot after draining any ACK generated for the
+	// echo, then verify that FIN uses the same capacity-driven wakeup.
+	deadline = time.Now().Add(time.Second)
+	for len(held) != cap(stack.outbound.free) && time.Now().Before(deadline) {
+		if slot, reserved := stack.outbound.tryReserve(); reserved {
+			held = append(held, slot)
+			continue
+		}
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			break
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if valid && packet.protocol == ProtocolTCP {
+			if err := link.handleOutboundPacket(wire); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("could not reacquire all output slots: held %d of %d", len(held), cap(stack.outbound.free))
+	}
+	if err := connection.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	checkResponsive("FIN output")
+	releaseOneSlot()
+	// A delayed ACK for the echoed data can become immediate before CloseWrite
+	// is processed. Let it use the circulating slot, then require FIN to follow.
+	finPublished := false
+	for attempt := 0; attempt < 2; attempt++ {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !available {
+			break
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("post-capacity packet is not TCP: %x", wire)
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if packet.payload[13]&TCPFlagFIN != 0 {
+			finPublished = true
+			break
+		}
+		if packet.payload[13]&TCPFlagACK == 0 || headerSize < tcpHeaderSize || headerSize > len(packet.payload) || headerSize != len(packet.payload) {
+			t.Fatalf("packet before FIN is not a pure ACK: %x", wire)
+		}
+	}
+	if !finPublished {
+		t.Fatal("FIN was not published through the returned output slot")
+	}
+}
+
+func TestTCPPersistProbeSurvivesStoppedDeviceRead(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		reopenWindow bool
+	}{
+		{name: "returned capacity publishes probe"},
+		{name: "window update cancels probe", reopenWindow: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			link, stack, connection := newManuallyPumpedTCPConnection(t)
+			defer connection.Close()
+
+			clientPort := uint16(connection.LocalAddr().(*net.TCPAddr).Port)
+			link.mu.Lock()
+			peer := link.tcp[clientPort]
+			sequence, acknowledgement := peer.serverNext, peer.clientNext
+			link.mu.Unlock()
+			if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement, TCPFlagACK, 0, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, time.Second, func() bool { return connection.Info().PeerWindow == 0 })
+
+			held := make([]uint16, 0, cap(stack.outbound.free))
+			defer func() {
+				for _, slot := range held {
+					stack.outbound.releaseReserved(slot)
+				}
+			}()
+			for {
+				slot, reserved := stack.outbound.tryReserve()
+				if !reserved {
+					break
+				}
+				held = append(held, slot)
+			}
+			if len(held) != cap(stack.outbound.free) {
+				t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+			}
+
+			payload := []byte("persist output")
+			if n, err := connection.Write(payload); err != nil || n != len(payload) {
+				t.Fatalf("Write = %d, %v", n, err)
+			}
+			// Two actor-serialized observations ensure the socket wake has armed
+			// persist before the test leaves the actor idle for its full deadline.
+			_ = connection.Info()
+			before := connection.Info()
+			persistDelay := before.RetransmissionTimeout
+			if persistDelay < time.Second {
+				persistDelay = time.Second
+			}
+			time.Sleep(persistDelay + 100*time.Millisecond)
+
+			responsive := make(chan TCPConnInfo, 1)
+			go func() {
+				_ = connection.Info()
+				responsive <- connection.Info()
+			}()
+			var blocked TCPConnInfo
+			select {
+			case blocked = <-responsive:
+			case <-time.After(time.Second):
+				t.Fatal("Info blocked while an expired persist probe waited for device capacity")
+			}
+			if blocked.BytesSent != before.BytesSent || stack.Stats().TCPZeroWindowProbes != 0 {
+				t.Fatalf("unpublished persist probe = before:%+v blocked:%+v stats:%+v", before, blocked, stack.Stats())
+			}
+
+			if test.reopenWindow {
+				if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				_ = connection.Info()
+				opened := connection.Info()
+				if opened.PeerWindow == 0 || opened.BytesSent != before.BytesSent || stack.Stats().TCPZeroWindowProbes != 0 {
+					t.Fatalf("window update did not cancel unpublished persist output: before:%+v opened:%+v stats:%+v", before, opened, stack.Stats())
+				}
+			}
+
+			last := len(held) - 1
+			stack.outbound.releaseReserved(held[last])
+			held = held[:last]
+			entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+			if !available {
+				t.Fatal("persist-blocked output did not resume when device capacity returned")
+			}
+			wire := consumeTestPacket(&stack.outbound, entry)
+			packet, valid := parseIPPacket(wire)
+			if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+				t.Fatalf("persist capacity-wakeup packet is not TCP: %x", wire)
+			}
+			headerSize := int(packet.payload[12]>>4) * 4
+			if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+				t.Fatalf("persist capacity-wakeup header length = %d in %x", headerSize, wire)
+			}
+			gotSequence := binary.BigEndian.Uint32(packet.payload[4:8])
+			gotPayload := packet.payload[headerSize:]
+			if test.reopenWindow {
+				if gotSequence != acknowledgement || !bytes.Equal(gotPayload, payload) {
+					t.Fatalf("window-reopened output did not replace persist probe: %x", wire)
+				}
+				if probes := stack.Stats().TCPZeroWindowProbes; probes != 0 {
+					t.Fatalf("canceled persist probes = %d, want 0", probes)
+				}
+			} else {
+				if gotSequence != acknowledgement-1 || !bytes.Equal(gotPayload, tcpZeroWindowProbe[:]) {
+					t.Fatalf("resumed output is not the current zero-window probe: %x", wire)
+				}
+				waitFor(t, time.Second, func() bool { return stack.Stats().TCPZeroWindowProbes == 1 })
+			}
+		})
+	}
+}
+
+func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		inboundActivity   bool
+		applicationOutput bool
+	}{
+		{name: "returned capacity publishes probe"},
+		{name: "inbound activity cancels probe", inboundActivity: true},
+		{name: "application output cancels probe", applicationOutput: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			link, stack, connection := newManuallyPumpedTCPConnection(t)
+			defer connection.Close()
+
+			clientPort := uint16(connection.LocalAddr().(*net.TCPAddr).Port)
+			link.mu.Lock()
+			peer := link.tcp[clientPort]
+			sequence, acknowledgement := peer.serverNext, peer.clientNext
+			link.mu.Unlock()
+
+			held := make([]uint16, 0, cap(stack.outbound.free))
+			defer func() {
+				for _, slot := range held {
+					stack.outbound.releaseReserved(slot)
+				}
+			}()
+			for {
+				slot, reserved := stack.outbound.tryReserve()
+				if !reserved {
+					break
+				}
+				held = append(held, slot)
+			}
+			if len(held) != cap(stack.outbound.free) {
+				t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+			}
+
+			keepAlive := KeepAliveConfig{Idle: 100 * time.Millisecond, Interval: 100 * time.Millisecond, Count: 3}
+			if err := connection.SetKeepAliveConfig(keepAlive); err != nil {
+				t.Fatal(err)
+			}
+			if err := connection.SetKeepAlive(true); err != nil {
+				t.Fatal(err)
+			}
+			_ = connection.Info()
+			_ = connection.Info()
+			time.Sleep(keepAlive.Idle + 50*time.Millisecond)
+
+			responsive := make(chan TCPConnInfo, 1)
+			go func() {
+				_ = connection.Info()
+				responsive <- connection.Info()
+			}()
+			select {
+			case info := <-responsive:
+				if info.KeepAliveConfig != keepAlive || stack.Stats().TCPKeepAliveProbes != 0 {
+					t.Fatalf("unpublished keepalive probe = info:%+v stats:%+v", info, stack.Stats())
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Info blocked while a keepalive probe waited for device capacity")
+			}
+
+			if test.inboundActivity {
+				payload := []byte("peer activity")
+				link.mu.Lock()
+				peer.serverNext += uint32(len(payload))
+				link.mu.Unlock()
+				if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement, TCPFlagACK|TCPFlagPSH, 65535, nil, payload); err != nil {
+					t.Fatal(err)
+				}
+				if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+					t.Fatal(err)
+				}
+				received := make([]byte, len(payload))
+				if _, err := io.ReadFull(connection, received); err != nil || !bytes.Equal(received, payload) {
+					t.Fatalf("Read after keepalive cancellation = %q, %v", received, err)
+				}
+				if err := connection.SetQuickACK(true); err != nil {
+					t.Fatal(err)
+				}
+				_ = connection.Info()
+				_ = connection.Info()
+			} else if test.applicationOutput {
+				payload := []byte("application output")
+				if n, err := connection.Write(payload); err != nil || n != len(payload) {
+					t.Fatalf("Write = %d, %v", n, err)
+				}
+				_ = connection.Info()
+				_ = connection.Info()
+			}
+
+			last := len(held) - 1
+			stack.outbound.releaseReserved(held[last])
+			held = held[:last]
+			entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+			if !available {
+				t.Fatal("keepalive-blocked output did not resume when device capacity returned")
+			}
+			wire := consumeTestPacket(&stack.outbound, entry)
+			packet, valid := parseIPPacket(wire)
+			if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+				t.Fatalf("keepalive capacity-wakeup packet is not TCP: %x", wire)
+			}
+			headerSize := int(packet.payload[12]>>4) * 4
+			if headerSize < tcpHeaderSize || headerSize > len(packet.payload) || packet.payload[13]&TCPFlagACK == 0 {
+				t.Fatalf("invalid keepalive capacity-wakeup TCP segment: %x", wire)
+			}
+			gotSequence := binary.BigEndian.Uint32(packet.payload[4:8])
+			gotAcknowledgement := binary.BigEndian.Uint32(packet.payload[8:12])
+			if test.applicationOutput {
+				if gotSequence != acknowledgement || !bytes.Equal(packet.payload[headerSize:], []byte("application output")) {
+					t.Fatalf("application output did not replace keepalive probe: %x", wire)
+				}
+				if probes := stack.Stats().TCPKeepAliveProbes; probes != 0 {
+					t.Fatalf("application-canceled keepalive probes = %d, want 0", probes)
+				}
+			} else if test.inboundActivity {
+				if headerSize != len(packet.payload) {
+					t.Fatalf("activity response is not a payload-free ACK: %x", wire)
+				}
+				if gotSequence != acknowledgement || gotAcknowledgement != sequence+uint32(len("peer activity")) {
+					t.Fatalf("activity ACK did not replace keepalive probe: %x", wire)
+				}
+				if probes := stack.Stats().TCPKeepAliveProbes; probes != 0 {
+					t.Fatalf("canceled keepalive probes = %d, want 0", probes)
+				}
+			} else {
+				if headerSize != len(packet.payload) {
+					t.Fatalf("keepalive probe carries payload: %x", wire)
+				}
+				if gotSequence != acknowledgement-1 || gotAcknowledgement != sequence {
+					t.Fatalf("resumed output is not the current keepalive probe: %x", wire)
+				}
+				waitFor(t, time.Second, func() bool { return stack.Stats().TCPKeepAliveProbes == 1 })
+			}
+		})
+	}
+}
+
+func TestTCPLivenessTimeoutSurvivesStoppedDeviceRead(t *testing.T) {
+	t.Run("idle timeout", func(t *testing.T) {
+		_, stack, connection := newManuallyPumpedTCPConnection(t)
+		defer connection.Close()
+
+		held := make([]uint16, 0, cap(stack.outbound.free))
+		defer func() {
+			for _, slot := range held {
+				stack.outbound.releaseReserved(slot)
+			}
+		}()
+		for {
+			slot, reserved := stack.outbound.tryReserve()
+			if !reserved {
+				break
+			}
+			held = append(held, slot)
+		}
+		if len(held) != cap(stack.outbound.free) {
+			t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+		}
+
+		if err := connection.SetKeepAliveConfig(KeepAliveConfig{Idle: 25 * time.Millisecond, Interval: 25 * time.Millisecond, Count: 20}); err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.SetIdleTimeout(125 * time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.SetKeepAlive(true); err != nil {
+			t.Fatal(err)
+		}
+		_ = connection.Info()
+		_ = connection.Info()
+		select {
+		case <-connection.done:
+		case <-time.After(time.Second):
+			t.Fatal("idle timeout was suppressed by a keepalive waiting for device capacity")
+		}
+		if info := connection.Info(); !errors.Is(info.LastError, os.ErrDeadlineExceeded) || stack.Stats().TCPKeepAliveProbes != 0 {
+			t.Fatalf("queue-blocked idle timeout = info:%+v stats:%+v", info, stack.Stats())
+		}
+	})
+
+	t.Run("user timeout", func(t *testing.T) {
+		_, stack, connection := newManuallyPumpedTCPConnection(t)
+		defer connection.Close()
+		if err := connection.SetKeepAliveConfig(KeepAliveConfig{Idle: 25 * time.Millisecond, Interval: 25 * time.Millisecond, Count: 20}); err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.SetUserTimeout(150 * time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		if err := connection.SetKeepAlive(true); err != nil {
+			t.Fatal(err)
+		}
+		_ = connection.Info()
+		_ = connection.Info()
+
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !available {
+			t.Fatal("initial keepalive probe was not published")
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize || int(packet.payload[12]>>4)*4 != len(packet.payload) {
+			t.Fatalf("initial keepalive output is not a payload-free TCP segment: %x", wire)
+		}
+		waitFor(t, time.Second, func() bool { return stack.Stats().TCPKeepAliveProbes == 1 })
+
+		held := make([]uint16, 0, cap(stack.outbound.free))
+		defer func() {
+			for _, slot := range held {
+				stack.outbound.releaseReserved(slot)
+			}
+		}()
+		for {
+			slot, reserved := stack.outbound.tryReserve()
+			if !reserved {
+				break
+			}
+			held = append(held, slot)
+		}
+		if len(held) != cap(stack.outbound.free) {
+			t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+		}
+
+		select {
+		case <-connection.done:
+		case <-time.After(time.Second):
+			t.Fatal("user timeout was suppressed by a keepalive waiting for device capacity")
+		}
+		if info := connection.Info(); !errors.Is(info.LastError, syscall.ETIMEDOUT) || stack.Stats().TCPKeepAliveProbes != 1 {
+			t.Fatalf("queue-blocked keepalive user timeout = info:%+v stats:%+v", info, stack.Stats())
+		}
+	})
+}
+
+func TestTCPSACKRecoverySurvivesStoppedDeviceRead(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x5a}, 5*before.MaximumSegmentSize)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	type dataSegment struct {
+		wire     []byte
+		sequence uint32
+		payload  []byte
+	}
+	segments := make([]dataSegment, 0, 5)
+	queuedBytes := 0
+	deadline := time.Now().Add(time.Second)
+	for queuedBytes < len(payload) {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("initial output is not TCP: %x", wire)
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+			t.Fatalf("initial TCP header length = %d in %x", headerSize, wire)
+		}
+		segmentPayload := packet.payload[headerSize:]
+		if len(segmentPayload) == 0 {
+			t.Fatalf("initial output is not a data segment: %x", wire)
+		}
+		segments = append(segments, dataSegment{
+			wire:     wire,
+			sequence: binary.BigEndian.Uint32(packet.payload[4:8]),
+			payload:  append([]byte(nil), segmentPayload...),
+		})
+		queuedBytes += len(segmentPayload)
+	}
+	if len(segments) < 4 {
+		t.Fatalf("initial TCP flight has %d segments, want at least 4", len(segments))
+	}
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+	for _, segment := range segments[1:] {
+		if err := link.handleOutboundPacket(segment.wire); err != nil {
+			t.Fatal(err)
+		}
+	}
+	responsiveInfo := func() TCPConnInfo {
+		t.Helper()
+		result := make(chan TCPConnInfo, 1)
+		go func() { result <- connection.Info() }()
+		select {
+		case info := <-result:
+			return info
+		case <-time.After(time.Second):
+			t.Fatal("Info blocked while SACK recovery waited for device capacity")
+			return TCPConnInfo{}
+		}
+	}
+	// The first request can be answered before the coalesced inbound batch. The
+	// second proves that all SACK feedback and its failed publication completed.
+	_ = responsiveInfo()
+	blocked := responsiveInfo()
+	if !blocked.FastRecovery {
+		t.Fatalf("SACK feedback did not enter fast recovery: %+v", blocked)
+	}
+	if blocked.Retransmissions != before.Retransmissions {
+		t.Fatalf("unpublished SACK recovery counted %d retransmissions, want %d", blocked.Retransmissions, before.Retransmissions)
+	}
+	if depth := stack.outbound.len(); depth != 0 {
+		t.Fatalf("full reserved output queue contains %d published packets, want 0", depth)
+	}
+
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+	if !available {
+		t.Fatal("SACK recovery did not resume when device capacity returned")
+	}
+	retransmissionWire := consumeTestPacket(&stack.outbound, entry)
+	retransmission, valid := parseIPPacket(retransmissionWire)
+	if !valid || retransmission.protocol != ProtocolTCP || len(retransmission.payload) < tcpHeaderSize {
+		t.Fatalf("recovery output is not TCP: %x", retransmissionWire)
+	}
+	headerSize := int(retransmission.payload[12]>>4) * 4
+	if headerSize < tcpHeaderSize || headerSize > len(retransmission.payload) {
+		t.Fatalf("recovery TCP header length = %d in %x", headerSize, retransmissionWire)
+	}
+	if sequence := binary.BigEndian.Uint32(retransmission.payload[4:8]); sequence != segments[0].sequence {
+		t.Fatalf("retransmitted sequence = %#x, want first lost sequence %#x", sequence, segments[0].sequence)
+	}
+	if !bytes.Equal(retransmission.payload[headerSize:], segments[0].payload) {
+		t.Fatal("retransmitted first-segment payload mismatch")
+	}
+	after := responsiveInfo()
+	if after.Retransmissions != before.Retransmissions+1 {
+		t.Fatalf("published SACK recovery counted %d retransmissions, want %d", after.Retransmissions, before.Retransmissions+1)
+	}
+	if err := link.handleOutboundPacket(retransmissionWire); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(connection, echo); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatal("SACK-recovered TCP echo payload mismatch")
+	}
+}
+
+// tcpRecoveryLossRecorder preserves Reno's behavior while counting the public
+// fast-loss and timeout signals emitted for recovery episodes.
+type tcpRecoveryLossRecorder struct {
+	mu        sync.Mutex
+	algorithm CongestionController
+	losses    int
+	timeouts  int
+}
+
+func (r *tcpRecoveryLossRecorder) HandleCongestionEvent(event *CongestionEvent) {
+	if event.Type == CongestionEventLoss || event.Type == CongestionEventTimeout {
+		r.mu.Lock()
+		if event.Type == CongestionEventLoss {
+			r.losses++
+		} else {
+			r.timeouts++
+		}
+		r.mu.Unlock()
+	}
+	r.algorithm.HandleCongestionEvent(event)
+}
+
+func (r *tcpRecoveryLossRecorder) lossCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.losses
+}
+
+func (r *tcpRecoveryLossRecorder) timeoutCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.timeouts
+}
+
+func TestTCPTailLossProbeSurvivesStoppedDeviceRead(t *testing.T) {
+	_, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x46}, 2*before.MaximumSegmentSize)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	type dataSegment struct {
+		sequence uint32
+		payload  []byte
+	}
+	segments := make([]dataSegment, 0, 2)
+	queuedBytes := 0
+	deadline := time.Now().Add(time.Second)
+	for queuedBytes < len(payload) {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("initial output is not TCP: %x", wire)
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+			t.Fatalf("initial TCP header length = %d in %x", headerSize, wire)
+		}
+		segmentPayload := packet.payload[headerSize:]
+		if len(segmentPayload) == 0 {
+			t.Fatalf("initial output is not a data segment: %x", wire)
+		}
+		segments = append(segments, dataSegment{
+			sequence: binary.BigEndian.Uint32(packet.payload[4:8]),
+			payload:  append([]byte(nil), segmentPayload...),
+		})
+		queuedBytes += len(segmentPayload)
+	}
+	if len(segments) < 2 {
+		t.Fatalf("initial TCP flight has %d segments, want at least 2", len(segments))
+	}
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+	probeDelay := tailLossProbeDelay(before.RTT, before.RetransmissionTimeout, false)
+	if probeDelay >= before.RetransmissionTimeout {
+		t.Fatalf("tail-loss probe delay = %v, want less than RTO %v", probeDelay, before.RetransmissionTimeout)
+	}
+	// Wait inside the interval owned only by the TLP deadline. This proves the
+	// actor has handled that logical timer without relying on the later RTO.
+	time.Sleep(probeDelay + (before.RetransmissionTimeout-probeDelay)/2)
+	responsiveInfo := func() TCPConnInfo {
+		t.Helper()
+		result := make(chan TCPConnInfo, 1)
+		go func() { result <- connection.Info() }()
+		select {
+		case info := <-result:
+			return info
+		case <-time.After(time.Second):
+			t.Fatal("Info blocked while a tail-loss probe waited for device capacity")
+			return TCPConnInfo{}
+		}
+	}
+	// The first request may race with the physical timer wake. The second is
+	// handled only after the actor has revisited the already expired deadline.
+	_ = responsiveInfo()
+	blocked := responsiveInfo()
+	if blocked.Retransmissions != before.Retransmissions || blocked.RetransmissionRecovery {
+		t.Fatalf("unpublished tail-loss probe = before:%+v blocked:%+v", before, blocked)
+	}
+	if depth := stack.outbound.len(); depth != 0 {
+		t.Fatalf("full reserved output queue contains %d published packets, want 0", depth)
+	}
+
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+	if !available {
+		t.Fatal("tail-loss probe did not resume when device capacity returned")
+	}
+	probeWire := consumeTestPacket(&stack.outbound, entry)
+	probe, valid := parseIPPacket(probeWire)
+	if !valid || probe.protocol != ProtocolTCP || len(probe.payload) < tcpHeaderSize {
+		t.Fatalf("tail-loss probe is not TCP: %x", probeWire)
+	}
+	headerSize := int(probe.payload[12]>>4) * 4
+	lastSegment := segments[len(segments)-1]
+	if headerSize < tcpHeaderSize || headerSize > len(probe.payload) || binary.BigEndian.Uint32(probe.payload[4:8]) != lastSegment.sequence || !bytes.Equal(probe.payload[headerSize:], lastSegment.payload) {
+		t.Fatalf("tail-loss probe does not retransmit the final range: %x", probeWire)
+	}
+	after := responsiveInfo()
+	if after.Retransmissions != before.Retransmissions+1 || stack.Stats().TCPTailLossProbes != 1 {
+		t.Fatalf("published tail-loss probe = before:%+v after:%+v stats:%+v", before, after, stack.Stats())
+	}
+}
+
+func TestTCPTailLossProbeNewDataSurvivesStoppedDeviceRead(t *testing.T) {
+	_, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x68}, int(before.CongestionWindow)+before.MaximumSegmentSize)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	firstSequence := uint32(0)
+	queuedBytes := 0
+	deadline := time.Now().Add(time.Second)
+	for queuedBytes < int(before.CongestionWindow) {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			t.Fatalf("initial TCP flight = %d bytes, want congestion window %d", queuedBytes, before.CongestionWindow)
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("initial output is not TCP: %x", wire)
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+			t.Fatalf("initial TCP header length = %d in %x", headerSize, wire)
+		}
+		if queuedBytes == 0 {
+			firstSequence = binary.BigEndian.Uint32(packet.payload[4:8])
+		}
+		queuedBytes += len(packet.payload) - headerSize
+	}
+	if queuedBytes != int(before.CongestionWindow) {
+		t.Fatalf("initial TCP flight = %d bytes, want congestion window %d", queuedBytes, before.CongestionWindow)
+	}
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+	probeDelay := tailLossProbeDelay(before.RTT, before.RetransmissionTimeout, false)
+	if probeDelay >= before.RetransmissionTimeout {
+		t.Fatalf("tail-loss probe delay = %v, want less than RTO %v", probeDelay, before.RetransmissionTimeout)
+	}
+	time.Sleep(probeDelay + (before.RetransmissionTimeout-probeDelay)/2)
+	responsiveInfo := func() TCPConnInfo {
+		t.Helper()
+		result := make(chan TCPConnInfo, 1)
+		go func() { result <- connection.Info() }()
+		select {
+		case info := <-result:
+			return info
+		case <-time.After(time.Second):
+			t.Fatal("Info blocked while a new-data tail-loss probe waited for device capacity")
+			return TCPConnInfo{}
+		}
+	}
+	_ = responsiveInfo()
+	blocked := responsiveInfo()
+	if blocked.Retransmissions != before.Retransmissions || blocked.BytesSent != before.BytesSent+uint64(queuedBytes) {
+		t.Fatalf("unpublished new-data tail-loss probe = before:%+v blocked:%+v", before, blocked)
+	}
+
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+	if !available {
+		t.Fatal("new-data tail-loss probe did not resume when device capacity returned")
+	}
+	probeWire := consumeTestPacket(&stack.outbound, entry)
+	probe, valid := parseIPPacket(probeWire)
+	if !valid || probe.protocol != ProtocolTCP || len(probe.payload) < tcpHeaderSize {
+		t.Fatalf("new-data tail-loss probe is not TCP: %x", probeWire)
+	}
+	headerSize := int(probe.payload[12]>>4) * 4
+	if headerSize < tcpHeaderSize || headerSize > len(probe.payload) {
+		t.Fatalf("new-data tail-loss probe header length = %d in %x", headerSize, probeWire)
+	}
+	probePayload := probe.payload[headerSize:]
+	wantSequence := firstSequence + uint32(queuedBytes)
+	if binary.BigEndian.Uint32(probe.payload[4:8]) != wantSequence || !bytes.Equal(probePayload, payload[queuedBytes:queuedBytes+len(probePayload)]) {
+		t.Fatalf("tail-loss probe did not publish current unsent data: %x", probeWire)
+	}
+	after := responsiveInfo()
+	if after.Retransmissions != before.Retransmissions || after.BytesSent != before.BytesSent+uint64(queuedBytes+len(probePayload)) || stack.Stats().TCPTailLossProbes != 1 {
+		t.Fatalf("published new-data tail-loss probe = before:%+v after:%+v stats:%+v", before, after, stack.Stats())
+	}
+}
+
+func TestTCPRTORecoverySurvivesStoppedDeviceRead(t *testing.T) {
+	_, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	recorder := &tcpRecoveryLossRecorder{algorithm: newRenoCongestionControl()}
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: "test-rto-device-backpressure", New: func(CongestionControlContext) CongestionController { return recorder },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetCongestionControlFactory(factory); err != nil {
+		t.Fatal(err)
+	}
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x2f}, 2*before.MaximumSegmentSize)
+	if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, writeErr)
+	}
+	type dataSegment struct {
+		sequence uint32
+		payload  []byte
+	}
+	segments := make([]dataSegment, 0, 2)
+	queuedBytes := 0
+	deadline := time.Now().Add(time.Second)
+	for queuedBytes < len(payload) {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("initial output is not TCP: %x", wire)
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+			t.Fatalf("initial TCP header length = %d in %x", headerSize, wire)
+		}
+		segmentPayload := packet.payload[headerSize:]
+		segments = append(segments, dataSegment{
+			sequence: binary.BigEndian.Uint32(packet.payload[4:8]),
+			payload:  append([]byte(nil), segmentPayload...),
+		})
+		queuedBytes += len(segmentPayload)
+	}
+	if len(segments) < 2 {
+		t.Fatalf("initial TCP flight has %d segments, want at least 2", len(segments))
+	}
+	// Let the earlier TLP leave the device as well, then stop Stack.Read for
+	// the full RTO. The recorder is independent evidence that timeout recovery
+	// has run before responsiveness is checked.
+	probeEntry, available := waitTestPacketEntry(&stack.outbound, before.RetransmissionTimeout)
+	if !available {
+		t.Fatal("tail-loss probe was not published before the RTO")
+	}
+	probeWire := consumeTestPacket(&stack.outbound, probeEntry)
+	probe, valid := parseIPPacket(probeWire)
+	if !valid || probe.protocol != ProtocolTCP || len(probe.payload) < tcpHeaderSize || binary.BigEndian.Uint32(probe.payload[4:8]) != segments[len(segments)-1].sequence {
+		t.Fatalf("pre-RTO output is not the final-range tail-loss probe: %x", probeWire)
+	}
+	afterProbe := connection.Info()
+	if afterProbe.Retransmissions != before.Retransmissions+1 || afterProbe.RetransmissionRecovery {
+		t.Fatalf("tail-loss probe state = before:%+v after:%+v", before, afterProbe)
+	}
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+	waitFor(t, 2*before.RetransmissionTimeout+time.Second, func() bool { return recorder.timeoutCount() != 0 })
+	responsiveInfo := func() TCPConnInfo {
+		t.Helper()
+		result := make(chan TCPConnInfo, 1)
+		go func() { result <- connection.Info() }()
+		select {
+		case info := <-result:
+			return info
+		case <-time.After(time.Second):
+			t.Fatal("Info blocked while RTO output waited for device capacity")
+			return TCPConnInfo{}
+		}
+	}
+	blocked := responsiveInfo()
+	if !blocked.RetransmissionRecovery || blocked.Retransmissions != afterProbe.Retransmissions || recorder.timeoutCount() != 1 {
+		t.Fatalf("unpublished RTO recovery = after-probe:%+v blocked:%+v timeout-events:%d", afterProbe, blocked, recorder.timeoutCount())
+	}
+	if depth := stack.outbound.len(); depth != 0 {
+		t.Fatalf("full reserved output queue contains %d published packets, want 0", depth)
+	}
+
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	rtoEntry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+	if !available {
+		t.Fatal("RTO retransmission did not resume when device capacity returned")
+	}
+	rtoWire := consumeTestPacket(&stack.outbound, rtoEntry)
+	rtoPacket, valid := parseIPPacket(rtoWire)
+	if !valid || rtoPacket.protocol != ProtocolTCP || len(rtoPacket.payload) < tcpHeaderSize {
+		t.Fatalf("RTO recovery output is not TCP: %x", rtoWire)
+	}
+	headerSize := int(rtoPacket.payload[12]>>4) * 4
+	if headerSize < tcpHeaderSize || headerSize > len(rtoPacket.payload) || binary.BigEndian.Uint32(rtoPacket.payload[4:8]) != segments[0].sequence || !bytes.Equal(rtoPacket.payload[headerSize:], segments[0].payload) {
+		t.Fatalf("RTO recovery does not retransmit the first range: %x", rtoWire)
+	}
+	after := responsiveInfo()
+	if after.Retransmissions != afterProbe.Retransmissions+1 || recorder.timeoutCount() != 1 {
+		t.Fatalf("published RTO recovery = after-probe:%+v after:%+v timeout-events:%d", afterProbe, after, recorder.timeoutCount())
+	}
+}
+
+func TestTCPRTOPendingOutputCanceledByLateACK(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	recorder := &tcpRecoveryLossRecorder{algorithm: newRenoCongestionControl()}
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: "test-rto-late-ack", New: func(CongestionControlContext) CongestionController { return recorder },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetCongestionControlFactory(factory); err != nil {
+		t.Fatal(err)
+	}
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x91}, 2*before.MaximumSegmentSize)
+	if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, writeErr)
+	}
+	type dataSegment struct {
+		wire    []byte
+		payload []byte
+	}
+	segments := make([]dataSegment, 0, 2)
+	queuedBytes := 0
+	deadline := time.Now().Add(time.Second)
+	for queuedBytes < len(payload) {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("initial output is not TCP: %x", wire)
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+			t.Fatalf("initial TCP header length = %d in %x", headerSize, wire)
+		}
+		segmentPayload := packet.payload[headerSize:]
+		segments = append(segments, dataSegment{wire: wire, payload: append([]byte(nil), segmentPayload...)})
+		queuedBytes += len(segmentPayload)
+	}
+	if len(segments) < 2 {
+		t.Fatalf("initial TCP flight has %d segments, want at least 2", len(segments))
+	}
+	probeEntry, available := waitTestPacketEntry(&stack.outbound, before.RetransmissionTimeout)
+	if !available {
+		t.Fatal("tail-loss probe was not published before the RTO")
+	}
+	consumeTestPacket(&stack.outbound, probeEntry)
+	afterProbe := connection.Info()
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+	waitFor(t, 2*before.RetransmissionTimeout+time.Second, func() bool { return recorder.timeoutCount() != 0 })
+	if err = link.handleOutboundPacket(segments[0].wire); err != nil {
+		t.Fatal(err)
+	}
+	responsiveInfo := func() TCPConnInfo {
+		t.Helper()
+		result := make(chan TCPConnInfo, 1)
+		go func() { result <- connection.Info() }()
+		select {
+		case info := <-result:
+			return info
+		case <-time.After(time.Second):
+			t.Fatal("Info blocked after a late ACK canceled pending RTO output")
+			return TCPConnInfo{}
+		}
+	}
+	// The first request can race ahead of the injected ACK. The second observes
+	// its cancellation of the unpublished timeout retransmission.
+	_ = responsiveInfo()
+	afterACK := responsiveInfo()
+	if afterACK.RetransmissionRecovery || afterACK.Retransmissions != afterProbe.Retransmissions || afterACK.BytesAcknowledged-before.BytesAcknowledged != uint64(len(segments[0].payload)) || afterACK.SpuriousRecoveryUndos == 0 {
+		t.Fatalf("late-ACK timeout cancellation = before:%+v after-probe:%+v after-ACK:%+v", before, afterProbe, afterACK)
+	}
+	if recorder.timeoutCount() != 1 {
+		t.Fatalf("late-ACK timeout events = %d, want 1", recorder.timeoutCount())
+	}
+	if depth := stack.outbound.len(); depth != 0 {
+		t.Fatalf("full reserved output queue contains %d published packets, want 0", depth)
+	}
+}
+
+func TestTCPRTOPendingOutputCanceledAfterCongestionControlChange(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	recorder := &tcpRecoveryLossRecorder{algorithm: newRenoCongestionControl()}
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: "test-rto-controller-change", New: func(CongestionControlContext) CongestionController { return recorder },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetCongestionControlFactory(factory); err != nil {
+		t.Fatal(err)
+	}
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x39}, 2*before.MaximumSegmentSize)
+	if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, writeErr)
+	}
+	sequence := uint32(0)
+	queuedBytes := 0
+	deadline := time.Now().Add(time.Second)
+	for queuedBytes < len(payload) {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("initial output is not TCP: %x", wire)
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+			t.Fatalf("initial TCP header length = %d in %x", headerSize, wire)
+		}
+		if queuedBytes == 0 {
+			sequence = binary.BigEndian.Uint32(packet.payload[4:8])
+		}
+		queuedBytes += len(packet.payload) - headerSize
+	}
+	probeEntry, available := waitTestPacketEntry(&stack.outbound, before.RetransmissionTimeout)
+	if !available {
+		t.Fatal("tail-loss probe was not published before the RTO")
+	}
+	consumeTestPacket(&stack.outbound, probeEntry)
+	afterProbe := connection.Info()
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+	waitFor(t, 2*before.RetransmissionTimeout+time.Second, func() bool { return recorder.timeoutCount() != 0 })
+
+	replacement, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: "test-rto-controller-replacement", New: func(CongestionControlContext) CongestionController { return newRenoCongestionControl() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetCongestionControlFactory(replacement); err != nil {
+		t.Fatal(err)
+	}
+	// Info serialization proves that the controller change invalidated the old
+	// undo snapshot while the timeout retransmission was still unpublished.
+	changed := connection.Info()
+	if changed.CongestionControl != "test-rto-controller-replacement" || !changed.RetransmissionRecovery || changed.Retransmissions != afterProbe.Retransmissions {
+		t.Fatalf("pending RTO after controller change = after-probe:%+v changed:%+v", afterProbe, changed)
+	}
+
+	clientPort := connection.key.local.Port()
+	link.mu.Lock()
+	serverSequence := link.tcp[clientPort].serverNext
+	link.mu.Unlock()
+	if err = link.deliverTCP(connection.key.remote.Port(), clientPort, serverSequence, sequence+uint32(len(payload)), TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The first request can race with the inbound wake. The second observes the
+	// full ACK after the unavailable undo path has canceled pending output.
+	_ = connection.Info()
+	afterACK := connection.Info()
+	if afterACK.RetransmissionRecovery || afterACK.Retransmissions != afterProbe.Retransmissions || afterACK.BytesAcknowledged-before.BytesAcknowledged != uint64(len(payload)) || afterACK.SpuriousRecoveryUndos != before.SpuriousRecoveryUndos {
+		t.Fatalf("late ACK after controller change = before:%+v after-probe:%+v after-ACK:%+v", before, afterProbe, afterACK)
+	}
+	if recorder.timeoutCount() != 1 {
+		t.Fatalf("late-ACK timeout events = %d, want 1", recorder.timeoutCount())
+	}
+	if depth := stack.outbound.len(); depth != 0 {
+		t.Fatalf("full reserved output queue contains %d published packets, want 0", depth)
+	}
+}
+
+func TestTCPRTOPendingPathMTURetransmissionStartsFRTO(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	recorder := &tcpRecoveryLossRecorder{algorithm: newRenoCongestionControl()}
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: "test-rto-pending-pmtu", New: func(CongestionControlContext) CongestionController { return recorder },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetCongestionControlFactory(factory); err != nil {
+		t.Fatal(err)
+	}
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0xa7}, 2*before.MaximumSegmentSize)
+	if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, writeErr)
+	}
+	type dataSegment struct {
+		wire     []byte
+		sequence uint32
+		payload  []byte
+	}
+	segments := make([]dataSegment, 0, 2)
+	queuedBytes := 0
+	deadline := time.Now().Add(time.Second)
+	for queuedBytes < len(payload) {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("initial output is not TCP: %x", wire)
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+			t.Fatalf("initial TCP header length = %d in %x", headerSize, wire)
+		}
+		segmentPayload := packet.payload[headerSize:]
+		segments = append(segments, dataSegment{
+			wire:     wire,
+			sequence: binary.BigEndian.Uint32(packet.payload[4:8]),
+			payload:  append([]byte(nil), segmentPayload...),
+		})
+		queuedBytes += len(segmentPayload)
+	}
+	if len(segments) < 2 {
+		t.Fatalf("initial TCP flight has %d segments, want at least 2", len(segments))
+	}
+	probeEntry, available := waitTestPacketEntry(&stack.outbound, before.RetransmissionTimeout)
+	if !available {
+		t.Fatal("tail-loss probe was not published before the RTO")
+	}
+	consumeTestPacket(&stack.outbound, probeEntry)
+	afterProbe := connection.Info()
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+	waitFor(t, 2*before.RetransmissionTimeout+time.Second, func() bool { return recorder.timeoutCount() != 0 })
+
+	const reducedMTU = 1000
+	if err = writeTestPacket(stack, buildTestPacketTooBig(link.remote, link.local, segments[0].wire, reducedMTU)); err != nil {
+		t.Fatal(err)
+	}
+	// Info may race ahead of the coalesced ICMP wake. The second request observes
+	// both the timeout transition and the failed reduced-MTU publication.
+	_ = connection.Info()
+	blocked := connection.Info()
+	if blocked.PathMTU != reducedMTU || !blocked.RetransmissionRecovery || blocked.Retransmissions != afterProbe.Retransmissions || recorder.timeoutCount() != 1 {
+		t.Fatalf("pending RTO path-MTU state = after-probe:%+v blocked:%+v timeout-events:%d", afterProbe, blocked, recorder.timeoutCount())
+	}
+
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	replacementEntry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+	if !available {
+		t.Fatal("path-MTU replacement did not resume when device capacity returned")
+	}
+	replacementWire := consumeTestPacket(&stack.outbound, replacementEntry)
+	replacement, valid := parseIPPacket(replacementWire)
+	if !valid || replacement.protocol != ProtocolTCP || len(replacement.payload) < tcpHeaderSize {
+		t.Fatalf("path-MTU replacement is not TCP: %x", replacementWire)
+	}
+	headerSize := int(replacement.payload[12]>>4) * 4
+	if headerSize < tcpHeaderSize || headerSize > len(replacement.payload) || len(replacementWire) > reducedMTU || binary.BigEndian.Uint32(replacement.payload[4:8]) != segments[0].sequence {
+		t.Fatalf("path-MTU replacement does not cover the first reduced-MTU range: %x", replacementWire)
+	}
+	replacementPayload := replacement.payload[headerSize:]
+	afterReplacement := connection.Info()
+	if afterReplacement.Retransmissions != afterProbe.Retransmissions+1 || afterReplacement.SpuriousRecoveryUndos != before.SpuriousRecoveryUndos {
+		t.Fatalf("published path-MTU replacement = before:%+v after:%+v", before, afterReplacement)
+	}
+
+	clientPort := connection.key.local.Port()
+	link.mu.Lock()
+	serverSequence := link.tcp[clientPort].serverNext
+	link.mu.Unlock()
+	acknowledgement := segments[0].sequence + uint32(len(replacementPayload))
+	if err = link.deliverTCP(connection.key.remote.Port(), clientPort, serverSequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The first request may race with the injected ACK. The second proves the
+	// published replacement entered F-RTO and selected its no-new-data fallback.
+	_ = connection.Info()
+	afterACK := connection.Info()
+	if !afterACK.RetransmissionRecovery || afterACK.SpuriousRecoveryUndos != before.SpuriousRecoveryUndos || afterACK.Retransmissions != afterReplacement.Retransmissions+1 {
+		t.Fatalf("path-MTU F-RTO ACK = replacement:%+v after:%+v", afterReplacement, afterACK)
+	}
+	fallbackEntry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+	if !available {
+		t.Fatal("path-MTU F-RTO fallback was not published")
+	}
+	fallbackWire := consumeTestPacket(&stack.outbound, fallbackEntry)
+	fallback, valid := parseIPPacket(fallbackWire)
+	if !valid || fallback.protocol != ProtocolTCP || len(fallback.payload) < tcpHeaderSize {
+		t.Fatalf("path-MTU F-RTO fallback is not TCP: %x", fallbackWire)
+	}
+	wantSequence := segments[0].sequence + uint32(len(replacementPayload))
+	if sequence := binary.BigEndian.Uint32(fallback.payload[4:8]); sequence != wantSequence {
+		t.Fatalf("path-MTU F-RTO fallback sequence = %#x, want %#x", sequence, wantSequence)
+	}
+}
+
+func TestTCPFRTOFallbackSurvivesStoppedDeviceRead(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x7d}, 2*before.MaximumSegmentSize)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	type dataSegment struct {
+		sequence uint32
+		payload  []byte
+	}
+	segments := make([]dataSegment, 0, 2)
+	queuedBytes := 0
+	deadline := time.Now().Add(time.Second)
+	for queuedBytes < len(payload) {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("initial output is not TCP: %x", wire)
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+			t.Fatalf("initial TCP header length = %d in %x", headerSize, wire)
+		}
+		segmentPayload := packet.payload[headerSize:]
+		segments = append(segments, dataSegment{
+			sequence: binary.BigEndian.Uint32(packet.payload[4:8]),
+			payload:  append([]byte(nil), segmentPayload...),
+		})
+		queuedBytes += len(segmentPayload)
+	}
+	if len(segments) < 2 {
+		t.Fatalf("initial TCP flight has %d segments, want at least 2", len(segments))
+	}
+	// Drop the TLP as well as the original flight. The next published packet is
+	// the first RTO retransmission whose ACK authorizes the F-RTO probe step.
+	probeEntry, available := waitTestPacketEntry(&stack.outbound, before.RetransmissionTimeout)
+	if !available {
+		t.Fatal("tail-loss probe was not published before the RTO")
+	}
+	consumeTestPacket(&stack.outbound, probeEntry)
+	rtoEntry, available := waitTestPacketEntry(&stack.outbound, 2*before.RetransmissionTimeout+time.Second)
+	if !available {
+		t.Fatal("initial RTO retransmission was not published")
+	}
+	rtoWire := consumeTestPacket(&stack.outbound, rtoEntry)
+	rtoPacket, valid := parseIPPacket(rtoWire)
+	if !valid || rtoPacket.protocol != ProtocolTCP || len(rtoPacket.payload) < tcpHeaderSize || binary.BigEndian.Uint32(rtoPacket.payload[4:8]) != segments[0].sequence {
+		t.Fatalf("initial RTO output does not retransmit the first range: %x", rtoWire)
+	}
+	rtoInfo := connection.Info()
+	if !rtoInfo.RetransmissionRecovery || rtoInfo.Retransmissions != before.Retransmissions+2 {
+		t.Fatalf("initial RTO state = before:%+v after:%+v", before, rtoInfo)
+	}
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+	if err := link.handleOutboundPacket(rtoWire); err != nil {
+		t.Fatal(err)
+	}
+	responsiveInfo := func() TCPConnInfo {
+		t.Helper()
+		result := make(chan TCPConnInfo, 1)
+		go func() { result <- connection.Info() }()
+		select {
+		case info := <-result:
+			return info
+		case <-time.After(time.Second):
+			t.Fatal("Info blocked while F-RTO fallback waited for device capacity")
+			return TCPConnInfo{}
+		}
+	}
+	// The first request may be answered before the coalesced ACK. The second
+	// proves that ACK processing reached the no-new-data fallback.
+	_ = responsiveInfo()
+	blocked := responsiveInfo()
+	if !blocked.RetransmissionRecovery || blocked.BytesAcknowledged-before.BytesAcknowledged != uint64(len(segments[0].payload)) || blocked.Retransmissions != rtoInfo.Retransmissions {
+		t.Fatalf("unpublished F-RTO fallback = before:%+v RTO:%+v blocked:%+v", before, rtoInfo, blocked)
+	}
+	if depth := stack.outbound.len(); depth != 0 {
+		t.Fatalf("full reserved output queue contains %d published packets, want 0", depth)
+	}
+
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	fallbackEntry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+	if !available {
+		t.Fatal("F-RTO fallback did not resume when device capacity returned")
+	}
+	fallbackWire := consumeTestPacket(&stack.outbound, fallbackEntry)
+	fallback, valid := parseIPPacket(fallbackWire)
+	if !valid || fallback.protocol != ProtocolTCP || len(fallback.payload) < tcpHeaderSize {
+		t.Fatalf("F-RTO fallback output is not TCP: %x", fallbackWire)
+	}
+	headerSize := int(fallback.payload[12]>>4) * 4
+	if headerSize < tcpHeaderSize || headerSize > len(fallback.payload) || binary.BigEndian.Uint32(fallback.payload[4:8]) != segments[1].sequence || !bytes.Equal(fallback.payload[headerSize:], segments[1].payload) {
+		t.Fatalf("F-RTO fallback does not retransmit the next range: %x", fallbackWire)
+	}
+	after := responsiveInfo()
+	if after.Retransmissions != rtoInfo.Retransmissions+1 {
+		t.Fatalf("published F-RTO fallback = RTO:%+v after:%+v", rtoInfo, after)
+	}
+	if err := link.handleOutboundPacket(fallbackWire); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(connection, echo); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatal("F-RTO fallback TCP echo payload mismatch")
+	}
+}
+
+func TestTCPLostRetransmissionSurvivesStoppedDeviceRead(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	recorder := &tcpRecoveryLossRecorder{algorithm: newRenoCongestionControl()}
+	factory, err := NewCongestionControlFactory(CongestionControlDefinition{
+		Name: "test-lost-retransmission", New: func(CongestionControlContext) CongestionController { return recorder },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetCongestionControlFactory(factory); err != nil {
+		t.Fatal(err)
+	}
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x37}, 6*before.MaximumSegmentSize)
+	if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, writeErr)
+	}
+	type dataSegment struct {
+		wire     []byte
+		sequence uint32
+	}
+	segments := make([]dataSegment, 0, 6)
+	queuedBytes := 0
+	deadline := time.Now().Add(time.Second)
+	for queuedBytes < len(payload) {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("initial output is not TCP: %x", wire)
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+			t.Fatalf("initial TCP header length = %d in %x", headerSize, wire)
+		}
+		segmentPayload := packet.payload[headerSize:]
+		if len(segmentPayload) == 0 {
+			t.Fatalf("initial output is not a data segment: %x", wire)
+		}
+		segments = append(segments, dataSegment{
+			wire:     wire,
+			sequence: binary.BigEndian.Uint32(packet.payload[4:8]),
+		})
+		queuedBytes += len(segmentPayload)
+	}
+	if len(segments) != 6 {
+		t.Fatalf("initial TCP flight has %d segments, want 6", len(segments))
+	}
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+	responsiveInfo := func() TCPConnInfo {
+		t.Helper()
+		result := make(chan TCPConnInfo, 1)
+		go func() { result <- connection.Info() }()
+		select {
+		case info := <-result:
+			return info
+		case <-time.After(time.Second):
+			t.Fatal("Info blocked while lost-retransmission recovery waited for device capacity")
+			return TCPConnInfo{}
+		}
+	}
+	waitInboundDrained := func() TCPConnInfo {
+		t.Helper()
+		for {
+			info := responsiveInfo()
+			if info.InboundQueueBytes == 0 {
+				return info
+			}
+		}
+	}
+	// Leave two holes. The higher delivered ranges first enter SACK recovery;
+	// the second recovery transmission later gives RACK newer delivery evidence
+	// for the deliberately dropped first recovery transmission.
+	var blocked TCPConnInfo
+	for _, index := range []int{1, 3, 4} {
+		if err = link.handleOutboundPacket(segments[index].wire); err != nil {
+			t.Fatal(err)
+		}
+		blocked = waitInboundDrained()
+	}
+	if !blocked.FastRecovery || recorder.lossCount() != 1 {
+		t.Fatalf("initial recovery = fast:%t loss events:%d, want true/1", blocked.FastRecovery, recorder.lossCount())
+	}
+
+	releaseSlot := func() {
+		t.Helper()
+		last := len(held) - 1
+		stack.outbound.releaseReserved(held[last])
+		held = held[:last]
+	}
+	readRetransmission := func(wantSequence uint32) []byte {
+		t.Helper()
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+		if !available {
+			t.Fatalf("retransmission %#x was not published", wantSequence)
+		}
+		wire := consumeTestPacket(&stack.outbound, entry)
+		packet, valid := parseIPPacket(wire)
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatalf("recovery output is not TCP: %x", wire)
+		}
+		if sequence := binary.BigEndian.Uint32(packet.payload[4:8]); sequence != wantSequence {
+			t.Fatalf("retransmitted sequence = %#x, want %#x", sequence, wantSequence)
+		}
+		return wire
+	}
+
+	releaseSlot()
+	// Deliberately lose the first recovery transmission.
+	readRetransmission(segments[0].sequence)
+	if slot, reserved := stack.outbound.tryReserve(); !reserved {
+		t.Fatal("failed to retain the returned first-recovery output slot")
+	} else {
+		held = append(held, slot)
+	}
+	// A newly SACKed range during recovery gives PRR one segment of output. This
+	// authorizes the second hole without depending on the retransmission timer.
+	if err = link.handleOutboundPacket(segments[5].wire); err != nil {
+		t.Fatal(err)
+	}
+	_ = waitInboundDrained()
+	releaseSlot()
+	secondRecovery := readRetransmission(segments[2].sequence)
+	if slot, reserved := stack.outbound.tryReserve(); !reserved {
+		t.Fatal("failed to retain the returned recovery output slot")
+	} else {
+		held = append(held, slot)
+	}
+	// Keep the retransmission delivery sample unambiguous relative to min_RTT.
+	time.Sleep(before.MinimumRTT + time.Millisecond)
+	if err = link.handleOutboundPacket(secondRecovery); err != nil {
+		t.Fatal(err)
+	}
+	lost := waitInboundDrained()
+	if losses := recorder.lossCount(); losses != 2 {
+		t.Fatalf("loss events after RACK detected a lost retransmission = %d, want 2", losses)
+	}
+	if lost.Retransmissions != before.Retransmissions+2 {
+		t.Fatalf("published retransmissions = %d, want %d", lost.Retransmissions, before.Retransmissions+2)
+	}
+	if depth := stack.outbound.len(); depth != 0 {
+		t.Fatalf("full reserved output queue contains %d published packets, want 0", depth)
+	}
+
+	releaseSlot()
+	finalRecovery := readRetransmission(segments[0].sequence)
+	if err = link.handleOutboundPacket(finalRecovery); err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	echo := make([]byte, len(payload))
+	if _, err = io.ReadFull(connection, echo); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatal("lost-retransmission recovery payload mismatch")
+	}
+}
+
+func TestTCPPathMTURetransmissionSurvivesStoppedDeviceRead(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x6d}, before.MaximumSegmentSize)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+	if !available {
+		t.Fatal("initial TCP data was not published")
+	}
+	originalWire := consumeTestPacket(&stack.outbound, entry)
+	original, valid := parseIPPacket(originalWire)
+	if !valid || original.protocol != ProtocolTCP || len(original.payload) < tcpHeaderSize {
+		t.Fatalf("initial output is not TCP: %x", originalWire)
+	}
+	originalHeaderSize := int(original.payload[12]>>4) * 4
+	if originalHeaderSize < tcpHeaderSize || originalHeaderSize > len(original.payload) || !bytes.Equal(original.payload[originalHeaderSize:], payload) {
+		t.Fatalf("initial TCP data mismatch: %x", originalWire)
+	}
+	originalSequence := binary.BigEndian.Uint32(original.payload[4:8])
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+	const reducedMTU = 1000
+	if err := writeTestPacket(stack, buildTestPacketTooBig(link.remote, link.local, originalWire, reducedMTU)); err != nil {
+		t.Fatal(err)
+	}
+	clientPort := connection.key.local.Port()
+	link.mu.Lock()
+	peer := link.tcp[clientPort]
+	serverSequence, acknowledgement := peer.serverNext, peer.clientNext
+	link.mu.Unlock()
+	if err := link.deliverTCP(connection.key.remote.Port(), clientPort, serverSequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Info can be answered before the coalesced network-error and inbound batch.
+	// A second request proves both events and their failed publications completed.
+	_ = connection.Info()
+	blocked := connection.Info()
+	if blocked.PathMTU != reducedMTU || blocked.Retransmissions != before.Retransmissions || blocked.RetransmissionRecovery {
+		t.Fatalf("blocked path-MTU recovery = before:%+v blocked:%+v", before, blocked)
+	}
+
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	wait := before.RetransmissionTimeout + time.Second
+	entry, available = waitTestPacketEntry(&stack.outbound, wait)
+	if !available {
+		t.Fatalf("path-MTU retransmission did not resume within %v of returned capacity", wait)
+	}
+	retransmissionWire := consumeTestPacket(&stack.outbound, entry)
+	retransmission, valid := parseIPPacket(retransmissionWire)
+	if !valid || retransmission.protocol != ProtocolTCP || len(retransmission.payload) < tcpHeaderSize {
+		t.Fatalf("path-MTU recovery output is not TCP: %x", retransmissionWire)
+	}
+	if len(retransmissionWire) > reducedMTU {
+		t.Fatalf("path-MTU retransmission length = %d, want <= %d", len(retransmissionWire), reducedMTU)
+	}
+	if sequence := binary.BigEndian.Uint32(retransmission.payload[4:8]); sequence != originalSequence {
+		t.Fatalf("path-MTU retransmitted sequence = %#x, want %#x", sequence, originalSequence)
+	}
+	if err := link.deliverTCP(connection.key.remote.Port(), clientPort, serverSequence, originalSequence+uint32(len(payload)), TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The first Info request may be answered before the cumulative ACK's
+	// coalesced inbound wake. The second observes it and prevents a legitimate
+	// RTO from making retransmission accounting depend on race-test scheduling.
+	_ = connection.Info()
+	after := connection.Info()
+	if after.Retransmissions != before.Retransmissions+1 || after.RetransmissionRecovery || after.FastRecovery {
+		t.Fatalf("published path-MTU recovery = before:%+v after:%+v", before, after)
+	}
+}
+
+func TestTCPImmediateACKReplacesDelayedACKWhileDeviceReadStopped(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+	if err := connection.SetQuickACK(false); err != nil {
+		t.Fatal(err)
+	}
+	// Info is handled after actor wake policy in the same turn, so its return
+	// proves that response-piggybacking mode is active before data arrives.
+	_ = connection.Info()
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+
+	clientPort := connection.key.local.Port()
+	link.mu.Lock()
+	peer := link.tcp[clientPort]
+	sequence, acknowledgement := peer.serverNext, peer.clientNext
+	peer.serverNext++
+	link.mu.Unlock()
+	packet := buildTestTCP(link.remote, link.local, 8080, clientPort, sequence, acknowledgement, TCPFlagACK, 65535, nil, []byte{1})
+	// A controlled future arrival keeps the original delayed-ACK deadline far
+	// beyond the assertion window. This avoids using a sub-25 ms wall-clock
+	// threshold to distinguish immediate capacity wakeup from timer expiry.
+	if err := stack.handleInboundPacket(packet, time.Now().Add(10*time.Second), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var received [1]byte
+	if _, err := io.ReadFull(connection, received[:]); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.Info()
+
+	if err := connection.SetQuickACK(true); err != nil {
+		t.Fatal(err)
+	}
+	// The actor processes the Quick ACK request and its failed queue-full flush
+	// before replying to Info. The old delayed deadline must no longer gate the
+	// pending ACK when capacity subsequently returns.
+	_ = connection.Info()
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	entry, available := waitTestPacketEntry(&stack.outbound, time.Second)
+	if !available {
+		t.Fatal("immediate ACK remained gated by the replaced delayed-ACK deadline")
+	}
+	wire := consumeTestPacket(&stack.outbound, entry)
+	parsed, valid := parseIPPacket(wire)
+	if !valid || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
+		t.Fatalf("capacity wakeup packet is not TCP: %x", wire)
+	}
+	headerSize := int(parsed.payload[12]>>4) * 4
+	if parsed.payload[13] != TCPFlagACK || headerSize < tcpHeaderSize || headerSize != len(parsed.payload) || binary.BigEndian.Uint32(parsed.payload[8:12]) != sequence+1 {
+		t.Fatalf("capacity wakeup packet is not the pending pure ACK: %x", wire)
+	}
+}
+
 func TestTCPEstablishedControlResponseDoesNotWaitForDeviceQueue(t *testing.T) {
 	link, stack, connection := newManuallyPumpedTCPConnection(t)
 	defer connection.Close()
@@ -4380,7 +6231,7 @@ func TestTCPLivenessClearsDisabledUserTimeoutState(t *testing.T) {
 		connection:    new(TCPConn),
 		livenessState: &tcpEstablishedLivenessState{zeroWindowSince: zeroWindowSince},
 	}
-	state.armLiveness()
+	state.armLiveness(false)
 	if !state.livenessState.zeroWindowSince.IsZero() {
 		t.Fatalf("disabled user timeout retained zero-window start %v", state.livenessState.zeroWindowSince)
 	}
@@ -4394,14 +6245,14 @@ func TestTCPLivenessDeadlineTracksActivity(t *testing.T) {
 	}
 	firstActivity := time.Now().Add(-time.Hour)
 	state := tcpEstablishedState{connection: connection, lastActivity: firstActivity}
-	state.armLiveness()
+	state.armLiveness(false)
 	if want := firstActivity.Add(idle); !state.liveness || state.livenessDeadline != want {
 		t.Fatalf("initial liveness = %t at %v, want true at %v", state.liveness, state.livenessDeadline, want)
 	}
 
 	secondActivity := firstActivity.Add(10 * time.Minute)
 	state.lastActivity = secondActivity
-	state.armLiveness()
+	state.armLiveness(false)
 	if want := secondActivity.Add(idle); !state.liveness || state.livenessDeadline != want {
 		t.Fatalf("rearmed liveness = %t at %v, want true at %v", state.liveness, state.livenessDeadline, want)
 	}
