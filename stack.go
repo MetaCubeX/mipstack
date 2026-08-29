@@ -1375,14 +1375,15 @@ type packetQueueEntry struct {
 // scheduler is nil for FIFO queues such as loopback and non-nil for the link's
 // byte-fair flow scheduler.
 type packetQueue struct {
-	packets   chan packetQueueEntry
-	free      chan uint16
-	slots     []atomic.Uint64
-	buffers   chan []byte
-	epoch     time.Time
-	scheduler *fairPacketScheduler
-	batchMu   sync.Mutex
-	closed    atomic.Bool
+	packets          chan packetQueueEntry
+	free             chan uint16
+	slots            []atomic.Uint64
+	buffers          chan []byte
+	epoch            time.Time
+	scheduler        *fairPacketScheduler
+	departureWaiters atomic.Pointer[packetQueueDepartureWaiters]
+	batchMu          sync.Mutex
+	closed           atomic.Bool
 }
 
 // monotonicStamp stores an exact monotonic duration relative to one stack
@@ -1426,6 +1427,22 @@ type packetQueueTicket struct {
 	queuedAt monotonicStamp
 }
 
+// packetQueueDepartureWaiter observes when one exact slot generation leaves
+// the queue. It retains only the actor's existing notification channel, not
+// its TCPConn, so an abandoned waiter cannot keep a connection alive.
+type packetQueueDepartureWaiter struct {
+	generation uint64
+	notify     chan<- struct{}
+	departedAt atomic.Int64
+}
+
+// packetQueueDepartureWaiters is allocated only after a loss timer encounters
+// a packet still owned by the queue. Ordinary stacks retain no per-slot waiter
+// storage.
+type packetQueueDepartureWaiters struct {
+	slots []atomic.Pointer[packetQueueDepartureWaiter]
+}
+
 const (
 	// packetQueueTicketLoopback distinguishes stack.loopback from the ordinary
 	// outbound queue without retaining a queue pointer in every TCP range.
@@ -1436,6 +1453,15 @@ const (
 	// packetQueueTicketGenerationMask bounds the generation to its 47-bit token
 	// field before a slot is published again.
 	packetQueueTicketGenerationMask = uint64(1)<<47 - 1
+	// packetQueueSlotPending marks a generation currently owned by the queue.
+	packetQueueSlotPending = uint64(1)
+	// packetQueueSlotDepartureWaiter makes dequeue visit the cold waiter table.
+	// Keeping this bit in the already loaded slot state avoids an atomic pointer
+	// read for ordinary packets.
+	packetQueueSlotDepartureWaiter = uint64(2)
+	// packetQueueSlotGenerationShift leaves the two low ownership bits outside
+	// the slot's reuse generation.
+	packetQueueSlotGenerationShift = 2
 )
 
 // packetQueueTicketToken packs the bounded 16-bit slot, its queue identity,
@@ -1472,6 +1498,7 @@ func (q *packetQueue) initStorage(capacity int, epoch time.Time) {
 	q.packets = nil
 	q.free = make(chan uint16, capacity)
 	q.slots = make([]atomic.Uint64, capacity)
+	q.departureWaiters.Store(nil)
 	// A full queue may legitimately own one buffer per position. Retaining no
 	// more than that avoids reallocating after a burst while the per-buffer
 	// limit keeps the cache below 512 KiB for the standard queue size.
@@ -1504,7 +1531,8 @@ func (t packetQueueTicket) pendingIn(queue *packetQueue) bool {
 	if queue == nil || int(slot) >= len(queue.slots) {
 		return false
 	}
-	return queue.slots[slot].Load() == t.generation()<<1|1
+	state := queue.slots[slot].Load()
+	return state>>packetQueueSlotGenerationShift == t.generation() && state&packetQueueSlotPending != 0
 }
 
 // pending selects the ticket's encoded outbound or loopback queue and reports
@@ -1518,6 +1546,78 @@ func (t packetQueueTicket) pending(stack *Stack) bool {
 		queue = &stack.loopback
 	}
 	return t.pendingIn(queue)
+}
+
+// departedTime returns the queue-departure time after this waiter completes.
+func (w *packetQueueDepartureWaiter) departedTime(epoch time.Time) (time.Time, bool) {
+	stamp := monotonicStamp(w.departedAt.Load())
+	return stamp.time(epoch), stamp != 0
+}
+
+// ensureDepartureWaiters returns the lazily allocated per-slot waiter table.
+func (q *packetQueue) ensureDepartureWaiters() *packetQueueDepartureWaiters {
+	if waiters := q.departureWaiters.Load(); waiters != nil {
+		return waiters
+	}
+	waiters := &packetQueueDepartureWaiters{slots: make([]atomic.Pointer[packetQueueDepartureWaiter], len(q.slots))}
+	if q.departureWaiters.CompareAndSwap(nil, waiters) {
+		return waiters
+	}
+	return q.departureWaiters.Load()
+}
+
+// departureWaiter registers notification for this exact ticket while it is
+// still pending. A dequeue racing registration either completes the installed
+// waiter or is detected by the final pending check, so no wakeup is lost.
+func (t packetQueueTicket) departureWaiter(stack *Stack, notify chan<- struct{}) *packetQueueDepartureWaiter {
+	if stack == nil {
+		return nil
+	}
+	queue := &stack.outbound
+	if t.loopback() {
+		queue = &stack.loopback
+	}
+	slot := t.slot()
+	if int(slot) >= len(queue.slots) || !t.pendingIn(queue) {
+		return nil
+	}
+	waiters := queue.ensureDepartureWaiters()
+	waiter := &packetQueueDepartureWaiter{generation: t.generation(), notify: notify}
+	for {
+		state := queue.slots[slot].Load()
+		if state>>packetQueueSlotGenerationShift != t.generation() || state&packetQueueSlotPending == 0 {
+			return nil
+		}
+		existing := waiters.slots[slot].Load()
+		if existing != nil {
+			if existing.generation == t.generation() {
+				return existing
+			}
+			// The current pending generation proves that a different waiter is
+			// stale. Complete it before installing the current generation.
+			if waiters.slots[slot].CompareAndSwap(existing, nil) {
+				queue.completeDepartureWaiter(existing, true)
+			}
+			continue
+		}
+		if !waiters.slots[slot].CompareAndSwap(nil, waiter) {
+			continue
+		}
+		for {
+			state = queue.slots[slot].Load()
+			if state>>packetQueueSlotGenerationShift != t.generation() || state&packetQueueSlotPending == 0 {
+				if waiters.slots[slot].CompareAndSwap(waiter, nil) {
+					// The registering actor is already running, so it can observe
+					// completion without another notification token.
+					queue.completeDepartureWaiter(waiter, false)
+				}
+				return waiter
+			}
+			if queue.slots[slot].CompareAndSwap(state, state|packetQueueSlotDepartureWaiter) {
+				return waiter
+			}
+		}
+	}
 }
 
 // tryReserve acquires one queue position without blocking.
@@ -1556,11 +1656,11 @@ func (q *packetQueue) enqueueReservedPacket(slot uint16, packet []byte, reusable
 // that raced with close removes any late publication without making Close wait.
 func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool, flowID uint64) (uint64, bool) {
 	state := q.slots[slot].Load()
-	generation := (state>>1 + 1) & packetQueueTicketGenerationMask
+	generation := (state>>packetQueueSlotGenerationShift + 1) & packetQueueTicketGenerationMask
 	if generation == 0 {
 		generation = 1
 	}
-	q.slots[slot].Store(generation<<1 | 1)
+	q.slots[slot].Store(generation<<packetQueueSlotGenerationShift | packetQueueSlotPending)
 	entry := packetQueueEntry{packet: packet, slot: slot, reusable: reusable}
 	if q.scheduler == nil {
 		q.packets <- entry
@@ -1577,10 +1677,17 @@ func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool,
 // dequeue waits for one schedulable packet or stack closure.
 func (q *packetQueue) dequeue(closeCh <-chan struct{}) (packetQueueEntry, bool) {
 	if q.scheduler != nil {
-		return q.scheduler.dequeue(closeCh)
+		entry, ok := q.scheduler.dequeue(closeCh)
+		if ok && q.depart(entry.slot) {
+			q.completeDeparture(entry.slot)
+		}
+		return entry, ok
 	}
 	select {
 	case entry := <-q.packets:
+		if q.depart(entry.slot) {
+			q.completeDeparture(entry.slot)
+		}
 		return entry, true
 	case <-closeCh:
 		return packetQueueEntry{}, false
@@ -1590,10 +1697,17 @@ func (q *packetQueue) dequeue(closeCh <-chan struct{}) (packetQueueEntry, bool) 
 // tryDequeue returns one immediately schedulable packet without blocking.
 func (q *packetQueue) tryDequeue() (packetQueueEntry, bool) {
 	if q.scheduler != nil {
-		return q.scheduler.tryDequeue()
+		entry, ok := q.scheduler.tryDequeue()
+		if ok && q.depart(entry.slot) {
+			q.completeDeparture(entry.slot)
+		}
+		return entry, ok
 	}
 	select {
 	case entry := <-q.packets:
+		if q.depart(entry.slot) {
+			q.completeDeparture(entry.slot)
+		}
 		return entry, true
 	default:
 		return packetQueueEntry{}, false
@@ -1660,14 +1774,53 @@ func (q *packetQueue) releaseBuffer(packet []byte, reusable bool) {
 	}
 }
 
-// release marks an entry as consumed, recycles bounded packet storage, and
-// makes its slot available to exactly one waiting producer. The caller must
-// finish reading packet before release because another writer may reuse it.
+// depart marks a dequeued generation as no longer owned by the host queue and
+// reports whether its cold loss-timer waiter must be completed. Capacity
+// remains reserved until release because the consumer may still be reading the
+// packet buffer.
+func (q *packetQueue) depart(slot uint16) bool {
+	state := q.slots[slot].Load()
+	q.slots[slot].Store(state &^ (packetQueueSlotPending | packetQueueSlotDepartureWaiter))
+	return state&packetQueueSlotDepartureWaiter != 0
+}
+
+// release recycles a departed entry's bounded packet storage and makes its
+// slot available to exactly one waiting producer. The caller must finish
+// reading packet before release because another writer may reuse it.
 func (q *packetQueue) release(entry packetQueueEntry) {
-	state := q.slots[entry.slot].Load()
-	q.slots[entry.slot].Store(state &^ 1)
 	q.releaseBuffer(entry.packet, entry.reusable)
 	q.free <- entry.slot
+}
+
+// completeDeparture visits the lazily allocated waiter table only for a slot
+// whose state reported an installed waiter.
+func (q *packetQueue) completeDeparture(slot uint16) {
+	if waiters := q.departureWaiters.Load(); waiters != nil {
+		q.releaseDepartureWaiter(waiters, slot)
+	}
+}
+
+// releaseDepartureWaiter completes the cold notification path after dequeue
+// has made this slot generation non-pending.
+func (q *packetQueue) releaseDepartureWaiter(waiters *packetQueueDepartureWaiters, slot uint16) {
+	waiter := waiters.slots[slot].Load()
+	if waiter != nil {
+		waiter = waiters.slots[slot].Swap(nil)
+	}
+	if waiter != nil {
+		q.completeDepartureWaiter(waiter, true)
+	}
+}
+
+// completeDepartureWaiter records the departure before publishing its wake.
+func (q *packetQueue) completeDepartureWaiter(waiter *packetQueueDepartureWaiter, notify bool) {
+	waiter.departedAt.Store(int64(monotonicStampAt(q.epoch, time.Now())))
+	if notify {
+		select {
+		case waiter.notify <- struct{}{}:
+		default:
+		}
+	}
 }
 
 // close rejects future publications and discards all currently published
@@ -2253,19 +2406,18 @@ func (s *Stack) Start() error {
 // runLoopback serializes local delivery outside the sending socket actor.
 func (s *Stack) runLoopback() {
 	for {
-		select {
-		case entry := <-s.loopback.packets:
-			select {
-			case <-s.closeCh:
-				s.loopback.release(entry)
-				return
-			default:
-			}
-			_ = s.handleInboundPacket(entry.packet, time.Now(), true)
-			s.loopback.release(entry)
-		case <-s.closeCh:
+		entry, ok := s.loopback.dequeue(s.closeCh)
+		if !ok {
 			return
 		}
+		select {
+		case <-s.closeCh:
+			s.loopback.release(entry)
+			return
+		default:
+		}
+		_ = s.handleInboundPacket(entry.packet, time.Now(), true)
+		s.loopback.release(entry)
 	}
 }
 

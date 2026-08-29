@@ -627,7 +627,7 @@ func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
 	if !first.pendingIn(&queue) {
 		t.Fatal("first queue ticket was not pending")
 	}
-	entry := <-queue.packets
+	entry, _ := queue.tryDequeue()
 	queue.release(entry)
 	if first.pendingIn(&queue) {
 		t.Fatal("consumed queue ticket remained pending")
@@ -646,7 +646,7 @@ func TestPacketQueueTicketGenerationSurvivesSlotReuse(t *testing.T) {
 	if first.pendingIn(&queue) || first.generation() == second.generation() {
 		t.Fatalf("slot reuse revived generation %d as %d", first.generation(), second.generation())
 	}
-	entry = <-queue.packets
+	entry, _ = queue.tryDequeue()
 	queue.release(entry)
 	if second.pendingIn(&queue) {
 		t.Fatal("second queue ticket remained pending")
@@ -670,15 +670,181 @@ func TestPacketQueueTicketSelectsItsQueue(t *testing.T) {
 	if outbound.loopback() || !loopback.loopback() || !outbound.pending(stack) || !loopback.pending(stack) {
 		t.Fatal("packet queue tickets did not retain their queue identity")
 	}
-	entry := <-stack.outbound.packets
+	entry, _ := stack.outbound.tryDequeue()
 	stack.outbound.release(entry)
 	if outbound.pending(stack) || !loopback.pending(stack) {
 		t.Fatal("consuming outbound packet changed the wrong ticket")
 	}
-	entry = <-stack.loopback.packets
+	entry, _ = stack.loopback.tryDequeue()
 	stack.loopback.release(entry)
 	if loopback.pending(stack) {
 		t.Fatal("loopback ticket remained pending after consumption")
+	}
+}
+
+func TestPacketQueueDepartureWaiterFollowsExactGeneration(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		fair     bool
+		loopback bool
+	}{
+		{name: "FIFO"},
+		{name: "DRR", fair: true},
+		{name: "loopback", loopback: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			epoch := time.Now()
+			stack := &Stack{}
+			queue := &stack.outbound
+			if test.loopback {
+				queue = &stack.loopback
+			}
+			if test.fair {
+				queue.initFair(1, epoch, 1500, [16]byte{})
+			} else {
+				queue.initFIFO(1, epoch)
+			}
+			slot, reserved := queue.tryReserve()
+			if !reserved {
+				t.Fatal("packet queue slot was not available")
+			}
+			ticket, published := queue.enqueueReservedTCP(slot, []byte{1}, false, 1, test.loopback)
+			if !published {
+				t.Fatal("packet queue ticket was not published")
+			}
+			notify := make(chan struct{}, 1)
+			waiter := ticket.departureWaiter(stack, notify)
+			if waiter == nil {
+				t.Fatal("pending packet did not install a departure waiter")
+			}
+			if _, departed := waiter.departedTime(epoch); departed {
+				t.Fatal("departure waiter completed before dequeue")
+			}
+			before := time.Now()
+			entry, available := queue.tryDequeue()
+			if !available {
+				t.Fatal("published packet was not schedulable")
+			}
+			select {
+			case <-notify:
+			default:
+				t.Fatal("queue dequeue did not notify the departure waiter")
+			}
+			departedAt, departed := waiter.departedTime(epoch)
+			if !departed || departedAt.Before(before) || departedAt.After(time.Now()) {
+				t.Fatalf("departure time = %v, departed %t", departedAt, departed)
+			}
+			if ticket.pending(stack) {
+				t.Fatal("dequeued ticket remained pending")
+			}
+			if len(queue.free) != 0 {
+				t.Fatal("dequeue released capacity before the consumer finished")
+			}
+			queue.release(entry)
+			if len(queue.free) != cap(queue.free) {
+				t.Fatal("packet release did not restore queue capacity")
+			}
+		})
+	}
+}
+
+func TestPacketQueueDepartureWaiterSurvivesRegistrationRace(t *testing.T) {
+	epoch := time.Now()
+	stack := &Stack{}
+	stack.outbound.initFIFO(1, epoch)
+	for iteration := 0; iteration < 2048; iteration++ {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			t.Fatalf("iteration %d did not reserve the queue slot", iteration)
+		}
+		ticket, published := stack.outbound.enqueueReservedTCP(slot, []byte{1}, false, 1, false)
+		if !published {
+			t.Fatalf("iteration %d did not publish the packet", iteration)
+		}
+		notify := make(chan struct{}, 1)
+		result := make(chan *packetQueueDepartureWaiter, 1)
+		start := make(chan struct{})
+		go func() {
+			<-start
+			result <- ticket.departureWaiter(stack, notify)
+		}()
+		close(start)
+		entry, available := stack.outbound.tryDequeue()
+		if !available {
+			t.Fatalf("iteration %d did not dequeue the packet", iteration)
+		}
+		stack.outbound.release(entry)
+		waiter := <-result
+		if waiter != nil {
+			if _, departed := waiter.departedTime(epoch); !departed {
+				t.Fatalf("iteration %d lost a release racing waiter registration", iteration)
+			}
+		}
+		if ticket.departureWaiter(stack, notify) != nil {
+			t.Fatalf("iteration %d registered a waiter after departure", iteration)
+		}
+	}
+}
+
+func TestPacketQueueDepartureWaiterDoesNotAliasReusedSlot(t *testing.T) {
+	epoch := time.Now()
+	stack := &Stack{}
+	stack.outbound.initFIFO(1, epoch)
+	firstSlot, _ := stack.outbound.tryReserve()
+	first, _ := stack.outbound.enqueueReservedTCP(firstSlot, []byte{1}, false, 1, false)
+	firstEntry, _ := stack.outbound.tryDequeue()
+	stack.outbound.release(firstEntry)
+
+	secondSlot, _ := stack.outbound.tryReserve()
+	second, _ := stack.outbound.enqueueReservedTCP(secondSlot, []byte{2}, false, 1, false)
+	notify := make(chan struct{}, 1)
+	waiter := second.departureWaiter(stack, notify)
+	if waiter == nil {
+		t.Fatal("reused slot did not install its current departure waiter")
+	}
+	if first.departureWaiter(stack, notify) != nil {
+		t.Fatal("departed generation installed a waiter over a reused slot")
+	}
+	secondEntry, _ := stack.outbound.tryDequeue()
+	stack.outbound.release(secondEntry)
+	select {
+	case <-notify:
+	default:
+		t.Fatal("current generation waiter was not notified")
+	}
+	if _, departed := waiter.departedTime(epoch); !departed {
+		t.Fatal("current generation waiter did not record departure")
+	}
+}
+
+func TestPacketQueueDepartureWaiterCompletesOnClose(t *testing.T) {
+	epoch := time.Now()
+	stack := &Stack{}
+	stack.outbound.initFIFO(1, epoch)
+	slot, _ := stack.outbound.tryReserve()
+	ticket, _ := stack.outbound.enqueueReservedTCP(slot, []byte{1}, false, 1, false)
+	notify := make(chan struct{}, 1)
+	waiter := ticket.departureWaiter(stack, notify)
+	stack.outbound.close()
+	select {
+	case <-notify:
+	default:
+		t.Fatal("queue close did not notify the departure waiter")
+	}
+	if _, departed := waiter.departedTime(epoch); !departed {
+		t.Fatal("queue close did not record packet departure")
+	}
+}
+
+func TestPacketQueueReleaseDoesNotAllocateDepartureState(t *testing.T) {
+	var queue packetQueue
+	queue.initFIFO(1, time.Now())
+	slot, _ := queue.tryReserve()
+	_, _ = queue.enqueueReservedTCP(slot, []byte{1}, false, 1, false)
+	entry, _ := queue.tryDequeue()
+	queue.release(entry)
+	if queue.departureWaiters.Load() != nil {
+		t.Fatal("ordinary queue release allocated departure state")
 	}
 }
 

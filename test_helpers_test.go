@@ -2,6 +2,7 @@ package mipstack
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -460,6 +461,70 @@ func newTestStack(t testing.TB, local, remote netip.Addr) (*testPacketLink, *Sta
 		<-link.done
 	})
 	return link, stack
+}
+
+// newManuallyPumpedTCPConnection completes a real wire handshake while the
+// test owns every device dequeue. Callers can therefore stop and resume
+// Stack.Read at an exact packet-generation boundary.
+func newManuallyPumpedTCPConnection(t *testing.T) (*testPacketLink, *Stack, *TCPConn) {
+	t.Helper()
+	local := netip.MustParseAddr("192.0.2.111")
+	remote := netip.MustParseAddr("192.0.2.112")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		_ = stack.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	link := &testPacketLink{
+		local: local, remote: remote, stack: stack, echoTCP: true, sackTCP: true,
+		outbound: make(chan []byte, 1), tcp: make(map[uint16]*testTCPPeer),
+	}
+	type dialResult struct {
+		connection net.Conn
+		err        error
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	t.Cleanup(cancel)
+	dialed := make(chan dialResult, 1)
+	go func() {
+		connection, dialErr := stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 8080))
+		dialed <- dialResult{connection: connection, err: dialErr}
+	}()
+	for {
+		select {
+		case result := <-dialed:
+			if result.err != nil {
+				t.Fatal(result.err)
+			}
+			connection := result.connection.(*TCPConn)
+			for {
+				entry, available := stack.outbound.tryDequeue()
+				if !available {
+					break
+				}
+				if err = link.handleOutboundPacket(consumeTestPacket(&stack.outbound, entry)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Info is actor-serialized and proves that the handshake loop has
+			// handed ownership to the established actor before output stops.
+			_ = connection.Info()
+			return link, stack, connection
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		default:
+		}
+		entry, available := waitTestPacketEntry(&stack.outbound, 10*time.Millisecond)
+		if available {
+			if err = link.handleOutboundPacket(consumeTestPacket(&stack.outbound, entry)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 }
 
 // run reads packets from the stack and passes them to the emulated peer.

@@ -228,10 +228,6 @@ const (
 	// It is an observation interval, not a wake-up timer; RTT normalization
 	// still preserves the measured BDP on genuinely fast paths.
 	tcpAutoTuneMinimumInterval = 10 * time.Millisecond
-	// tcpHostQueueRetryInterval defers a loss timer while the candidate packet
-	// is still waiting in mipstack's output FIFO. This mirrors Linux's local-
-	// congestion retry without changing the packet's RACK transmission time.
-	tcpHostQueueRetryInterval = 10 * time.Millisecond
 	// tcpEifelClockGranularity is the timestamp and retransmission-timer clock
 	// granularity used by the RFC 4015 response.
 	tcpEifelClockGranularity = time.Millisecond
@@ -1230,13 +1226,6 @@ func (w *tcpReceiveWindow) next(receiveNext uint32, available, minimumIncrease i
 	return uint16((right - receiveNext) >> w.shift), right
 }
 
-// advertise commits and returns the window carried by an outgoing segment.
-func (w *tcpReceiveWindow) advertise(receiveNext uint32, available, minimumIncrease int) uint16 {
-	window, right := w.next(receiveNext, available, minimumIncrease)
-	w.right = right
-	return window
-}
-
 // size returns the receive sequence space covered by prior advertisements.
 func (w *tcpReceiveWindow) size(receiveNext uint32) uint32 {
 	if tcpSequenceLess(w.right, receiveNext) {
@@ -1314,7 +1303,8 @@ const (
 	// sentTCPSegmentSACKed marks a range that the peer selectively acknowledged.
 	sentTCPSegmentSACKed sentTCPSegmentState = 1 << iota
 	// sentTCPSegmentSACKRetried marks a range already sent during the current
-	// SACK recovery so it is not selected again without new loss evidence.
+	// recovery round so it is not selected again without new delivery or loss
+	// evidence.
 	sentTCPSegmentSACKRetried
 	// sentTCPSegmentRACKLost marks a range whose transmission time satisfies
 	// RACK's loss test.
@@ -1330,9 +1320,6 @@ const (
 	sentTCPSegmentSACKSplit
 	// sentTCPSegmentMTUProbe associates the range with the active PLPMTUD probe.
 	sentTCPSegmentMTUProbe
-	// sentTCPSegmentDeliveryPending defers refreshing the delivery snapshot
-	// until the ACK currently being processed has updated the rate sampler.
-	sentTCPSegmentDeliveryPending
 	// sentTCPSegmentDeliverySchedulerLimited records that the congestion
 	// controller considered this transmission scheduler-limited.
 	sentTCPSegmentDeliverySchedulerLimited
@@ -1362,7 +1349,7 @@ func (s *sentTCPSegmentState) set(flag sentTCPSegmentState, enabled bool) {
 // sentTCPSegmentInitialState constructs the state of a newly transmitted range.
 // Every such range starts with a current transmission generation; the remaining
 // arguments capture properties of that first transmission.
-func sentTCPSegmentInitialState(limited, cwr, mtuProbe, deliveryPending, schedulerLimited bool) sentTCPSegmentState {
+func sentTCPSegmentInitialState(limited, cwr, mtuProbe, schedulerLimited bool) sentTCPSegmentState {
 	state := sentTCPSegmentTransmitted
 	if limited {
 		state |= sentTCPSegmentLimited
@@ -1372,9 +1359,6 @@ func sentTCPSegmentInitialState(limited, cwr, mtuProbe, deliveryPending, schedul
 	}
 	if mtuProbe {
 		state |= sentTCPSegmentMTUProbe
-	}
-	if deliveryPending {
-		state |= sentTCPSegmentDeliveryPending
 	}
 	if schedulerLimited {
 		state |= sentTCPSegmentDeliverySchedulerLimited
@@ -1626,8 +1610,9 @@ type tcpRecoveryTransportState struct {
 	ecnRecoveryPoint, prrPriorFlight        uint32
 	prrDelivered, prrOut                    uint64
 	rtoAttempts                             int
+	frtoProbeBudget                         uint8
 	fastRecovery, rtoRecovery               bool
-	frtoActive, frtoProbe                   bool
+	frtoState                               tcpFRTOState
 	sackRenegingRecovery, ecnRecoveryActive bool
 	captured                                bool
 }
@@ -1957,7 +1942,6 @@ type tcpEstablishedState struct {
 	// deliverySample is allocated only for controllers that consume delivery
 	// rate samples; loss-based controllers leave it nil.
 	deliverySample          *tcpDeliveryRateSample
-	deliveryACKAddedFlight  uint32
 	lastDataReceived        monotonicStamp
 	lastAdvertisedWindow    uint16
 	lastReceiveSegmentSize  uint16
@@ -1972,25 +1956,37 @@ type tcpEstablishedState struct {
 
 	// Group single-byte state to avoid alignment holes without adding bitset
 	// operations to packet-processing paths.
-	peerScale, quickACKBudget, sackACKs, compressedSACKs     uint8
-	peerSACK, haveRecentDSACK                                bool
-	localFINSent, localFINAcked                              bool
-	remoteFINReceived, timeWaitRequired                      bool
-	finWaitArmed, timeWaitArmed, fastRecovery                bool
-	limitedTransmitActive                                    bool
-	tailProbeActive, tailProbeRetransmit                     bool
-	rtoRecovery, frtoActive, frtoProbe, sackRenegingRecovery bool
-	ecnRecoveryActive, ecnDataSeen                           bool
-	rackForwardACKSet, rackReorderingSeen                    bool
-	rackDSACKRoundSet, seenDSACK                             bool
-	dsackUndoDisabled, haveRACKLoss                          bool
-	retransmit, persist, delayedACK                          bool
-	ackPending, ackPingPong                                  bool
-	liveness, pathMTUProbe, pacing                           bool
-	retransmissionKind                                       tcpRetransmissionKind
-	processingDeliveryACK                                    bool
-	deliveryACKPendingSnapshots                              bool
+	peerScale, quickACKBudget, sackACKs, compressedSACKs uint8
+	frtoProbeBudget                                      uint8
+	peerSACK, haveRecentDSACK                            bool
+	localFINSent, localFINAcked                          bool
+	remoteFINReceived, timeWaitRequired                  bool
+	finWaitArmed, timeWaitArmed, fastRecovery            bool
+	limitedTransmitActive                                bool
+	tailProbeActive, tailProbeRetransmit                 bool
+	rtoRecovery, sackRenegingRecovery                    bool
+	ecnRecoveryActive, ecnDataSeen                       bool
+	rackForwardACKSet, rackReorderingSeen                bool
+	rackDSACKRoundSet, seenDSACK                         bool
+	dsackUndoDisabled, haveRACKLoss                      bool
+	retransmit, persist, delayedACK                      bool
+	ackPending, ackPingPong                              bool
+	liveness, pathMTUProbe, pacing                       bool
+	retransmissionKind                                   tcpRetransmissionKind
+	frtoState                                            tcpFRTOState
 }
+
+// tcpFRTOState identifies the RFC 5682 step currently owned by RTO recovery.
+// Explicit phases avoid the invalid combinations admitted by separate active
+// and probe booleans and leave room for an ACK-authorized unsent probe.
+type tcpFRTOState uint8
+
+const (
+	tcpFRTOInactive tcpFRTOState = iota
+	tcpFRTOAwaitingACK
+	tcpFRTOProbePending
+	tcpFRTOProbeSent
+)
 
 // tcpRetransmissionKind identifies the single protocol event selected by the
 // shared retransmission timer. The zero value is the ordinary RTO path.
@@ -2001,6 +1997,7 @@ const (
 	tcpRetransmissionProbe
 	tcpRetransmissionRACK
 	tcpRetransmissionSACKReneging
+	tcpRetransmissionPathMTU
 	tcpRetransmissionClose
 )
 
@@ -2096,7 +2093,8 @@ func (s *tcpEstablishedState) finish() {
 	c := s.connection
 	if c.takeAbortReset() {
 		sequence := tcpAcceptableSendSequence(s.sendUnacknowledged, s.sendNext, s.peerWindow, s.peerScale)
-		_ = c.sendAbortReset(sequence, s.receiveNext, s.advertisedReceiveWindow())
+		window, _ := s.nextAdvertisedReceiveWindow()
+		_ = c.sendAbortReset(sequence, s.receiveNext, window)
 	}
 	info := s.tcpInfo()
 	c.lastInfo.Store(&info)
@@ -2201,25 +2199,19 @@ func (s *tcpEstablishedState) recordRetransmission(start, end uint32) {
 	s.retransmitHistory.record(start, end)
 }
 
-// lossObservationTime selects the ACK arrival time for a delivery sample and
-// otherwise uses the current actor time for congestion loss reporting.
-func (s *tcpEstablishedState) lossObservationTime() time.Time {
-	if s.processingDeliveryACK && s.deliverySample != nil && !s.deliverySample.ackTime.IsZero() {
-		return s.deliverySample.ackTime
-	}
-	return time.Now()
-}
-
 // recordProvenLosses reports newly proven loss through the event family used
-// by the active congestion controller.
-func (s *tcpEstablishedState) recordProvenLosses() {
+// by the active congestion controller. duringACK retains delivery accounting
+// for the rate sample currently being assembled at observedAt.
+func (s *tcpEstablishedState) recordProvenLosses(duringACK bool, observedAt time.Time) {
 	if !s.controller.usesLossEvents() {
-		s.controller.noteLoss(recordProvenTCPLosses(s.outstanding, s.peerMSS), s.processingDeliveryACK)
+		s.controller.noteLoss(recordProvenTCPLosses(s.outstanding, s.peerMSS), duringACK)
 		return
 	}
-	now := s.lossObservationTime()
+	if !duringACK {
+		observedAt = time.Now()
+	}
 	recordProvenTCPLossesWith(s.outstanding, s.peerMSS, func(segment *sentTCPSegment, bytes uint32) {
-		s.controller.notePacketLoss(segment, bytes, s.processingDeliveryACK, now, s.congestionWindow, s.slowStartThreshold, s.congestionFlight(), s.peerMSS, s.rtt.srtt)
+		s.controller.notePacketLoss(segment, bytes, duringACK, observedAt, s.congestionWindow, s.slowStartThreshold, s.congestionFlight(), s.peerMSS, s.rtt.srtt)
 	})
 }
 
@@ -2281,11 +2273,12 @@ func (s *tcpEstablishedState) tcpInfo() TCPConnInfo {
 	return info
 }
 
-// advertisedReceiveWindow advances the RFC window advertisement state from
-// current contiguous and out-of-order receive occupancy.
-func (s *tcpEstablishedState) advertisedReceiveWindow() uint16 {
+// nextAdvertisedReceiveWindow derives the next RFC window and right edge from
+// current contiguous and out-of-order receive occupancy. Publication commits
+// the returned edge through commitAcknowledgment.
+func (s *tcpEstablishedState) nextAdvertisedReceiveWindow() (uint16, uint32) {
 	available, capacity := s.connection.receiveSpace(s.outOfOrderBytes)
-	return s.receiveWindowState.advertise(s.receiveNext, available, tcpReceiveWindowIncrease(capacity, s.receiveMSS))
+	return s.receiveWindowState.next(s.receiveNext, available, tcpReceiveWindowIncrease(capacity, s.receiveMSS))
 }
 
 // effectivePathMTU returns the route MTU capped by any connection-local
@@ -2516,13 +2509,15 @@ func (s *tcpEstablishedState) observeSentData(sentAt monotonicStamp) {
 	}
 }
 
-// commitAcknowledgment records an ACK carried by a successfully queued
-// packet. selective reports that current SACK/DSACK state was encoded; a
-// retransmission without those options must not suppress the later SACK ACK.
-func (s *tcpEstablishedState) commitAcknowledgment(window uint16, selective bool) {
+// commitAcknowledgment records an ACK carried by a successfully queued packet.
+// right is the receive-window edge calculated for that packet; selective
+// reports that current SACK/DSACK state was encoded. A retransmission without
+// those options must not suppress the later SACK ACK.
+func (s *tcpEstablishedState) commitAcknowledgment(window uint16, right uint32, selective bool) {
 	pending := s.ackPending
 	selectivePending := s.peerSACK && (len(s.outOfOrder) != 0 || s.haveRecentDSACK)
 	satisfied := selective || !selectivePending
+	s.receiveWindowState.right = right
 	s.lastACKSent = s.receiveNext
 	s.lastAdvertisedWindow = window
 	if pending && satisfied && s.quickACKBudget != 0 {
@@ -2813,17 +2808,17 @@ func (s *tcpEstablishedState) sackOptions(reservePayload int) ([]byte, bool) {
 }
 
 // sendACKAt emits an ACK from sequence and commits window, SACK, and delayed-
-// ACK bookkeeping only after packet construction succeeds.
+// ACK bookkeeping only after packet publication succeeds.
 func (s *tcpEstablishedState) sendACKAt(sequence uint32) error {
 	options, dsackSent := s.sackOptions(0)
-	window := s.advertisedReceiveWindow()
+	window, right := s.nextAdvertisedReceiveWindow()
 	if err := s.connection.sendSegmentWithOptions(sequence, s.receiveNext, TCPFlagACK, window, options, nil); err != nil {
 		return err
 	}
 	if dsackSent {
 		s.haveRecentDSACK = false
 	}
-	s.commitAcknowledgment(window, len(options) != 0)
+	s.commitAcknowledgment(window, right, len(options) != 0)
 	return nil
 }
 
@@ -2833,21 +2828,45 @@ func (s *tcpEstablishedState) sendACK() error {
 	return s.sendACKAt(sequence)
 }
 
-// sendChallengeACK emits a rate-limited RFC 5961 challenge ACK.
-func (s *tcpEstablishedState) sendChallengeACK() error {
-	if !s.connection.stack.allowControlResponse(controlResponseTCPChallengeACK) {
-		return nil
+// trySendACKAt makes one best-effort ACK attempt and commits its advertised
+// state only after publication. Control input can regenerate this response, so
+// local device pressure must not block the connection actor.
+func (s *tcpEstablishedState) trySendACKAt(sequence uint32) {
+	options, dsackSent := s.sackOptions(0)
+	window, right := s.nextAdvertisedReceiveWindow()
+	if err := s.connection.trySendSegmentWithOptions(sequence, s.receiveNext, TCPFlagACK, window, options); err != nil {
+		return
 	}
-	return s.sendACK()
+	if dsackSent {
+		s.haveRecentDSACK = false
+	}
+	s.commitAcknowledgment(window, right, len(options) != 0)
 }
 
-// sendChallengeACKAt emits a rate-limited challenge ACK from an explicit
-// sequence selected by the validating control path.
-func (s *tcpEstablishedState) sendChallengeACKAt(sequence uint32) error {
+// trySendACK makes one best-effort ACK attempt from a sequence acceptable in
+// the current peer window.
+func (s *tcpEstablishedState) trySendACK() {
+	sequence := tcpAcceptableSendSequence(s.sendUnacknowledged, s.sendNext, s.peerWindow, s.peerScale)
+	s.trySendACKAt(sequence)
+}
+
+// trySendChallengeACK emits a rate-limited RFC 5961 challenge ACK without
+// waiting for device capacity.
+func (s *tcpEstablishedState) trySendChallengeACK() {
 	if !s.connection.stack.allowControlResponse(controlResponseTCPChallengeACK) {
-		return nil
+		return
 	}
-	return s.sendACKAt(sequence)
+	s.trySendACK()
+}
+
+// trySendChallengeACKAt emits a rate-limited challenge ACK from an explicit
+// sequence selected by the validating control path without waiting for device
+// capacity.
+func (s *tcpEstablishedState) trySendChallengeACKAt(sequence uint32) {
+	if !s.connection.stack.allowControlResponse(controlResponseTCPChallengeACK) {
+		return
+	}
+	s.trySendACKAt(sequence)
 }
 
 // scheduleACK records an acknowledgement request and reports whether the
@@ -2949,11 +2968,12 @@ func (s *tcpEstablishedState) recoveryTransportState(timeout bool) tcpRecoveryTr
 		ecnRecoveryPoint: s.ecnRecoveryPoint, prrPriorFlight: s.prrPriorFlight,
 		prrDelivered: s.prrDelivered, prrOut: s.prrOut, rtoAttempts: rtoAttempts,
 		fastRecovery: s.fastRecovery, rtoRecovery: s.rtoRecovery,
-		frtoActive: s.frtoActive, frtoProbe: s.frtoProbe,
+		frtoState:            s.frtoState,
+		frtoProbeBudget:      s.frtoProbeBudget,
 		sackRenegingRecovery: s.sackRenegingRecovery,
 		ecnRecoveryActive:    s.ecnRecoveryActive,
 	}
-	transport.captured = transport.phase != CongestionPhaseOpen || transport.fastRecovery || transport.rtoRecovery || transport.frtoActive || transport.sackRenegingRecovery
+	transport.captured = transport.phase != CongestionPhaseOpen || transport.fastRecovery || transport.rtoRecovery || transport.frtoState != tcpFRTOInactive || transport.sackRenegingRecovery
 	return transport
 }
 
@@ -2969,7 +2989,7 @@ func (t *tcpRecoveryTransportState) recoveryPhaseAt(acknowledgement uint32) Cong
 			return CongestionPhaseOpen
 		}
 	case CongestionPhaseLoss:
-		if !t.rtoRecovery || !t.frtoActive && tcpSequenceGreaterEqual(acknowledgement, t.rtoRecoveryPoint) {
+		if !t.rtoRecovery || t.frtoState == tcpFRTOInactive && tcpSequenceGreaterEqual(acknowledgement, t.rtoRecoveryPoint) {
 			return CongestionPhaseOpen
 		}
 	case CongestionPhaseCWR:
@@ -2989,8 +3009,13 @@ func (s *tcpEstablishedState) restoreRecoveryTransportState(acknowledged uint32)
 		transport = *s.undo.transport
 	}
 	s.fastRecovery = transport.fastRecovery && tcpSequenceLess(s.sendUnacknowledged, transport.recoveryPoint)
-	s.rtoRecovery = transport.rtoRecovery && (transport.frtoActive || tcpSequenceLess(s.sendUnacknowledged, transport.rtoRecoveryPoint))
-	s.frtoActive, s.frtoProbe = s.rtoRecovery && transport.frtoActive, s.rtoRecovery && transport.frtoProbe
+	s.rtoRecovery = transport.rtoRecovery && (transport.frtoState != tcpFRTOInactive || tcpSequenceLess(s.sendUnacknowledged, transport.rtoRecoveryPoint))
+	s.frtoState = tcpFRTOInactive
+	s.frtoProbeBudget = 0
+	if s.rtoRecovery {
+		s.frtoState = transport.frtoState
+		s.frtoProbeBudget = transport.frtoProbeBudget
+	}
 	s.sackRenegingRecovery = s.rtoRecovery && transport.sackRenegingRecovery
 	s.recoveryPoint, s.rtoRecoveryPoint = transport.recoveryPoint, transport.rtoRecoveryPoint
 	if s.fastRecovery {
@@ -5986,17 +6011,32 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 	var timeout <-chan time.Time
 	var timeoutDeadline time.Time
 	var synSentAt time.Time
+	var synHostQueue packetQueueTicket
+	var hostQueueWait *packetQueueDepartureWaiter
 	var optionStorage [40]byte
-	send := func(rearm bool) error {
+	send := func(reservation tcpOutputReservation, rearm bool) error {
+		c.mtu = c.stack.mtuFor(c.key.remote.Addr())
+		localMSS = tcpMSSForMTU(c.mtu, c.key.local.Addr())
+		if localMSS < 1 {
+			reservation.release()
+			return errors.New("mipstack: MTU is too small for TCP")
+		}
 		options := tcpPassiveSYNOptions(optionStorage[:0], localMSS, sack, windowScaling, timestamp, c.receiveWindowScale, c.stack.tcpTimestamp(), c.recentTimestamp)
 		flags := byte(TCPFlagSYN | TCPFlagACK)
 		if c.peerECN {
 			flags |= TCPFlagECE
 		}
-		hostQueue, err := c.writeTCPControlWithMTU(initialSequence, c.receiveNext, flags, c.receiveWindow(0, false), options, nil, c.mtu)
+		var payload tcpPayloadView
+		hostQueue, err := c.publishReservedTCP(initialSequence, c.receiveNext, flags, c.receiveWindow(0, false), options, &payload, c.mtu, uint8(c.trafficClass.Load()), 0, reservation)
 		if err != nil {
 			return err
 		}
+		if hostQueueWait != nil {
+			// This copy supersedes a local-queue wait for the prior SYN-ACK.
+			hostQueueWait = nil
+			rearm = true
+		}
+		synHostQueue = hostQueue
 		synSentAt = hostQueue.queuedTime(c.stack.timestampEpoch)
 		if transmissions != 0 {
 			c.noteRetransmission()
@@ -6012,12 +6052,39 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 		}
 		return nil
 	}
-	if err := send(true); err != nil {
-		return err
+	sendReserved := func(queue *packetQueue, slot uint16, loopback, rearm bool) error {
+		reservation := tcpOutputReservation{queue: queue, slot: slot, loopback: loopback}
+		select {
+		case <-c.abortCh:
+			reservation.release()
+			return c.abortedError()
+		case <-c.stack.closeCh:
+			reservation.release()
+			return ErrClosed
+		default:
+		}
+		return send(reservation, rearm)
 	}
-	eventTime := tcpSegmentEventTime(syn, synSentAt, time.Time{}, c.stack.timestampEpoch)
+	sendPending, sendRearm := true, true
+	eventTime := tcpSegmentEventTime(syn, time.Now(), time.Time{}, c.stack.timestampEpoch)
 	var timerBacklog tcpTimerBacklog
 	for {
+		// Cancellation owns the connection before a newly available device slot
+		// can authorize another SYN-ACK.
+		select {
+		case <-c.abortCh:
+			return c.abortedError()
+		case <-c.stack.closeCh:
+			return ErrClosed
+		default:
+		}
+		if hostQueueWait != nil {
+			if departedAt, departed := hostQueueWait.departedTime(c.stack.timestampEpoch); departed {
+				hostQueueWait = nil
+				timeoutDeadline = departedAt.Add(rto)
+				timeout = timer.reset(time.Until(timeoutDeadline))
+			}
+		}
 		activeTimeout := timeout
 		inboundNotify := c.inbound.notify
 		drainBacklog, forceTimeout := timerBacklog.order(c.inbound.len(), timeoutDeadline, time.Now())
@@ -6028,7 +6095,38 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 		} else if forceTimeout && c.actorWakeFlags.Load() == 0 {
 			inboundNotify = nil
 		}
+		var outputQueue *packetQueue
+		var outputLoopback bool
+		var activeOutput <-chan uint16
+		if sendPending && !drainBacklog && !forceTimeout {
+			outputQueue, outputLoopback = c.stack.outputQueueFor(c.key.remote.Addr())
+			activeOutput = outputQueue.free
+			// Prefer an immediately available slot only when no already-published
+			// actor work needs to update the handshake plan first.
+			if c.actorWakeFlags.Load() == 0 && c.inbound.len() == 0 {
+				select {
+				case slot := <-activeOutput:
+					if err := sendReserved(outputQueue, slot, outputLoopback, sendRearm); err != nil {
+						if errors.Is(err, errTCPOutputRouteChanged) {
+							continue
+						}
+						return err
+					}
+					sendPending, sendRearm = false, false
+					continue
+				default:
+				}
+			}
+		}
 		select {
+		case slot := <-activeOutput:
+			if err := sendReserved(outputQueue, slot, outputLoopback, sendRearm); err != nil {
+				if errors.Is(err, errTCPOutputRouteChanged) {
+					continue
+				}
+				return err
+			}
+			sendPending, sendRearm = false, false
 		case <-inboundNotify:
 			wake := c.takeActorWake()
 			if wake&tcpActorWakeNetworkError != 0 {
@@ -6043,9 +6141,10 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 				if localMSS < 1 {
 					return errors.New("mipstack: MTU is too small for TCP")
 				}
-				if err := send(false); err != nil {
-					return err
+				if hostQueueWait != nil {
+					sendRearm = true
 				}
+				sendPending = true
 			}
 			segment, ok := c.inbound.dequeue()
 			if !ok {
@@ -6063,17 +6162,15 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 			}
 			receiveWindow := uint32(c.receiveWindow(0, false))
 			if segment.flags&TCPFlagRST != 0 {
-				if segment.sequence == c.receiveNext {
+				if segment.sequence == c.receiveNext && (segment.flags&TCPFlagACK == 0 || transmissions != 0) {
 					return syscall.ECONNRESET
 				}
 				if tcpSegmentAcceptable(segment.sequence, segmentLength, c.receiveNext, receiveWindow) && c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
-					if err := c.sendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false), nil); err != nil {
-						return err
-					}
+					_ = c.trySendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false))
 				}
 				continue
 			}
-			if !c.passive && segment.flags&(TCPFlagSYN|TCPFlagACK) == TCPFlagSYN|TCPFlagACK && segment.acknowledgement == initialSequence+1 && segment.sequence+1 == c.receiveNext {
+			if transmissions != 0 && !c.passive && segment.flags&(TCPFlagSYN|TCPFlagACK) == TCPFlagSYN|TCPFlagACK && segment.acknowledgement == initialSequence+1 && segment.sequence+1 == c.receiveNext {
 				// During simultaneous open both endpoints send SYN-ACK. Its
 				// SYN repeats the already accepted IRS while its ACK completes
 				// our active half of the handshake.
@@ -6091,7 +6188,8 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 					c.handshakeRTT = elapsedRTTSampleAt(synSentAt, receivedAt)
 				}
 				timer.stop()
-				return c.sendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, c.peerWindowScaling), nil)
+				_ = c.trySendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, c.peerWindowScaling))
+				return nil
 			}
 			if segment.flags&TCPFlagSYN != 0 && segment.flags&TCPFlagACK == 0 && segment.sequence+1 == c.receiveNext {
 				// RFC 3168 section 6.1.1.1 permits an initiator to clear ECE
@@ -6108,34 +6206,29 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 						c.recentTimestamp = value
 					}
 				}
-				if err := send(false); err != nil {
-					return err
+				if hostQueueWait != nil {
+					sendRearm = true
 				}
+				sendPending = true
 				continue
 			}
 			if !tcpSegmentAcceptable(segment.sequence, segmentLength, c.receiveNext, receiveWindow) {
 				if c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
-					if err := c.sendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false), nil); err != nil {
-						return err
-					}
+					_ = c.trySendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false))
 				}
 				continue
 			}
 			if segment.flags&TCPFlagACK != 0 && segment.acknowledgement != initialSequence+1 {
-				if _, err := c.writeTCPControlWithMTU(segment.acknowledgement, 0, TCPFlagRST, 0, nil, nil, c.mtu); err != nil {
-					return err
-				}
+				_ = c.tryWriteTCPControl(segment.acknowledgement, 0, TCPFlagRST, 0, nil)
 				continue
 			}
 			if segment.flags&TCPFlagSYN != 0 {
 				if c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
-					if err := c.sendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false), nil); err != nil {
-						return err
-					}
+					_ = c.trySendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false))
 				}
 				continue
 			}
-			if segment.flags&TCPFlagACK == 0 || segment.acknowledgement != initialSequence+1 {
+			if transmissions == 0 || segment.flags&TCPFlagACK == 0 || segment.acknowledgement != initialSequence+1 {
 				continue
 			}
 			if c.peerTimestamp {
@@ -6165,6 +6258,12 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 			return nil
 		case <-activeTimeout:
 			timer.consumed()
+			timeout = nil
+			timeoutDeadline = time.Time{}
+			if waiter := synHostQueue.departureWaiter(c.stack, c.inbound.notify); waiter != nil {
+				hostQueueWait = waiter
+				continue
+			}
 			if timeoutAttempts >= tcpPassiveSYNMaximumAttempts-1 {
 				return os.ErrDeadlineExceeded
 			}
@@ -6174,9 +6273,7 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 			if rto > tcpMaximumRTO {
 				rto = tcpMaximumRTO
 			}
-			if err := send(true); err != nil {
-				return err
-			}
+			sendPending, sendRearm = true, true
 		case <-c.abortCh:
 			return c.abortedError()
 		case <-c.stack.closeCh:
@@ -6199,17 +6296,32 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 	var timeoutDeadline time.Time
 	var lastSoftError error
 	var synSentAt time.Time
+	var synHostQueue packetQueueTicket
+	var hostQueueWait *packetQueueDepartureWaiter
 	var optionStorage [40]byte
-	send := func(rearm bool) error {
+	send := func(reservation tcpOutputReservation, rearm bool) error {
+		c.mtu = c.stack.mtuFor(c.key.remote.Addr())
+		localMSS = tcpMSSForMTU(c.mtu, c.key.local.Addr())
+		if localMSS < 1 {
+			reservation.release()
+			return errors.New("mipstack: MTU is too small for TCP")
+		}
 		options := tcpSYNOptions(optionStorage[:0], localMSS, c.receiveWindowScale, c.stack.tcpTimestamp())
 		flags := byte(TCPFlagSYN)
 		if !ecnFallback {
 			flags |= TCPFlagECE | TCPFlagCWR
 		}
-		hostQueue, err := c.writeTCPControlWithMTU(initialSequence, 0, flags, c.receiveWindow(0, false), options, nil, c.mtu)
+		var payload tcpPayloadView
+		hostQueue, err := c.publishReservedTCP(initialSequence, 0, flags, c.receiveWindow(0, false), options, &payload, c.mtu, uint8(c.trafficClass.Load()), 0, reservation)
 		if err != nil {
 			return err
 		}
+		if hostQueueWait != nil {
+			// This copy supersedes a local-queue wait for the prior SYN.
+			hostQueueWait = nil
+			rearm = true
+		}
+		synHostQueue = hostQueue
 		synSentAt = hostQueue.queuedTime(c.stack.timestampEpoch)
 		if transmissions != 0 {
 			c.noteRetransmission()
@@ -6225,12 +6337,39 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 		}
 		return nil
 	}
-	if err := send(true); err != nil {
-		return err
+	sendReserved := func(queue *packetQueue, slot uint16, loopback, rearm bool) error {
+		reservation := tcpOutputReservation{queue: queue, slot: slot, loopback: loopback}
+		select {
+		case <-c.abortCh:
+			reservation.release()
+			return c.abortedError()
+		case <-c.stack.closeCh:
+			reservation.release()
+			return ErrClosed
+		default:
+		}
+		return send(reservation, rearm)
 	}
-	eventTime := synSentAt
+	sendPending, sendRearm := true, true
+	eventTime := time.Now()
 	var timerBacklog tcpTimerBacklog
 	for {
+		// Cancellation owns the connection before a newly available device slot
+		// can authorize another SYN.
+		select {
+		case <-c.abortCh:
+			return c.abortedError()
+		case <-c.stack.closeCh:
+			return ErrClosed
+		default:
+		}
+		if hostQueueWait != nil {
+			if departedAt, departed := hostQueueWait.departedTime(c.stack.timestampEpoch); departed {
+				hostQueueWait = nil
+				timeoutDeadline = departedAt.Add(rto)
+				timeout = timer.reset(time.Until(timeoutDeadline))
+			}
+		}
 		activeTimeout := timeout
 		inboundNotify := c.inbound.notify
 		drainBacklog, forceTimeout := timerBacklog.order(c.inbound.len(), timeoutDeadline, time.Now())
@@ -6239,7 +6378,38 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 		} else if forceTimeout && c.actorWakeFlags.Load() == 0 {
 			inboundNotify = nil
 		}
+		var outputQueue *packetQueue
+		var outputLoopback bool
+		var activeOutput <-chan uint16
+		if sendPending && !drainBacklog && !forceTimeout {
+			outputQueue, outputLoopback = c.stack.outputQueueFor(c.key.remote.Addr())
+			activeOutput = outputQueue.free
+			// Prefer an immediately available slot only when no already-published
+			// actor work needs to update the handshake plan first.
+			if c.actorWakeFlags.Load() == 0 && c.inbound.len() == 0 {
+				select {
+				case slot := <-activeOutput:
+					if err := sendReserved(outputQueue, slot, outputLoopback, sendRearm); err != nil {
+						if errors.Is(err, errTCPOutputRouteChanged) {
+							continue
+						}
+						return err
+					}
+					sendPending, sendRearm = false, false
+					continue
+				default:
+				}
+			}
+		}
 		select {
+		case slot := <-activeOutput:
+			if err := sendReserved(outputQueue, slot, outputLoopback, sendRearm); err != nil {
+				if errors.Is(err, errTCPOutputRouteChanged) {
+					continue
+				}
+				return err
+			}
+			sendPending, sendRearm = false, false
 		case <-inboundNotify:
 			wake := c.takeActorWake()
 			if wake&tcpActorWakeNetworkError != 0 {
@@ -6266,9 +6436,10 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 				if localMSS < 1 {
 					return errors.New("mipstack: MTU is too small for TCP")
 				}
-				if err := send(false); err != nil {
-					return err
+				if hostQueueWait != nil {
+					sendRearm = true
 				}
+				sendPending = true
 			}
 			segment, ok := c.inbound.dequeue()
 			if !ok {
@@ -6281,12 +6452,12 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 				// RFC 9293 SYN-SENT processing: an unacceptable ACK elicits
 				// RST unless the incoming segment was itself a reset.
 				if segment.flags&TCPFlagRST == 0 {
-					_, _ = c.writeTCPControlWithMTU(segment.acknowledgement, 0, TCPFlagRST, 0, nil, nil, c.mtu)
+					_ = c.tryWriteTCPControl(segment.acknowledgement, 0, TCPFlagRST, 0, nil)
 				}
 				continue
 			}
 			if segment.flags&TCPFlagRST != 0 {
-				if segment.flags&TCPFlagACK != 0 && segment.acknowledgement == initialSequence+1 {
+				if transmissions != 0 && segment.flags&TCPFlagACK != 0 && segment.acknowledgement == initialSequence+1 {
 					return syscall.ECONNREFUSED
 				}
 				continue
@@ -6301,7 +6472,7 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 				}
 				return c.passiveHandshake(segment, initialSequence, timer)
 			}
-			if segment.flags&(TCPFlagSYN|TCPFlagACK) != TCPFlagSYN|TCPFlagACK || segment.acknowledgement != initialSequence+1 {
+			if transmissions == 0 || segment.flags&(TCPFlagSYN|TCPFlagACK) != TCPFlagSYN|TCPFlagACK || segment.acknowledgement != initialSequence+1 {
 				continue
 			}
 			mss, scale, windowScaling, sack, timestamp, timestampValue := parseTCPOptions(segment.optionBytes(), defaultTCPPeerMSS(c.key.remote.Addr()), 65535)
@@ -6326,9 +6497,16 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 				c.handshakeRTT = elapsedRTTSampleAt(synSentAt, receivedAt)
 			}
 			timer.stop()
-			return c.sendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, c.peerWindowScaling), nil)
+			_ = c.trySendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, c.peerWindowScaling))
+			return nil
 		case <-activeTimeout:
 			timer.consumed()
+			timeout = nil
+			timeoutDeadline = time.Time{}
+			if waiter := synHostQueue.departureWaiter(c.stack, c.inbound.notify); waiter != nil {
+				hostQueueWait = waiter
+				continue
+			}
 			if timeoutAttempts >= tcpActiveSYNMaximumAttempts-1 {
 				return tcpTimeoutError(lastSoftError)
 			}
@@ -6339,9 +6517,7 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 			if rto > tcpMaximumRTO {
 				rto = tcpMaximumRTO
 			}
-			if err := send(true); err != nil {
-				return err
-			}
+			sendPending, sendRearm = true, true
 		case <-c.abortCh:
 			return c.abortedError()
 		case <-c.stack.closeCh:
@@ -6350,30 +6526,28 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 	}
 }
 
-// tcpEstablishedACKOperations exposes actor-local send and recovery actions to
+// tcpEstablishedACKOperations exposes actor-local state transitions to
 // processAcknowledgment without recapturing the complete established frame.
 // The callbacks are borrowed for one synchronous call and must not be retained
 // or invoked from another goroutine.
 type tcpEstablishedACKOperations struct {
 	// applyPathMTU applies confirmed path feedback and optionally restarts
 	// connection-local discovery.
-	applyPathMTU func(int, bool) error
-	// retransmitSegment retransmits one scoreboard entry.
-	retransmitSegment func(int, bool) error
+	applyPathMTU func(int, bool)
+	// enterRecovery applies ACK-derived loss recovery without publishing a
+	// retransmission.
+	enterRecovery func(int, time.Time)
 	// failPLPMTUProbe processes isolated loss of the active probe.
-	failPLPMTUProbe func() error
-	// retransmitRTORecovery sends the next range admitted by RTO recovery.
-	retransmitRTORecovery func(int) error
-	// recoverSACKHoles sends ranges admitted by RFC 6675 and PRR.
-	recoverSACKHoles func(uint32, bool) error
-	// sendNextData fills newly available peer or congestion window space.
-	sendNextData func(uint32, bool) (bool, error)
+	failPLPMTUProbe func()
+	// prepareSACKRecovery applies current RFC 6675/RACK loss evidence without
+	// publishing a retransmission.
+	prepareSACKRecovery func(uint32, bool, time.Time)
 }
 
 // processAcknowledgment validates and applies one acceptable ACK to the
 // actor-owned scoreboard, recovery, RTT, PMTU, and congestion state. It calls
-// operations synchronously and returns the first packet-output failure.
-func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, receivedAt time.Time, timestampEcho uint32, operations *tcpEstablishedACKOperations) error {
+// operations synchronously and does not publish packets.
+func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, receivedAt time.Time, timestampEcho uint32, operations *tcpEstablishedACKOperations) {
 	c := state.connection
 	ack := segment.acknowledgement
 	previousSendUnacknowledged := state.sendUnacknowledged
@@ -6405,9 +6579,6 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	hadOutstandingAtACK := len(state.outstanding) != 0
 	flightBeforeACK := state.congestionFlight()
 	deliveryACK := state.controller.usesDeliveryRate()
-	state.processingDeliveryACK = deliveryACK
-	state.deliveryACKAddedFlight = 0
-	state.deliveryACKPendingSnapshots = false
 	if deliveryACK {
 		if state.deliverySample == nil {
 			state.deliverySample = new(tcpDeliveryRateSample)
@@ -6420,15 +6591,15 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		state.controller.setCongestionPhase(CongestionPhaseOpen, receivedAt)
 	}
 	ecnFeedback := c.peerECN && segment.flags&TCPFlagECE != 0
-	if ecnFeedback && state.frtoActive {
+	if ecnFeedback && state.frtoState != tcpFRTOInactive {
 		// ECE is independent evidence of congestion even when the timeout loss
 		// response already suppresses a second window reduction. It therefore
 		// invalidates F-RTO's spurious-recovery conclusion unconditionally.
 		if state.undo != nil {
 			state.undo.active = false
 		}
-		state.frtoActive = false
-		state.frtoProbe = false
+		state.frtoState = tcpFRTOInactive
+		state.frtoProbeBudget = 0
 	}
 	if ecnFeedback && len(state.outstanding) != 0 && tcpECNStartsRecovery(state.ecnRecoveryActive, ack, state.ecnRecoveryPoint) {
 		state.hyStart.disable()
@@ -6462,7 +6633,7 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		state.duplicateACKs = 0
 		state.rtoAttempts = 0
 		if state.rtoRecovery {
-			if tcpSequenceGreaterEqual(ack, state.rtoRecoveryPoint) && !state.frtoActive {
+			if tcpSequenceGreaterEqual(ack, state.rtoRecoveryPoint) && state.frtoState == tcpFRTOInactive {
 				state.rtoRecovery = false
 				state.rtoRecoveryPoint = 0
 				state.sackRenegingRecovery = false
@@ -6549,9 +6720,7 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 			c.stack.confirmPathMTU(c.key.remote.Addr(), mtu, c)
 			state.ensurePathMTUState().successes++
 			c.stack.stats.pathMTUProbeSuccesses.Add(1)
-			if err := operations.applyPathMTU(mtu, false); err != nil {
-				return err
-			}
+			operations.applyPathMTU(mtu, false)
 		}
 		// RFC 3042 excludes Limited Transmit data only when the
 		// duplicate-ACK episode that sent it enters recovery. Once a
@@ -6604,9 +6773,11 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 				// but not the recovery point. Deflate by newly ACKed
 				// data, add one SMSS, and retransmit the next hole.
 				state.congestionWindow = state.controller.partialACKWindow(receivedAt, state.congestionWindow, acknowledged, state.congestionFlight(), state.peerMSS)
-				if err := operations.retransmitSegment(firstUnsackedSegment(state.outstanding), false); err != nil {
-					return err
+				index := firstUnsackedSegment(state.outstanding)
+				if index >= 0 {
+					state.outstanding[index].state.set(sentTCPSegmentSACKRetried, false)
 				}
+				operations.enterRecovery(index, receivedAt)
 			}
 		} else if !ecnCongestion && !state.controller.usesDeliveryRate() {
 			growth := acknowledged
@@ -6673,8 +6844,8 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	}
 	if spuriousRecovery && ecnFeedback {
 		state.undo.active = false
-		state.frtoActive = false
-		state.frtoProbe = false
+		state.frtoState = tcpFRTOInactive
+		state.frtoProbeBudget = 0
 	} else if spuriousRecovery {
 		state.restoreSpuriousRecovery(receivedAt, acknowledgedForUndo)
 	}
@@ -6709,7 +6880,7 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 				state.deliverySample.observe(candidate)
 			}
 			if !candidate.isRetransmitted() {
-				if state.frtoActive && tcpSequenceLess(candidate.sequence, state.rtoRecoveryPoint) {
+				if state.frtoState != tcpFRTOInactive && tcpSequenceLess(candidate.sequence, state.rtoRecoveryPoint) {
 					frtoOriginalDelivered = true
 				}
 				sentAt := candidate.transmittedAt(c.stack.timestampEpoch)
@@ -6743,13 +6914,11 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	}
 	probeFailed := false
 	if state.pathMTUState != nil && state.pathMTUState.discovery.active && hasSACK && state.sendUnacknowledged == state.pathMTUState.discovery.probeStart && isolatedPLPMTUProbeLoss(state.outstanding, state.pathMTUState.discovery.probeStart, highestSACK, state.peerMSS) {
-		if err := operations.failPLPMTUProbe(); err != nil {
-			return err
-		}
+		operations.failPLPMTUProbe()
 		probeFailed = true
 	}
 	if !sackReneging && (hasSACK || state.haveRACKLoss) {
-		state.recordProvenLosses()
+		state.recordProvenLosses(deliveryACK, receivedAt)
 	}
 	if state.tailProbeActive && state.tailProbeRetransmit && !ackAdvanced && ack == state.tailProbeEnd && previousWindow == state.peerWindow && !hasSACK && len(segment.payload) == 0 && segment.flags&TCPFlagFIN == 0 {
 		state.tailProbeActive = false
@@ -6762,9 +6931,10 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		state.armSACKReneging()
 	}
 	duplicateEvidence := tcpDuplicateACKEvidence(*segment, state.peerSACK, newSACKInfo, ackAdvanced, state.sendUnacknowledged, previousWindow, state.peerWindow)
-	if state.frtoActive && !sackReneging {
+	if state.frtoState != tcpFRTOInactive && !sackReneging {
 		spurious, fallback, limitWindow := false, false, false
-		if state.frtoProbe {
+		probePublished := state.frtoState == tcpFRTOProbeSent || state.frtoState == tcpFRTOProbePending && state.frtoProbeBudget < 2
+		if probePublished {
 			if state.peerSACK {
 				beyondRecovery := tcpSequenceGreater(ack, state.rtoRecoveryPoint) || hasSACK && tcpSequenceGreater(highestSACK, state.rtoRecoveryPoint)
 				spurious = !beyondRecovery && (ackAdvanced || frtoOriginalDelivered)
@@ -6781,27 +6951,12 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 			}
 			fallback = retransmissionEnd == 0 || tcpSequenceLess(ack, retransmissionEnd) || tcpSequenceGreaterEqual(ack, state.rtoRecoveryPoint)
 			if !fallback {
-				allowance := 2 * uint32(state.peerMSS)
-				if flight := state.congestionFlight(); flight > state.congestionWindow {
-					allowance = growCongestionWindow(allowance, flight-state.congestionWindow)
-				}
-				sent := false
-				for attempts := 0; attempts < 2; attempts++ {
-					one, err := operations.sendNextData(allowance, false)
-					if err != nil {
-						return err
-					}
-					if !one {
-						break
-					}
-					sent = true
-				}
-				if sent {
-					state.frtoProbe = true
-					rtoPartialACK = false
-				} else {
-					fallback = true
-				}
+				// RFC 5682 permits up to two new segments after this ACK. The
+				// established output path applies current pacing, window, and
+				// application-data constraints before publishing each probe.
+				state.frtoState = tcpFRTOProbePending
+				state.frtoProbeBudget = 2
+				rtoPartialACK = false
 			}
 		} else if !state.peerSACK && duplicateEvidence {
 			fallback = true
@@ -6812,8 +6967,8 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 				rtoPartialACK = false
 			}
 		case fallback:
-			state.frtoActive = false
-			state.frtoProbe = false
+			state.frtoState = tcpFRTOInactive
+			state.frtoProbeBudget = 0
 			if limitWindow {
 				limit := 3 * uint32(state.peerMSS)
 				if state.congestionWindow > limit {
@@ -6840,14 +6995,22 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 			// the ACK of the RTO packet supplies time-based loss proof.
 			index = firstRACKLoss(state.outstanding)
 		}
-		if err := operations.retransmitRTORecovery(index); err != nil {
-			return err
+		if index >= 0 {
+			segment := &state.outstanding[index]
+			if !state.peerSACK {
+				segment.state.set(sentTCPSegmentSACKRetried, false)
+			}
+			lossObservedAt := receivedAt
+			if !deliveryACK {
+				lossObservedAt = time.Now()
+			}
+			state.controller.notePacketLoss(segment, recordTCPSegmentLoss(segment, true), deliveryACK, lossObservedAt, state.congestionWindow, state.slowStartThreshold, state.ordinaryFlight(), state.peerMSS, state.rtt.srtt)
+			state.tailProbeActive = false
+			state.tailProbeRetransmit = false
 		}
 	}
 	if !sackReneging && !state.rtoRecovery && state.haveRACKLoss {
-		if err := operations.recoverSACKHoles(highestSACK, false); err != nil {
-			return err
-		}
+		operations.prepareSACKRecovery(highestSACK, false, receivedAt)
 		state.haveRACKLoss = hasRACKLoss(state.outstanding)
 	}
 	// RFC 6675 DupAcks and Limited Transmit apply before recovery.
@@ -6858,26 +7021,17 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		state.duplicateACKs++
 		if state.duplicateACKs < tcpDuplicateACKThreshold && !state.fastRecovery {
 			// RFC 3042 Limited Transmit permits one new segment for each
-			// of the first two duplicate ACKs without inflating cwnd.
-			// sendNextData still enforces the receive window and the
-			// cumulative cwnd+2*SMSS allowance.
-			sent, err := operations.sendNextData(uint32(state.duplicateACKs*state.peerMSS), true)
-			if err != nil {
-				return err
-			}
-			state.limitedTransmitActive = state.limitedTransmitActive || sent
+			// of the first two duplicate ACKs without inflating cwnd. The
+			// established output path derives its cumulative allowance from this
+			// count after ACK processing is complete.
 		} else if state.duplicateACKs == tcpDuplicateACKThreshold {
 			if state.peerSACK {
 				// RFC 6675 enters recovery after DupThresh ACKs carrying
 				// new SACK information even if IsLost remains false.
-				if err := operations.retransmitSegment(firstUnsackedSegment(state.outstanding), false); err != nil {
-					return err
-				}
-				if err := operations.recoverSACKHoles(highestSACK, false); err != nil {
-					return err
-				}
-			} else if err := operations.retransmitSegment(firstUnsackedSegment(state.outstanding), false); err != nil {
-				return err
+				operations.enterRecovery(firstUnsackedSegment(state.outstanding), receivedAt)
+				operations.prepareSACKRecovery(highestSACK, false, receivedAt)
+			} else {
+				operations.enterRecovery(firstUnsackedSegment(state.outstanding), receivedAt)
 			}
 		} else if state.duplicateACKs > tcpDuplicateACKThreshold && !state.peerSACK {
 			state.congestionWindow = state.controller.duplicateACKWindow(receivedAt, state.congestionWindow, state.congestionFlight(), state.peerMSS)
@@ -6885,20 +7039,12 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	}
 	if !sackReneging && state.fastRecovery && hasSACK {
 		if ackAdvanced || newSACKInfo {
-			if err := operations.recoverSACKHoles(highestSACK, true); err != nil {
-				return err
-			}
+			operations.prepareSACKRecovery(highestSACK, true, receivedAt)
 		}
 	}
 	if deliveryACK {
 		if hadOutstandingAtACK {
-			inFlight := state.congestionFlight()
-			if state.deliveryACKAddedFlight >= inFlight {
-				inFlight = 0
-			} else {
-				inFlight -= state.deliveryACKAddedFlight
-			}
-			state.controller.finishDeliveryRateSample(state.deliverySample, newlyDelivered, flightBeforeACK, inFlight, receivedAt, monotonicStampAt(c.stack.timestampEpoch, receivedAt), state.rtt.minimum, state.rtt.srtt, normalizedRTTSample(rttSample), rateSACKReneging)
+			state.controller.finishDeliveryRateSample(state.deliverySample, newlyDelivered, flightBeforeACK, state.congestionFlight(), receivedAt, monotonicStampAt(c.stack.timestampEpoch, receivedAt), state.rtt.minimum, state.rtt.srtt, normalizedRTTSample(rttSample), rateSACKReneging)
 			state.deliverySample.recovery = state.fastRecovery || state.rtoRecovery
 			state.deliverySample.fastRecovery = state.fastRecovery
 			// Linux excludes a lone runt packet's delayed ACK when an
@@ -6910,19 +7056,6 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 				state.slowStartThreshold = threshold
 			}
 		}
-		if state.deliveryACKPendingSnapshots {
-			packetsOut := state.sendNext - state.sendUnacknowledged
-			for index := range state.outstanding {
-				candidate := &state.outstanding[index]
-				if !candidate.state.has(sentTCPSegmentDeliveryPending) {
-					continue
-				}
-				candidate.delivery = state.controller.snapshotSend(candidate.hostQueue.queuedAt, packetsOut)
-				candidate.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
-				candidate.state.set(sentTCPSegmentDeliveryPending, false)
-			}
-		}
-		state.processingDeliveryACK = false
 	}
 	if multiplier := state.controller.sendBufferMultiplier(); hadOutstandingAtACK && newlyDelivered != 0 && multiplier != 0 {
 		// An algorithm may provision multiple cwnds so the application
@@ -6935,7 +7068,6 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		}
 		c.growSendCapacity(int(target))
 	}
-	return nil
 }
 
 // established runs the serialized data, congestion, receive, and close state
@@ -6944,6 +7076,11 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialReceive tcpInitialReceive) error {
 	state := newTCPEstablishedState(c, sendNext)
 	defer state.finish()
+	// An expired loss timer's departure wait is actor-local and identifies one
+	// exact queue generation. ACK, recovery, and route events can replace its
+	// scoreboard target without retaining the old ticket in connection state.
+	var hostQueueWait *packetQueueDepartureWaiter
+	var hostQueueWaitTicket packetQueueTicket
 	// Coalesce liveness recalculation after receive batches, send-window
 	// reevaluation, and direct recovery paths that consume new sequence space.
 	livenessDirty := false
@@ -7045,7 +7182,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		next := state.sendNext + uint32(payload.size)
 		carriesCWR := c.peerECN && c.sendCWR
 		c.publishICMPSequenceRange(state.sendUnacknowledged, next)
-		window := state.advertisedReceiveWindow()
+		window, right := state.nextAdvertisedReceiveWindow()
 		timestamp, hostQueue, err := c.sendPayloadForMTU(state.sendNext, state.receiveNext, flags, window, options, &payload, true, transmitMTU)
 		if err != nil {
 			return false, err
@@ -7054,18 +7191,14 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if dsackSent {
 			state.haveRecentDSACK = false
 		}
-		state.commitAcknowledgment(window, len(options) != 0)
+		state.commitAcknowledgment(window, right, len(options) != 0)
 		state.observeSentData(hostQueue.queuedAt)
 		// Delivery sampling resets its pipeline timestamps only when packets_out
 		// is zero. SACKed or loss-marked data therefore remains part of the first
 		// argument even when it is no longer congestion flight.
 		rate, updatedWindow := state.controller.onDataSend(payload.size, state.peerMSS, sentAt, hostQueue.queuedAt, windowFlight, state.congestionWindow, congestionFlight, state.rtt.srtt, state.slowStartThreshold)
 		state.congestionWindow = updatedWindow
-		state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: next, flags: flags, timestamp: timestamp, state: sentTCPSegmentInitialState(limitedTransmit, carriesCWR, probe, state.processingDeliveryACK, state.controller.schedulerLimited()), firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, congestionPacketState: state.controller.transmissionState(), delivery: rate}, offset+payload.size < total)
-		if state.processingDeliveryACK {
-			state.deliveryACKAddedFlight = growCongestionWindow(state.deliveryACKAddedFlight, uint32(payload.size))
-			state.deliveryACKPendingSnapshots = true
-		}
+		state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: next, flags: flags, timestamp: timestamp, state: sentTCPSegmentInitialState(limitedTransmit, carriesCWR, probe, state.controller.schedulerLimited()), firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, congestionPacketState: state.controller.transmissionState(), delivery: rate}, offset+payload.size < total)
 		state.bytesSent += uint64(payload.size)
 		if probe {
 			state.pathMTUState.discovery.sent(transmitMTU, state.sendNext, next)
@@ -7092,6 +7225,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		}
 		return nil
 	}
+	var retransmitRTORecovery func(int) error
 	fillWindow := func(retransmissionUpdate tcpRetransmissionUpdate) error {
 		livenessDirty = true
 		if state.localFINSent {
@@ -7101,6 +7235,45 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			state.updateRetransmissionTimer(retransmissionUpdate, state.eventTime)
 			state.armPersist(time.Time{}, 0, false)
 			return nil
+		}
+		for state.frtoState == tcpFRTOProbePending {
+			allowance := 2 * uint32(state.peerMSS)
+			if flight := state.congestionFlight(); flight > state.congestionWindow {
+				allowance = growCongestionWindow(allowance, flight-state.congestionWindow)
+			}
+			sent, err := sendNextData(allowance, false)
+			if err != nil {
+				return err
+			}
+			if sent {
+				state.frtoProbeBudget--
+				if state.frtoProbeBudget == 0 {
+					state.frtoState = tcpFRTOProbeSent
+				}
+				continue
+			}
+			if state.frtoProbeBudget == 2 {
+				state.frtoState = tcpFRTOInactive
+				state.frtoProbeBudget = 0
+				if err := retransmitRTORecovery(firstUnsackedSegment(state.outstanding)); err != nil {
+					return err
+				}
+			} else {
+				state.frtoState = tcpFRTOProbeSent
+				state.frtoProbeBudget = 0
+			}
+			break
+		}
+		limitedTransmit := !state.rtoRecovery && !state.fastRecovery && state.duplicateACKs > 0 && state.duplicateACKs < tcpDuplicateACKThreshold
+		for limitedTransmit {
+			sent, err := sendNextData(uint32(state.duplicateACKs*state.peerMSS), true)
+			if err != nil {
+				return err
+			}
+			if !sent {
+				break
+			}
+			state.limitedTransmitActive = true
 		}
 		for {
 			sent, err := sendNextData(0, false)
@@ -7139,7 +7312,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			if writeClosed && offset >= total && windowFlight < state.peerWindow && congestionFlight < state.congestionWindow {
 				c.publishICMPSequenceRange(state.sendUnacknowledged, state.sendNext+1)
 				options, dsackSent := state.sackOptions(0)
-				window := state.advertisedReceiveWindow()
+				window, right := state.nextAdvertisedReceiveWindow()
 				timestamp, hostQueue, err := c.sendSegmentForMTU(state.sendNext, state.receiveNext, TCPFlagACK|TCPFlagFIN, window, options, nil, false, c.mtu)
 				if err != nil {
 					return err
@@ -7148,7 +7321,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				if dsackSent {
 					state.haveRecentDSACK = false
 				}
-				state.commitAcknowledgment(window, len(options) != 0)
+				state.commitAcknowledgment(window, right, len(options) != 0)
 				state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: state.sendNext + 1, flags: TCPFlagACK | TCPFlagFIN, timestamp: timestamp, state: sentTCPSegmentTransmitted, firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue}, false)
 				state.sendNext++
 				// Only the endpoint that closes first, or closes simultaneously,
@@ -7161,15 +7334,15 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		state.armPersist(time.Time{}, total, writeClosed)
 		return nil
 	}
-	retransmitSegment := func(index int, timeout bool) error {
+	prepareRetransmission := func(index int, timeout, duringACK bool, lossObservedAt time.Time) int {
 		if len(state.outstanding) == 0 {
-			return nil
+			return -1
 		}
 		if index < 0 || index >= len(state.outstanding) {
 			index = firstUnsackedSegment(state.outstanding)
 		}
 		if index < 0 || index >= len(state.outstanding) {
-			return nil
+			return -1
 		}
 		// RFC 5682 restarts F-RTO when the timer expires repeatedly for the
 		// same SND.UNA. Any advancing ACK resets rtoAttempts, so a timeout
@@ -7203,10 +7376,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			state.armPathMTUProbe()
 		}
 		if index < 0 || index >= len(state.outstanding) {
-			return nil
+			return -1
 		}
 		oldest := &state.outstanding[index]
-		sentSize := oldest.end - oldest.sequence
 		rackRetransmission := oldest.state.has(sentTCPSegmentRACKLost)
 		lostRetransmission := rackRetransmission && oldest.isRetransmitted()
 		lostCWR := oldest.state.has(sentTCPSegmentCWR)
@@ -7223,35 +7395,11 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			state.undo.begin(timeout, state.sendNext, state.congestionWindow, state.slowStartThreshold, flight, &state.controller, state.rtt)
 			state.undo.setTransport(transport)
 		}
-		window := state.advertisedReceiveWindow()
-		repeated := oldest.isRetransmitted()
-		retransmitTimestamp, hostQueue, err := c.sendBufferedSegmentForMTU(state.sendUnacknowledged, *oldest, state.receiveNext, window, nil, false, c.mtu)
-		if err != nil {
-			return err
-		}
-		state.recordRetransmission(oldest.sequence, oldest.end)
-		if state.undo != nil {
-			state.undo.recordRetransmission(oldest.sequence, oldest.end, retransmitTimestamp, repeated)
-		}
-		state.commitAcknowledgment(window, false)
-		oldest.timestamp = retransmitTimestamp
-		oldest.hostQueue = hostQueue
 		lossProven := timeout || !state.peerSACK || sackSegmentLost(state.outstanding, index, state.peerMSS)
-		state.controller.notePacketLoss(oldest, recordTCPSegmentLoss(oldest, lossProven), state.processingDeliveryACK, state.lossObservationTime(), state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), state.peerMSS, state.rtt.srtt)
-		oldest.advanceTransmissionGeneration()
-		oldest.state.set(sentTCPSegmentSACKRetried, !timeout)
-		oldest.state.set(sentTCPSegmentRACKLost, false)
-		if rackRetransmission {
-			state.haveRACKLoss = hasRACKLoss(state.outstanding)
+		if !duringACK {
+			lossObservedAt = time.Now()
 		}
-		oldest.state.set(sentTCPSegmentCWR, false)
-		c.noteRetransmission()
-		if !timeout && state.peerSACK {
-			c.stack.stats.tcpSACKRetransmissions.Add(1)
-			if rackRetransmission {
-				c.stack.stats.tcpRACKRetransmissions.Add(1)
-			}
-		}
+		state.controller.notePacketLoss(oldest, recordTCPSegmentLoss(oldest, lossProven), duringACK, lossObservedAt, state.congestionWindow, state.slowStartThreshold, state.congestionFlight(), state.peerMSS, state.rtt.srtt)
 		if timeout {
 			state.tailProbeActive = false
 			state.tailProbeRetransmit = false
@@ -7271,8 +7419,11 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			// The recovery point belongs to this timeout, including data sent
 			// by an earlier F-RTO attempt before a recurring timeout.
 			state.rtoRecoveryPoint = state.sendNext
-			state.frtoActive = frtoEligible
-			state.frtoProbe = false
+			state.frtoState = tcpFRTOInactive
+			state.frtoProbeBudget = 0
+			if frtoEligible {
+				state.frtoState = tcpFRTOAwaitingACK
+			}
 			state.congestionWindow = uint32(state.peerMSS)
 			state.fastRecovery = false
 			state.prrPriorFlight = 0
@@ -7322,13 +7473,52 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				if state.peerSACK {
 					state.prrPriorFlight = flight
 					state.prrDelivered = 0
-					state.prrOut = uint64(sentSize)
-					// Linux PRR admits exactly the forced recovery-entry
-					// retransmission before delivery feedback grants more.
-					state.congestionWindow = sackRecoveryPipe(state.outstanding, state.peerMSS)
+					state.prrOut = 0
 				}
-			} else if state.peerSACK {
-				state.prrOut += uint64(sentSize)
+			}
+		}
+		return index
+	}
+	publishRetransmission := func(index int, timeout bool) error {
+		if index < 0 || index >= len(state.outstanding) {
+			return nil
+		}
+		oldest := &state.outstanding[index]
+		rackRetransmission := oldest.state.has(sentTCPSegmentRACKLost)
+		repeated := oldest.isRetransmitted()
+		window, right := state.nextAdvertisedReceiveWindow()
+		retransmitTimestamp, hostQueue, err := c.sendBufferedSegmentForMTU(state.sendUnacknowledged, *oldest, state.receiveNext, window, nil, false, c.mtu)
+		if err != nil {
+			return err
+		}
+		state.recordRetransmission(oldest.sequence, oldest.end)
+		if state.undo != nil {
+			state.undo.recordRetransmission(oldest.sequence, oldest.end, retransmitTimestamp, repeated)
+		}
+		state.commitAcknowledgment(window, right, false)
+		oldest.timestamp = retransmitTimestamp
+		oldest.hostQueue = hostQueue
+		oldest.advanceTransmissionGeneration()
+		oldest.state.set(sentTCPSegmentSACKRetried, true)
+		oldest.state.set(sentTCPSegmentRACKLost, false)
+		if rackRetransmission {
+			state.haveRACKLoss = hasRACKLoss(state.outstanding)
+		}
+		oldest.state.set(sentTCPSegmentCWR, false)
+		c.noteRetransmission()
+		if !timeout && state.peerSACK {
+			c.stack.stats.tcpSACKRetransmissions.Add(1)
+			if rackRetransmission {
+				c.stack.stats.tcpRACKRetransmissions.Add(1)
+			}
+			firstRecoverySend := state.fastRecovery && state.prrOut == 0
+			if state.fastRecovery {
+				state.prrOut += uint64(oldest.dataSize())
+			}
+			if firstRecoverySend {
+				// Linux PRR admits the forced recovery-entry retransmission
+				// before delivery feedback grants additional output.
+				state.congestionWindow = sackRecoveryPipe(state.outstanding, state.peerMSS)
 			}
 		}
 		if timeout && len(state.outstanding) != 0 {
@@ -7337,14 +7527,13 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		oldest.delivery = state.controller.onRetransmit(oldest.dataSize(), state.peerMSS, oldest.transmittedAt(c.stack.timestampEpoch), oldest.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
 		oldest.congestionPacketState = state.controller.transmissionState()
 		oldest.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
-		oldest.state.set(sentTCPSegmentDeliveryPending, state.processingDeliveryACK)
-		if state.processingDeliveryACK && state.peerSACK && state.fastRecovery {
-			state.deliveryACKAddedFlight = growCongestionWindow(state.deliveryACKAddedFlight, uint32(oldest.dataSize()))
-		}
-		state.deliveryACKPendingSnapshots = state.deliveryACKPendingSnapshots || state.processingDeliveryACK
 		return nil
 	}
-	retransmitRTORecovery := func(index int) error {
+	retransmitSegment := func(index int, timeout bool) error {
+		index = prepareRetransmission(index, timeout, false, time.Time{})
+		return publishRetransmission(index, timeout)
+	}
+	retransmitRTORecovery = func(index int) error {
 		if len(state.outstanding) == 0 {
 			return nil
 		}
@@ -7352,7 +7541,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			return nil
 		}
 		segment := &state.outstanding[index]
-		window := state.advertisedReceiveWindow()
+		window, right := state.nextAdvertisedReceiveWindow()
 		retransmitTimestamp, hostQueue, err := c.sendBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu)
 		if err != nil {
 			return err
@@ -7361,16 +7550,16 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if state.undo != nil {
 			state.undo.recordRetransmission(segment.sequence, segment.end, retransmitTimestamp, segment.isRetransmitted())
 		}
-		state.commitAcknowledgment(window, false)
+		state.commitAcknowledgment(window, right, false)
 		if segment.state.has(sentTCPSegmentCWR) && c.peerECN {
 			c.sendCWR = true
 		}
 		segment.state.set(sentTCPSegmentCWR, false)
 		segment.timestamp = retransmitTimestamp
 		segment.hostQueue = hostQueue
-		state.controller.notePacketLoss(segment, recordTCPSegmentLoss(segment, true), state.processingDeliveryACK, state.lossObservationTime(), state.congestionWindow, state.slowStartThreshold, state.ordinaryFlight(), state.peerMSS, state.rtt.srtt)
+		state.controller.notePacketLoss(segment, recordTCPSegmentLoss(segment, true), false, time.Now(), state.congestionWindow, state.slowStartThreshold, state.ordinaryFlight(), state.peerMSS, state.rtt.srtt)
 		segment.advanceTransmissionGeneration()
-		segment.state.set(sentTCPSegmentSACKRetried, false)
+		segment.state.set(sentTCPSegmentSACKRetried, true)
 		rackLost := segment.state.has(sentTCPSegmentRACKLost)
 		segment.state.set(sentTCPSegmentRACKLost, false)
 		if rackLost {
@@ -7382,13 +7571,31 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.ordinaryFlight(), state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
 		segment.congestionPacketState = state.controller.transmissionState()
 		segment.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
-		segment.state.set(sentTCPSegmentDeliveryPending, state.processingDeliveryACK)
-		state.deliveryACKPendingSnapshots = state.deliveryACKPendingSnapshots || state.processingDeliveryACK
 		return nil
 	}
-	failPLPMTUProbe := func() error {
-		if state.pathMTUState == nil || !state.pathMTUState.discovery.active {
+	drainRTORecovery := func() error {
+		if !state.rtoRecovery || state.frtoState != tcpFRTOInactive || len(state.outstanding) == 0 {
 			return nil
+		}
+		index := firstUnsackedSegment(state.outstanding)
+		if state.peerSACK {
+			index = firstRACKLoss(state.outstanding)
+		} else if index >= 0 && state.outstanding[index].state.has(sentTCPSegmentSACKRetried) {
+			index = -1
+		}
+		return retransmitRTORecovery(index)
+	}
+	armPathMTURetransmission := func() {
+		if len(state.outstanding) == 0 || state.retransmit && state.retransmissionKind == tcpRetransmissionClose {
+			return
+		}
+		state.retransmit = true
+		state.retransmissionDeadline = time.Now()
+		state.retransmissionKind = tcpRetransmissionPathMTU
+	}
+	failPLPMTUProbe := func() {
+		if state.pathMTUState == nil || !state.pathMTUState.discovery.active {
+			return
 		}
 		state.pathMTUState.discovery.failed(time.Now(), tcpPLPMTUProbeHeadway(state.congestionWindow, state.peerMSS, state.rtt.srtt))
 		if !state.pathMTUState.discovery.searching {
@@ -7413,35 +7620,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		index := firstUnsackedSegment(state.outstanding)
 		if index < 0 || index >= len(state.outstanding) {
 			state.armPathMTUProbe()
-			return nil
+			return
 		}
-		segment := &state.outstanding[index]
-		window := state.advertisedReceiveWindow()
-		timestamp, hostQueue, err := c.sendBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu)
-		if err != nil {
-			return err
-		}
-		state.recordRetransmission(segment.sequence, segment.end)
-		segment.timestamp = timestamp
-		segment.hostQueue = hostQueue
-		segment.state.set(sentTCPSegmentRACKLost, false)
-		segment.advanceTransmissionGeneration()
-		segment.state.set(sentTCPSegmentSACKRetried, true)
-		state.haveRACKLoss = hasRACKLoss(state.outstanding)
-		state.commitAcknowledgment(window, false)
-		c.noteRetransmission()
 		state.ensurePathMTUState().failures++
 		c.stack.stats.pathMTUProbeFailures.Add(1)
-		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
-		segment.congestionPacketState = state.controller.transmissionState()
-		segment.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
-		segment.state.set(sentTCPSegmentDeliveryPending, state.processingDeliveryACK)
-		if state.processingDeliveryACK && state.peerSACK && state.fastRecovery {
-			state.deliveryACKAddedFlight = growCongestionWindow(state.deliveryACKAddedFlight, uint32(segment.dataSize()))
-		}
-		state.deliveryACKPendingSnapshots = state.deliveryACKPendingSnapshots || state.processingDeliveryACK
+		armPathMTURetransmission()
 		state.armPathMTUProbe()
-		return nil
 	}
 	recoverSACKHoles := func(highest uint32, allowSpeculative bool) error {
 		for {
@@ -7471,7 +7655,32 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			}
 		}
 	}
-	applyPathMTU := func(mtu int, retransmit bool) error {
+	enterRecovery := func(index int, receivedAt time.Time) {
+		prepareRetransmission(index, false, state.controller.usesDeliveryRate(), receivedAt)
+	}
+	prepareSACKRecovery := func(highest uint32, allowSpeculative bool, receivedAt time.Time) {
+		index := firstUnretriedLoss(state.outstanding, state.peerMSS)
+		if index < 0 && allowSpeculative {
+			index = firstUnretriedSACKHole(state.outstanding, highest)
+		}
+		if index >= 0 {
+			prepareRetransmission(index, false, state.controller.usesDeliveryRate(), receivedAt)
+		}
+	}
+	drainPreparedRecovery := func() error {
+		if !state.fastRecovery || len(state.outstanding) == 0 {
+			return nil
+		}
+		if state.peerSACK {
+			return recoverSACKHoles(highestSACKedSequence(state.outstanding), true)
+		}
+		index := firstUnsackedSegment(state.outstanding)
+		if index < 0 || state.outstanding[index].state.has(sentTCPSegmentSACKRetried) {
+			return nil
+		}
+		return publishRetransmission(index, false)
+	}
+	applyPathMTU := func(mtu int, retransmit bool) {
 		options := c.socketOptions()
 		state.changeCongestionController(options.congestionFactory, options.maximumPacingRate)
 		priorMTU := c.mtu
@@ -7493,12 +7702,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		state.armPathMTUProbe()
 		newMSS := clampMSS(c.peerMSS, state.pathMSS)
 		if newMSS == state.peerMSS {
-			return nil
+			return
 		}
 		if newMSS > state.peerMSS {
 			state.peerMSS = newMSS
 			state.controller.onMTUChange(state.congestionWindow, state.slowStartThreshold, state.peerMSS)
-			return nil
+			return
 		}
 		oldMSS := state.peerMSS
 		state.peerMSS = newMSS
@@ -7512,40 +7721,49 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		if state.sackedRanges != 0 {
 			state.recountSACK()
 		}
-		if retransmit && len(state.outstanding) != 0 {
-			index := firstUnsackedSegment(state.outstanding)
-			segment := &state.outstanding[index]
-			window := state.advertisedReceiveWindow()
-			timestamp, hostQueue, err := c.sendBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu)
-			if err != nil {
-				return err
-			}
-			state.recordRetransmission(segment.sequence, segment.end)
-			state.commitAcknowledgment(window, false)
-			if segment.state.has(sentTCPSegmentCWR) && c.peerECN {
-				c.sendCWR = true
-			}
-			segment.state.set(sentTCPSegmentCWR, false)
-			segment.timestamp = timestamp
-			segment.hostQueue = hostQueue
-			segment.advanceTransmissionGeneration()
-			c.noteRetransmission()
-			segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
-			segment.congestionPacketState = state.controller.transmissionState()
-			segment.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
-			segment.state.set(sentTCPSegmentDeliveryPending, state.processingDeliveryACK)
-			state.deliveryACKPendingSnapshots = state.deliveryACKPendingSnapshots || state.processingDeliveryACK
-			state.armRetransmission()
+		if retransmit {
+			armPathMTURetransmission()
 		}
+	}
+	drainPathMTURetransmission := func() error {
+		if !state.retransmit || state.retransmissionKind != tcpRetransmissionPathMTU {
+			return nil
+		}
+		index := firstUnsackedSegment(state.outstanding)
+		if index < 0 {
+			state.armRetransmission()
+			return nil
+		}
+		segment := &state.outstanding[index]
+		window, right := state.nextAdvertisedReceiveWindow()
+		timestamp, hostQueue, err := c.sendBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu)
+		if err != nil {
+			return err
+		}
+		state.recordRetransmission(segment.sequence, segment.end)
+		state.commitAcknowledgment(window, right, false)
+		if segment.state.has(sentTCPSegmentCWR) && c.peerECN {
+			c.sendCWR = true
+		}
+		segment.state.set(sentTCPSegmentCWR, false)
+		segment.timestamp = timestamp
+		segment.hostQueue = hostQueue
+		segment.advanceTransmissionGeneration()
+		segment.state.set(sentTCPSegmentRACKLost, false)
+		segment.state.set(sentTCPSegmentSACKRetried, true)
+		state.haveRACKLoss = hasRACKLoss(state.outstanding)
+		c.noteRetransmission()
+		segment.delivery = state.controller.onRetransmit(segment.dataSize(), state.peerMSS, segment.transmittedAt(c.stack.timestampEpoch), segment.hostQueue.queuedAt, state.congestionWindow, state.congestionFlight(), state.sendNext-state.sendUnacknowledged, state.rtt.srtt, state.slowStartThreshold)
+		segment.congestionPacketState = state.controller.transmissionState()
+		segment.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
+		state.armRetransmission()
 		return nil
 	}
 	ackOperations := tcpEstablishedACKOperations{
-		applyPathMTU:          applyPathMTU,
-		retransmitSegment:     retransmitSegment,
-		failPLPMTUProbe:       failPLPMTUProbe,
-		retransmitRTORecovery: retransmitRTORecovery,
-		recoverSACKHoles:      recoverSACKHoles,
-		sendNextData:          sendNextData,
+		applyPathMTU:        applyPathMTU,
+		enterRecovery:       enterRecovery,
+		failPLPMTUProbe:     failPLPMTUProbe,
+		prepareSACKRecovery: prepareSACKRecovery,
 	}
 	if len(initialReceive.payload) != 0 || initialReceive.fin {
 		payload := initialReceive.payload
@@ -7585,6 +7803,30 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		actorTimerPacing
 	)
 	for {
+		if hostQueueWait != nil {
+			matchingTarget := false
+			if state.retransmit && state.retransmissionKind != tcpRetransmissionClose {
+				index := state.retransmissionTarget(state.retransmissionKind)
+				matchingTarget = index >= 0 && state.outstanding[index].hostQueue.token == hostQueueWaitTicket.token
+			}
+			departedAt, departed := hostQueueWait.departedTime(c.stack.timestampEpoch)
+			if departed || !matchingTarget {
+				hostQueueWait = nil
+				hostQueueWaitTicket = packetQueueTicket{}
+				if departed && matchingTarget {
+					// This generation remained queue-owned at its earlier loss
+					// deadline. Reselect its loss clocks from exact departure while
+					// preserving current ACK/SACK state.
+					state.selectRetransmission(departedAt.Add(state.rtt.rto), departedAt, departedAt)
+				} else if len(state.outstanding) != 0 && (!state.retransmit || state.retransmissionDeadline.IsZero()) {
+					state.armRetransmission()
+				}
+			} else {
+				// ACK processing may have reselected a timer while the same
+				// generation remains queue-owned. Departure still owns its start.
+				state.retransmissionDeadline = time.Time{}
+			}
+		}
 		if livenessDirty {
 			state.armLiveness()
 			livenessDirty = false
@@ -7673,7 +7915,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			}
 			fillSendWindow := wake&(tcpActorWakeSend|tcpActorWakeWindow|tcpActorWakeOptions) != 0
 			if wake&tcpActorWakePathMTU != 0 {
-				if err := applyPathMTU(state.effectivePathMTU(), true); err != nil {
+				applyPathMTU(state.effectivePathMTU(), true)
+				if err := drainPathMTURetransmission(); err != nil {
 					return err
 				}
 			}
@@ -7767,22 +8010,16 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					segment.sequence+uint32(len(segment.payload))+1 == state.receiveNext
 				if !tcpSegmentAcceptable(segment.sequence, segmentLength, state.receiveNext, receiveWindow) {
 					if retransmittedTimeWaitFIN {
-						if err := state.sendACK(); err != nil {
-							return err
-						}
+						state.trySendACK()
 						state.armClose(time.Now(), tcpTimeWaitDuration)
 						continue
 					}
 					if segment.flags&TCPFlagRST == 0 {
-						var err error
 						if tcpKeepAliveOrWindowProbe(segment, segmentLength, state.receiveNext, receiveWindow) {
-							err = state.sendACK()
+							state.trySendACK()
 						} else {
 							sequence := tcpChallengeACKSequence(segment, state.sendUnacknowledged, state.sendNext, state.peerWindow, state.peerScale)
-							err = state.sendChallengeACKAt(sequence)
-						}
-						if err != nil {
-							return err
+							state.trySendChallengeACKAt(sequence)
 						}
 					}
 					continue
@@ -7795,9 +8032,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 					timestampEcho = echo
 					if receivedAt.Sub(state.lastTimestampUpdate) < 24*24*time.Hour && tcpSequenceLess(timestampValue, c.recentTimestamp) {
-						if err := state.sendChallengeACK(); err != nil {
-							return err
-						}
+						state.trySendChallengeACK()
 						continue
 					}
 					if tcpSequenceLessEqual(segment.sequence, state.lastACKSent) {
@@ -7820,15 +8055,11 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					if segment.sequence == state.receiveNext {
 						return syscall.ECONNRESET
 					}
-					if err := state.sendChallengeACK(); err != nil {
-						return err
-					}
+					state.trySendChallengeACK()
 					continue
 				}
 				if segment.flags&TCPFlagSYN != 0 {
-					if err := state.sendChallengeACK(); err != nil {
-						return err
-					}
+					state.trySendChallengeACK()
 					continue
 				}
 				if segment.flags&TCPFlagACK == 0 {
@@ -7837,9 +8068,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				ack := segment.acknowledgement
 				retransmissionUpdate := tcpRetransmissionPreserve
 				if tcpSequenceGreater(ack, state.sendNext) {
-					if err := state.sendChallengeACK(); err != nil {
-						return err
-					}
+					state.trySendChallengeACK()
 					continue
 				}
 				if tcpSequenceLess(ack, state.sendUnacknowledged) {
@@ -7851,9 +8080,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					// the largest observed send window and all bytes ever acknowledged.
 					// A merely reordered ACK may still carry valid receive data below.
 					if tcpSequenceLess(ack, state.sendUnacknowledged-oldestAcceptable) {
-						if err := state.sendChallengeACK(); err != nil {
-							return err
-						}
+						state.trySendChallengeACK()
 						continue
 					}
 				} else {
@@ -7862,7 +8089,14 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					} else {
 						retransmissionUpdate = tcpRetransmissionReselect
 					}
-					if err := state.processAcknowledgment(&segment, receivedAt, timestampEcho, &ackOperations); err != nil {
+					state.processAcknowledgment(&segment, receivedAt, timestampEcho, &ackOperations)
+					if err := drainPathMTURetransmission(); err != nil {
+						return err
+					}
+					if err := drainRTORecovery(); err != nil {
+						return err
+					}
+					if err := drainPreparedRecovery(); err != nil {
 						return err
 					}
 				}
@@ -7895,7 +8129,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 					if newPayloadData && c.applicationReceiveClosed() {
 						sequence := tcpAcceptableSendSequence(state.sendUnacknowledged, state.sendNext, state.peerWindow, state.peerScale)
-						_ = c.sendSegment(sequence, state.receiveNext, TCPFlagRST|TCPFlagACK, state.advertisedReceiveWindow(), nil)
+						window, _ := state.nextAdvertisedReceiveWindow()
+						_ = c.trySendSegment(sequence, state.receiveNext, TCPFlagRST|TCPFlagACK, window)
 						return net.ErrClosed
 					}
 					irregularData := len(segment.payload) != 0 && (segment.sequence != previousReceiveNext || hadOutOfOrder || len(state.outOfOrder) != 0 || !newPayloadData)
@@ -7975,13 +8210,16 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			if pendingIndex < 0 {
 				continue
 			}
-			if state.outstanding[pendingIndex].hostQueue.pending(c.stack) {
-				// Linux refuses every retransmission while the original skb is
-				// still owned by qdisc or the driver. SACK-reneging grace has
-				// already transitioned to ordinary loss recovery here; preserve the
-				// original xmit time and retry after local queue progress.
+			hostQueueTicket := state.outstanding[pendingIndex].hostQueue
+			if waiter := hostQueueTicket.departureWaiter(c.stack, c.inbound.notify); waiter != nil {
+				// Linux refuses retransmission while the original skb is still
+				// owned by qdisc or the driver. After the loss deadline expires,
+				// wait for this exact generation instead of polling or treating
+				// queue residence as network loss.
+				hostQueueWait = waiter
+				hostQueueWaitTicket = hostQueueTicket
 				state.retransmit = true
-				state.retransmissionDeadline = time.Now().Add(tcpHostQueueRetryInterval)
+				state.retransmissionDeadline = time.Time{}
 				continue
 			}
 			if retransmissionKind == tcpRetransmissionRACK {
@@ -7995,11 +8233,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					// PLPMTU probe was lost. Apply the same RFC 4821 isolation
 					// rule as the ACK path before ordinary congestion recovery.
 					if state.pathMTUState != nil && state.pathMTUState.discovery.active && state.sendUnacknowledged == state.pathMTUState.discovery.probeStart && isolatedPLPMTUProbeLoss(state.outstanding, state.pathMTUState.discovery.probeStart, highestSACKedSequence(state.outstanding), state.peerMSS) {
-						if err := failPLPMTUProbe(); err != nil {
+						failPLPMTUProbe()
+						if err := drainPathMTURetransmission(); err != nil {
 							return err
 						}
 					}
-					state.recordProvenLosses()
+					state.recordProvenLosses(false, time.Time{})
 					if state.haveRACKLoss {
 						if err := recoverSACKHoles(0, false); err != nil {
 							return err
@@ -8025,14 +8264,14 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				if !sent {
 					segment := &state.outstanding[pendingIndex]
 					originalCongestionState := segment.congestionPacketState
-					window := state.advertisedReceiveWindow()
+					window, right := state.nextAdvertisedReceiveWindow()
 					timestamp, hostQueue, err := c.sendBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu)
 					if err != nil {
 						return err
 					}
 					state.recordRetransmission(segment.sequence, segment.end)
 					sentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
-					state.commitAcknowledgment(window, false)
+					state.commitAcknowledgment(window, right, false)
 					segment.timestamp = timestamp
 					segment.hostQueue = hostQueue
 					probeSentAt = sentAt
@@ -8043,8 +8282,6 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					state.tailProbeBytes = segment.dataSize()
 					state.tailProbeState = originalCongestionState
 					segment.state.set(sentTCPSegmentDeliverySchedulerLimited, state.controller.schedulerLimited())
-					segment.state.set(sentTCPSegmentDeliveryPending, state.processingDeliveryACK)
-					state.deliveryACKPendingSnapshots = state.deliveryACKPendingSnapshots || state.processingDeliveryACK
 				}
 				state.tailProbeActive = true
 				state.tailProbeEnd = state.sendNext
@@ -8074,9 +8311,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 						pathState := state.ensurePathMTUState()
 						pathState.blackHoleMTU = mtu
 						pathState.blackHoleExpiry = time.Now().Add(pathMTULifetime)
-						if err := applyPathMTU(state.effectivePathMTU(), false); err != nil {
-							return err
-						}
+						applyPathMTU(state.effectivePathMTU(), false)
 					}
 				}
 			}
@@ -8099,13 +8334,13 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			// peer's zero window and can deadlock a full-duplex connection.
 			sequence, flags := state.sendUnacknowledged-1, byte(TCPFlagACK)
 			payload := tcpZeroWindowProbe[:]
-			window := state.advertisedReceiveWindow()
+			window, right := state.nextAdvertisedReceiveWindow()
 			_, hostQueue, err := c.sendSegmentTimestamp(sequence, state.receiveNext, flags, window, payload)
 			if err != nil {
 				return err
 			}
 			probeSentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
-			state.commitAcknowledgment(window, false)
+			state.commitAcknowledgment(window, right, false)
 			c.stack.stats.tcpZeroWindowProbes.Add(1)
 			state.sendTimer.persistRTO *= 2
 			if state.sendTimer.persistRTO > tcpMaximumRTO {
@@ -8191,12 +8426,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					if probeSequence-state.sendUnacknowledged > state.sendNext-state.sendUnacknowledged {
 						c.publishICMPSequenceRange(probeSequence, state.sendNext)
 					}
-					window := state.advertisedReceiveWindow()
+					window, right := state.nextAdvertisedReceiveWindow()
 					_, hostQueue, err := c.sendSegmentTimestamp(probeSequence, state.receiveNext, TCPFlagACK, window, nil)
 					if err != nil {
 						return err
 					}
-					state.commitAcknowledgment(window, false)
+					state.commitAcknowledgment(window, right, false)
 					liveness := state.ensureLivenessState()
 					liveness.keepAliveProbes++
 					liveness.lastKeepAlive = hostQueue.queuedTime(c.stack.timestampEpoch)
@@ -8208,7 +8443,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			err := c.abortedError()
 			if c.takeAbortReset() {
 				sequence := tcpAcceptableSendSequence(state.sendUnacknowledged, state.sendNext, state.peerWindow, state.peerScale)
-				_ = c.sendAbortReset(sequence, state.receiveNext, state.advertisedReceiveWindow())
+				window, _ := state.nextAdvertisedReceiveWindow()
+				_ = c.sendAbortReset(sequence, state.receiveNext, window)
 			}
 			return err
 		case <-c.stack.closeCh:
@@ -8225,30 +8461,43 @@ func (c *TCPConn) sendSegment(sequence, acknowledgement uint32, flags byte, wind
 // sendAbortReset makes one nonblocking attempt to publish the final RST from
 // an actor whose normal packet writes have already been canceled.
 func (c *TCPConn) sendAbortReset(sequence, acknowledgement uint32, window uint16) error {
-	if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
-		return syscall.EADDRNOTAVAIL
-	}
-	flags := byte(TCPFlagRST | TCPFlagACK)
-	var options []byte
+	return c.trySendSegment(sequence, acknowledgement, TCPFlagRST|TCPFlagACK, window)
+}
+
+// trySendSegment makes one nonblocking attempt to publish a control segment
+// whose loss is recoverable from another peer packet. It is used where waiting
+// for device capacity would prevent the actor from processing that packet.
+func (c *TCPConn) trySendSegment(sequence, acknowledgement uint32, flags byte, window uint16) error {
+	return c.trySendSegmentWithOptions(sequence, acknowledgement, flags, window, nil)
+}
+
+// trySendSegmentWithOptions is the option-bearing form of trySendSegment. Its
+// fixed workspace keeps control traffic allocation-free while
+// preserving negotiated timestamps and current ECN feedback.
+func (c *TCPConn) trySendSegmentWithOptions(sequence, acknowledgement uint32, flags byte, window uint16, options []byte) error {
+	var timestampOptions [40]byte
 	if c.peerTimestamp {
-		options = tcpTimestampOptions(c.stack.tcpTimestamp(), c.recentTimestamp)
+		if len(options) > len(timestampOptions)-12 {
+			return errors.New("mipstack: invalid TCP options")
+		}
+		encoded := appendTCPTimestampOptions(timestampOptions[:0], c.stack.tcpTimestamp(), c.recentTimestamp)
+		options = append(encoded, options...)
 	}
 	if c.echoCongestion {
 		flags |= TCPFlagECE
 	}
+	return c.tryWriteTCPControl(sequence, acknowledgement, flags, window, options)
+}
+
+// tryWriteTCPControl publishes one best-effort connection control packet with
+// explicitly chosen options and the actor's current path MTU.
+func (c *TCPConn) tryWriteTCPControl(sequence, acknowledgement uint32, flags byte, window uint16, options []byte) error {
+	if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
+		return syscall.EADDRNOTAVAIL
+	}
 	return c.stack.tryWriteTCPControl(
 		c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(),
 		sequence, acknowledgement, flags, window, options, nil, c.mtu, uint8(c.trafficClass.Load()), 0, c.flowLabel, true,
-	)
-}
-
-// writeTCPControlWithMTU applies the socket DSCP policy to handshake and
-// reset packets that precede established's timestamp and ECN state.
-func (c *TCPConn) writeTCPControlWithMTU(sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int) (packetQueueTicket, error) {
-	var view tcpPayloadView
-	view.setBytes(payload)
-	return c.writeTCP(
-		sequence, acknowledgement, flags, window, options, &view, mtu, uint8(c.trafficClass.Load()), 0,
 	)
 }
 
@@ -8275,18 +8524,30 @@ func (c *TCPConn) sendSegmentForMTU(sequence, acknowledgement uint32, flags byte
 
 // sendPayloadForMTU is the scatter-payload form of sendSegmentForMTU.
 func (c *TCPConn) sendPayloadForMTU(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, ecnCapable bool, mtu int) (uint32, packetQueueTicket, error) {
+	var prepared tcpPreparedTransmission
+	if err := c.preparePayloadForMTU(sequence, acknowledgement, flags, window, options, payload, ecnCapable, mtu, &prepared); err != nil {
+		return 0, packetQueueTicket{}, err
+	}
+	hostQueue, err := c.publishPreparedTCP(prepared.output)
+	if err == nil && prepared.carriesCWR {
+		c.sendCWR = false
+	}
+	return prepared.timestamp, hostQueue, err
+}
+
+// preparePayloadForMTU adds negotiated per-connection wire state and prepares
+// one complete transmission without publishing it. On success, prepared owns
+// the packet and reservation until immediate publication.
+func (c *TCPConn) preparePayloadForMTU(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, ecnCapable bool, mtu int, prepared *tcpPreparedTransmission) error {
 	timestamp := uint32(0)
 	var timestampOptions [40]byte
 	if c.peerTimestamp {
 		if len(options) > len(timestampOptions)-12 {
-			return 0, packetQueueTicket{}, errors.New("mipstack: invalid TCP options")
+			return errors.New("mipstack: invalid TCP options")
 		}
 		timestamp = c.stack.tcpTimestamp()
-		timestampOptions[0], timestampOptions[1], timestampOptions[2], timestampOptions[3] = 1, 1, 8, 10
-		binary.BigEndian.PutUint32(timestampOptions[4:8], timestamp)
-		binary.BigEndian.PutUint32(timestampOptions[8:12], c.recentTimestamp)
-		copy(timestampOptions[12:], options)
-		options = timestampOptions[:12+len(options)]
+		encoded := appendTCPTimestampOptions(timestampOptions[:0], timestamp, c.recentTimestamp)
+		options = append(encoded, options...)
 	}
 	if c.echoCongestion {
 		flags |= TCPFlagECE
@@ -8300,11 +8561,12 @@ func (c *TCPConn) sendPayloadForMTU(sequence, acknowledgement uint32, flags byte
 		ecn = 2
 	}
 	trafficClass := uint8(c.trafficClass.Load())
-	hostQueue, err := c.writeTCP(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn)
-	if err == nil && includeCWR {
-		c.sendCWR = false
+	var output tcpPreparedOutput
+	if err := c.prepareTCPOutputBlocking(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, &output); err != nil {
+		return err
 	}
-	return timestamp, hostQueue, err
+	*prepared = tcpPreparedTransmission{output: output, timestamp: timestamp, carriesCWR: includeCWR}
+	return nil
 }
 
 // sendBufferedSegmentForMTU resolves a retransmission range directly from the
@@ -8321,31 +8583,126 @@ func (c *TCPConn) sendBufferedSegmentForMTU(sendBase uint32, segment sentTCPSegm
 	return c.sendPayloadForMTU(segment.sequence, acknowledgement, segment.flags, window, options, &payload, ecnCapable, mtu)
 }
 
-// writeTCP emits one connection-owned segment and remains interruptible while
-// the embedding packet queue is full.
-func (c *TCPConn) writeTCP(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte) (packetQueueTicket, error) {
+// tcpOutputReservation is one queue slot owned for a single synchronous TCP
+// publication attempt. It contains no protocol action and is never retained by
+// a connection or transport state across actor events.
+type tcpOutputReservation struct {
+	queue    *packetQueue
+	slot     uint16
+	loopback bool
+}
+
+// release returns an unused output slot to its queue.
+func (r tcpOutputReservation) release() { r.queue.releaseReserved(r.slot) }
+
+// tcpPreparedOutput owns one serialized packet and its reserved queue slot.
+// It is an actor-local transaction value: callers must publish it immediately
+// and must never retain it across an actor event.
+type tcpPreparedOutput struct {
+	reservation tcpOutputReservation
+	packet      []byte
+	reusable    bool
+}
+
+// tcpPreparedTransmission adds connection-level send metadata to one prepared
+// packet. It remains actor-local and is consumed by immediate publication.
+type tcpPreparedTransmission struct {
+	output     tcpPreparedOutput
+	timestamp  uint32
+	carriesCWR bool
+}
+
+// errTCPOutputRouteChanged reports that address configuration changed the
+// selected output queue after an actor acquired its slot. The caller must plan
+// again from current state; preparation has released the stale slot.
+var errTCPOutputRouteChanged = errors.New("mipstack: TCP output route changed")
+
+// prepareTCPOutputBlocking waits interruptibly for one output slot and
+// completes every fallible validation and construction step. A route change
+// while waiting releases the stale slot and restarts acquisition. On success,
+// output owns the prepared packet and reservation until immediate publication.
+func (c *TCPConn) prepareTCPOutputBlocking(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, output *tcpPreparedOutput) error {
 	if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
+		return syscall.EADDRNOTAVAIL
+	}
+	_, _, packetSize, err := tcpPacketLayout(c.key.local.Addr(), c.key.remote.Addr(), options, payload.size, mtu)
+	if err != nil {
+		return err
+	}
+	for {
+		queue, loopback := c.stack.outputQueueFor(c.key.remote.Addr())
+		// A graceful Close deliberately leaves protocol output active so already
+		// accepted bytes and FIN can still be transmitted; only abort cancels it.
+		state := socketWriteState{closed: c.abortCh}
+		slot, reserveErr := c.stack.reservePacketUntil(queue, loopback, state)
+		if reserveErr != nil {
+			if errors.Is(reserveErr, net.ErrClosed) {
+				select {
+				case <-c.abortCh:
+					return c.abortedError()
+				default:
+				}
+			}
+			return reserveErr
+		}
+		reservation := tcpOutputReservation{queue: queue, slot: slot, loopback: loopback}
+		if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
+			reservation.release()
+			return syscall.EADDRNOTAVAIL
+		}
+		currentQueue, currentLoopback := c.stack.outputQueueFor(c.key.remote.Addr())
+		if queue != currentQueue || loopback != currentLoopback {
+			reservation.release()
+			continue
+		}
+		prepared, prepareErr := c.prepareTCPOutput(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, packetSize, reservation)
+		if prepareErr == nil {
+			*output = prepared
+		}
+		return prepareErr
+	}
+}
+
+// publishReservedTCP validates and serializes one segment into an actor-owned
+// slot. The reservation is consumed on every return, including layout errors.
+func (c *TCPConn) publishReservedTCP(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, reservation tcpOutputReservation) (packetQueueTicket, error) {
+	if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
+		reservation.release()
 		return packetQueueTicket{}, syscall.EADDRNOTAVAIL
 	}
 	_, _, packetSize, err := tcpPacketLayout(c.key.local.Addr(), c.key.remote.Addr(), options, payload.size, mtu)
 	if err != nil {
+		reservation.release()
 		return packetQueueTicket{}, err
+	}
+	output, err := c.prepareReservedTCPOutput(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, packetSize, reservation)
+	if err != nil {
+		return packetQueueTicket{}, err
+	}
+	return c.publishPreparedTCP(output)
+}
+
+// prepareReservedTCPOutput revalidates an owned slot and serializes one packet.
+// It consumes the reservation on every error and otherwise transfers ownership
+// to the returned prepared value.
+func (c *TCPConn) prepareReservedTCPOutput(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, packetSize int, reservation tcpOutputReservation) (tcpPreparedOutput, error) {
+	if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
+		reservation.release()
+		return tcpPreparedOutput{}, syscall.EADDRNOTAVAIL
 	}
 	queue, loopback := c.stack.outputQueueFor(c.key.remote.Addr())
-	// A graceful Close deliberately leaves protocol output active so already
-	// accepted bytes and FIN can still be transmitted; only abort cancels it.
-	state := socketWriteState{closed: c.abortCh}
-	slot, err := c.stack.reservePacketUntil(queue, loopback, state)
-	if err != nil {
-		if errors.Is(err, net.ErrClosed) {
-			select {
-			case <-c.abortCh:
-				return packetQueueTicket{}, c.abortedError()
-			default:
-			}
-		}
-		return packetQueueTicket{}, err
+	if reservation.queue != queue || reservation.loopback != loopback {
+		reservation.release()
+		return tcpPreparedOutput{}, errTCPOutputRouteChanged
 	}
+	return c.prepareTCPOutput(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, packetSize, reservation)
+}
+
+// prepareTCPOutput completes every fallible packet check and construction step
+// while retaining ownership of the reserved slot. Once this succeeds, queue
+// closure is the only remaining publication failure.
+func (c *TCPConn) prepareTCPOutput(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, packetSize int, reservation tcpOutputReservation) (tcpPreparedOutput, error) {
+	queue := reservation.queue
 	packet, reusable := queue.acquireBuffer(packetSize)
 	built, err := buildTCPPacketViewInto(
 		packet,
@@ -8354,14 +8711,22 @@ func (c *TCPConn) writeTCP(sequence, acknowledgement uint32, flags byte, window 
 	)
 	if err != nil {
 		queue.releaseBuffer(packet, reusable)
-		queue.releaseReserved(slot)
-		return packetQueueTicket{}, err
+		reservation.release()
+		return tcpPreparedOutput{}, err
 	}
-	hostQueue, published := queue.enqueueReservedTCP(slot, built, reusable, c.outputFlowID, loopback)
+	return tcpPreparedOutput{reservation: reservation, packet: built, reusable: reusable}, nil
+}
+
+// publishPreparedTCP transfers an already constructed packet to its queue.
+// A false publication means Stack closure won the race and discarded the
+// queue, including the prepared packet and its slot.
+func (c *TCPConn) publishPreparedTCP(output tcpPreparedOutput) (packetQueueTicket, error) {
+	reservation := output.reservation
+	hostQueue, published := reservation.queue.enqueueReservedTCP(reservation.slot, output.packet, output.reusable, c.outputFlowID, reservation.loopback)
 	if !published {
 		return packetQueueTicket{}, ErrClosed
 	}
-	c.stack.recordOutput(loopback)
+	c.stack.recordOutput(reservation.loopback)
 	return hostQueue, nil
 }
 
@@ -8770,13 +9135,22 @@ func parseTCPTimestamp(options []byte) (uint32, uint32, bool) {
 	return 0, 0, false
 }
 
+// appendTCPTimestampOptions appends the aligned timestamp option used on TCP
+// segments.
+func appendTCPTimestampOptions(dst []byte, value, echo uint32) []byte {
+	start := len(dst)
+	dst = append(dst,
+		TCPHeaderOptionNOP, TCPHeaderOptionNOP, TCPHeaderOptionTimestamp, 10,
+		0, 0, 0, 0, 0, 0, 0, 0,
+	)
+	binary.BigEndian.PutUint32(dst[start+4:start+8], value)
+	binary.BigEndian.PutUint32(dst[start+8:start+12], echo)
+	return dst
+}
+
 // tcpTimestampOptions serializes TSval and the most recent peer TSval.
 func tcpTimestampOptions(value, echo uint32) []byte {
-	options := make([]byte, 12)
-	options[0], options[1], options[2], options[3] = TCPHeaderOptionNOP, TCPHeaderOptionNOP, TCPHeaderOptionTimestamp, 10
-	binary.BigEndian.PutUint32(options[4:8], value)
-	binary.BigEndian.PutUint32(options[8:12], echo)
-	return options
+	return appendTCPTimestampOptions(nil, value, echo)
 }
 
 // tcpSACKBlockLimit returns the largest SACK option fitting both TCP's

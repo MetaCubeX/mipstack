@@ -1753,18 +1753,25 @@ func TestTCPReceiveWindowPreservesRightEdge(t *testing.T) {
 	windowScale := tcpReceiveWindowScaleFor(tcpMaximumReceiveCapacity)
 	window := newTCPReceiveWindow(receiveNext, 65535, true, false, windowScale)
 	want := uint16(int(tcpReceiveCapacity) >> windowScale)
-	if got := window.advertise(receiveNext, tcpReceiveCapacity, 0); got != want {
-		t.Fatalf("initial scaled window = %d, want %d", got, want)
+	initialRight := window.right
+	proposed, proposedRight := window.next(receiveNext, tcpReceiveCapacity, 0)
+	if proposed != want {
+		t.Fatalf("proposed scaled window = %d, want %d", proposed, want)
 	}
+	if window.right != initialRight {
+		t.Fatalf("window proposal moved right edge from %d to %d", initialRight, window.right)
+	}
+	window.right = proposedRight
 	right := window.right
-	if got := window.advertise(receiveNext, tcpReceiveCapacity/2, 0); got != want {
+	got, nextRight := window.next(receiveNext, tcpReceiveCapacity/2, 0)
+	if got != want {
 		t.Fatalf("window after out-of-order storage = %d, want %d", got, want)
 	}
-	if window.right != right {
-		t.Fatalf("right edge moved from %d to %d", right, window.right)
+	if nextRight != right {
+		t.Fatalf("proposed right edge moved from %d to %d", right, nextRight)
 	}
 	advanced := receiveNext + 1380
-	got := window.advertise(advanced, tcpReceiveCapacity-1380, 0)
+	got, _ = window.next(advanced, tcpReceiveCapacity-1380, 0)
 	if advertisedRight := advanced + uint32(got)<<windowScale; tcpSequenceLess(advertisedRight+uint32(1<<windowScale)-1, right) {
 		t.Fatalf("scaled right edge shrank from %d to %d", right, advertisedRight)
 	}
@@ -2080,10 +2087,10 @@ func TestTCPReceiveWindowAvoidsSillyWindowGrowth(t *testing.T) {
 	const receiveNext = uint32(100)
 	window := newTCPReceiveWindow(receiveNext, 1000, false, false, 0)
 	advanced := receiveNext + 1000
-	if got := window.advertise(advanced, 499, tcpReceiveWindowIncrease(1000, 600)); got != 0 {
+	if got, _ := window.next(advanced, 499, tcpReceiveWindowIncrease(1000, 600)); got != 0 {
 		t.Fatalf("sub-threshold reopened window = %d, want 0", got)
 	}
-	if got := window.advertise(advanced, 500, tcpReceiveWindowIncrease(1000, 600)); got != 500 {
+	if got, _ := window.next(advanced, 500, tcpReceiveWindowIncrease(1000, 600)); got != 500 {
 		t.Fatalf("threshold reopened window = %d, want 500", got)
 	}
 	maximumInt := int(^uint(0) >> 1)
@@ -2642,7 +2649,7 @@ func TestTCPRetransmitsLostHandshakeAndData(t *testing.T) {
 	}
 }
 
-func TestTCPDialCancellationUnblocksFullPacketQueue(t *testing.T) {
+func TestTCPActiveHandshakeProcessesEventsWithFullPacketQueue(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.101")
 	remote := netip.MustParseAddrPort("192.0.2.102:8080")
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
@@ -2654,12 +2661,262 @@ func TestTCPDialCancellationUnblocksFullPacketQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	fillTestPacketQueue(t, &stack.outbound, []byte{0x45})
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if _, err = stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, remote); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("DialTCP with a full packet queue = %v", err)
+	dialed := make(chan error, 1)
+	go func() {
+		_, dialErr := stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, remote)
+		dialed <- dialErr
+	}()
+	var connection *TCPConn
+	waitFor(t, time.Second, func() bool {
+		stack.mu.Lock()
+		defer stack.mu.Unlock()
+		for _, candidate := range stack.tcp {
+			connection = candidate
+			return true
+		}
+		return false
+	})
+	info := func() TCPConnInfo {
+		result := make(chan TCPConnInfo, 1)
+		go func() { result <- connection.Info() }()
+		select {
+		case snapshot := <-result:
+			return snapshot
+		case <-time.After(time.Second):
+			t.Fatal("active handshake did not process an Info request with a full packet queue")
+			return TCPConnInfo{}
+		}
+	}
+	if snapshot := info(); snapshot.State != TCPStateSYNSent || snapshot.Retransmissions != 0 {
+		t.Fatalf("blocked active handshake info = %+v", snapshot)
+	}
+	initialSequence := uint32(connection.icmpSequence.Load() >> 32)
+	forgedReset := buildTestTCP(remote.Addr(), local, remote.Port(), connection.key.local.Port(), 1, initialSequence+1, TCPFlagRST|TCPFlagACK, 65535, nil, nil)
+	if err = writeTestPacket(stack, forgedReset); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := info(); snapshot.State != TCPStateSYNSent || snapshot.Retransmissions != 0 {
+		t.Fatalf("pre-publication reset changed active handshake = %+v", snapshot)
+	}
+	cancel()
+	select {
+	case err = <-dialed:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("DialTCP cancellation with a full packet queue = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DialTCP cancellation remained blocked by the packet queue")
 	}
 	waitFor(t, time.Second, func() bool { return stack.Stats().ActiveTCPConnections == 0 })
+}
+
+func TestTCPActiveHandshakeRTOStartsAfterDeviceDeparture(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.113")
+	remote := netip.MustParseAddr("192.0.2.114")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		_ = stack.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	link := &testPacketLink{local: local, remote: remote, stack: stack, echoTCP: true, sackTCP: true, outbound: make(chan []byte, 1), tcp: make(map[uint16]*testTCPPeer)}
+	type dialResult struct {
+		connection net.Conn
+		err        error
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*tcpInitialRTO)
+	t.Cleanup(cancel)
+	dialed := make(chan dialResult, 1)
+	go func() {
+		connection, dialErr := stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 8080))
+		dialed <- dialResult{connection: connection, err: dialErr}
+	}()
+
+	var connection *TCPConn
+	waitFor(t, time.Second, func() bool {
+		stack.mu.Lock()
+		defer stack.mu.Unlock()
+		for _, candidate := range stack.tcp {
+			connection = candidate
+			return true
+		}
+		return false
+	})
+	waitFor(t, tcpInitialRTO+time.Second, func() bool {
+		waiters := stack.outbound.departureWaiters.Load()
+		if waiters == nil {
+			return false
+		}
+		for index := range waiters.slots {
+			if waiters.slots[index].Load() != nil {
+				return true
+			}
+		}
+		return false
+	})
+	if info := connection.Info(); info.Retransmissions != 0 || info.State != TCPStateSYNSent {
+		t.Fatalf("queue-resident active handshake = %+v", info)
+	}
+	if depth := stack.outbound.len(); depth != 1 {
+		t.Fatalf("queue-resident SYN depth = %d, want 1", depth)
+	}
+	entry, ok := stack.outbound.tryDequeue()
+	if !ok {
+		t.Fatal("queue-resident SYN was unavailable")
+	}
+	wire := consumeTestPacket(&stack.outbound, entry)
+	if info := connection.Info(); info.Retransmissions != 0 {
+		t.Fatalf("device departure counted %d active retransmissions, want 0", info.Retransmissions)
+	}
+	if depth := stack.outbound.len(); depth != 0 {
+		t.Fatalf("active handshake retransmitted at device departure: depth %d", depth)
+	}
+	if err = link.handleOutboundPacket(wire); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-dialed:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if err = result.connection.Close(); err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func TestTCPEstablishedRTOStartsAfterDeviceDeparture(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+	before := connection.Info()
+	payload := bytes.Repeat([]byte{0x73}, before.MaximumSegmentSize)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	// Keep Stack.Read stopped through the publication-based loss deadline. The
+	// actor must install one exact departure waiter rather than polling the
+	// still-queued packet.
+	var departureWaiter *packetQueueDepartureWaiter
+	waitFor(t, before.RetransmissionTimeout+time.Second, func() bool {
+		waiters := stack.outbound.departureWaiters.Load()
+		if waiters == nil {
+			return false
+		}
+		for index := range waiters.slots {
+			if waiter := waiters.slots[index].Load(); waiter != nil {
+				departureWaiter = waiter
+				return true
+			}
+		}
+		return false
+	})
+	blocked := connection.Info()
+	if blocked.RetransmissionRecovery || blocked.Retransmissions != before.Retransmissions {
+		t.Fatalf("queue-resident data entered loss recovery: before=%+v blocked=%+v", before, blocked)
+	}
+	if depth := stack.outbound.len(); depth != 1 {
+		t.Fatalf("queue-resident data depth = %d, want 1", depth)
+	}
+	entry, available := stack.outbound.tryDequeue()
+	if !available {
+		t.Fatal("queue-resident TCP data was unavailable")
+	}
+	wire := consumeTestPacket(&stack.outbound, entry)
+	departedAt, departed := departureWaiter.departedTime(stack.timestampEpoch)
+	if !departed {
+		t.Fatal("TCP data dequeue did not record device departure")
+	}
+	retryDelay := before.RetransmissionTimeout
+	retry, available := waitTestPacketEntry(&stack.outbound, retryDelay+time.Second)
+	if !available {
+		t.Fatal("timed out waiting for the post-departure retransmission")
+	}
+	retryQueuedAt := time.Now()
+	consumeTestPacket(&stack.outbound, retry)
+	if elapsed := retryQueuedAt.Sub(departedAt); elapsed < retryDelay {
+		t.Fatalf("retransmission followed device departure after %v, want at least %v", elapsed, retryDelay)
+	}
+	afterRetry := connection.Info()
+	if !afterRetry.RetransmissionRecovery || afterRetry.CongestionWindow != uint32(afterRetry.MaximumSegmentSize) || afterRetry.Retransmissions != before.Retransmissions+1 {
+		t.Fatalf("post-departure RTO recovery = before=%+v after=%+v", before, afterRetry)
+	}
+	if err := link.handleOutboundPacket(wire); err != nil {
+		t.Fatal(err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	echo := make([]byte, len(payload))
+	if _, err := io.ReadFull(connection, echo); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(echo, payload) {
+		t.Fatal("device-departure TCP echo mismatch")
+	}
+}
+
+func TestTCPEstablishedControlResponseDoesNotWaitForDeviceQueue(t *testing.T) {
+	link, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+	clientPort := uint16(connection.LocalAddr().(*net.TCPAddr).Port)
+	link.mu.Lock()
+	peer := link.tcp[clientPort]
+	sequence, acknowledgement := peer.serverNext-1, peer.clientNext
+	link.mu.Unlock()
+	fillTestPacketQueue(t, &stack.outbound, []byte{0})
+	if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The first Info response can race ahead of the inbound batch in the same
+	// actor turn. A second request proves the queue-full ACK attempt completed.
+	responsive := make(chan struct{})
+	go func() {
+		_ = connection.Info()
+		_ = connection.Info()
+		close(responsive)
+	}()
+	select {
+	case <-responsive:
+	case <-time.After(time.Second):
+		t.Fatal("queue-full control response blocked the TCP actor")
+	}
+	if depth := stack.outbound.len(); depth != cap(stack.outbound.free) {
+		t.Fatalf("queue depth after dropped control response = %d, want %d", depth, cap(stack.outbound.free))
+	}
+	entry, available := stack.outbound.tryDequeue()
+	if !available {
+		t.Fatal("full device queue had no releasable packet")
+	}
+	consumeTestPacket(&stack.outbound, entry)
+	if err := link.deliverTCP(8080, clientPort, sequence, acknowledgement, TCPFlagACK, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return stack.outbound.len() == cap(stack.outbound.free) })
+	foundACK := false
+	for {
+		entry, available = stack.outbound.tryDequeue()
+		if !available {
+			break
+		}
+		packet := consumeTestPacket(&stack.outbound, entry)
+		parsed, valid := parseIPPacket(packet)
+		if valid && parsed.protocol == ProtocolTCP && len(parsed.payload) >= tcpHeaderSize &&
+			binary.BigEndian.Uint16(parsed.payload[0:2]) == clientPort &&
+			binary.BigEndian.Uint16(parsed.payload[2:4]) == 8080 &&
+			parsed.payload[13]&TCPFlagACK != 0 {
+			foundACK = true
+		}
+	}
+	if !foundACK {
+		t.Fatal("repeated peer probe did not regenerate its ACK after capacity returned")
+	}
 }
 
 // TestTCPWriteReturnsAfterBuffering verifies that Write does not wait for a
@@ -3792,7 +4049,7 @@ func TestTCPConnectionMemoryLayout(t *testing.T) {
 	}{
 		{"TCPConn", unsafe.Sizeof(TCPConn{}), 696},
 		{"socketDeadline", unsafe.Sizeof(socketDeadline{}), 16},
-		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1528},
+		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1520},
 		{"tcpEstablishedLivenessState", unsafe.Sizeof(tcpEstablishedLivenessState{}), 72},
 		{"tcpEstablishedPathMTUState", unsafe.Sizeof(tcpEstablishedPathMTUState{}), 120},
 		{"tcpRecoveryUndo", unsafe.Sizeof(tcpRecoveryUndo{}), 80},
@@ -5049,6 +5306,131 @@ func TestBuildTCPPacketIntoOverwritesReusedBuffer(t *testing.T) {
 	}
 }
 
+func TestTCPPublishReservationLifecycle(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.245")
+	remote := netip.MustParseAddr("198.51.100.245")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newTCPConn(stack, "tcp4", tcpKey{
+		local:  netip.AddrPortFrom(local, 49152),
+		remote: netip.AddrPortFrom(remote, 8443),
+	}, 1400, tcpSocketOptionSet{})
+	payloadBytes := []byte("reserved publication")
+	var payload tcpPayloadView
+	payload.setBytes(payloadBytes)
+	_, _, packetSize, err := tcpPacketLayout(local, remote, nil, payload.size, 1400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, reserved := stack.outbound.tryReserve()
+	if !reserved {
+		t.Fatal("TCP publication could not reserve an output slot")
+	}
+	output, err := connection.prepareTCPOutput(100, 200, TCPFlagACK|TCPFlagPSH, 32768, nil, &payload, 1400, 0, 0, packetSize, tcpOutputReservation{
+		queue: &stack.outbound, slot: slot,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ticket, err := connection.publishPreparedTCP(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ticket.pending(stack) {
+		t.Fatal("published TCP ticket is not pending")
+	}
+	entry, available := stack.outbound.tryDequeue()
+	if !available {
+		t.Fatal("published TCP packet is not queued")
+	}
+	packet, valid := parseIPPacket(entry.packet)
+	if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize || !bytes.Equal(packet.payload[tcpHeaderSize:], payloadBytes) {
+		t.Fatalf("published TCP packet = %x", entry.packet)
+	}
+	stack.outbound.release(entry)
+	if ticket.pending(stack) {
+		t.Fatal("TCP ticket remained pending after queue release")
+	}
+	if got := stack.Stats().OutboundPackets; got != 1 {
+		t.Fatalf("outbound packets = %d, want 1", got)
+	}
+}
+
+func TestTCPPreparationFailureReleasesReservation(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.246")
+	remote := netip.MustParseAddr("198.51.100.246")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newTCPConn(stack, "tcp4", tcpKey{
+		local:  netip.AddrPortFrom(local, 49152),
+		remote: netip.AddrPortFrom(remote, 8443),
+	}, 1400, tcpSocketOptionSet{})
+	var payload tcpPayloadView
+	payload.setBytes([]byte("invalid reservation size"))
+	_, _, packetSize, err := tcpPacketLayout(local, remote, nil, payload.size, 1400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, reserved := stack.outbound.tryReserve()
+	if !reserved {
+		t.Fatal("TCP preparation could not reserve an output slot")
+	}
+	_, err = connection.prepareTCPOutput(100, 200, TCPFlagACK, 32768, nil, &payload, 1400, 0, 0, packetSize-1, tcpOutputReservation{
+		queue: &stack.outbound, slot: slot,
+	})
+	if err == nil {
+		t.Fatal("TCP preparation accepted an invalid packet buffer size")
+	}
+	if stack.outbound.len() != 0 || len(stack.outbound.free) != cap(stack.outbound.free) {
+		t.Fatalf("failed TCP preparation retained queue state: packets=%d free=%d/%d", stack.outbound.len(), len(stack.outbound.free), cap(stack.outbound.free))
+	}
+	if got := stack.Stats().OutboundPackets; got != 0 {
+		t.Fatalf("failed TCP publication counted %d outbound packets", got)
+	}
+}
+
+func TestTCPPublishRevalidatesReservedOutputQueue(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.247")
+	remote := netip.MustParseAddr("198.51.100.247")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newTCPConn(stack, "tcp4", tcpKey{
+		local:  netip.AddrPortFrom(local, 49152),
+		remote: netip.AddrPortFrom(remote, 8443),
+	}, 1400, tcpSocketOptionSet{})
+	slot, reserved := stack.outbound.tryReserve()
+	if !reserved {
+		t.Fatal("TCP publication could not reserve the original output queue")
+	}
+	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(local, 32), netip.PrefixFrom(remote, 32),
+	}, MTU: 1400}); err != nil {
+		t.Fatal(err)
+	}
+	var payload tcpPayloadView
+	_, err = connection.publishReservedTCP(100, 200, TCPFlagACK, 32768, nil, &payload, 1400, 0, 0, tcpOutputReservation{
+		queue: &stack.outbound, slot: slot,
+	})
+	if !errors.Is(err, errTCPOutputRouteChanged) {
+		t.Fatalf("publication with a stale output queue = %v", err)
+	}
+	if stack.outbound.len() != 0 || len(stack.outbound.free) != cap(stack.outbound.free) {
+		t.Fatalf("stale TCP reservation retained outbound state: packets=%d free=%d/%d", stack.outbound.len(), len(stack.outbound.free), cap(stack.outbound.free))
+	}
+	if stack.loopback.len() != 0 || len(stack.loopback.free) != cap(stack.loopback.free) {
+		t.Fatalf("stale TCP reservation changed loopback state: packets=%d free=%d/%d", stack.loopback.len(), len(stack.loopback.free), cap(stack.loopback.free))
+	}
+}
+
 func TestTCPSegmentTimestampOptionsUseFixedWorkspace(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.243")
 	remote := netip.MustParseAddr("198.51.100.243")
@@ -5080,12 +5462,36 @@ func TestTCPSegmentTimestampOptionsUseFixedWorkspace(t *testing.T) {
 	if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
 		t.Fatalf("timestamped TCP header size = %d", headerSize)
 	}
-	want := append(tcpTimestampOptions(timestamp, connection.recentTimestamp), extra...)
+	want := []byte{
+		TCPHeaderOptionNOP, TCPHeaderOptionNOP, TCPHeaderOptionTimestamp, 10,
+		byte(timestamp >> 24), byte(timestamp >> 16), byte(timestamp >> 8), byte(timestamp),
+		0x10, 0x20, 0x30, 0x40,
+	}
+	want = append(want, extra...)
 	if got := packet.payload[tcpHeaderSize:headerSize]; !bytes.Equal(got, want) {
 		t.Fatalf("timestamped TCP options = %x, want %x", got, want)
 	}
+	if err = connection.trySendSegmentWithOptions(101, 201, TCPFlagACK, 32768, extra); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || len(packet.payload) < tcpHeaderSize {
+		t.Fatal("best-effort timestamped TCP segment could not be parsed")
+	}
+	headerSize = int(packet.payload[12]>>4) * 4
+	if headerSize < tcpHeaderSize || headerSize > len(packet.payload) {
+		t.Fatalf("best-effort timestamped TCP header size = %d", headerSize)
+	}
+	got := packet.payload[tcpHeaderSize:headerSize]
+	if len(got) != 12+len(extra) || !bytes.Equal(got[:4], []byte{TCPHeaderOptionNOP, TCPHeaderOptionNOP, TCPHeaderOptionTimestamp, 10}) ||
+		binary.BigEndian.Uint32(got[8:12]) != connection.recentTimestamp || !bytes.Equal(got[12:], extra) {
+		t.Fatalf("best-effort timestamped TCP options = %x", got)
+	}
 	if _, _, err = connection.sendSegmentForMTU(100, 200, TCPFlagACK, 32768, make([]byte, 29), nil, false, 1500); err == nil || err.Error() != "mipstack: invalid TCP options" {
 		t.Fatalf("oversized timestamp options error = %v", err)
+	}
+	if err = connection.trySendSegmentWithOptions(100, 200, TCPFlagACK, 32768, make([]byte, 29)); err == nil || err.Error() != "mipstack: invalid TCP options" {
+		t.Fatalf("oversized best-effort timestamp options error = %v", err)
 	}
 	if entry, ok := stack.outbound.tryDequeue(); ok {
 		stack.outbound.release(entry)
@@ -5343,7 +5749,7 @@ func TestTCPACKPolicy(t *testing.T) {
 	state.quickACKBudget = 2
 	state.ackPending = true
 	state.receiveNext++
-	state.commitAcknowledgment(512, false)
+	state.commitAcknowledgment(512, state.receiveWindowState.right, false)
 	if state.quickACKBudget != 1 || state.ackPending {
 		t.Fatalf("committed ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
 	}
@@ -5356,18 +5762,18 @@ func TestTCPACKPolicy(t *testing.T) {
 	state.ackPending = true
 	state.outOfOrder = []tcpReceivedPiece{{sequence: state.receiveNext + 1, payload: []byte{1}}}
 	state.peerSACK = false
-	state.commitAcknowledgment(512, false)
+	state.commitAcknowledgment(512, state.receiveWindowState.right, false)
 	if state.ackPending || state.quickACKBudget != 1 {
 		t.Fatalf("non-SACK ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
 	}
 	state.quickACKBudget = 2
 	state.ackPending = true
 	state.peerSACK = true
-	state.commitAcknowledgment(512, false)
+	state.commitAcknowledgment(512, state.receiveWindowState.right, false)
 	if !state.ackPending || state.quickACKBudget != 2 {
 		t.Fatalf("omitted SACK ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
 	}
-	state.commitAcknowledgment(512, true)
+	state.commitAcknowledgment(512, state.receiveWindowState.right, true)
 	if state.ackPending || state.quickACKBudget != 1 {
 		t.Fatalf("selective ACK state = budget %d, pending %t", state.quickACKBudget, state.ackPending)
 	}
@@ -7199,38 +7605,51 @@ trafficClassPackets:
 	}
 }
 
-// TestTCPPassiveHandshakeInfoAndFailure verifies diagnostic snapshots during
-// SYN-RECEIVED and listener accounting when that handshake is aborted.
-func TestTCPPassiveHandshakeInfoAndFailure(t *testing.T) {
+// TestTCPPassiveHandshakeProcessesEventsWithFullPacketQueue verifies that a
+// pending SYN-ACK does not prevent diagnostics or listener-driven teardown.
+func TestTCPPassiveHandshakeProcessesEventsWithFullPacketQueue(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.69")
 	remote := netip.MustParseAddr("198.51.100.69")
-	link, stack := newTestStack(t, local, remote)
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
 	listener, err := stack.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(local, 8083))
 	if err != nil {
 		t.Fatal(err)
 	}
+	fillTestPacketQueue(t, &stack.outbound, []byte{0})
 	packet := buildTestTCP(remote, local, 45000, 8083, 100, 0, TCPFlagSYN, 65535, nil, nil)
 	if err = writeTestPacket(stack, packet); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-link.outbound:
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for passive SYN-ACK")
-	}
-	listener.(*TCPListener).mu.Lock()
 	var connection *TCPConn
-	for candidate := range listener.(*TCPListener).handshaking {
-		connection = candidate
-		break
-	}
-	listener.(*TCPListener).mu.Unlock()
-	if connection == nil {
-		t.Fatal("passive handshake was not tracked")
-	}
+	waitFor(t, time.Second, func() bool {
+		listener.(*TCPListener).mu.Lock()
+		defer listener.(*TCPListener).mu.Unlock()
+		for candidate := range listener.(*TCPListener).handshaking {
+			connection = candidate
+			return true
+		}
+		return false
+	})
 	info := connection.Info()
 	if info.State != TCPStateSYNReceived || info.MaximumSegmentSize == 0 || info.PathMTU != 1400 || info.RetransmissionTimeout != tcpInitialRTO {
 		t.Fatalf("passive handshake info = %+v", info)
+	}
+	initialSequence := uint32(connection.icmpSequence.Load() >> 32)
+	for _, flags := range []byte{TCPFlagACK, TCPFlagRST | TCPFlagACK} {
+		packet = buildTestTCP(remote, local, 45000, 8083, 101, initialSequence+1, flags, 65535, nil, nil)
+		if err = writeTestPacket(stack, packet); err != nil {
+			t.Fatal(err)
+		}
+		if info = connection.Info(); info.State != TCPStateSYNReceived || info.Retransmissions != 0 {
+			t.Fatalf("pre-publication flags %#x changed passive handshake = %+v", flags, info)
+		}
 	}
 	if err = listener.Close(); err != nil {
 		t.Fatal(err)
@@ -7244,6 +7663,94 @@ func TestTCPPassiveHandshakeInfoAndFailure(t *testing.T) {
 	closed := listener.(*TCPListener).Info()
 	if closed.HandshakeTimeouts != 0 || closed.HandshakeFailures != 1 {
 		t.Fatalf("aborted passive handshake diagnostics = %+v", closed)
+	}
+}
+
+func TestTCPPassiveHandshakeRTOStartsAfterDeviceDeparture(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.115")
+	remote := netip.MustParseAddr("198.51.100.115")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := stack.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(local, 8084))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err = writeTestPacket(stack, buildTestTCP(remote, local, 45001, 8084, 100, 0, TCPFlagSYN, 65535, nil, nil)); err != nil {
+		t.Fatal(err)
+	}
+	var connection *TCPConn
+	waitFor(t, time.Second, func() bool {
+		listener.(*TCPListener).mu.Lock()
+		defer listener.(*TCPListener).mu.Unlock()
+		for candidate := range listener.(*TCPListener).handshaking {
+			connection = candidate
+			return true
+		}
+		return false
+	})
+	waitFor(t, tcpInitialRTO+time.Second, func() bool {
+		waiters := stack.outbound.departureWaiters.Load()
+		if waiters == nil {
+			return false
+		}
+		for index := range waiters.slots {
+			if waiters.slots[index].Load() != nil {
+				return true
+			}
+		}
+		return false
+	})
+	if info := connection.Info(); info.Retransmissions != 0 || info.State != TCPStateSYNReceived {
+		t.Fatalf("queue-resident passive handshake = %+v", info)
+	}
+	if depth := stack.outbound.len(); depth != 1 {
+		t.Fatalf("queue-resident SYN-ACK depth = %d, want 1", depth)
+	}
+	entry, ok := stack.outbound.tryDequeue()
+	if !ok {
+		t.Fatal("queue-resident SYN-ACK was unavailable")
+	}
+	wire := consumeTestPacket(&stack.outbound, entry)
+	if info := connection.Info(); info.Retransmissions != 0 {
+		t.Fatalf("device departure counted %d passive retransmissions, want 0", info.Retransmissions)
+	}
+	if depth := stack.outbound.len(); depth != 0 {
+		t.Fatalf("passive handshake retransmitted at device departure: depth %d", depth)
+	}
+	packet, valid := parseIPPacket(wire)
+	if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+		t.Fatal("passive handshake output was not TCP")
+	}
+	serverSequence := binary.BigEndian.Uint32(packet.payload[4:8])
+	if err = writeTestPacket(stack, buildTestTCP(remote, local, 45001, 8084, 101, serverSequence+1, TCPFlagACK, 65535, nil, nil)); err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan net.Conn, 1)
+	acceptError := make(chan error, 1)
+	go func() {
+		acceptedConnection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			acceptError <- acceptErr
+			return
+		}
+		accepted <- acceptedConnection
+	}()
+	select {
+	case acceptedConnection := <-accepted:
+		if err = acceptedConnection.Close(); err != nil {
+			t.Fatal(err)
+		}
+	case err = <-acceptError:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out accepting device-departed SYN-ACK")
 	}
 }
 

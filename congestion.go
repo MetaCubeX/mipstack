@@ -768,14 +768,6 @@ func (c *tcpCongestionController) initialize(now time.Time, minimumRTT, smoothed
 	return c.state.CongestionWindow, c.state.SlowStartThreshold
 }
 
-// snapshotSend captures current delivery state for a retransmitted range.
-func (c *tcpCongestionController) snapshotSend(stamp monotonicStamp, packetsOut uint32) tcpDeliverySnapshot {
-	if !c.usesDeliveryRate() {
-		return tcpDeliverySnapshot{}
-	}
-	return c.delivery.snapshotSend(stamp, packetsOut)
-}
-
 // schedulerLimited reports whether new delivery snapshots include host delay.
 func (c *tcpCongestionController) schedulerLimited() bool {
 	return c.usesDeliveryRate() && c.delivery.schedulerLimited()

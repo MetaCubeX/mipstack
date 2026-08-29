@@ -335,12 +335,3 @@ func (d *tcpDeliveryRateEstimator) onDeliveryRetransmit(_, _ int, _ time.Time, s
 	}
 	return d.snapshot()
 }
-
-// snapshotSend captures common delivery state for a range whose snapshot must
-// be refreshed after ACK processing sends more data.
-func (d *tcpDeliveryRateEstimator) snapshotSend(stamp monotonicStamp, packetsOut uint32) tcpDeliverySnapshot {
-	if packetsOut == 0 {
-		d.restartFlight(stamp)
-	}
-	return d.snapshot()
-}
