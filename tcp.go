@@ -1978,7 +1978,8 @@ type tcpEstablishedState struct {
 
 // tcpFRTOState identifies the RFC 5682 step currently owned by RTO recovery.
 // Explicit phases distinguish a timeout whose retransmission has not reached
-// the device queue from the ACK and probe steps that begin after publication.
+// the device queue, the ACK and probe steps that begin after publication, and
+// a conventional fallback that still awaits output capacity.
 type tcpFRTOState uint8
 
 const (
@@ -1987,6 +1988,7 @@ const (
 	tcpFRTOAwaitingACK
 	tcpFRTOProbePending
 	tcpFRTOProbeSent
+	tcpFRTOFallbackPending
 )
 
 // tcpRetransmissionKind identifies the single protocol event selected by the
@@ -2941,6 +2943,9 @@ func (s *tcpEstablishedState) recoveryOutputReady() bool {
 	if s.retransmit && s.retransmissionKind == tcpRetransmissionPathMTU {
 		return firstUnsackedSegment(s.outstanding) >= 0
 	}
+	if s.rtoRecovery && s.frtoState == tcpFRTOFallbackPending {
+		return firstUnsackedSegment(s.outstanding) >= 0
+	}
 	if s.rtoRecovery && s.frtoState == tcpFRTOInactive && len(s.outstanding) != 0 {
 		index := firstUnsackedSegment(s.outstanding)
 		if s.peerSACK {
@@ -2979,11 +2984,7 @@ func (s *tcpEstablishedState) sendACKAt(sequence uint32, reservation tcpOutputRe
 	options, dsackSent := s.sackOptions(0)
 	window, right := s.nextAdvertisedReceiveWindow()
 	var payload tcpPayloadView
-	var prepared tcpPreparedTransmission
-	if err := s.connection.prepareReservedPayloadForMTU(sequence, s.receiveNext, TCPFlagACK, window, options, &payload, false, s.connection.mtu, reservation, &prepared); err != nil {
-		return err
-	}
-	if _, err := s.connection.publishPreparedTCP(prepared.output); err != nil {
+	if _, err := s.connection.publishReservedPayloadForMTU(sequence, s.receiveNext, TCPFlagACK, window, options, &payload, false, s.connection.mtu, reservation, tcpOutputSequenceRange{}); err != nil {
 		return err
 	}
 	if dsackSent {
@@ -6199,7 +6200,7 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 			flags |= TCPFlagECE
 		}
 		var payload tcpPayloadView
-		hostQueue, err := c.publishReservedTCP(initialSequence, c.receiveNext, flags, c.receiveWindow(0, false), options, &payload, c.mtu, uint8(c.trafficClass.Load()), 0, reservation)
+		hostQueue, err := c.publishReservedTCP(initialSequence, c.receiveNext, flags, c.receiveWindow(0, false), options, &payload, c.mtu, uint8(c.trafficClass.Load()), 0, reservation, tcpOutputSequenceRange{})
 		if err != nil {
 			return err
 		}
@@ -6484,7 +6485,7 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 			flags |= TCPFlagECE | TCPFlagCWR
 		}
 		var payload tcpPayloadView
-		hostQueue, err := c.publishReservedTCP(initialSequence, 0, flags, c.receiveWindow(0, false), options, &payload, c.mtu, uint8(c.trafficClass.Load()), 0, reservation)
+		hostQueue, err := c.publishReservedTCP(initialSequence, 0, flags, c.receiveWindow(0, false), options, &payload, c.mtu, uint8(c.trafficClass.Load()), 0, reservation, tcpOutputSequenceRange{})
 		if err != nil {
 			return err
 		}
@@ -6767,6 +6768,12 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		if state.undo != nil {
 			state.undo.active = false
 		}
+		state.frtoState = tcpFRTOInactive
+		state.frtoProbeBudget = 0
+	}
+	if state.frtoState == tcpFRTOFallbackPending && ackAdvanced {
+		// A cumulative ACK supersedes the scoreboard that authorized the pending
+		// fallback, so conventional recovery must select from current state.
 		state.frtoState = tcpFRTOInactive
 		state.frtoProbeBudget = 0
 	}
@@ -7100,6 +7107,12 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 		state.armSACKReneging()
 	}
 	duplicateEvidence := tcpDuplicateACKEvidence(*segment, state.peerSACK, newSACKInfo, ackAdvanced, state.sendUnacknowledged, previousWindow, state.peerWindow)
+	if state.frtoState == tcpFRTOFallbackPending && (duplicateEvidence || sackReneging) {
+		// New loss or reneging evidence replaces F-RTO's earlier fallback
+		// authorization with conventional recovery over the updated scoreboard.
+		state.frtoState = tcpFRTOInactive
+		state.frtoProbeBudget = 0
+	}
 	if state.frtoState != tcpFRTOInactive && !sackReneging {
 		spurious, fallback, limitWindow := false, false, false
 		probePublished := state.frtoState == tcpFRTOProbeSent || state.frtoState == tcpFRTOProbePending && state.frtoProbeBudget < 2
@@ -7369,30 +7382,19 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		}
 		next := state.sendNext + uint32(payload.size)
 		window, right := state.nextAdvertisedReceiveWindow()
-		var prepared tcpPreparedTransmission
-		var err error
-		if !outputWindow.enabled {
-			err = c.preparePayloadForMTU(state.sendNext, state.receiveNext, flags, window, options, &payload, true, transmitMTU, &prepared)
-		} else {
-			var reservation tcpOutputReservation
-			var available bool
-			reservation, outputWindow, available = outputWindow.reserve(c)
-			if !available {
-				return outputWindow, false, true, nil
-			}
-			err = c.prepareReservedPayloadForMTU(state.sendNext, state.receiveNext, flags, window, options, &payload, true, transmitMTU, reservation, &prepared)
+		reservation, outputWindow, available := outputWindow.reserve(c)
+		if !available {
+			return outputWindow, false, true, nil
 		}
+		published, err := c.publishReservedPayloadForMTU(state.sendNext, state.receiveNext, flags, window, options, &payload, true, transmitMTU, reservation, tcpOutputSequenceRange{
+			unacknowledged: state.sendUnacknowledged,
+			next:           next,
+		})
 		if err != nil {
 			return outputWindow, false, false, err
 		}
-		// Publish correlation after every fallible construction step and before
-		// the packet becomes visible to Stack.Read.
-		c.publishICMPSequenceRange(state.sendUnacknowledged, next)
-		hostQueue, err := c.publishPreparedTCP(prepared.output)
-		if err != nil {
-			return outputWindow, false, false, err
-		}
-		if prepared.carriesCWR {
+		hostQueue := published.hostQueue
+		if published.carriesCWR {
 			c.sendCWR = false
 		}
 		sentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
@@ -7406,7 +7408,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		// argument even when it is no longer congestion flight.
 		rate, updatedWindow := state.controller.onDataSend(payload.size, state.peerMSS, sentAt, hostQueue.queuedAt, windowFlight, state.congestionWindow, congestionFlight, state.rtt.srtt, state.slowStartThreshold)
 		state.congestionWindow = updatedWindow
-		state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: next, flags: flags, timestamp: prepared.timestamp, state: sentTCPSegmentInitialState(limitedTransmit, prepared.carriesCWR, probe, state.controller.schedulerLimited()), firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, congestionPacketState: state.controller.transmissionState(), delivery: rate}, offset+payload.size < total)
+		state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: next, flags: flags, timestamp: published.timestamp, state: sentTCPSegmentInitialState(limitedTransmit, published.carriesCWR, probe, state.controller.schedulerLimited()), firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, congestionPacketState: state.controller.transmissionState(), delivery: rate}, offset+payload.size < total)
 		state.bytesSent += uint64(payload.size)
 		if probe {
 			state.pathMTUState.discovery.sent(transmitMTU, state.sendNext, next)
@@ -7496,15 +7498,6 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		}
 		outputWindow := newTCPOutputWindow(first)
 		livenessDirty = true
-		if state.localFINSent {
-			// FIN-WAIT-2 and TIME-WAIT own the shared retransmission timer
-			// after transport work has finished. Preserve that close deadline
-			// while still clearing a stale RTO, RACK, or tail-loss probe.
-			state.updateRetransmissionTimer(retransmissionUpdate, state.eventTime)
-			state.armPersist(time.Time{}, 0, false)
-			outputWindow.release()
-			return nil
-		}
 		capacityBlocked := false
 		for state.frtoState == tcpFRTOProbePending {
 			allowance := 2 * uint32(state.peerMSS)
@@ -7535,7 +7528,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				continue
 			}
 			if state.frtoProbeBudget == 2 {
-				state.frtoState = tcpFRTOInactive
+				// RFC 5682's no-new-data branch authorizes conventional RTO
+				// recovery without requiring RACK loss evidence. Retain that
+				// authorization until its retransmission is actually published.
+				state.frtoState = tcpFRTOFallbackPending
 				state.frtoProbeBudget = 0
 				// Capacity is independent of the action selected after acquisition.
 				// Reuse this finite turn for the conventional recovery fallback.
@@ -7547,12 +7543,23 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				if blocked {
 					recoveryOutputWaiting = true
 					capacityBlocked = true
+				} else {
+					state.frtoState = tcpFRTOInactive
 				}
 			} else {
 				state.frtoState = tcpFRTOProbeSent
 				state.frtoProbeBudget = 0
 			}
 			break
+		}
+		if state.localFINSent {
+			// FIN-WAIT-2 and TIME-WAIT own the shared retransmission timer
+			// after transport work has finished. Preserve that close deadline
+			// while still clearing a stale RTO, RACK, or tail-loss probe.
+			state.updateRetransmissionTimer(retransmissionUpdate, state.eventTime)
+			state.armPersist(time.Time{}, 0, false)
+			outputWindow.release()
+			return nil
 		}
 		limitedTransmit := !state.rtoRecovery && !state.fastRecovery && state.duplicateACKs > 0 && state.duplicateACKs < tcpDuplicateACKThreshold
 		for limitedTransmit && !capacityBlocked {
@@ -7631,8 +7638,11 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					options, dsackSent := state.sackOptions(0)
 					window, right := state.nextAdvertisedReceiveWindow()
 					var payload tcpPayloadView
-					var prepared tcpPreparedTransmission
-					if err := c.prepareReservedPayloadForMTU(state.sendNext, state.receiveNext, TCPFlagACK|TCPFlagFIN, window, options, &payload, false, c.mtu, reservation, &prepared); err != nil {
+					published, err := c.publishReservedPayloadForMTU(state.sendNext, state.receiveNext, TCPFlagACK|TCPFlagFIN, window, options, &payload, false, c.mtu, reservation, tcpOutputSequenceRange{
+						unacknowledged: state.sendUnacknowledged,
+						next:           state.sendNext + 1,
+					})
+					if err != nil {
 						if errors.Is(err, errTCPOutputRouteChanged) {
 							ordinaryOutputWaiting = true
 							outputWindow.release()
@@ -7641,18 +7651,13 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 						outputWindow.release()
 						return err
 					}
-					c.publishICMPSequenceRange(state.sendUnacknowledged, state.sendNext+1)
-					hostQueue, err := c.publishPreparedTCP(prepared.output)
-					if err != nil {
-						outputWindow.release()
-						return err
-					}
+					hostQueue := published.hostQueue
 					sentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
 					if dsackSent {
 						state.haveRecentDSACK = false
 					}
 					state.commitAcknowledgment(window, right, len(options) != 0)
-					state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: state.sendNext + 1, flags: TCPFlagACK | TCPFlagFIN, timestamp: prepared.timestamp, state: sentTCPSegmentTransmitted, firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue}, false)
+					state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: state.sendNext + 1, flags: TCPFlagACK | TCPFlagFIN, timestamp: published.timestamp, state: sentTCPSegmentTransmitted, firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue}, false)
 					state.sendNext++
 					// Only the endpoint that closes first, or closes simultaneously,
 					// enters TIME-WAIT. A FIN sent after the peer's FIN is LAST-ACK.
@@ -7824,21 +7829,17 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		rackRetransmission := oldest.state.has(sentTCPSegmentRACKLost)
 		repeated := oldest.isRetransmitted()
 		window, right := state.nextAdvertisedReceiveWindow()
-		var prepared tcpPreparedTransmission
-		outputWindow, blocked, err := c.prepareBufferedSegmentForMTU(state.sendUnacknowledged, *oldest, state.receiveNext, window, nil, false, c.mtu, outputWindow, &prepared)
+		outputWindow, published, blocked, err := c.publishBufferedSegmentForMTU(state.sendUnacknowledged, *oldest, state.receiveNext, window, nil, false, c.mtu, outputWindow)
 		if err != nil || blocked {
 			return outputWindow, blocked, err
 		}
-		hostQueue, err := c.publishPreparedTCP(prepared.output)
-		if err != nil {
-			return outputWindow, false, err
-		}
+		hostQueue := published.hostQueue
 		state.recordRetransmission(oldest.sequence, oldest.end)
 		if state.undo != nil {
-			state.undo.recordRetransmission(oldest.sequence, oldest.end, prepared.timestamp, repeated)
+			state.undo.recordRetransmission(oldest.sequence, oldest.end, published.timestamp, repeated)
 		}
 		state.commitAcknowledgment(window, right, false)
-		oldest.timestamp = prepared.timestamp
+		oldest.timestamp = published.timestamp
 		oldest.hostQueue = hostQueue
 		oldest.advanceTransmissionGeneration()
 		oldest.state.set(sentTCPSegmentSACKRetried, true)
@@ -7883,25 +7884,21 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		}
 		segment := &state.outstanding[index]
 		window, right := state.nextAdvertisedReceiveWindow()
-		var prepared tcpPreparedTransmission
-		outputWindow, blocked, err := c.prepareBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu, outputWindow, &prepared)
+		outputWindow, published, blocked, err := c.publishBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu, outputWindow)
 		if err != nil || blocked {
 			return outputWindow, blocked, err
 		}
-		hostQueue, err := c.publishPreparedTCP(prepared.output)
-		if err != nil {
-			return outputWindow, false, err
-		}
+		hostQueue := published.hostQueue
 		state.recordRetransmission(segment.sequence, segment.end)
 		if state.undo != nil {
-			state.undo.recordRetransmission(segment.sequence, segment.end, prepared.timestamp, segment.isRetransmitted())
+			state.undo.recordRetransmission(segment.sequence, segment.end, published.timestamp, segment.isRetransmitted())
 		}
 		state.commitAcknowledgment(window, right, false)
 		if segment.state.has(sentTCPSegmentCWR) && c.peerECN {
 			c.sendCWR = true
 		}
 		segment.state.set(sentTCPSegmentCWR, false)
-		segment.timestamp = prepared.timestamp
+		segment.timestamp = published.timestamp
 		segment.hostQueue = hostQueue
 		state.controller.notePacketLoss(segment, recordTCPSegmentLoss(segment, true), false, time.Now(), state.congestionWindow, state.slowStartThreshold, state.ordinaryFlight(), state.peerMSS, state.rtt.srtt)
 		segment.advanceTransmissionGeneration()
@@ -7960,21 +7957,17 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			segment := &state.outstanding[pendingIndex]
 			originalCongestionState := segment.congestionPacketState
 			window, right := state.nextAdvertisedReceiveWindow()
-			var prepared tcpPreparedTransmission
-			outputWindow, blocked, err = c.prepareBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu, outputWindow, &prepared)
+			var published tcpPublishedTransmission
+			outputWindow, published, blocked, err = c.publishBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu, outputWindow)
 			if err != nil || blocked {
 				outputWindow.release()
 				return err
 			}
-			hostQueue, publishErr := c.publishPreparedTCP(prepared.output)
-			if publishErr != nil {
-				outputWindow.release()
-				return publishErr
-			}
+			hostQueue := published.hostQueue
 			state.recordRetransmission(segment.sequence, segment.end)
 			sentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
 			state.commitAcknowledgment(window, right, false)
-			segment.timestamp = prepared.timestamp
+			segment.timestamp = published.timestamp
 			segment.hostQueue = hostQueue
 			probeSentAt = sentAt
 			segment.advanceTransmissionGeneration()
@@ -8011,11 +8004,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		window, right := state.nextAdvertisedReceiveWindow()
 		var payload tcpPayloadView
 		payload.setBytes(tcpZeroWindowProbe[:])
-		var prepared tcpPreparedTransmission
 		// Like Linux and gVisor, probe with an already acknowledged byte.
 		// Consuming new sequence space here would move pure ACKs beyond the
 		// peer's zero window and can deadlock a full-duplex connection.
-		err := c.prepareReservedPayloadForMTU(state.sendUnacknowledged-1, state.receiveNext, TCPFlagACK, window, nil, &payload, false, c.mtu, reservation, &prepared)
+		published, err := c.publishReservedPayloadForMTU(state.sendUnacknowledged-1, state.receiveNext, TCPFlagACK, window, nil, &payload, false, c.mtu, reservation, tcpOutputSequenceRange{})
 		if errors.Is(err, errTCPOutputRouteChanged) {
 			outputWindow.release()
 			return nil
@@ -8024,11 +8016,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			outputWindow.release()
 			return err
 		}
-		hostQueue, err := c.publishPreparedTCP(prepared.output)
-		if err != nil {
-			outputWindow.release()
-			return err
-		}
+		hostQueue := published.hostQueue
 		probeSentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
 		state.commitAcknowledgment(window, right, false)
 		c.stack.stats.tcpZeroWindowProbes.Add(1)
@@ -8065,8 +8053,11 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		probeSequence := state.sendNext - 1
 		window, right := state.nextAdvertisedReceiveWindow()
 		var payload tcpPayloadView
-		var prepared tcpPreparedTransmission
-		err := c.prepareReservedPayloadForMTU(probeSequence, state.receiveNext, TCPFlagACK, window, nil, &payload, false, c.mtu, reservation, &prepared)
+		sequenceRange := tcpOutputSequenceRange{}
+		if probeSequence-state.sendUnacknowledged > state.sendNext-state.sendUnacknowledged {
+			sequenceRange = tcpOutputSequenceRange{unacknowledged: probeSequence, next: state.sendNext}
+		}
+		published, err := c.publishReservedPayloadForMTU(probeSequence, state.receiveNext, TCPFlagACK, window, nil, &payload, false, c.mtu, reservation, sequenceRange)
 		if errors.Is(err, errTCPOutputRouteChanged) {
 			outputWindow.release()
 			return nil
@@ -8075,14 +8066,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			outputWindow.release()
 			return err
 		}
-		if probeSequence-state.sendUnacknowledged > state.sendNext-state.sendUnacknowledged {
-			c.publishICMPSequenceRange(probeSequence, state.sendNext)
-		}
-		hostQueue, err := c.publishPreparedTCP(prepared.output)
-		if err != nil {
-			outputWindow.release()
-			return err
-		}
+		hostQueue := published.hostQueue
 		state.commitAcknowledgment(window, right, false)
 		liveness := state.ensureLivenessState()
 		liveness.keepAliveProbes++
@@ -8194,25 +8178,21 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		segment := &state.outstanding[index]
 		repeated := segment.isRetransmitted()
 		window, right := state.nextAdvertisedReceiveWindow()
-		var prepared tcpPreparedTransmission
-		outputWindow, blocked, err := c.prepareBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu, outputWindow, &prepared)
+		outputWindow, published, blocked, err := c.publishBufferedSegmentForMTU(state.sendUnacknowledged, *segment, state.receiveNext, window, nil, false, c.mtu, outputWindow)
 		if err != nil || blocked {
 			return outputWindow, blocked, err
 		}
-		hostQueue, err := c.publishPreparedTCP(prepared.output)
-		if err != nil {
-			return outputWindow, false, err
-		}
+		hostQueue := published.hostQueue
 		state.recordRetransmission(segment.sequence, segment.end)
 		if state.undo != nil {
-			state.undo.recordRetransmission(segment.sequence, segment.end, prepared.timestamp, repeated)
+			state.undo.recordRetransmission(segment.sequence, segment.end, published.timestamp, repeated)
 		}
 		state.commitAcknowledgment(window, right, false)
 		if segment.state.has(sentTCPSegmentCWR) && c.peerECN {
 			c.sendCWR = true
 		}
 		segment.state.set(sentTCPSegmentCWR, false)
-		segment.timestamp = prepared.timestamp
+		segment.timestamp = published.timestamp
 		segment.hostQueue = hostQueue
 		segment.advanceTransmissionGeneration()
 		segment.state.set(sentTCPSegmentRACKLost, false)
@@ -8251,6 +8231,20 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		var blocked bool
 		var err error
 		outputWindow, blocked, err = drainPathMTURetransmission(outputWindow)
+		if err == nil && !blocked && state.rtoRecovery && state.frtoState == tcpFRTOFallbackPending {
+			// Publish this explicit fallback once before generic RACK/SACK
+			// recovery derives any additional transmission from the scoreboard.
+			outputWindow, blocked, err = retransmitRTORecovery(outputWindow, firstUnsackedSegment(state.outstanding))
+			if err == nil && !blocked {
+				state.frtoState = tcpFRTOInactive
+				state.frtoProbeBudget = 0
+			}
+			if blocked {
+				recoveryOutputWaiting = true
+			}
+			outputWindow.release()
+			return err
+		}
 		if err == nil && !blocked && state.rtoRecovery && state.frtoState == tcpFRTOInactive && len(state.outstanding) != 0 {
 			index := firstUnsackedSegment(state.outstanding)
 			if state.peerSACK {
@@ -9021,11 +9015,6 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 	}
 }
 
-// sendSegment emits a segment with the supplied advertised window.
-func (c *TCPConn) sendSegment(sequence, acknowledgement uint32, flags byte, window uint16, payload []byte) error {
-	return c.sendSegmentWithOptions(sequence, acknowledgement, flags, window, nil, payload)
-}
-
 // sendAbortReset makes one nonblocking attempt to publish the final RST from
 // an actor whose normal packet writes have already been canceled.
 func (c *TCPConn) sendAbortReset(sequence, acknowledgement uint32, window uint16) error {
@@ -9069,59 +9058,16 @@ func (c *TCPConn) tryWriteTCPControl(sequence, acknowledgement uint32, flags byt
 	)
 }
 
-// sendSegmentWithOptions emits a segment with TCP options and the actor's
-// current advertised window.
-func (c *TCPConn) sendSegmentWithOptions(sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte) error {
-	_, _, err := c.sendSegmentForMTU(sequence, acknowledgement, flags, window, options, payload, false, c.mtu)
-	return err
-}
-
-// sendSegmentForMTU emits a segment against an explicit path ceiling. It
-// returns the serialized TSval so Eifel does not need a second clock read.
-func (c *TCPConn) sendSegmentForMTU(sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, ecnCapable bool, mtu int) (uint32, packetQueueTicket, error) {
-	var view tcpPayloadView
-	view.setBytes(payload)
-	return c.sendPayloadForMTU(sequence, acknowledgement, flags, window, options, &view, ecnCapable, mtu)
-}
-
-// sendPayloadForMTU is the scatter-payload form of sendSegmentForMTU.
-func (c *TCPConn) sendPayloadForMTU(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, ecnCapable bool, mtu int) (uint32, packetQueueTicket, error) {
-	var prepared tcpPreparedTransmission
-	if err := c.preparePayloadForMTU(sequence, acknowledgement, flags, window, options, payload, ecnCapable, mtu, &prepared); err != nil {
-		return 0, packetQueueTicket{}, err
-	}
-	hostQueue, err := c.publishPreparedTCP(prepared.output)
-	if err == nil && prepared.carriesCWR {
-		c.sendCWR = false
-	}
-	return prepared.timestamp, hostQueue, err
-}
-
-// preparePayloadForMTU adds negotiated per-connection wire state and prepares
-// one complete transmission without publishing it. On success, prepared owns
-// the packet and reservation until immediate publication.
-func (c *TCPConn) preparePayloadForMTU(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, ecnCapable bool, mtu int, prepared *tcpPreparedTransmission) error {
-	return c.preparePayloadForMTUWithReservation(sequence, acknowledgement, flags, window, options, payload, ecnCapable, mtu, tcpOutputReservation{}, prepared)
-}
-
-// prepareReservedPayloadForMTU is the actor-owned-slot form of
-// preparePayloadForMTU. The reservation is consumed on every error and is
-// transferred to prepared on success.
-func (c *TCPConn) prepareReservedPayloadForMTU(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, ecnCapable bool, mtu int, reservation tcpOutputReservation, prepared *tcpPreparedTransmission) error {
-	return c.preparePayloadForMTUWithReservation(sequence, acknowledgement, flags, window, options, payload, ecnCapable, mtu, reservation, prepared)
-}
-
-// preparePayloadForMTUWithReservation adds negotiated per-connection wire
-// state before choosing blocking or actor-owned queue admission.
-func (c *TCPConn) preparePayloadForMTUWithReservation(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, ecnCapable bool, mtu int, reservation tcpOutputReservation, prepared *tcpPreparedTransmission) error {
+// publishReservedPayloadForMTU adds negotiated per-connection wire state and
+// publishes one segment through an actor-owned slot. The reservation is
+// consumed on every return.
+func (c *TCPConn) publishReservedPayloadForMTU(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, ecnCapable bool, mtu int, reservation tcpOutputReservation, sequenceRange tcpOutputSequenceRange) (tcpPublishedTransmission, error) {
 	timestamp := uint32(0)
 	var timestampOptions [40]byte
 	if c.peerTimestamp {
 		if len(options) > len(timestampOptions)-12 {
-			if reservation.queue != nil {
-				reservation.release()
-			}
-			return errors.New("mipstack: invalid TCP options")
+			reservation.release()
+			return tcpPublishedTransmission{}, errors.New("mipstack: invalid TCP options")
 		}
 		timestamp = c.stack.tcpTimestamp()
 		encoded := appendTCPTimestampOptions(timestampOptions[:0], timestamp, c.recentTimestamp)
@@ -9138,43 +9084,31 @@ func (c *TCPConn) preparePayloadForMTUWithReservation(sequence, acknowledgement 
 	if c.peerECN && ecnCapable && payload.size != 0 {
 		ecn = 2
 	}
-	trafficClass := uint8(c.trafficClass.Load())
-	var output tcpPreparedOutput
-	var err error
-	if reservation.queue == nil {
-		err = c.prepareTCPOutputBlocking(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, &output)
-	} else {
-		err = c.prepareTCPOutputReserved(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, reservation, &output)
-	}
+	hostQueue, err := c.publishReservedTCP(sequence, acknowledgement, flags, window, options, payload, mtu, uint8(c.trafficClass.Load()), ecn, reservation, sequenceRange)
 	if err != nil {
-		return err
+		return tcpPublishedTransmission{}, err
 	}
-	*prepared = tcpPreparedTransmission{output: output, timestamp: timestamp, carriesCWR: includeCWR}
-	return nil
+	return tcpPublishedTransmission{hostQueue: hostQueue, timestamp: timestamp, carriesCWR: includeCWR}, nil
 }
 
-// prepareBufferedSegmentForMTU resolves one immutable send-buffer range and
-// prepares it through either blocking admission or a caller's finite output
-// window. A missing slot or a changed output route is reported as blocked so
-// the actor can derive the transmission again after current capacity returns.
-func (c *TCPConn) prepareBufferedSegmentForMTU(sendBase uint32, segment sentTCPSegment, acknowledgement uint32, window uint16, options []byte, ecnCapable bool, mtu int, outputWindow tcpOutputWindow, prepared *tcpPreparedTransmission) (tcpOutputWindow, bool, error) {
+// publishBufferedSegmentForMTU resolves and publishes one immutable send-buffer
+// range through a caller's finite output window. A missing slot or changed
+// route is reported as blocked so the actor can derive the transmission again
+// after capacity returns.
+func (c *TCPConn) publishBufferedSegmentForMTU(sendBase uint32, segment sentTCPSegment, acknowledgement uint32, window uint16, options []byte, ecnCapable bool, mtu int, outputWindow tcpOutputWindow) (tcpOutputWindow, tcpPublishedTransmission, bool, error) {
 	var payload tcpPayloadView
 	if err := c.bufferedSegmentPayload(sendBase, segment, &payload); err != nil {
-		return outputWindow, false, err
-	}
-	if !outputWindow.enabled {
-		err := c.preparePayloadForMTU(segment.sequence, acknowledgement, segment.flags, window, options, &payload, ecnCapable, mtu, prepared)
-		return outputWindow, false, err
+		return outputWindow, tcpPublishedTransmission{}, false, err
 	}
 	reservation, outputWindow, available := outputWindow.reserve(c)
 	if !available {
-		return outputWindow, true, nil
+		return outputWindow, tcpPublishedTransmission{}, true, nil
 	}
-	err := c.prepareReservedPayloadForMTU(segment.sequence, acknowledgement, segment.flags, window, options, &payload, ecnCapable, mtu, reservation, prepared)
+	published, err := c.publishReservedPayloadForMTU(segment.sequence, acknowledgement, segment.flags, window, options, &payload, ecnCapable, mtu, reservation, tcpOutputSequenceRange{})
 	if errors.Is(err, errTCPOutputRouteChanged) {
-		return outputWindow, true, nil
+		return outputWindow, tcpPublishedTransmission{}, true, nil
 	}
-	return outputWindow, false, err
+	return outputWindow, published, false, err
 }
 
 // bufferedSegmentPayload resolves one retransmission range from the immutable
@@ -9204,6 +9138,24 @@ type tcpOutputReservation struct {
 // release returns an unused output slot to its queue.
 func (r tcpOutputReservation) release() { r.queue.releaseReserved(r.slot) }
 
+// tcpOutputSequenceRange optionally supplies the transmitted sequence span
+// used to authenticate an ICMP quotation. Only sequence-consuming output and
+// an out-of-range keepalive set a nonempty range; ordinary ACKs and
+// retransmissions leave it empty.
+type tcpOutputSequenceRange struct {
+	unacknowledged uint32
+	next           uint32
+}
+
+// tcpPublishedTransmission contains wire metadata returned only after a packet
+// is visible to Stack.Read. Protocol state remains with the actor and is
+// committed by the action-specific caller.
+type tcpPublishedTransmission struct {
+	hostQueue  packetQueueTicket
+	timestamp  uint32
+	carriesCWR bool
+}
+
 // tcpOutputWindow bounds one actor turn to the queue capacity visible when its
 // first slot is acquired. It never retains a slot across an actor event, and
 // capacity returned later is left for the next selection turn.
@@ -9211,7 +9163,6 @@ type tcpOutputWindow struct {
 	queue     *packetQueue
 	slot      uint16
 	remaining uint16
-	enabled   bool
 	first     bool
 	loopback  bool
 }
@@ -9219,7 +9170,7 @@ type tcpOutputWindow struct {
 // newTCPOutputWindow creates a finite nonblocking output turn. A nonzero
 // reservation transfers a slot received by the actor select.
 func newTCPOutputWindow(reservation tcpOutputReservation) tcpOutputWindow {
-	w := tcpOutputWindow{enabled: true}
+	var w tcpOutputWindow
 	if reservation.queue != nil {
 		w.queue = reservation.queue
 		w.slot = reservation.slot
@@ -9267,123 +9218,34 @@ func (w tcpOutputWindow) release() {
 	}
 }
 
-// tcpPreparedOutput owns one serialized packet and its reserved queue slot.
-// It is an actor-local transaction value: callers must publish it immediately
-// and must never retain it across an actor event.
-type tcpPreparedOutput struct {
-	reservation tcpOutputReservation
-	packet      []byte
-	reusable    bool
-}
-
-// tcpPreparedTransmission adds connection-level send metadata to one prepared
-// packet. It remains actor-local and is consumed by immediate publication.
-type tcpPreparedTransmission struct {
-	output     tcpPreparedOutput
-	timestamp  uint32
-	carriesCWR bool
-}
-
 // errTCPOutputRouteChanged reports that address configuration changed the
 // selected output queue after an actor acquired its slot. The caller must plan
-// again from current state; preparation has released the stale slot.
+// again from current state; publication has released the stale slot.
 var errTCPOutputRouteChanged = errors.New("mipstack: TCP output route changed")
 
-// prepareTCPOutputBlocking waits interruptibly for one output slot and
-// completes every fallible validation and construction step. A route change
-// while waiting releases the stale slot and restarts acquisition. On success,
-// output owns the prepared packet and reservation until immediate publication.
-func (c *TCPConn) prepareTCPOutputBlocking(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, output *tcpPreparedOutput) error {
+// publishReservedTCP validates, serializes, and publishes one segment through
+// an actor-owned slot. A nonempty sequenceRange is exposed after all fallible
+// construction and immediately before the packet becomes visible to
+// Stack.Read. The reservation is consumed on every return.
+func (c *TCPConn) publishReservedTCP(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, reservation tcpOutputReservation, sequenceRange tcpOutputSequenceRange) (packetQueueTicket, error) {
 	if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
-		return syscall.EADDRNOTAVAIL
+		reservation.release()
+		return packetQueueTicket{}, syscall.EADDRNOTAVAIL
 	}
 	_, _, packetSize, err := tcpPacketLayout(c.key.local.Addr(), c.key.remote.Addr(), options, payload.size, mtu)
 	if err != nil {
-		return err
-	}
-	for {
-		queue, loopback := c.stack.outputQueueFor(c.key.remote.Addr())
-		// A graceful Close deliberately leaves protocol output active so already
-		// accepted bytes and FIN can still be transmitted; only abort cancels it.
-		slot, reserveErr := c.stack.reservePacketUntil(queue, loopback, c.abortCh)
-		if reserveErr != nil {
-			if errors.Is(reserveErr, net.ErrClosed) {
-				select {
-				case <-c.abortCh:
-					return c.abortedError()
-				default:
-				}
-			}
-			return reserveErr
-		}
-		reservation := tcpOutputReservation{queue: queue, slot: slot, loopback: loopback}
-		if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
-			reservation.release()
-			return syscall.EADDRNOTAVAIL
-		}
-		currentQueue, currentLoopback := c.stack.outputQueueFor(c.key.remote.Addr())
-		if queue != currentQueue || loopback != currentLoopback {
-			reservation.release()
-			continue
-		}
-		prepared, prepareErr := c.prepareTCPOutput(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, packetSize, reservation)
-		if prepareErr == nil {
-			*output = prepared
-		}
-		return prepareErr
-	}
-}
-
-// publishReservedTCP validates and serializes one segment into an actor-owned
-// slot. The reservation is consumed on every return, including layout errors.
-func (c *TCPConn) publishReservedTCP(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, reservation tcpOutputReservation) (packetQueueTicket, error) {
-	var output tcpPreparedOutput
-	if err := c.prepareTCPOutputReserved(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, reservation, &output); err != nil {
+		reservation.release()
 		return packetQueueTicket{}, err
 	}
-	return c.publishPreparedTCP(output)
-}
-
-// prepareTCPOutputReserved validates and serializes one segment while
-// retaining its actor-owned slot. It consumes the reservation on every error.
-func (c *TCPConn) prepareTCPOutputReserved(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, reservation tcpOutputReservation, output *tcpPreparedOutput) error {
 	if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
 		reservation.release()
-		return syscall.EADDRNOTAVAIL
-	}
-	_, _, packetSize, err := tcpPacketLayout(c.key.local.Addr(), c.key.remote.Addr(), options, payload.size, mtu)
-	if err != nil {
-		reservation.release()
-		return err
-	}
-	prepared, err := c.prepareReservedTCPOutput(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, packetSize, reservation)
-	if err == nil {
-		*output = prepared
-	}
-	return err
-}
-
-// prepareReservedTCPOutput revalidates an owned slot and serializes one packet.
-// It consumes the reservation on every error and otherwise transfers ownership
-// to the returned prepared value.
-func (c *TCPConn) prepareReservedTCPOutput(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, packetSize int, reservation tcpOutputReservation) (tcpPreparedOutput, error) {
-	if c.forwarded && !c.stack.network.Load().acceptsInboundDestination(c.key.local.Addr()) {
-		reservation.release()
-		return tcpPreparedOutput{}, syscall.EADDRNOTAVAIL
+		return packetQueueTicket{}, syscall.EADDRNOTAVAIL
 	}
 	queue, loopback := c.stack.outputQueueFor(c.key.remote.Addr())
 	if reservation.queue != queue || reservation.loopback != loopback {
 		reservation.release()
-		return tcpPreparedOutput{}, errTCPOutputRouteChanged
+		return packetQueueTicket{}, errTCPOutputRouteChanged
 	}
-	return c.prepareTCPOutput(sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, packetSize, reservation)
-}
-
-// prepareTCPOutput completes every fallible packet check and construction step
-// while retaining ownership of the reserved slot. Once this succeeds, queue
-// closure is the only remaining publication failure.
-func (c *TCPConn) prepareTCPOutput(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, packetSize int, reservation tcpOutputReservation) (tcpPreparedOutput, error) {
-	queue := reservation.queue
 	packet, reusable := queue.acquireBuffer(packetSize)
 	built, err := buildTCPPacketViewInto(
 		packet,
@@ -9393,21 +9255,16 @@ func (c *TCPConn) prepareTCPOutput(sequence, acknowledgement uint32, flags byte,
 	if err != nil {
 		queue.releaseBuffer(packet, reusable)
 		reservation.release()
-		return tcpPreparedOutput{}, err
+		return packetQueueTicket{}, err
 	}
-	return tcpPreparedOutput{reservation: reservation, packet: built, reusable: reusable}, nil
-}
-
-// publishPreparedTCP transfers an already constructed packet to its queue.
-// A false publication means Stack closure won the race and discarded the
-// queue, including the prepared packet and its slot.
-func (c *TCPConn) publishPreparedTCP(output tcpPreparedOutput) (packetQueueTicket, error) {
-	reservation := output.reservation
-	hostQueue, published := reservation.queue.enqueueReservedTCP(reservation.slot, output.packet, output.reusable, c.outputFlowID, reservation.loopback)
+	if sequenceRange.unacknowledged != sequenceRange.next {
+		c.publishICMPSequenceRange(sequenceRange.unacknowledged, sequenceRange.next)
+	}
+	hostQueue, published := queue.enqueueReservedTCP(reservation.slot, built, reusable, c.outputFlowID, loopback)
 	if !published {
 		return packetQueueTicket{}, ErrClosed
 	}
-	c.stack.recordOutput(reservation.loopback)
+	c.stack.recordOutput(loopback)
 	return hostQueue, nil
 }
 

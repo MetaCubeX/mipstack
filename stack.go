@@ -1779,10 +1779,11 @@ func (q *packetQueue) releaseBuffer(packet []byte, reusable bool) {
 // depart marks a dequeued generation as no longer owned by the host queue and
 // reports whether its cold loss-timer waiter must be completed. Capacity
 // remains reserved until release because the consumer may still be reading the
-// packet buffer.
+// packet buffer. Pending is the low bit, so one atomic subtraction cannot
+// overwrite the waiter's concurrent CAS: either the returned state includes
+// the waiter bit or registration observes that ownership has already ended.
 func (q *packetQueue) depart(slot uint16) bool {
-	state := q.slots[slot].Load()
-	q.slots[slot].Store(state &^ (packetQueueSlotPending | packetQueueSlotDepartureWaiter))
+	state := q.slots[slot].Add(^uint64(0))
 	return state&packetQueueSlotDepartureWaiter != 0
 }
 
@@ -3144,42 +3145,6 @@ func (s *Stack) tryWritePacketsTo(packets [][]byte, queue *packetQueue, loopback
 		s.recordOutput(loopback)
 	}
 	return nil
-}
-
-// reservePacketUntil acquires one queue slot while observing connection and
-// Stack closure. Callers must release the slot if packet construction fails
-// before publication.
-func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, closed <-chan struct{}) (uint16, error) {
-	select {
-	case <-closed:
-		return 0, net.ErrClosed
-	default:
-	}
-	if slot, reserved := queue.tryReserve(); reserved {
-		return slot, nil
-	}
-	if loopback {
-		select {
-		case <-s.closeCh:
-			return 0, ErrClosed
-		default:
-			return 0, ErrResourceLimit
-		}
-	}
-	select {
-	case slot := <-queue.free:
-		select {
-		case <-closed:
-			queue.releaseReserved(slot)
-			return 0, net.ErrClosed
-		default:
-		}
-		return slot, nil
-	case <-closed:
-		return 0, net.ErrClosed
-	case <-s.closeCh:
-		return 0, ErrClosed
-	}
 }
 
 // deadlineTimer returns a disabled channel for an unset deadline.

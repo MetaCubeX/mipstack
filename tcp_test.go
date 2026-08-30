@@ -4228,25 +4228,48 @@ func TestTCPRTOPendingPathMTURetransmissionStartsFRTO(t *testing.T) {
 }
 
 func TestTCPFRTOFallbackSurvivesStoppedDeviceRead(t *testing.T) {
+	t.Run("Open", func(t *testing.T) {
+		testTCPFRTOFallbackSurvivesStoppedDeviceRead(t, false, false)
+	})
+	t.Run("AfterCloseWrite", func(t *testing.T) {
+		testTCPFRTOFallbackSurvivesStoppedDeviceRead(t, true, false)
+	})
+	t.Run("NewACKSupersedesFallback", func(t *testing.T) {
+		testTCPFRTOFallbackSurvivesStoppedDeviceRead(t, false, true)
+	})
+}
+
+func testTCPFRTOFallbackSurvivesStoppedDeviceRead(t *testing.T, closeWrite, supersedeFallback bool) {
 	link, stack, connection := newManuallyPumpedTCPConnection(t)
 	defer connection.Close()
 
 	before := connection.Info()
-	payload := bytes.Repeat([]byte{0x7d}, 2*before.MaximumSegmentSize)
+	segmentCount := 2
+	if supersedeFallback {
+		segmentCount = 3
+	}
+	payload := bytes.Repeat([]byte{0x7d}, segmentCount*before.MaximumSegmentSize)
 	if n, err := connection.Write(payload); err != nil || n != len(payload) {
 		t.Fatalf("Write = %d, %v", n, err)
 	}
+	if closeWrite {
+		if err := connection.CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	type dataSegment struct {
+		wire     []byte
 		sequence uint32
 		payload  []byte
 	}
-	segments := make([]dataSegment, 0, 2)
+	segments := make([]dataSegment, 0, segmentCount)
 	queuedBytes := 0
+	finQueued := !closeWrite
 	deadline := time.Now().Add(time.Second)
-	for queuedBytes < len(payload) {
+	for queuedBytes < len(payload) || !finQueued {
 		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
 		if !available {
-			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
+			t.Fatalf("queued TCP bytes = %d, want %d; FIN queued = %t, want %t", queuedBytes, len(payload), finQueued, closeWrite)
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
 		packet, valid := parseIPPacket(wire)
@@ -4258,14 +4281,20 @@ func TestTCPFRTOFallbackSurvivesStoppedDeviceRead(t *testing.T) {
 			t.Fatalf("initial TCP header length = %d in %x", headerSize, wire)
 		}
 		segmentPayload := packet.payload[headerSize:]
-		segments = append(segments, dataSegment{
-			sequence: binary.BigEndian.Uint32(packet.payload[4:8]),
-			payload:  append([]byte(nil), segmentPayload...),
-		})
-		queuedBytes += len(segmentPayload)
+		if len(segmentPayload) != 0 {
+			segments = append(segments, dataSegment{
+				wire:     wire,
+				sequence: binary.BigEndian.Uint32(packet.payload[4:8]),
+				payload:  append([]byte(nil), segmentPayload...),
+			})
+			queuedBytes += len(segmentPayload)
+		}
+		if packet.payload[13]&TCPFlagFIN != 0 {
+			finQueued = true
+		}
 	}
-	if len(segments) < 2 {
-		t.Fatalf("initial TCP flight has %d segments, want at least 2", len(segments))
+	if len(segments) < segmentCount {
+		t.Fatalf("initial TCP flight has %d segments, want at least %d", len(segments), segmentCount)
 	}
 	// Drop the TLP as well as the original flight. The next published packet is
 	// the first RTO retransmission whose ACK authorizes the F-RTO probe step.
@@ -4329,13 +4358,28 @@ func TestTCPFRTOFallbackSurvivesStoppedDeviceRead(t *testing.T) {
 	if depth := stack.outbound.len(); depth != 0 {
 		t.Fatalf("full reserved output queue contains %d published packets, want 0", depth)
 	}
+	if supersedeFallback {
+		// Deliver the next original segment after F-RTO selected its fallback.
+		// Its cumulative ACK must replace that selection with current RACK state.
+		if err := link.handleOutboundPacket(segments[1].wire); err != nil {
+			t.Fatal(err)
+		}
+		wantAcknowledged := before.BytesAcknowledged + uint64(len(segments[0].payload)+len(segments[1].payload))
+		deadline := time.Now().Add(time.Second)
+		for blocked.BytesAcknowledged < wantAcknowledged && time.Now().Before(deadline) {
+			blocked = responsiveInfo()
+		}
+		if blocked.BytesAcknowledged != wantAcknowledged || !blocked.RetransmissionRecovery || blocked.Retransmissions != rtoInfo.Retransmissions {
+			t.Fatalf("ACK-superseded F-RTO fallback = RTO:%+v after:%+v", rtoInfo, blocked)
+		}
+	}
 
 	last := len(held) - 1
 	stack.outbound.releaseReserved(held[last])
 	held = held[:last]
 	fallbackEntry, available := waitTestPacketEntry(&stack.outbound, time.Second)
 	if !available {
-		t.Fatal("F-RTO fallback did not resume when device capacity returned")
+		t.Fatal("F-RTO output did not resume when device capacity returned")
 	}
 	fallbackWire := consumeTestPacket(&stack.outbound, fallbackEntry)
 	fallback, valid := parseIPPacket(fallbackWire)
@@ -4343,15 +4387,34 @@ func TestTCPFRTOFallbackSurvivesStoppedDeviceRead(t *testing.T) {
 		t.Fatalf("F-RTO fallback output is not TCP: %x", fallbackWire)
 	}
 	headerSize := int(fallback.payload[12]>>4) * 4
-	if headerSize < tcpHeaderSize || headerSize > len(fallback.payload) || binary.BigEndian.Uint32(fallback.payload[4:8]) != segments[1].sequence || !bytes.Equal(fallback.payload[headerSize:], segments[1].payload) {
-		t.Fatalf("F-RTO fallback does not retransmit the next range: %x", fallbackWire)
+	wantSegment := segments[1]
+	if supersedeFallback {
+		wantSegment = segments[2]
+	}
+	if headerSize < tcpHeaderSize || headerSize > len(fallback.payload) {
+		t.Fatalf("F-RTO recovery TCP header length = %d in %x", headerSize, fallbackWire)
 	}
 	after := responsiveInfo()
-	if after.Retransmissions != rtoInfo.Retransmissions+1 {
-		t.Fatalf("published F-RTO fallback = RTO:%+v after:%+v", rtoInfo, after)
-	}
-	if err := link.handleOutboundPacket(fallbackWire); err != nil {
-		t.Fatal(err)
+	if len(fallback.payload) == headerSize && supersedeFallback {
+		if fallback.payload[13] != TCPFlagACK || after.Retransmissions != rtoInfo.Retransmissions {
+			t.Fatalf("ACK-only F-RTO recovery = RTO:%+v after:%+v wire:%x", rtoInfo, after, fallbackWire)
+		}
+		if err := link.handleOutboundPacket(fallbackWire); err != nil {
+			t.Fatal(err)
+		}
+		if err := link.handleOutboundPacket(wantSegment.wire); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if binary.BigEndian.Uint32(fallback.payload[4:8]) != wantSegment.sequence || !bytes.Equal(fallback.payload[headerSize:], wantSegment.payload) {
+			t.Fatalf("F-RTO recovery does not retransmit the current next range: %x", fallbackWire)
+		}
+		if after.Retransmissions != rtoInfo.Retransmissions+1 {
+			t.Fatalf("published F-RTO recovery = RTO:%+v after:%+v", rtoInfo, after)
+		}
+		if err := link.handleOutboundPacket(fallbackWire); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
@@ -7172,23 +7235,18 @@ func TestTCPPublishReservationLifecycle(t *testing.T) {
 	payloadBytes := []byte("reserved publication")
 	var payload tcpPayloadView
 	payload.setBytes(payloadBytes)
-	_, _, packetSize, err := tcpPacketLayout(local, remote, nil, payload.size, 1400)
-	if err != nil {
-		t.Fatal(err)
-	}
 	slot, reserved := stack.outbound.tryReserve()
 	if !reserved {
 		t.Fatal("TCP publication could not reserve an output slot")
 	}
-	output, err := connection.prepareTCPOutput(100, 200, TCPFlagACK|TCPFlagPSH, 32768, nil, &payload, 1400, 0, 0, packetSize, tcpOutputReservation{
+	ticket, err := connection.publishReservedTCP(100, 200, TCPFlagACK|TCPFlagPSH, 32768, nil, &payload, 1400, 0, 0, tcpOutputReservation{
 		queue: &stack.outbound, slot: slot,
-	})
+	}, tcpOutputSequenceRange{unacknowledged: 90, next: 120})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ticket, err := connection.publishPreparedTCP(output)
-	if err != nil {
-		t.Fatal(err)
+	if got, want := connection.icmpSequence.Load(), uint64(90)<<32|120; got != want {
+		t.Fatalf("published TCP sequence range = %#x, want %#x", got, want)
 	}
 	if !ticket.pending(stack) {
 		t.Fatal("published TCP ticket is not pending")
@@ -7210,7 +7268,7 @@ func TestTCPPublishReservationLifecycle(t *testing.T) {
 	}
 }
 
-func TestTCPPreparationFailureReleasesReservation(t *testing.T) {
+func TestTCPPublicationFailureReleasesReservation(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.246")
 	remote := netip.MustParseAddr("198.51.100.246")
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
@@ -7223,26 +7281,26 @@ func TestTCPPreparationFailureReleasesReservation(t *testing.T) {
 		remote: netip.AddrPortFrom(remote, 8443),
 	}, 1400, tcpSocketOptionSet{})
 	var payload tcpPayloadView
-	payload.setBytes([]byte("invalid reservation size"))
-	_, _, packetSize, err := tcpPacketLayout(local, remote, nil, payload.size, 1400)
-	if err != nil {
-		t.Fatal(err)
-	}
+	payload.setBytes([]byte("invalid packet layout"))
+	connection.publishICMPSequenceRange(10, 20)
 	slot, reserved := stack.outbound.tryReserve()
 	if !reserved {
-		t.Fatal("TCP preparation could not reserve an output slot")
+		t.Fatal("TCP publication could not reserve an output slot")
 	}
-	_, err = connection.prepareTCPOutput(100, 200, TCPFlagACK, 32768, nil, &payload, 1400, 0, 0, packetSize-1, tcpOutputReservation{
+	_, err = connection.publishReservedTCP(100, 200, TCPFlagACK, 32768, nil, &payload, 39, 0, 0, tcpOutputReservation{
 		queue: &stack.outbound, slot: slot,
-	})
+	}, tcpOutputSequenceRange{unacknowledged: 100, next: 120})
 	if err == nil {
-		t.Fatal("TCP preparation accepted an invalid packet buffer size")
+		t.Fatal("TCP publication accepted an invalid MTU")
 	}
 	if stack.outbound.len() != 0 || len(stack.outbound.free) != cap(stack.outbound.free) {
-		t.Fatalf("failed TCP preparation retained queue state: packets=%d free=%d/%d", stack.outbound.len(), len(stack.outbound.free), cap(stack.outbound.free))
+		t.Fatalf("failed TCP publication retained queue state: packets=%d free=%d/%d", stack.outbound.len(), len(stack.outbound.free), cap(stack.outbound.free))
 	}
 	if got := stack.Stats().OutboundPackets; got != 0 {
 		t.Fatalf("failed TCP publication counted %d outbound packets", got)
+	}
+	if got, want := connection.icmpSequence.Load(), uint64(10)<<32|20; got != want {
+		t.Fatalf("failed TCP publication changed sequence range to %#x, want %#x", got, want)
 	}
 }
 
@@ -7258,6 +7316,7 @@ func TestTCPPublishRevalidatesReservedOutputQueue(t *testing.T) {
 		local:  netip.AddrPortFrom(local, 49152),
 		remote: netip.AddrPortFrom(remote, 8443),
 	}, 1400, tcpSocketOptionSet{})
+	connection.publishICMPSequenceRange(10, 20)
 	slot, reserved := stack.outbound.tryReserve()
 	if !reserved {
 		t.Fatal("TCP publication could not reserve the original output queue")
@@ -7270,7 +7329,7 @@ func TestTCPPublishRevalidatesReservedOutputQueue(t *testing.T) {
 	var payload tcpPayloadView
 	_, err = connection.publishReservedTCP(100, 200, TCPFlagACK, 32768, nil, &payload, 1400, 0, 0, tcpOutputReservation{
 		queue: &stack.outbound, slot: slot,
-	})
+	}, tcpOutputSequenceRange{unacknowledged: 100, next: 120})
 	if !errors.Is(err, errTCPOutputRouteChanged) {
 		t.Fatalf("publication with a stale output queue = %v", err)
 	}
@@ -7279,6 +7338,9 @@ func TestTCPPublishRevalidatesReservedOutputQueue(t *testing.T) {
 	}
 	if stack.loopback.len() != 0 || len(stack.loopback.free) != cap(stack.loopback.free) {
 		t.Fatalf("stale TCP reservation changed loopback state: packets=%d free=%d/%d", stack.loopback.len(), len(stack.loopback.free), cap(stack.loopback.free))
+	}
+	if got, want := connection.icmpSequence.Load(), uint64(10)<<32|20; got != want {
+		t.Fatalf("stale TCP reservation changed sequence range to %#x, want %#x", got, want)
 	}
 }
 
@@ -7301,10 +7363,19 @@ func TestTCPSegmentTimestampOptionsUseFixedWorkspace(t *testing.T) {
 	connection.peerTimestamp = true
 	connection.recentTimestamp = 0x10203040
 	extra := []byte{1, 1, 5, 10, 0, 0, 0, 1, 0, 0, 0, 2}
-	timestamp, _, err := connection.sendSegmentForMTU(100, 200, TCPFlagACK, 32768, extra, nil, false, 1500)
+	queue, loopback := stack.outputQueueFor(remote)
+	slot, err := stack.tryReservePacket(queue)
 	if err != nil {
 		t.Fatal(err)
 	}
+	var payload tcpPayloadView
+	published, err := connection.publishReservedPayloadForMTU(100, 200, TCPFlagACK, 32768, extra, &payload, false, 1500, tcpOutputReservation{
+		queue: queue, slot: slot, loopback: loopback,
+	}, tcpOutputSequenceRange{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	timestamp := published.timestamp
 	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
 	if !ok || len(packet.payload) < tcpHeaderSize {
 		t.Fatal("timestamped TCP segment could not be parsed")
@@ -7338,7 +7409,14 @@ func TestTCPSegmentTimestampOptionsUseFixedWorkspace(t *testing.T) {
 		binary.BigEndian.Uint32(got[8:12]) != connection.recentTimestamp || !bytes.Equal(got[12:], extra) {
 		t.Fatalf("best-effort timestamped TCP options = %x", got)
 	}
-	if _, _, err = connection.sendSegmentForMTU(100, 200, TCPFlagACK, 32768, make([]byte, 29), nil, false, 1500); err == nil || err.Error() != "mipstack: invalid TCP options" {
+	slot, err = stack.tryReservePacket(queue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = connection.publishReservedPayloadForMTU(100, 200, TCPFlagACK, 32768, make([]byte, 29), &payload, false, 1500, tcpOutputReservation{
+		queue: queue, slot: slot, loopback: loopback,
+	}, tcpOutputSequenceRange{})
+	if err == nil || err.Error() != "mipstack: invalid TCP options" {
 		t.Fatalf("oversized timestamp options error = %v", err)
 	}
 	if err = connection.trySendSegmentWithOptions(100, 200, TCPFlagACK, 32768, make([]byte, 29)); err == nil || err.Error() != "mipstack: invalid TCP options" {
@@ -7854,10 +7932,32 @@ func TestTCPCompressedSACK(t *testing.T) {
 	sequence, acknowledgement := peer.serverNext, peer.clientNext
 	baseline := link.clientACKs
 	link.mu.Unlock()
+	// Hold the actor on an existing diagnostic response until the complete
+	// receive burst is queued. Otherwise race instrumentation can spread the
+	// injection across two legitimate compressed-SACK timer windows.
+	actorResponse := make(chan TCPConnInfo)
+	tcpConnection.mu.Lock()
+	if tcpConnection.pending == nil {
+		tcpConnection.pending = new(tcpPendingEvents)
+	}
+	tcpConnection.pending.infoRequests = append(tcpConnection.pending.infoRequests, actorResponse)
+	tcpConnection.mu.Unlock()
+	tcpConnection.wakeActor(tcpActorWakeInfo)
+	waitFor(t, time.Second, func() bool {
+		tcpConnection.mu.Lock()
+		dequeued := len(tcpConnection.pending.infoRequests) == 0
+		tcpConnection.mu.Unlock()
+		return dequeued
+	})
 	for index := uint32(1); index <= 16; index++ {
 		if err = link.deliverTCP(tcpConnection.key.remote.Port(), tcpConnection.key.local.Port(), sequence+index, acknowledgement, TCPFlagACK, 65535, nil, []byte{byte(index)}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	select {
+	case <-actorResponse:
+	case <-time.After(time.Second):
+		t.Fatal("TCP actor did not reach the diagnostic response")
 	}
 	waitFor(t, time.Second, func() bool {
 		link.mu.Lock()

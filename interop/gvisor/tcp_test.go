@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -61,6 +62,163 @@ func TestTCPInterop(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestTCPStoppedDeviceReadInterop verifies that a full embedding-link queue
+// does not couple TCP socket or actor progress to Stack.Read and that the
+// connection resumes without losing either direction when device reads return.
+func TestTCPStoppedDeviceReadInterop(t *testing.T) {
+	family := interopFamilies[0]
+	bridgeStopped := make(chan struct{})
+	releaseBridge := make(chan struct{})
+	var bridgeArmed atomic.Bool
+	var stopOnce, releaseOnce sync.Once
+	network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+		families: []interopFamily{family}, mtu: 1500,
+		mipstackToGVisor: func([]byte) bool {
+			if bridgeArmed.Load() {
+				stopOnce.Do(func() {
+					close(bridgeStopped)
+					<-releaseBridge
+				})
+			}
+			return true
+		},
+	})
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseBridge) }) })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	gvisorTCP, mipstackTCP, listener := openTCPPair(t, ctx, network, family, true)
+	defer listener.Close()
+	defer gvisorTCP.Close()
+	defer mipstackTCP.Close()
+	mipstackUDP, gvisorUDP := openUDPPair(t, ctx, network, family, true)
+	defer mipstackUDP.Close()
+	defer gvisorUDP.Close()
+	udpConnection := mipstackUDP.(*mipstack.UDPConn)
+	if err := udpConnection.SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
+
+	bridgeArmed.Store(true)
+	if written, err := udpConnection.Write([]byte("bridge-stop")); err != nil || written != len("bridge-stop") {
+		t.Fatalf("write bridge-stop datagram: n=%d, error=%v", written, err)
+	}
+	select {
+	case <-bridgeStopped:
+	case <-ctx.Done():
+		t.Fatal("mipstack output bridge did not stop")
+	}
+
+	type saturationResult struct {
+		admitted int
+		err      error
+	}
+	saturated := make(chan saturationResult, 1)
+	go func() {
+		payload := []byte("queue-pressure")
+		for admitted := 0; admitted < 2048; admitted++ {
+			if written, err := udpConnection.Write(payload); err != nil {
+				saturated <- saturationResult{admitted: admitted, err: err}
+				return
+			} else if written != len(payload) {
+				saturated <- saturationResult{admitted: admitted, err: fmt.Errorf("short UDP write: %d", written)}
+				return
+			}
+		}
+		saturated <- saturationResult{admitted: 2048, err: errors.New("device queue did not saturate")}
+	}()
+	select {
+	case result := <-saturated:
+		if result.admitted < 128 || !errors.Is(result.err, syscall.ENOBUFS) {
+			t.Fatalf("stopped-read saturation = %d admitted, %v", result.admitted, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		releaseOnce.Do(func() { close(releaseBridge) })
+		t.Fatal("UDP writes blocked while Stack.Read was stopped")
+	}
+
+	outbound := patternedPayload(4096, 43)
+	tcpWrite := make(chan error, 1)
+	go func() {
+		written, err := mipstackTCP.Write(outbound)
+		if err == nil && written != len(outbound) {
+			err = io.ErrShortWrite
+		}
+		tcpWrite <- err
+	}()
+	select {
+	case err := <-tcpWrite:
+		if err != nil {
+			t.Fatalf("buffer TCP output while Stack.Read was stopped: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		releaseOnce.Do(func() { close(releaseBridge) })
+		t.Fatal("TCP Write blocked on the stopped device reader")
+	}
+
+	infoResult := make(chan mipstack.TCPConnInfo, 1)
+	go func() { infoResult <- mipstackTCP.(*mipstack.TCPConn).Info() }()
+	select {
+	case info := <-infoResult:
+		if info.SendBufferSize != len(outbound) || info.BytesSent != 0 {
+			t.Fatalf("TCP output escaped a full device queue: buffered=%d sent=%d", info.SendBufferSize, info.BytesSent)
+		}
+	case <-time.After(2 * time.Second):
+		releaseOnce.Do(func() { close(releaseBridge) })
+		t.Fatal("TCP Info blocked on the stopped device reader")
+	}
+
+	inbound := patternedPayload(4096, 97)
+	peerWrite := make(chan error, 1)
+	go func() {
+		written, err := gvisorTCP.Write(inbound)
+		if err == nil && written != len(inbound) {
+			err = io.ErrShortWrite
+		}
+		peerWrite <- err
+	}()
+	receivedInbound := make(chan error, 1)
+	go func() {
+		storage := make([]byte, len(inbound))
+		_, err := io.ReadFull(mipstackTCP, storage)
+		if err == nil && !bytes.Equal(storage, inbound) {
+			err = errors.New("inbound TCP payload mismatch")
+		}
+		receivedInbound <- err
+	}()
+	select {
+	case err := <-receivedInbound:
+		if err != nil {
+			t.Fatalf("receive TCP input while Stack.Read was stopped: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		releaseOnce.Do(func() { close(releaseBridge) })
+		t.Fatal("TCP input processing blocked on the stopped device reader")
+	}
+	select {
+	case err := <-peerWrite:
+		if err != nil {
+			t.Fatalf("write gVisor TCP input while Stack.Read was stopped: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		releaseOnce.Do(func() { close(releaseBridge) })
+		t.Fatal("gVisor TCP input write did not complete")
+	}
+
+	releaseOnce.Do(func() { close(releaseBridge) })
+	if err := gvisorTCP.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	receivedOutbound := make([]byte, len(outbound))
+	if _, err := io.ReadFull(gvisorTCP, receivedOutbound); err != nil {
+		t.Fatalf("read TCP output after device-read recovery: %v", err)
+	}
+	if !bytes.Equal(receivedOutbound, outbound) {
+		t.Fatal("recovered outbound TCP payload mismatch")
+	}
+	exchangeTCPPayload(t, mipstackTCP, gvisorTCP, patternedPayload(32*1024, 151))
+	exchangeTCPPayload(t, gvisorTCP, mipstackTCP, patternedPayload(32*1024, 211))
 }
 
 // TestTCPQuickACKInterop verifies that transient Linux-style quick-ACK
