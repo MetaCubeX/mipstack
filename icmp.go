@@ -962,9 +962,9 @@ func prepareICMPForwarderIPPacket(input []byte, destination netip.Addr) (icmpFor
 	return result, nil
 }
 
-// writeICMPForwarderIPPacket revalidates interception and return routing,
-// applies current PMTU state, and atomically enqueues the normalized
-// header-included packet or all of its fragments.
+// writeICMPForwarderIPPacket revalidates interception and return routing, then
+// makes one best-effort output attempt for the normalized header-included packet
+// or its source fragments.
 func (s *Stack) writeICMPForwarderIPPacket(request ipPacket, reply icmpForwarderIPPacket) error {
 	state := s.network.Load()
 	if !state.acceptsInboundDestination(request.target) {
@@ -977,7 +977,11 @@ func (s *Stack) writeICMPForwarderIPPacket(request ipPacket, reply icmpForwarder
 	if err != nil {
 		return err
 	}
-	return s.tryWritePackets(packets)
+	err = s.tryWritePackets(packets)
+	if err == ErrResourceLimit {
+		return nil
+	}
+	return err
 }
 
 // Error formats the remote ICMP failure.

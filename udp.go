@@ -671,7 +671,7 @@ func (f *forwarderRuntime) replyUDPFlow(flow ForwarderFlow, payload []byte, sour
 		hopLimit: byte(defaults.HopLimit), trafficClass: defaults.TrafficClass,
 		flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
 	}
-	if err := f.stack.tryWriteUDPDatagram(source.Addr(), remote.Addr(), source.Port(), remote.Port(), payload, options, defaults.PathMTUDiscovery); err != nil {
+	if err := f.stack.writeBestEffortUDPDatagram(source.Addr(), remote.Addr(), source.Port(), remote.Port(), payload, options, defaults.PathMTUDiscovery); err != nil {
 		return 0, err
 	}
 	return len(payload), nil
@@ -1499,9 +1499,10 @@ func (c *UDPConn) writeDatagram(source, target netip.Addr, sourcePort, targetPor
 	return c.writeDatagramForMTU(source, target, sourcePort, targetPort, payload, options, fragmentation, mtu)
 }
 
-// tryWriteUDPDatagram atomically queues one best-effort UDP datagram or all of
-// its source fragments without waiting for device capacity.
-func (s *Stack) tryWriteUDPDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery) error {
+// writeBestEffortUDPDatagram queues one forwarder reply without waiting for
+// device capacity. Output capacity drops the unavailable datagram or fragment
+// suffix without becoming a caller error.
+func (s *Stack) writeBestEffortUDPDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery) error {
 	udpSize := udpHeaderSize + len(payload)
 	if udpSize > 65535 {
 		return syscall.EMSGSIZE
@@ -1523,6 +1524,9 @@ func (s *Stack) tryWriteUDPDatagram(source, target netip.Addr, sourcePort, targe
 		queue, loopback := s.outputQueueFor(target)
 		slot, err := s.tryReservePacket(queue)
 		if err != nil {
+			if err == ErrResourceLimit {
+				return nil
+			}
 			return err
 		}
 		packet, reusable := queue.acquireBuffer(ipSize + udpSize)
@@ -1542,10 +1546,14 @@ func (s *Stack) tryWriteUDPDatagram(source, target netip.Addr, sourcePort, targe
 	if err := s.ipFragmentLayoutForMTU(source, target, udpSize, fragmentation, options, mtu, &layout); err != nil {
 		return err
 	}
-	datagram := make([]byte, udpSize)
-	marshalUDPDatagram(datagram, source, target, sourcePort, targetPort, payload)
-	packets := buildIPFragmentPackets(source, target, ProtocolUDP, datagram, layout)
-	return s.tryWritePackets(packets)
+	var udpHeader [udpHeaderSize]byte
+	marshalUDPHeaderFields(udpHeader[:], sourcePort, targetPort, udpSize)
+	writeUDPChecksumValue(udpHeader[:], transportChecksumParts(source, target, ProtocolUDP, udpSize, udpHeader[:], payload))
+	err := s.tryWriteIPFragmentsLayout(source, target, ProtocolUDP, udpHeader[:], payload, layout)
+	if err == ErrResourceLimit {
+		return nil
+	}
+	return err
 }
 
 // writePathMTUProbeDatagram is retained only when an application references

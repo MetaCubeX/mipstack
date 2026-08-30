@@ -1173,10 +1173,11 @@ func buildIPFragmentPackets(source, target netip.Addr, protocol byte, payload []
 	return packets
 }
 
-// tryWriteIPPayloadForMTU writes a fitting payload directly into queue-owned
-// packet storage. Datagrams that require fragmentation retain the packet-list
-// path so every fragment is reserved before any fragment becomes visible.
-func (s *Stack) tryWriteIPPayloadForMTU(source, target netip.Addr, protocol byte, payload []byte, fragmentation sourceFragmentation, options ipPacketOptions, mtu int) error {
+// writeBestEffortIPPayloadForMTU writes a fitting payload directly into
+// queue-owned packet storage and streams source fragments through the shared
+// fragment writer when the payload exceeds the path MTU. Output capacity drops
+// the unavailable packet or fragment suffix without becoming a caller error.
+func (s *Stack) writeBestEffortIPPayloadForMTU(source, target netip.Addr, protocol byte, payload []byte, fragmentation sourceFragmentation, options ipPacketOptions, mtu int) error {
 	headerSize := ipHeaderSize(source, target, len(payload))
 	if headerSize == 0 {
 		return syscall.EMSGSIZE
@@ -1190,11 +1191,11 @@ func (s *Stack) tryWriteIPPayloadForMTU(source, target netip.Addr, protocol byte
 		if err := s.ipFragmentLayoutForMTU(source, target, len(payload), fragmentation, options, mtu, &layout); err != nil {
 			return err
 		}
-		packets := buildIPFragmentPackets(source, target, protocol, payload, layout)
-		if len(packets) == 0 {
-			return syscall.EMSGSIZE
+		err := s.tryWriteIPFragmentsLayout(source, target, protocol, payload, nil, layout)
+		if err == ErrResourceLimit {
+			return nil
 		}
-		return s.tryWritePackets(packets)
+		return err
 	}
 	var identification uint16
 	if source.Is4() && fragmentation.requiresIPv4ID() {
@@ -1203,6 +1204,9 @@ func (s *Stack) tryWriteIPPayloadForMTU(source, target netip.Addr, protocol byte
 	queue, loopback := s.outputQueueFor(target)
 	slot, err := s.tryReservePacket(queue)
 	if err != nil {
+		if err == ErrResourceLimit {
+			return nil
+		}
 		return err
 	}
 	packet, reusable := queue.acquireBuffer(headerSize + len(payload))
@@ -1262,14 +1266,14 @@ func (s *Stack) tryWriteIPSocketPayloadForMTU(source, target netip.Addr, protoco
 	return s.tryWriteIPFragmentsLayout(source, target, protocol, payload, nil, layout)
 }
 
-// writeIPPayload atomically queues one best-effort protocol response or its
-// complete source-fragmented sequence without waiting for device capacity.
+// writeIPPayload queues one best-effort protocol response without waiting for
+// device capacity.
 func (s *Stack) writeIPPayload(source, target netip.Addr, protocol byte, payload []byte, allowFragment bool) error {
 	if _, routed := s.network.Load().routeFor(target); !routed {
 		return syscall.ENETUNREACH
 	}
 	fragmentation := sourceFragmentation{allow: allowFragment, dontFragment: !allowFragment}
-	return s.tryWriteIPPayloadForMTU(source, target, protocol, payload, fragmentation, ipPacketOptions{}, s.mtuFor(target))
+	return s.writeBestEffortIPPayloadForMTU(source, target, protocol, payload, fragmentation, ipPacketOptions{}, s.mtuFor(target))
 }
 
 // tryWriteIPFragmentsLayout streams a validated fragment layout directly into
@@ -1299,7 +1303,7 @@ func (s *Stack) tryWriteIPFragmentsLayout(source, target netip.Addr, protocol by
 		if len(packets) == 0 {
 			return syscall.EMSGSIZE
 		}
-		return s.tryWritePacketsTo(packets, queue, true)
+		return s.tryWriteLoopbackPackets(packets)
 	}
 	for offset, size, more, ok := ranges.next(); ok; offset, size, more, ok = ranges.next() {
 		slot, err := s.tryReservePacket(queue)

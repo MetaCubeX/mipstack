@@ -91,6 +91,13 @@ remains connection-owned: the scheduler only chooses among packets that a TCP
 actor has already made eligible. Local loopback delivery remains FIFO because
 it has no serialized external-link bottleneck.
 
+The link queue is finite. If `Stack.Read` stops, TCP retains protocol output until
+capacity returns while its actors remain responsive and stream writes continue
+to obey their send-buffer and deadline rules. UDP and IP socket writes instead
+make one immediate bounded admission attempt and apply the socket's
+`ReceiveErrors` policy when the queue is full. Best-effort control packets may
+be discarded, and `Stack.Write` itself does not wait for outbound capacity.
+
 For integration with userspace packet-device consumers, `Stack` also provides
 `MTU`, `Name`, and `BatchSize`. `LocalAddresses` returns an independent
 snapshot of every configured address in configuration order. Operating-system
@@ -583,8 +590,9 @@ terminal request actions report the same error.
 
 A detached UDP, IP, or ICMP responder permits repeated or concurrent reply
 operations while it is active or restricted to replies. An argument,
-forwarder, configuration, route, PMTU, queue, or stack error fails only that
-call and may be followed by another reply or, while active, a terminal action.
+forwarder, configuration, route, PMTU, or stack error fails only that call and
+may be followed by another reply or, while active, a terminal action. Local
+output queue pressure follows the best-effort policy described below.
 Concurrent calls have no ordering guarantee.
 
 `RestrictToReplies` irreversibly converts a responder returned by `Detach` to
@@ -618,17 +626,16 @@ caller-owned snapshot. Configuration changes remain dynamic and are reported
 by individual calls.
 
 Request-scoped `Reply` and every `Reject` action are nonblocking with respect to
-the outbound packet queue. They report `ErrResourceLimit` when capacity is
-unavailable; a fragmented reply reserves all required slots before publishing
-any fragment. TCP resets and ICMP errors generated automatically for unhandled
-local traffic follow the same best-effort policy but silently discard queue
-pressure. Ordinary UDP and IP sockets use the separate bounded-admission policy
-described below; they do not turn a stopped device reader into socket write
-backpressure.
+the outbound packet queue. They use best-effort link output: queue pressure may
+discard a packet or a suffix of a source-fragmented sequence sent to the
+external link without turning the action into an error. TCP resets and ICMP
+errors generated automatically for unhandled local traffic follow the same
+policy. Ordinary UDP and IP sockets use the bounded-admission policy described
+below; a stopped device reader never makes their writes wait.
 
 `ForwarderInfo.Pending` excludes caller-owned responders and handlers that
 continue running after selecting an action. `Accepted` counts created TCP/UDP
-endpoints, `Replies` counts successfully queued reply calls, and `ReplyErrors`
+endpoints, `Replies` counts completed best-effort reply calls, and `ReplyErrors`
 counts failed output attempts, including argument and packet validation
 failures. Calls rejected because a terminal action already completed the
 request or responder are lifecycle misuse rather than output attempts and do
@@ -726,7 +733,7 @@ uses the link MTU, leaves DF clear, and rejects an oversized local packet;
 ICMP PMTU updates for that socket, matching Linux. The zero value is `Dont` and
 preserves MIPS's fragmentable datagram default.
 
-Socket operation failures use `*net.OpError`. `errors.Is` continues to identify
+Socket operation failures use `*net.OpError`. `errors.Is` identifies
 `os.ErrDeadlineExceeded`, `net.ErrClosed`, and syscall errors. Orderly TCP EOF
 is returned directly as `io.EOF`, and destination-specific writes on connected
 UDP or IP sockets retain `net.ErrWriteToConnected`. Validated asynchronous ICMP
@@ -738,10 +745,10 @@ queue's approximate retained-memory capacity; payload, per-datagram metadata,
 and asynchronous errors share the bound. `IPConn` applies the same policy.
 `SetReceiveErrors(true)` reserves asynchronous ICMP errors for nonblocking
 `ReadError`; an empty error queue returns `EAGAIN`. With the default false
-setting, ordinary reads return queued errors after already queued payloads,
-preserving the original socket behavior. `ReceiveErrors` reports the current
-mode. It also selects the local-output policy: UDP and IP writes
-make one immediate bounded queue-admission attempt, report a full queue as
+setting, ordinary reads return queued errors after already queued payloads.
+`ReceiveErrors` reports the current mode and selects the local-output policy.
+UDP and IP writes make one immediate bounded queue-admission attempt, report a
+full queue as
 `ENOBUFS` when enabled, and otherwise treat that local link loss as a successful
 message write. They retain no per-socket transmit queue, so `SetWriteBuffer` is
 a validated no-op and a write deadline is checked only before the attempt.
@@ -752,9 +759,9 @@ errors and successful `MessageFlagErrorQueue` reads are consumed like Linux. A
 `MessageFlagErrorQueue` read never blocks and returns the quoted failed payload,
 the original destination in `Addr`, and a Linux `sock_extended_err` record in
 `OOB`.
-`MessageFlagDontWait` makes the first packet-queue read return `EAGAIN` instead
-of waiting. Writes are already nonblocking with respect to device capacity, so
-the flag is accepted without changing their admission result.
+`MessageFlagDontWait` makes the first batch read nonblocking. Writes are already
+nonblocking with respect to device capacity, so the flag is accepted without
+changing their admission result.
 `MessageFlagTruncated` requests the complete payload length and, along with
 `MessageFlagControlTruncated`, also reports output truncation. Source-fragmented
 external output publishes immediately available fragments in wire order; queue
@@ -806,13 +813,15 @@ from network loss.
 the accept and SYN backlogs, along with handshake, SYN-cookie, accept, timeout,
 and queue-drop counters. `UDPConn.Info` and `IPConn.Info` expose endpoint
 identity, queue occupancy, socket defaults, path MTU for connected sockets,
-and cumulative accepted, dropped, and transmitted datagram counters. Both
-also report the PMTU-discovery mode, explicit-error mode, queued error count and
-bytes, and errors dropped by the shared receive-buffer bound. They retain the
-latest correlated ICMP error while open; closing the socket releases that
-diagnostic state while preserving cumulative counters. An automatic `IPConn`
-Flow Label is reported as zero because raw payload fields may select a different
-flow on each write; fixed socket labels are reported directly.
+and cumulative receive, receive-drop, and successful socket-write counters.
+The write counters include default-policy writes affected by silent local
+link-queue loss. Both also report the PMTU-discovery mode, explicit-error mode,
+queued error count and bytes, and errors dropped by the shared receive-buffer
+bound. They retain the latest correlated ICMP error while open. Closing the
+socket releases that diagnostic state while preserving cumulative counters.
+An automatic `IPConn` Flow Label is reported as zero because raw payload fields
+may select a different flow on each write; fixed socket labels are reported
+directly.
 
 UDP message methods use the Linux 64-bit little-endian control-message layout
 on every host. `ReadMsgUDP` emits `IP_PKTINFO` or `IPV6_PKTINFO` for the local

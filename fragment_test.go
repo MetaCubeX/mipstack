@@ -1713,7 +1713,7 @@ func FuzzIPPayloadFragmentationRoundTrip(f *testing.F) {
 		if err != nil {
 			t.Fatalf("fragmentation of %d-byte payload at MTU %d: %v", len(payload), mtu, err)
 		}
-		packets := takeIPOutputPackets(&stack.loopback)
+		packets := takeIPOutputPackets(&stack.loopback.packetQueue)
 		if len(packets) == 0 {
 			t.Fatal("fragmentation returned no packets")
 		}

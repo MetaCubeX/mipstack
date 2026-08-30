@@ -6835,6 +6835,32 @@ func TestTCPConnectionResourceLimit(t *testing.T) {
 	if !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("DialTCP error = %v, want ErrResourceLimit", err)
 	}
+	acceptResult := make(chan error, 1)
+	forwarder, err := NewTCPForwarder(stack, TCPForwarderOptions{}, func(request *TCPForwarderRequest) {
+		connection, acceptErr := request.Accept(context.Background())
+		if connection != nil {
+			_ = connection.Close()
+		}
+		acceptResult <- acceptErr
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := buildTestTCP(remote, local, 55000, 443, 100, 0, TCPFlagSYN, 65535, nil, nil)
+	if err = writeTestPacket(stack, packet); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-acceptResult:
+		if !errors.Is(err, ErrResourceLimit) {
+			t.Fatalf("TCPForwarderRequest.Accept error = %v, want ErrResourceLimit", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TCPForwarderRequest.Accept did not report the connection limit")
+	}
+	if err = forwarder.Close(); err != nil {
+		t.Fatal(err)
+	}
 	stack.mu.Lock()
 	stack.tcp = make(map[tcpKey]*TCPConn)
 	stack.mu.Unlock()

@@ -162,7 +162,8 @@ type acceptQueueSocketOption socketOptionOverride[int]
 // synBacklogSocketOption stores one stateful TCP handshake limit.
 type synBacklogSocketOption socketOptionOverride[int]
 
-// receiveErrorsSocketOption stores one UDP or IP asynchronous-error policy.
+// receiveErrorsSocketOption stores one UDP or IP error-delivery and local-output
+// reporting policy.
 type receiveErrorsSocketOption socketOptionBoolOverride
 
 // pathMTUDiscoverySocketOption stores one UDP or IP PMTU-discovery policy.
@@ -626,13 +627,13 @@ func (SocketOptionFactory) ReceiveErrors(enabled bool) SocketOption {
 	return receiveErrorsSocketOption(newSocketOptionBoolOverride(enabled))
 }
 
-// UnsetReceiveErrors restores the current Stack asynchronous-error policy. It
-// is valid for every socket creation operation.
+// UnsetReceiveErrors restores the current Stack ReceiveErrors policy. It is
+// valid for every socket creation operation.
 func (SocketOptionFactory) UnsetReceiveErrors() SocketOption {
 	return receiveErrorsSocketOption(socketOptionBoolOverrideUnset)
 }
 
-// apply validates and applies one UDP or IP asynchronous-error override.
+// apply validates and applies one UDP or IP ReceiveErrors override.
 func (option receiveErrorsSocketOption) apply(set socketOptionSet, use socketOptionUse) (socketOptionSet, error) {
 	override := socketOptionBoolOverride(option)
 	if !override.valid() {

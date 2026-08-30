@@ -1580,14 +1580,14 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 	queue := &s.outbound
 	slot := externalSlot
 	if externalErr != nil || !external {
-		queue = &s.loopback
+		queue = &s.loopback.packetQueue
 		slot = localSlot
 	}
 	packet, reusable := queue.acquireBuffer(size)
 	if !marshal(packet) {
 		queue.releaseBuffer(packet, reusable)
 		queue.releaseReserved(slot)
-		if localReserved && queue != &s.loopback {
+		if localReserved && queue != &s.loopback.packetQueue {
 			s.loopback.releaseReserved(localSlot)
 		}
 		return syscall.EMSGSIZE
@@ -1642,7 +1642,7 @@ func (s *Stack) tryWriteNonUnicastPackets(packets [][]byte, external, loopback b
 		}
 	}
 	if loopback {
-		localErr := s.tryWritePacketsTo(packets, &s.loopback, true)
+		localErr := s.tryWriteLoopbackPackets(packets)
 		if localErr == ErrClosed {
 			return localErr
 		}

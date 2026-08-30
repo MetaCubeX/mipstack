@@ -512,7 +512,7 @@ func TestFullLoopbackQueueDoesNotBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stack.Close()
-	fillTestPacketQueue(t, &stack.loopback, []byte{0})
+	fillTestPacketQueue(t, &stack.loopback.packetQueue, []byte{0})
 	packet := buildIPPacket(local, local, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
 	if err = stack.tryWritePacket(packet); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("tryWritePacket to full loopback queue = %v, want ErrResourceLimit", err)
@@ -640,7 +640,7 @@ func TestPacketQueueDepartureWaiterFollowsExactGeneration(t *testing.T) {
 			stack := &Stack{}
 			queue := &stack.outbound
 			if test.loopback {
-				queue = &stack.loopback
+				queue = &stack.loopback.packetQueue
 			}
 			if test.fair {
 				queue.initFair(1, epoch, 1500, [16]byte{})
@@ -791,7 +791,7 @@ func TestPacketQueueReleaseDoesNotAllocateDepartureState(t *testing.T) {
 	}
 }
 
-func TestTryWritePacketsCloseBeforeBatchPublication(t *testing.T) {
+func TestTryWriteLoopbackPacketsCloseBeforeBatchPublication(t *testing.T) {
 	stack, err := New(Config{
 		LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/24")},
 		MTU:            1400,
@@ -804,14 +804,14 @@ func TestTryWritePacketsCloseBeforeBatchPublication(t *testing.T) {
 	}
 
 	packets := [][]byte{
-		buildIPPacket(netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("198.51.100.1"), 253, []byte{1}, 1, true),
-		buildIPPacket(netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("198.51.100.1"), 253, []byte{2}, 2, true),
+		buildIPPacket(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.1"), 253, []byte{1}, 1, true),
+		buildIPPacket(netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.1"), 253, []byte{2}, 2, true),
 	}
-	stack.outbound.batchMu.Lock()
+	stack.loopback.batchMu.Lock()
 	writeResult := make(chan error, 1)
 	go func() { writeResult <- stack.tryWritePackets(packets) }()
-	wantFree := cap(stack.outbound.free) - len(packets)
-	waitFor(t, time.Second, func() bool { return len(stack.outbound.free) == wantFree })
+	wantFree := cap(stack.loopback.free) - len(packets)
+	waitFor(t, time.Second, func() bool { return len(stack.loopback.free) == wantFree })
 
 	closeResult := make(chan error, 1)
 	go func() { closeResult <- stack.Close() }()
@@ -820,7 +820,7 @@ func TestTryWritePacketsCloseBeforeBatchPublication(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Close did not publish stack closure")
 	}
-	stack.outbound.batchMu.Unlock()
+	stack.loopback.batchMu.Unlock()
 
 	if err = <-writeResult; !errors.Is(err, ErrClosed) {
 		t.Fatalf("tryWritePackets during Close = %v, want ErrClosed", err)
@@ -828,10 +828,10 @@ func TestTryWritePacketsCloseBeforeBatchPublication(t *testing.T) {
 	if err = <-closeResult; err != nil {
 		t.Fatal(err)
 	}
-	if got := stack.outbound.len(); got != 0 {
+	if got := stack.loopback.len(); got != 0 {
 		t.Fatalf("closed batch exposed %d packets", got)
 	}
-	if got, want := len(stack.outbound.free), cap(stack.outbound.free); got != want {
+	if got, want := len(stack.loopback.free), cap(stack.loopback.free); got != want {
 		t.Fatalf("closed batch free slots = %d, want %d", got, want)
 	}
 }

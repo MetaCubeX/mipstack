@@ -311,7 +311,7 @@ type Config struct {
 type Stack struct {
 	network  atomic.Pointer[networkState]
 	outbound packetQueue
-	loopback packetQueue
+	loopback loopbackQueue
 
 	mu            sync.RWMutex
 	started       bool
@@ -1384,8 +1384,15 @@ type packetQueue struct {
 	epoch            time.Time
 	scheduler        *fairPacketScheduler
 	departureWaiters atomic.Pointer[packetQueueDepartureWaiters]
-	batchMu          sync.Mutex
 	closed           atomic.Bool
+}
+
+// loopbackQueue adds atomic multi-packet publication to the common packet
+// queue so the local reassembler never observes a capacity-truncated fragment
+// sequence.
+type loopbackQueue struct {
+	packetQueue
+	batchMu sync.Mutex
 }
 
 // monotonicStamp stores an exact monotonic duration relative to one stack
@@ -1545,7 +1552,7 @@ func (t packetQueueTicket) pending(stack *Stack) bool {
 	}
 	queue := &stack.outbound
 	if t.loopback() {
-		queue = &stack.loopback
+		queue = &stack.loopback.packetQueue
 	}
 	return t.pendingIn(queue)
 }
@@ -1577,7 +1584,7 @@ func (t packetQueueTicket) departureWaiter(stack *Stack, notify chan<- struct{})
 	}
 	queue := &stack.outbound
 	if t.loopback() {
-		queue = &stack.loopback
+		queue = &stack.loopback.packetQueue
 	}
 	slot := t.slot()
 	if int(slot) >= len(queue.slots) || !t.pendingIn(queue) {
@@ -1827,14 +1834,71 @@ func (q *packetQueue) completeDepartureWaiter(waiter *packetQueueDepartureWaiter
 }
 
 // close rejects future publications and discards all currently published
-// packets and reusable buffers. batchMu lets a previously admitted multi-packet
-// datagram finish publication before closure; ordinary single-packet publishers
-// racing closure discard themselves without making close wait.
+// packets and reusable buffers. A publisher racing closure discards its late
+// packet without making close wait.
 func (q *packetQueue) close() {
-	q.batchMu.Lock()
 	q.closed.Store(true)
 	q.discard()
+}
+
+// close serializes loopback shutdown with an already admitted packet sequence.
+func (q *loopbackQueue) close() {
+	q.batchMu.Lock()
+	q.packetQueue.close()
 	q.batchMu.Unlock()
+}
+
+// tryWritePackets atomically queues one complete packet sequence for local
+// delivery.
+func (q *loopbackQueue) tryWritePackets(packets [][]byte, closeCh <-chan struct{}) error {
+	if len(packets) == 0 {
+		return nil
+	}
+	select {
+	case <-closeCh:
+		return ErrClosed
+	default:
+	}
+	if len(packets) > cap(q.free) {
+		return ErrResourceLimit
+	}
+	slots := make([]uint16, len(packets))
+	reserved := 0
+	for ; reserved < len(slots); reserved++ {
+		slot, ok := q.tryReserve()
+		if !ok {
+			for _, acquired := range slots[:reserved] {
+				q.releaseReserved(acquired)
+			}
+			return ErrResourceLimit
+		}
+		slots[reserved] = slot
+	}
+	q.batchMu.Lock()
+	defer q.batchMu.Unlock()
+	select {
+	case <-closeCh:
+		for _, slot := range slots {
+			q.releaseReserved(slot)
+		}
+		return ErrClosed
+	default:
+	}
+	if q.closed.Load() {
+		for _, slot := range slots {
+			q.releaseReserved(slot)
+		}
+		return ErrClosed
+	}
+	for index, packet := range packets {
+		if !q.enqueueReservedPacket(slots[index], packet, false) {
+			for _, slot := range slots[index+1:] {
+				q.releaseReserved(slot)
+			}
+			return ErrClosed
+		}
+	}
+	return nil
 }
 
 // discard releases every packet and reusable buffer currently owned by q.
@@ -2937,8 +3001,9 @@ func (s *Stack) localEndpointFor(network string, remote, requested netip.AddrPor
 // TCP retains protocol work until capacity returns while its socket send-buffer
 // and deadline rules remain in force. UDP and IP writes make one immediate
 // admission attempt: local queue loss is successful by default and reports
-// ENOBUFS when ReceiveErrors is enabled. Best-effort control output may be
-// discarded. Resuming Read releases capacity for pending TCP work.
+// ENOBUFS when the socket's ReceiveErrors policy is enabled. Best-effort
+// control output may be discarded. Resuming Read releases capacity for pending
+// TCP work.
 //
 // Read may run concurrently with Write and with other Read calls. Each queued
 // packet is assigned to at most one call, but concurrent calls have no relative
@@ -3078,9 +3143,10 @@ func (s *Stack) tryReservePacket(queue *packetQueue) (uint16, error) {
 	}
 }
 
-// tryWritePackets atomically queues packets that all select the same output
-// queue. It reserves every required slot before publishing any packet, so a
-// fragmented datagram is either accepted in full or not emitted at all.
+// tryWritePackets queues packets that all select the same output queue. Link
+// output publishes the immediately available prefix in wire order. Loopback
+// retains all-or-none admission so the local reassembler cannot observe a
+// capacity-truncated sequence.
 func (s *Stack) tryWritePackets(packets [][]byte) error {
 	if len(packets) == 0 {
 		return nil
@@ -3089,61 +3155,39 @@ func (s *Stack) tryWritePackets(packets [][]byte) error {
 		return s.tryWritePacket(packets[0])
 	}
 	queue, loopback := s.outputQueue(packets[0])
-	return s.tryWritePacketsTo(packets, queue, loopback)
-}
-
-// tryWritePacketsTo atomically queues packets into one explicitly selected
-// output queue. It underpins nonblocking non-unicast output, where external
-// and local delivery are selected independently of the packet destination.
-func (s *Stack) tryWritePacketsTo(packets [][]byte, queue *packetQueue, loopback bool) error {
-	if len(packets) == 0 {
-		return nil
+	if loopback {
+		return s.tryWriteLoopbackPackets(packets)
 	}
 	select {
 	case <-s.closeCh:
 		return ErrClosed
 	default:
 	}
-	if len(packets) > cap(queue.free) {
-		return ErrResourceLimit
-	}
-	slots := make([]uint16, len(packets))
-	reserved := 0
-	for ; reserved < len(slots); reserved++ {
+	for _, packet := range packets {
 		slot, ok := queue.tryReserve()
 		if !ok {
-			for _, acquired := range slots[:reserved] {
-				queue.releaseReserved(acquired)
+			select {
+			case <-s.closeCh:
+				return ErrClosed
+			default:
+				return ErrResourceLimit
 			}
-			return ErrResourceLimit
 		}
-		slots[reserved] = slot
-	}
-	queue.batchMu.Lock()
-	defer queue.batchMu.Unlock()
-	select {
-	case <-s.closeCh:
-		for _, slot := range slots {
-			queue.releaseReserved(slot)
-		}
-		return ErrClosed
-	default:
-	}
-	if queue.closed.Load() {
-		for _, slot := range slots {
-			queue.releaseReserved(slot)
-		}
-		return ErrClosed
-	}
-	for index, packet := range packets {
-		if !queue.enqueueReservedPacket(slots[index], packet, false) {
-			for _, slot := range slots[index+1:] {
-				queue.releaseReserved(slot)
-			}
+		if !queue.enqueueReservedPacket(slot, packet, false) {
 			return ErrClosed
 		}
-		s.recordOutput(loopback)
+		s.recordOutput(false)
 	}
+	return nil
+}
+
+// tryWriteLoopbackPackets atomically publishes one complete local packet
+// sequence and records every successfully admitted packet.
+func (s *Stack) tryWriteLoopbackPackets(packets [][]byte) error {
+	if err := s.loopback.tryWritePackets(packets, s.closeCh); err != nil {
+		return err
+	}
+	s.stats.loopbackPackets.Add(uint64(len(packets)))
 	return nil
 }
 
@@ -3236,8 +3280,9 @@ func datagramLinkWriteError(err error, receiveErrors bool) error {
 }
 
 // datagramWriteNeedsCorrelation reports whether a validated unicast write may
-// produce a later ICMP quote. Resource exhaustion is included because a
-// fragmented write may have published a prefix before the queue became full.
+// produce a later ICMP quote. Resource exhaustion is included conservatively
+// because a fragmented write may have published a prefix before the queue
+// became full.
 func datagramWriteNeedsCorrelation(err error) bool {
 	return err == nil || err == ErrResourceLimit
 }
@@ -3451,7 +3496,7 @@ func (s *Stack) outputQueue(packet []byte) (*packetQueue, bool) {
 // validated destination address.
 func (s *Stack) outputQueueFor(destination netip.Addr) (*packetQueue, bool) {
 	if s.isLocal(destination) {
-		return &s.loopback, true
+		return &s.loopback.packetQueue, true
 	}
 	return &s.outbound, false
 }

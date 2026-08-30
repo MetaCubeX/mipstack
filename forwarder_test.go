@@ -1646,15 +1646,34 @@ func TestUDPForwarderRequestConcurrentReplyAndTerminalAction(t *testing.T) {
 }
 
 func TestForwarderOutputActionsDoNotBlockOnFullQueue(t *testing.T) {
-	awaitResourceLimit := func(t *testing.T, result <-chan error) {
+	awaitBestEffort := func(t *testing.T, stack *Stack, packet []byte, result <-chan error) {
 		t.Helper()
-		select {
-		case err := <-result:
-			if !errors.Is(err, ErrResourceLimit) {
-				t.Fatalf("full-queue action error = %v, want ErrResourceLimit", err)
+		writeResult := make(chan error, 1)
+		go func() { writeResult <- writeTestPacket(stack, packet) }()
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		actionResult := result
+		for actionResult != nil || writeResult != nil {
+			select {
+			case err := <-actionResult:
+				if err != nil {
+					t.Fatalf("full-queue best-effort action = %v", err)
+				}
+				actionResult = nil
+			case err := <-writeResult:
+				if err != nil {
+					t.Fatalf("full-queue Stack.Write error = %v", err)
+				}
+				writeResult = nil
+			case <-timer.C:
+				if actionResult != nil && writeResult != nil {
+					t.Fatal("full-queue action and Stack.Write blocked")
+				}
+				if actionResult != nil {
+					t.Fatal("full-queue action blocked")
+				}
+				t.Fatal("full-queue Stack.Write blocked")
 			}
-		case <-time.After(time.Second):
-			t.Fatal("full-queue action blocked")
 		}
 	}
 
@@ -1673,10 +1692,7 @@ func TestForwarderOutputActionsDoNotBlockOnFullQueue(t *testing.T) {
 		}
 		defer forwarder.Close()
 		packet := buildTestTCP(remote, target, 55001, 443, 100, 0, TCPFlagSYN, 65535, nil, nil)
-		if err = writeTestPacket(stack, packet); err != nil {
-			t.Fatal(err)
-		}
-		awaitResourceLimit(t, result)
+		awaitBestEffort(t, stack, packet, result)
 		if info := forwarder.Info(); info.Pending != 0 || info.Rejected != 1 {
 			t.Fatalf("full-queue TCP forwarder info = %+v", info)
 		}
@@ -1697,10 +1713,8 @@ func TestForwarderOutputActionsDoNotBlockOnFullQueue(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer forwarder.Close()
-		if err = writeTestPacket(stack, buildTestUDP(remote, target, 55002, 53, []byte("query"))); err != nil {
-			t.Fatal(err)
-		}
-		awaitResourceLimit(t, result)
+		packet := buildTestUDP(remote, target, 55002, 53, []byte("query"))
+		awaitBestEffort(t, stack, packet, result)
 	})
 
 	t.Run("UDP Reject", func(t *testing.T) {
@@ -1717,10 +1731,44 @@ func TestForwarderOutputActionsDoNotBlockOnFullQueue(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer forwarder.Close()
-		if err = writeTestPacket(stack, buildTestUDP(remote, target, 55003, 5353, []byte("reject"))); err != nil {
+		packet := buildTestUDP(remote, target, 55003, 5353, []byte("reject"))
+		awaitBestEffort(t, stack, packet, result)
+	})
+
+	t.Run("IP Reply", func(t *testing.T) {
+		owned := netip.MustParseAddr("192.0.2.110")
+		remote := netip.MustParseAddr("192.0.2.111")
+		target := netip.MustParseAddr("198.51.100.110")
+		stack := newForwarderTestStack(t, owned, true)
+		fillTestPacketQueue(t, &stack.outbound, []byte{0})
+		result := make(chan error, 1)
+		forwarder, err := NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+			result <- request.Reply([]byte("answer"))
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
-		awaitResourceLimit(t, result)
+		defer forwarder.Close()
+		packet := buildIPPacket(remote, target, 253, []byte("query"), 1, true)
+		awaitBestEffort(t, stack, packet, result)
+	})
+
+	t.Run("IP Reject", func(t *testing.T) {
+		owned := netip.MustParseAddr("192.0.2.112")
+		remote := netip.MustParseAddr("192.0.2.113")
+		target := netip.MustParseAddr("198.51.100.112")
+		stack := newForwarderTestStack(t, owned, true)
+		fillTestPacketQueue(t, &stack.outbound, []byte{0})
+		result := make(chan error, 1)
+		forwarder, err := NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
+			result <- request.Reject()
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer forwarder.Close()
+		packet := buildIPPacket(remote, target, 252, []byte("reject"), 1, true)
+		awaitBestEffort(t, stack, packet, result)
 	})
 
 	t.Run("ICMP Reply", func(t *testing.T) {
@@ -1742,10 +1790,29 @@ func TestForwarderOutputActionsDoNotBlockOnFullQueue(t *testing.T) {
 		icmp := make([]byte, 8)
 		icmp[0] = 8
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
+		packet := buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)
+		awaitBestEffort(t, stack, packet, result)
+	})
+
+	t.Run("ICMP ReplyEcho", func(t *testing.T) {
+		owned := netip.MustParseAddr("192.0.2.114")
+		remote := netip.MustParseAddr("192.0.2.115")
+		target := netip.MustParseAddr("198.51.100.114")
+		stack := newForwarderTestStack(t, owned, true)
+		fillTestPacketQueue(t, &stack.outbound, []byte{0})
+		result := make(chan error, 1)
+		forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+			result <- request.ReplyEcho()
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
-		awaitResourceLimit(t, result)
+		defer forwarder.Close()
+		icmp := make([]byte, 8)
+		icmp[0] = ICMPv4TypeEchoRequest
+		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
+		packet := buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)
+		awaitBestEffort(t, stack, packet, result)
 	})
 
 	t.Run("ICMP Reject", func(t *testing.T) {
@@ -1765,14 +1832,93 @@ func TestForwarderOutputActionsDoNotBlockOnFullQueue(t *testing.T) {
 		icmp := make([]byte, 8)
 		icmp[0] = 8
 		binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-		if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)); err != nil {
-			t.Fatal(err)
-		}
-		awaitResourceLimit(t, result)
+		packet := buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)
+		awaitBestEffort(t, stack, packet, result)
 	})
 }
 
-func TestUDPForwarderReplyReservesAllFragments(t *testing.T) {
+func TestTCPForwarderAcceptResumesAfterFullPacketQueue(t *testing.T) {
+	owned := netip.MustParseAddr("192.0.2.116")
+	remote := netip.MustParseAddr("192.0.2.117")
+	target := netip.MustParseAddr("198.51.100.116")
+	stack := newForwarderTestStack(t, owned, true)
+	fillTestPacketQueue(t, &stack.outbound, []byte{0})
+	type acceptResult struct {
+		connection *TCPConn
+		err        error
+	}
+	result := make(chan acceptResult, 1)
+	forwarder, err := NewTCPForwarder(stack, TCPForwarderOptions{}, func(request *TCPForwarderRequest) {
+		connection, acceptErr := request.Accept(context.Background())
+		result <- acceptResult{connection: connection, err: acceptErr}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	local := netip.AddrPortFrom(target, 443)
+	peer := netip.AddrPortFrom(remote, 55007)
+	writeResult := make(chan error, 1)
+	go func() {
+		writeResult <- writeTestPacket(stack, buildTestTCP(remote, target, peer.Port(), local.Port(), 100, 0, TCPFlagSYN, 65535, nil, nil))
+	}()
+	select {
+	case err = <-writeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stack.Write blocked in TCP forwarder")
+	}
+	key := tcpKey{local: local, remote: peer}
+	var connection *TCPConn
+	waitFor(t, time.Second, func() bool {
+		stack.mu.RLock()
+		connection = stack.tcp[key]
+		stack.mu.RUnlock()
+		return connection != nil
+	})
+	infoResult := make(chan TCPConnInfo, 1)
+	go func() { infoResult <- connection.Info() }()
+	select {
+	case info := <-infoResult:
+		if info.State != TCPStateSYNReceived || info.Retransmissions != 0 {
+			t.Fatalf("full-queue forwarded handshake info = %+v", info)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("full-queue forwarded handshake blocked diagnostics")
+	}
+
+	var synACK ipPacket
+	for attempts := cap(stack.outbound.free) + 1; attempts != 0; attempts-- {
+		packet := readOutboundPacket(t, stack)
+		parsed, valid := parseIPPacket(packet)
+		if valid && parsed.protocol == ProtocolTCP && len(parsed.payload) >= tcpHeaderSize && parsed.payload[13]&byte(TCPFlagSYN|TCPFlagACK) == byte(TCPFlagSYN|TCPFlagACK) {
+			synACK = parsed
+			break
+		}
+	}
+	if synACK.original == nil {
+		t.Fatal("forwarded SYN-ACK was not published after device capacity returned")
+	}
+	serverSequence := binary.BigEndian.Uint32(synACK.payload[4:8])
+	ack := buildTestTCP(remote, target, peer.Port(), local.Port(), 101, serverSequence+1, TCPFlagACK, 65535, nil, nil)
+	if err = writeTestPacket(stack, ack); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case accepted := <-result:
+		if accepted.err != nil || accepted.connection != connection {
+			t.Fatalf("forwarded Accept after capacity returned = %p, %v; want %p, nil", accepted.connection, accepted.err, connection)
+		}
+		_ = accepted.connection.SetLinger(0)
+		_ = accepted.connection.Close()
+	case <-time.After(time.Second):
+		t.Fatal("forwarded Accept did not complete after device capacity returned")
+	}
+}
+
+func TestUDPForwarderReplyPublishesAvailableFragments(t *testing.T) {
 	owned := netip.MustParseAddr("192.0.2.110")
 	remote := netip.MustParseAddr("192.0.2.111")
 	target := netip.MustParseAddr("198.51.100.110")
@@ -1796,11 +1942,11 @@ func TestUDPForwarderReplyReservesAllFragments(t *testing.T) {
 	if err = writeTestPacket(stack, buildTestUDP(remote, target, 55004, 5353, []byte("fragment"))); err != nil {
 		t.Fatal(err)
 	}
-	if err = <-result; !errors.Is(err, ErrResourceLimit) {
-		t.Fatalf("fragmented Reply with one slot = %v, want ErrResourceLimit", err)
+	if err = <-result; err != nil {
+		t.Fatalf("fragmented Reply with one slot = %v", err)
 	}
-	if got := stack.outbound.len(); got != before {
-		t.Fatalf("partial UDP fragments were queued: before=%d after=%d", before, got)
+	if got := stack.outbound.len(); got != before+1 {
+		t.Fatalf("best-effort UDP fragment prefix changed queue depth from %d to %d, want %d", before, got, before+1)
 	}
 }
 
@@ -2989,17 +3135,19 @@ func TestICMPForwarderReplyRejectsOversizedIPv6Error(t *testing.T) {
 	}
 }
 
-func TestICMPForwarderReplyIPPacketDFAndAtomicQueue(t *testing.T) {
+func TestICMPForwarderReplyIPPacketDFAndBestEffortQueue(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.158")
 	remote := netip.MustParseAddr("192.0.2.159")
 	target := netip.MustParseAddr("198.51.100.158")
 	for _, test := range []struct {
-		name string
-		fill bool
-		want error
+		name        string
+		fill        bool
+		want        error
+		queued      int
+		wantReplies uint64
 	}{
-		{"DF", false, syscall.EMSGSIZE},
-		{"queue", true, ErrResourceLimit},
+		{"DF", false, syscall.EMSGSIZE, 0, 0},
+		{"queue", true, nil, 1, 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			stack := newForwarderTestStack(t, local, true)
@@ -3026,17 +3174,30 @@ func TestICMPForwarderReplyIPPacketDFAndAtomicQueue(t *testing.T) {
 			defer forwarder.Close()
 			request := []byte{13, 0, 0, 0, 1, 2, 3, 4}
 			binary.BigEndian.PutUint16(request[2:4], checksum(request))
-			if err = writeTestPacket(stack, buildIPPacket(remote, target, ProtocolICMPv4, request, 1, true)); err != nil {
-				t.Fatal(err)
+			packet := buildIPPacket(remote, target, ProtocolICMPv4, request, 1, true)
+			writeResult := make(chan error, 1)
+			go func() { writeResult <- writeTestPacket(stack, packet) }()
+			select {
+			case err = <-result:
+				if !errors.Is(err, test.want) {
+					t.Fatalf("ReplyIPPacket = %v, want %v", err, test.want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("ReplyIPPacket blocked")
 			}
-			if err = <-result; !errors.Is(err, test.want) {
-				t.Fatalf("ReplyIPPacket = %v, want %v", err, test.want)
+			select {
+			case err = <-writeResult:
+				if err != nil {
+					t.Fatalf("Stack.Write after ReplyIPPacket = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Stack.Write blocked in ICMP forwarder")
 			}
-			if got := stack.outbound.len(); got != before {
-				t.Fatalf("failed ReplyIPPacket changed queue length %d -> %d", before, got)
+			if got := stack.outbound.len(); got != before+test.queued {
+				t.Fatalf("ReplyIPPacket changed queue length %d -> %d, want %d", before, got, before+test.queued)
 			}
-			if info := forwarder.Info(); info.Replies != 0 || info.ReplyErrors != 1 || info.Dropped != 0 {
-				t.Fatalf("dynamic ReplyIPPacket failure diagnostics = %+v", info)
+			if info := forwarder.Info(); info.Replies != test.wantReplies || info.ReplyErrors != 1-test.wantReplies || info.Dropped != 0 {
+				t.Fatalf("dynamic ReplyIPPacket diagnostics = %+v", info)
 			}
 		})
 	}
@@ -3490,8 +3651,18 @@ func TestUDPForwarderDetachedReplyCanRetry(t *testing.T) {
 	}
 	responder := <-detached
 	fillTestPacketQueue(t, &stack.outbound, []byte{0})
-	if _, err = responder.Reply([]byte("answer")); !errors.Is(err, ErrResourceLimit) {
-		t.Fatalf("full-queue detached UDP Reply = %v", err)
+	replyResult := make(chan error, 1)
+	go func() {
+		_, replyErr := responder.Reply([]byte("answer"))
+		replyResult <- replyErr
+	}()
+	select {
+	case err = <-replyResult:
+		if err != nil {
+			t.Fatalf("full-queue detached UDP Reply = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("full-queue detached UDP Reply blocked")
 	}
 	for {
 		entry, ok := stack.outbound.tryDequeue()
@@ -3514,12 +3685,12 @@ func TestUDPForwarderDetachedReplyCanRetry(t *testing.T) {
 	if _, err = responder.Reply([]byte("closed")); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Reply after detached UDP Drop = %v", err)
 	}
-	if info := forwarder.Info(); info.Replies != 1 || info.ReplyErrors != 1 || info.Dropped != 1 {
+	if info := forwarder.Info(); info.Replies != 2 || info.ReplyErrors != 0 || info.Dropped != 1 {
 		t.Fatalf("retried detached UDP forwarder info = %+v", info)
 	}
 }
 
-func TestUDPForwarderRequestReplyCanRetry(t *testing.T) {
+func TestUDPForwarderBestEffortReplyCanPrecedeAccept(t *testing.T) {
 	owned := netip.MustParseAddr("192.0.2.134")
 	remote := netip.MustParseAddr("192.0.2.135")
 	target := netip.MustParseAddr("198.51.100.134")
@@ -3549,7 +3720,7 @@ func TestUDPForwarderRequestReplyCanRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := <-results
-	if !errors.Is(result[0], ErrResourceLimit) {
+	if result[0] != nil {
 		t.Fatalf("full-queue request Reply = %v", result[0])
 	}
 	if result[1] != nil {
@@ -3558,8 +3729,8 @@ func TestUDPForwarderRequestReplyCanRetry(t *testing.T) {
 	if !errors.Is(result[2], ErrForwarderRequestCompleted) {
 		t.Fatalf("Reply request after Accept = %v", result[2])
 	}
-	if info := forwarder.Info(); info.Accepted != 1 || info.Replies != 0 || info.ReplyErrors != 1 || info.Dropped != 0 {
-		t.Fatalf("retried request UDP forwarder info = %+v", info)
+	if info := forwarder.Info(); info.Accepted != 1 || info.Replies != 1 || info.ReplyErrors != 0 || info.Dropped != 0 {
+		t.Fatalf("best-effort request UDP forwarder info = %+v", info)
 	}
 }
 

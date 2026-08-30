@@ -4556,8 +4556,10 @@ func (s *Stack) handleTCP(packet ipPacket, receivedAt time.Time, localDestinatio
 	return nil
 }
 
-// rejectTCPSegment emits the RFC 9293 response for one otherwise unhandled
-// segment. Incoming resets never elicit another reset.
+// rejectTCPSegment makes one best-effort attempt to emit the RFC 9293 response
+// for an otherwise unhandled segment. Incoming resets never elicit another
+// reset, and output capacity drops the response without becoming a caller
+// error.
 func (s *Stack) rejectTCPSegment(key tcpKey, segment tcpSegment) error {
 	if segment.flags&TCPFlagRST != 0 {
 		return nil
@@ -4586,7 +4588,11 @@ func (s *Stack) rejectTCPSegment(key tcpKey, segment tcpSegment) error {
 		}
 		flags |= TCPFlagACK
 	}
-	return s.tryWriteTCPControl(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, acknowledgement, flags, 0, nil, nil, s.mtuFor(key.remote.Addr()), 0, 0, 0, false)
+	err := s.tryWriteTCPControl(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, acknowledgement, flags, 0, nil, nil, s.mtuFor(key.remote.Addr()), 0, 0, 0, false)
+	if err == ErrResourceLimit {
+		return nil
+	}
+	return err
 }
 
 // acceptTCP creates and starts one forwarded passive connection after the
@@ -9156,9 +9162,11 @@ type tcpPublishedTransmission struct {
 	carriesCWR bool
 }
 
-// tcpOutputWindow bounds one actor turn to the queue capacity visible when its
-// first slot is acquired. It never retains a slot across an actor event, and
-// capacity returned later is left for the next selection turn.
+// tcpOutputWindow bounds one actor turn with a fixed slot-acquisition quota
+// derived when its first slot is acquired. It never retains a slot across an
+// actor event. The quota prevents concurrent dequeues from extending one turn
+// without bound; it does not identify which physical slots satisfy later
+// acquisitions.
 type tcpOutputWindow struct {
 	queue     *packetQueue
 	slot      uint16
@@ -9167,7 +9175,7 @@ type tcpOutputWindow struct {
 	loopback  bool
 }
 
-// newTCPOutputWindow creates a finite nonblocking output turn. A nonzero
+// newTCPOutputWindow creates a finite nonblocking output turn. A nonempty
 // reservation transfers a slot received by the actor select.
 func newTCPOutputWindow(reservation tcpOutputReservation) tcpOutputWindow {
 	var w tcpOutputWindow
@@ -9181,7 +9189,7 @@ func newTCPOutputWindow(reservation tcpOutputReservation) tcpOutputWindow {
 	return w
 }
 
-// reserve returns the next slot from this turn's finite capacity snapshot.
+// reserve returns the next slot permitted by this turn's fixed quota.
 func (w tcpOutputWindow) reserve(c *TCPConn) (tcpOutputReservation, tcpOutputWindow, bool) {
 	if w.first {
 		w.first = false
