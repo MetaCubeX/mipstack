@@ -207,8 +207,9 @@ const (
 	// MessageFlagTruncated is Linux MSG_TRUNC. ReadMsg and ReadBatch include it in
 	// the result flags when the supplied payload buffers were too small.
 	MessageFlagTruncated = 0x20
-	// MessageFlagDontWait is Linux MSG_DONTWAIT. Reads and writes return EAGAIN
-	// instead of waiting for queue state to change.
+	// MessageFlagDontWait is Linux MSG_DONTWAIT. Reads return EAGAIN instead of
+	// waiting. Datagram writes accept it for compatibility but already use
+	// immediate device-queue admission.
 	MessageFlagDontWait = 0x40
 	// MessageFlagErrorQueue is Linux MSG_ERRQUEUE. ReadBatch reads asynchronous
 	// network errors instead of ordinary payloads and never blocks.
@@ -221,7 +222,8 @@ type DatagramSocketDefaults struct {
 	// ReceiveBuffer is the approximate retained-memory receive capacity.
 	ReceiveBuffer int
 	// ReceiveErrors reserves asynchronous network errors for ReadError instead
-	// of returning them from ordinary reads after queued payloads.
+	// of returning them from ordinary reads after queued payloads. It also makes
+	// local output-queue exhaustion fail a UDP or IP write with ENOBUFS.
 	ReceiveErrors bool
 	// PathMTUDiscovery selects the Linux-compatible source-fragmentation and
 	// destination-PMTU policy. The zero value is PathMTUDiscoveryDont.
@@ -2930,6 +2932,13 @@ func (s *Stack) localEndpointFor(network string, remote, requested netip.AddrPor
 // call. Other errors likewise return the successfully completed packet prefix.
 // Close unblocks a waiting Read with os.ErrClosed.
 //
+// Outbound capacity is finite. If the embedding device stops calling Read,
+// TCP retains protocol work until capacity returns while its socket send-buffer
+// and deadline rules remain in force. UDP and IP writes make one immediate
+// admission attempt: local queue loss is successful by default and reports
+// ENOBUFS when ReceiveErrors is enabled. Best-effort control output may be
+// discarded. Resuming Read releases capacity for pending TCP work.
+//
 // Read may run concurrently with Write and with other Read calls. Each queued
 // packet is assigned to at most one call, but concurrent calls have no relative
 // completion order. Stack does not access the destination buffers after Read
@@ -3023,19 +3032,26 @@ func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 // tryWritePacket queues one already-built best-effort packet without waiting
 // for device space.
 func (s *Stack) tryWritePacket(packet []byte) error {
-	select {
-	case <-s.closeCh:
-		return ErrClosed
-	default:
-	}
 	queue, loopback := s.outputQueue(packet)
-	if !queue.tryEnqueue(packet) {
-		select {
-		case <-s.closeCh:
-			return ErrClosed
-		default:
-		}
-		return ErrResourceLimit
+	return s.tryWritePacketTo(packet, queue, loopback)
+}
+
+// tryWriteCompletePacket queues a caller-owned complete packet using an
+// independently selected route destination. Header-included sockets may route
+// through a send address that differs from the destination in the IP header.
+func (s *Stack) tryWriteCompletePacket(packet []byte, routeTarget netip.Addr) error {
+	queue, loopback := s.outputQueueFor(routeTarget)
+	return s.tryWritePacketTo(packet, queue, loopback)
+}
+
+// tryWritePacketTo publishes one packet to an already selected output queue.
+func (s *Stack) tryWritePacketTo(packet []byte, queue *packetQueue, loopback bool) error {
+	slot, err := s.tryReservePacket(queue)
+	if err != nil {
+		return err
+	}
+	if !queue.enqueueReservedPacket(slot, packet, false) {
+		return ErrClosed
 	}
 	s.recordOutput(loopback)
 	return nil
@@ -3130,54 +3146,17 @@ func (s *Stack) tryWritePacketsTo(packets [][]byte, queue *packetQueue, loopback
 	return nil
 }
 
-// writePacketUntil queues a packet while observing a socket's mutable write
-// deadline. The fast path allocates no timer when the packet queue has room.
-func (s *Stack) writePacketUntil(packet []byte, state socketWriteState) error {
-	queue, loopback := s.outputQueue(packet)
-	slot, err := s.reservePacketUntil(queue, loopback, state)
-	if err != nil {
-		return err
-	}
-	if !queue.enqueueReservedPacket(slot, packet, false) {
-		return ErrClosed
-	}
-	s.recordOutput(loopback)
-	return nil
-}
-
-// writeCompletePacketUntil queues a caller-owned complete packet using an
-// independently selected route destination. Header-included sockets may route
-// through a send address that differs from the destination in the IP header.
-func (s *Stack) writeCompletePacketUntil(packet []byte, routeTarget netip.Addr, state socketWriteState) error {
-	queue, loopback := s.outputQueueFor(routeTarget)
-	slot, err := s.reservePacketUntil(queue, loopback, state)
-	if err != nil {
-		return err
-	}
-	if !queue.enqueueReservedPacket(slot, packet, false) {
-		return ErrClosed
-	}
-	s.recordOutput(loopback)
-	return nil
-}
-
-// reservePacketUntil acquires one queue slot while observing a socket's
-// mutable write deadline. Callers must release the slot if packet construction
-// fails before publishing it.
-func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, state socketWriteState) (uint16, error) {
-	if err := state.err(); err != nil {
-		return 0, err
+// reservePacketUntil acquires one queue slot while observing connection and
+// Stack closure. Callers must release the slot if packet construction fails
+// before publication.
+func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, closed <-chan struct{}) (uint16, error) {
+	select {
+	case <-closed:
+		return 0, net.ErrClosed
+	default:
 	}
 	if slot, reserved := queue.tryReserve(); reserved {
 		return slot, nil
-	}
-	if state.dontWait {
-		select {
-		case <-s.closeCh:
-			return 0, ErrClosed
-		default:
-			return 0, syscall.EAGAIN
-		}
 	}
 	if loopback {
 		select {
@@ -3187,21 +3166,15 @@ func (s *Stack) reservePacketUntil(queue *packetQueue, loopback bool, state sock
 			return 0, ErrResourceLimit
 		}
 	}
-	var timeout <-chan struct{}
-	closed := state.closed
-	if state.datagram != nil {
-		timeout = state.datagram.writeDeadline.wait()
-		closed = state.datagram.closed
-	}
 	select {
 	case slot := <-queue.free:
-		if err := state.err(); err != nil {
+		select {
+		case <-closed:
 			queue.releaseReserved(slot)
-			return 0, err
+			return 0, net.ErrClosed
+		default:
 		}
 		return slot, nil
-	case <-timeout:
-		return 0, os.ErrDeadlineExceeded
 	case <-closed:
 		return 0, net.ErrClosed
 	case <-s.closeCh:
@@ -3259,12 +3232,49 @@ type datagramSocketDeadlineState struct {
 }
 
 // datagramSocketWriteControl groups the close signal and mutable write
-// deadline observed by a blocked UDP or raw IP output operation. Embedding it
-// in each datagram socket keeps socketWriteState compact without adding an
-// allocation or indirection to the socket's ordinary deadline methods.
+// deadline checked before an immediate UDP or raw IP device-admission attempt.
+// Embedding it avoids an allocation or indirection in deadline methods.
 type datagramSocketWriteControl struct {
 	closed        chan struct{}
 	writeDeadline datagramSocketDeadline
+}
+
+// writeError reports an already-observable close before a deadline. Datagram
+// output never waits for device capacity, but an expired deadline retains the
+// standard net error precedence before an admission attempt starts.
+func (c *datagramSocketWriteControl) writeError() error {
+	select {
+	case <-c.closed:
+		return net.ErrClosed
+	default:
+	}
+	select {
+	case <-c.writeDeadline.channel():
+		return os.ErrDeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+// datagramLinkWriteError applies the local device-queue policy at the socket
+// boundary. A datagram accepted by the socket may be lost at the link without
+// changing its successful message-oriented write result. Extended-error mode
+// instead exposes local queue exhaustion as Linux ENOBUFS.
+func datagramLinkWriteError(err error, receiveErrors bool) error {
+	if err != ErrResourceLimit {
+		return err
+	}
+	if receiveErrors {
+		return syscall.ENOBUFS
+	}
+	return nil
+}
+
+// datagramWriteNeedsCorrelation reports whether a validated unicast write may
+// produce a later ICMP quote. Resource exhaustion is included because a
+// fragmented write may have published a prefix before the queue became full.
+func datagramWriteNeedsCorrelation(err error) bool {
+	return err == nil || err == ErrResourceLimit
 }
 
 // stoppedDatagramSocketDeadline is the shared terminal state installed during
@@ -3413,38 +3423,6 @@ func (d *socketDeadline) stopLocked() {
 		d.timer.Stop()
 		d.timer = nil
 	}
-}
-
-// socketWriteState carries the two independent events that can interrupt a
-// write blocked on the stack's bounded packet queue.
-type socketWriteState struct {
-	datagram *datagramSocketWriteControl
-	closed   <-chan struct{}
-	dontWait bool
-}
-
-// err reports an already-observable close before a deadline, matching socket
-// methods that reject operations after Close even when a deadline also fired.
-func (s socketWriteState) err() error {
-	if s.datagram != nil {
-		select {
-		case <-s.datagram.closed:
-			return net.ErrClosed
-		default:
-		}
-		select {
-		case <-s.datagram.writeDeadline.channel():
-			return os.ErrDeadlineExceeded
-		default:
-		}
-		return nil
-	}
-	select {
-	case <-s.closed:
-		return net.ErrClosed
-	default:
-	}
-	return nil
 }
 
 // ownedTimer is a reusable timer consumed by exactly one actor goroutine. Its

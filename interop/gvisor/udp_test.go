@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -95,6 +97,118 @@ func TestUDPConnectedWriteBatchInterop(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestUDPStoppedDeviceReadInterop verifies that a stopped embedding reader
+// cannot block UDP socket writes and that ordinary communication resumes after
+// bounded link-queue pressure clears at a real gVisor endpoint.
+func TestUDPStoppedDeviceReadInterop(t *testing.T) {
+	family := interopFamilies[0]
+	bridgeStopped := make(chan struct{})
+	releaseBridge := make(chan struct{})
+	var stopOnce, releaseOnce sync.Once
+	network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+		families: []interopFamily{family}, mtu: 1500,
+		mipstackToGVisor: func([]byte) bool {
+			stopOnce.Do(func() {
+				close(bridgeStopped)
+				<-releaseBridge
+			})
+			return true
+		},
+	})
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseBridge) }) })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	connected, peer := openUDPPair(t, ctx, network, family, true)
+	defer connected.Close()
+	defer peer.Close()
+	udpConnection := connected.(*mipstack.UDPConn)
+	if err := udpConnection.SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
+	if written, err := udpConnection.Write([]byte("bridge-stop")); err != nil || written != len("bridge-stop") {
+		t.Fatalf("write bridge-stop datagram: n=%d, error=%v", written, err)
+	}
+	select {
+	case <-bridgeStopped:
+	case <-ctx.Done():
+		t.Fatal("mipstack output bridge did not stop")
+	}
+
+	type saturationResult struct {
+		admitted int
+		err      error
+	}
+	saturated := make(chan saturationResult, 1)
+	go func() {
+		payload := []byte("queue-pressure")
+		for admitted := 0; admitted < 2048; admitted++ {
+			if written, err := udpConnection.Write(payload); err != nil {
+				saturated <- saturationResult{admitted: admitted, err: err}
+				return
+			} else if written != len(payload) {
+				saturated <- saturationResult{admitted: admitted, err: fmt.Errorf("short UDP write: %d", written)}
+				return
+			}
+		}
+		saturated <- saturationResult{admitted: 2048, err: errors.New("device queue did not saturate")}
+	}()
+	select {
+	case result := <-saturated:
+		if result.admitted < 128 || !errors.Is(result.err, syscall.ENOBUFS) {
+			t.Fatalf("stopped-read saturation = %d admitted, %v", result.admitted, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		releaseOnce.Do(func() { close(releaseBridge) })
+		t.Fatal("UDP writes blocked while Stack.Read was stopped")
+	}
+
+	recovered := make(chan error, 1)
+	go func() {
+		buffer := make([]byte, 64)
+		if err := peer.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			recovered <- err
+			return
+		}
+		for {
+			read, _, err := peer.ReadFrom(buffer)
+			if err != nil {
+				recovered <- err
+				return
+			}
+			if string(buffer[:read]) == "after-recovery" {
+				recovered <- nil
+				return
+			}
+		}
+	}()
+	releaseOnce.Do(func() { close(releaseBridge) })
+	for {
+		written, err := udpConnection.Write([]byte("after-recovery"))
+		if err == nil {
+			if written != len("after-recovery") {
+				t.Fatalf("recovery UDP write = %d bytes", written)
+			}
+			break
+		}
+		if !errors.Is(err, syscall.ENOBUFS) {
+			t.Fatalf("recovery UDP write: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("device queue did not recover")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	select {
+	case err := <-recovered:
+		if err != nil {
+			t.Fatalf("read recovered gVisor UDP endpoint: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("gVisor did not receive UDP after device-read recovery")
 	}
 }
 

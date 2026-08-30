@@ -2634,7 +2634,10 @@ func TestNewQueriesFollowActiveCompatibilityMode(t *testing.T) {
 	})
 }
 
-func TestCompatibilityChangeCancelsBlockedReportGeneration(t *testing.T) {
+// TestCompatibilityChangeReplacesDroppedReportGeneration verifies that a
+// report discarded under device pressure cannot make a later compatibility
+// change emit the obsolete report form after capacity returns.
+func TestCompatibilityChangeReplacesDroppedReportGeneration(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.117")
 	querier := netip.MustParseAddr("192.0.2.118")
 	group := netip.MustParseAddr("239.117.0.1")
@@ -2666,7 +2669,7 @@ func TestCompatibilityChangeCancelsBlockedReportGeneration(t *testing.T) {
 	}
 }
 
-func TestNonblockingFragmentedNonUnicastCopiesAreAtomic(t *testing.T) {
+func TestFragmentedNonUnicastLocalCopiesAreAtomic(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.119")
 	remote := netip.MustParseAddr("198.51.100.119")
 	// Keep the stack inactive so its loopback worker cannot consume the dummy
@@ -2687,7 +2690,7 @@ func TestNonblockingFragmentedNonUnicastCopiesAreAtomic(t *testing.T) {
 		}
 	}
 	beforeLocal := stack.loopback.len()
-	if err := stack.writeNonUnicastPacketsUntil(packets, true, true, socketWriteState{dontWait: true}); err != nil {
+	if err := stack.tryWriteNonUnicastPackets(packets, true, true); err != nil {
 		t.Fatalf("external non-unicast write with full local copy queue: %v", err)
 	}
 	if after := stack.loopback.len(); after != beforeLocal {
@@ -2703,11 +2706,46 @@ func TestNonblockingFragmentedNonUnicastCopiesAreAtomic(t *testing.T) {
 		}
 		stack.outbound.release(entry)
 	}
-	if err := stack.writeNonUnicastPacketsUntil(packets, false, true, socketWriteState{dontWait: true}); err != nil {
+	for stack.outbound.len() < outboundPacketQueue-1 {
+		if !stack.outbound.tryEnqueue(dummy) {
+			t.Fatal("outbound queue filled before the expected boundary")
+		}
+	}
+	beforeExternal := stack.outbound.len()
+	if err := stack.tryWriteNonUnicastPackets(packets, true, true); !errors.Is(err, ErrResourceLimit) {
+		t.Fatalf("capacity-truncated external non-unicast write = %v, want ErrResourceLimit", err)
+	}
+	if after := stack.outbound.len(); after != beforeExternal+1 {
+		t.Fatalf("external fragment prefix changed queue depth from %d to %d, want %d", beforeExternal, after, beforeExternal+1)
+	}
+	if after := stack.loopback.len(); after != beforeLocal {
+		t.Fatalf("capacity-truncated local copy changed queue depth from %d to %d", beforeLocal, after)
+	}
+	if err := stack.tryWriteNonUnicastPackets(packets, false, true); err != nil {
 		t.Fatalf("local-only non-unicast write with full queue: %v", err)
 	}
 	if after := stack.loopback.len(); after != beforeLocal {
 		t.Fatalf("local-only fragment failure changed queue depth from %d to %d", beforeLocal, after)
+	}
+
+	for {
+		entry, ok := stack.outbound.tryDequeue()
+		if !ok {
+			break
+		}
+		stack.outbound.release(entry)
+	}
+	// Model Close winning after external publication but before the local copy
+	// is admitted. Queue closure must not be hidden by successful link output.
+	stack.loopback.close()
+	if err := stack.tryWriteNonUnicastPacket(len(dummy), true, true, func(packet []byte) bool {
+		copy(packet, dummy)
+		return true
+	}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("external packet with closed local queue = %v, want ErrClosed", err)
+	}
+	if err := stack.tryWriteNonUnicastPackets(packets, true, true); !errors.Is(err, ErrClosed) {
+		t.Fatalf("external write with closed local queue = %v, want ErrClosed", err)
 	}
 }
 

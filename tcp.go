@@ -9305,8 +9305,7 @@ func (c *TCPConn) prepareTCPOutputBlocking(sequence, acknowledgement uint32, fla
 		queue, loopback := c.stack.outputQueueFor(c.key.remote.Addr())
 		// A graceful Close deliberately leaves protocol output active so already
 		// accepted bytes and FIN can still be transmitted; only abort cancels it.
-		state := socketWriteState{closed: c.abortCh}
-		slot, reserveErr := c.stack.reservePacketUntil(queue, loopback, state)
+		slot, reserveErr := c.stack.reservePacketUntil(queue, loopback, c.abortCh)
 		if reserveErr != nil {
 			if errors.Is(reserveErr, net.ErrClosed) {
 				select {

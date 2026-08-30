@@ -286,8 +286,8 @@ func (option flowLabelSocketOption) apply(set socketOptionSet, use socketOptionU
 
 // WriteBuffer fixes the send-buffer capacity of a newly created TCP
 // connection and disables send auto-tuning for that connection. It is not a
-// UDP or IP option because those protocols synchronously hand writes to the
-// stack output queue and retain no per-socket send buffer.
+// UDP or IP option because those protocols make one immediate attempt to admit
+// output to a bounded stack queue and retain no per-socket send buffer.
 //
 // It is valid for ListenConfig.ListenTCP, Dialer.DialTCP, and
 // TCPForwarderRequest.Accept.
@@ -618,8 +618,9 @@ func (option synBacklogSocketOption) apply(set socketOptionSet, use socketOption
 
 // ReceiveErrors controls whether newly created UDP and IP sockets reserve
 // asynchronous errors for ReadError instead of returning them from ordinary
-// reads after queued payloads. It is valid for the UDP and IP creation methods
-// on ListenConfig and Dialer, and for UDPForwarderRequest.Accept and
+// reads after queued payloads. It also makes local output-queue exhaustion fail
+// writes with ENOBUFS. It is valid for the UDP and IP creation methods on
+// ListenConfig and Dialer, and for UDPForwarderRequest.Accept and
 // UDPForwarderRequest.Listen.
 func (SocketOptionFactory) ReceiveErrors(enabled bool) SocketOption {
 	return receiveErrorsSocketOption(newSocketOptionBoolOverride(enabled))

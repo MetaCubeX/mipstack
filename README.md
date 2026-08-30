@@ -622,8 +622,9 @@ the outbound packet queue. They report `ErrResourceLimit` when capacity is
 unavailable; a fragmented reply reserves all required slots before publishing
 any fragment. TCP resets and ICMP errors generated automatically for unhandled
 local traffic follow the same best-effort policy but silently discard queue
-pressure. Applications that need ordinary UDP write backpressure should use
-`Accept` or `Listen`, retain the returned `UDPConn`, and set a write deadline.
+pressure. Ordinary UDP and IP sockets use the separate bounded-admission policy
+described below; they do not turn a stopped device reader into socket write
+backpressure.
 
 `ForwarderInfo.Pending` excludes caller-owned responders and handlers that
 continue running after selecting an action. `Accepted` counts created TCP/UDP
@@ -739,8 +740,11 @@ and asynchronous errors share the bound. `IPConn` applies the same policy.
 `ReadError`; an empty error queue returns `EAGAIN`. With the default false
 setting, ordinary reads return queued errors after already queued payloads,
 preserving the original socket behavior. `ReceiveErrors` reports the current
-mode. UDP and IP writes are synchronous with packet delivery to the embedding
-device, so `SetWriteBuffer` is a validated no-op.
+mode. It also selects the local-output policy: UDP and IP writes
+make one immediate bounded queue-admission attempt, report a full queue as
+`ENOBUFS` when enabled, and otherwise treat that local link loss as a successful
+message write. They retain no per-socket transmit queue, so `SetWriteBuffer` is
+a validated no-op and a write deadline is checked only before the attempt.
 
 UDP and IP `ReadBatch`/`WriteBatch` also accept Linux-compatible message flags.
 `MessageFlagPeek` preserves an ordinary queued payload, while pending socket
@@ -748,12 +752,15 @@ errors and successful `MessageFlagErrorQueue` reads are consumed like Linux. A
 `MessageFlagErrorQueue` read never blocks and returns the quoted failed payload,
 the original destination in `Addr`, and a Linux `sock_extended_err` record in
 `OOB`.
-`MessageFlagDontWait` makes packet-queue reads and writes return `EAGAIN`
-instead of waiting. `MessageFlagTruncated` requests the complete payload length
-and, along with `MessageFlagControlTruncated`, also reports output truncation.
-Nonblocking fragmented output reserves the complete fragment set before
-publishing it, so a failed send cannot leave a partial datagram on the link or
-loopback path.
+`MessageFlagDontWait` makes the first packet-queue read return `EAGAIN` instead
+of waiting. Writes are already nonblocking with respect to device capacity, so
+the flag is accepted without changing their admission result.
+`MessageFlagTruncated` requests the complete payload length and, along with
+`MessageFlagControlTruncated`, also reports output truncation. Source-fragmented
+external output publishes immediately available fragments in wire order; queue
+exhaustion can therefore leave a prefix on the link, like ordinary packet loss.
+Local loopback fragment output remains all-or-nothing so its reassembler never
+receives a capacity-truncated datagram.
 
 `SocketErrorControlMessage.Parse` finds one Linux `sock_extended_err` record in
 a possibly compound OOB buffer. `MarshalBinary` and `AppendBinary` encode the

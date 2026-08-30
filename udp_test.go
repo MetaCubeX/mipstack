@@ -509,37 +509,84 @@ func TestUDPBatchWrite(t *testing.T) {
 	}
 }
 
-func TestUDPNonblockingFragmentedWriteIsAtomic(t *testing.T) {
-	local := netip.MustParseAddr("192.0.2.237")
-	remote := netip.MustParseAddrPort("198.51.100.237:5353")
-	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 600})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = stack.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer stack.Close()
-	packetConnection, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(local, 5341))
-	if err != nil {
-		t.Fatal(err)
-	}
-	connection := packetConnection.(*UDPConn)
-	defer connection.Close()
+func TestUDPFragmentedWriteQueueExhaustionPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		flags         int
+		receiveErrors bool
+	}{
+		{name: "default"},
+		{name: "default/dontwait", flags: MessageFlagDontWait},
+		{name: "receive-errors", receiveErrors: true},
+		{name: "receive-errors/dontwait", flags: MessageFlagDontWait, receiveErrors: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			local := netip.MustParseAddr("192.0.2.237")
+			remote := netip.MustParseAddrPort("198.51.100.237:5353")
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 600})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			packetConnection, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(local, 5341))
+			if err != nil {
+				t.Fatal(err)
+			}
+			connection := packetConnection.(*UDPConn)
+			defer connection.Close()
+			if err = connection.SetReceiveErrors(test.receiveErrors); err != nil {
+				t.Fatal(err)
+			}
 
-	dummy := buildIPPacket(local, remote.Addr(), ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
-	for stack.outbound.len() < outboundPacketQueue-1 {
-		if !stack.outbound.tryEnqueue(dummy) {
-			t.Fatal("outbound queue filled before the expected boundary")
-		}
-	}
-	before := stack.outbound.len()
-	message := []SocketMessage{{Buffers: [][]byte{bytes.Repeat([]byte{0x71}, 1200)}, Addr: net.UDPAddrFromAddrPort(remote)}}
-	if count, writeErr := connection.WriteBatch(message, MessageFlagDontWait); count != 0 || !errors.Is(writeErr, syscall.EAGAIN) {
-		t.Fatalf("nonblocking fragmented write = %d, %v", count, writeErr)
-	}
-	if after := stack.outbound.len(); after != before {
-		t.Fatalf("failed fragmented write changed queue depth from %d to %d", before, after)
+			dummy := buildIPPacket(local, remote.Addr(), ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
+			for stack.outbound.len() < outboundPacketQueue-1 {
+				if !stack.outbound.tryEnqueue(dummy) {
+					t.Fatal("outbound queue filled before the expected boundary")
+				}
+			}
+			before := stack.outbound.len()
+			payload := bytes.Repeat([]byte{0x71}, 1200)
+			message := []SocketMessage{{Buffers: [][]byte{payload}, Addr: net.UDPAddrFromAddrPort(remote)}}
+			count, writeErr := connection.WriteBatch(message, test.flags)
+			if test.receiveErrors {
+				if count != 0 || !errors.Is(writeErr, syscall.ENOBUFS) || message[0].N != 0 {
+					t.Fatalf("fragmented WriteBatch = %d, %v, N=%d; want 0, ENOBUFS, 0", count, writeErr, message[0].N)
+				}
+				if info := connection.Info(); info.PacketsSent != 0 || info.BytesSent != 0 {
+					t.Fatalf("failed fragmented write statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
+				}
+			} else {
+				if count != 1 || writeErr != nil || message[0].N != len(payload) {
+					t.Fatalf("fragmented WriteBatch = %d, %v, N=%d", count, writeErr, message[0].N)
+				}
+				if info := connection.Info(); info.PacketsSent != 1 || info.BytesSent != uint64(len(payload)) {
+					t.Fatalf("successful fragmented write statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
+				}
+			}
+			if after := stack.outbound.len(); after != before+1 {
+				t.Fatalf("fragmented write changed queue depth from %d to %d, want %d", before, after, before+1)
+			}
+			fragments := 0
+			for {
+				entry, ok := stack.outbound.tryDequeue()
+				if !ok {
+					break
+				}
+				if len(entry.packet) >= 20 && entry.packet[9] == ProtocolUDP && binary.BigEndian.Uint16(entry.packet[6:8])&0x2000 != 0 {
+					fragments++
+				}
+				stack.outbound.release(entry)
+			}
+			if fragments != 1 {
+				t.Fatalf("published fragment prefix = %d packets, want 1", fragments)
+			}
+			if !connection.acceptsError(remote) {
+				t.Fatal("fragment prefix did not retain ICMP correlation")
+			}
+		})
 	}
 }
 
@@ -888,7 +935,7 @@ func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
 					stack.outbound.release(entry)
 				}
 			}
-			if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, sourceFragmentation{allow: true}, 1280, false); err != nil {
+			if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, sourceFragmentation{allow: true}, 1280); err != nil {
 				b.Fatal(err)
 			}
 			drain()
@@ -896,7 +943,7 @@ func BenchmarkUDPFragmentedDatagramOutput(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
-				if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, sourceFragmentation{allow: true}, 1280, false); err != nil {
+				if err = connection.writeDatagramForMTU(test.source, test.target, 49152, 5353, payload, ipPacketOptions{}, sourceFragmentation{allow: true}, 1280); err != nil {
 					b.Fatal(err)
 				}
 				drain()
@@ -1084,49 +1131,6 @@ func TestConnectedUDP(t *testing.T) {
 				t.Fatalf("spoof-filter Read error = %v", err)
 			}
 		})
-	}
-}
-
-// TestUDPWriteDeadlineInterruptsFullQueue verifies that changing a deadline
-// wakes a WriteTo already blocked on the packet-device queue.
-func TestUDPWriteDeadlineInterruptsFullQueue(t *testing.T) {
-	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")}, MTU: 1400})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stack.Close()
-	if err = stack.Start(); err != nil {
-		t.Fatal(err)
-	}
-	connection, err := stack.ListenUDP(context.Background(), `udp`, wildcardUDP(netip.MustParseAddr("192.0.2.2")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.Close()
-	fillTestPacketQueue(t, &stack.outbound, []byte{0})
-	if err = connection.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	target := netip.MustParseAddrPort("192.0.2.2:53")
-	done := make(chan error, 1)
-	go func() {
-		_, writeErr := connection.WriteTo([]byte("query"), net.UDPAddrFromAddrPort(target))
-		done <- writeErr
-	}()
-	time.Sleep(20 * time.Millisecond)
-	if err = connection.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err = <-done:
-		if !errors.Is(err, os.ErrDeadlineExceeded) {
-			t.Fatalf("WriteTo error = %v, want os.ErrDeadlineExceeded", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("WriteTo did not observe changed deadline")
-	}
-	if connection.(*UDPConn).acceptsError(target) {
-		t.Fatal("failed UDP write retained an ICMP correlation target")
 	}
 }
 

@@ -1846,6 +1846,155 @@ func TestIPBatchWriteFragmentedBuffers(t *testing.T) {
 	}
 }
 
+func TestIPFragmentedWriteQueueExhaustionPolicy(t *testing.T) {
+	for _, family := range []struct {
+		name          string
+		network       string
+		local, remote netip.Addr
+		mtu           uint32
+		payloadSize   int
+	}{
+		{name: "IPv4", network: "ip4:99", local: netip.MustParseAddr("192.0.2.238"), remote: netip.MustParseAddr("198.51.100.238"), mtu: 600, payloadSize: 1200},
+		{name: "IPv6", network: "ip6:99", local: netip.MustParseAddr("2001:db8::238"), remote: netip.MustParseAddr("2001:db8:1::238"), mtu: 1280, payloadSize: 2600},
+	} {
+		for _, policy := range []struct {
+			name          string
+			flags         int
+			receiveErrors bool
+		}{
+			{name: "default"},
+			{name: "default/dontwait", flags: MessageFlagDontWait},
+			{name: "receive-errors", receiveErrors: true},
+			{name: "receive-errors/dontwait", flags: MessageFlagDontWait, receiveErrors: true},
+		} {
+			t.Run(family.name+"/"+policy.name, func(t *testing.T) {
+				stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(family.local, family.local.BitLen())}, MTU: family.mtu})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = stack.Start(); err != nil {
+					t.Fatal(err)
+				}
+				defer stack.Close()
+				netConnection, err := stack.DialIP(context.Background(), family.network, family.local, family.remote)
+				if err != nil {
+					t.Fatal(err)
+				}
+				connection := netConnection.(*IPConn)
+				defer connection.Close()
+				if err = connection.SetReceiveErrors(policy.receiveErrors); err != nil {
+					t.Fatal(err)
+				}
+
+				dummy := buildIPPacket(family.local, family.remote, 98, []byte{0}, 1, false)
+				for stack.outbound.len() < outboundPacketQueue-1 {
+					if !stack.outbound.tryEnqueue(dummy) {
+						t.Fatal("outbound queue filled before the expected boundary")
+					}
+				}
+				before := stack.outbound.len()
+				payload := bytes.Repeat([]byte{0x72}, family.payloadSize)
+				messages := []SocketMessage{{Buffers: [][]byte{payload[:37], payload[37:]}}}
+				count, writeErr := connection.WriteBatch(messages, policy.flags)
+				if policy.receiveErrors {
+					if count != 0 || !errors.Is(writeErr, syscall.ENOBUFS) || messages[0].N != 0 {
+						t.Fatalf("fragmented IP WriteBatch = %d, %v, N=%d; want 0, ENOBUFS, 0", count, writeErr, messages[0].N)
+					}
+					if info := connection.Info(); info.PacketsSent != 0 || info.BytesSent != 0 {
+						t.Fatalf("failed fragmented IP statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
+					}
+				} else {
+					if count != 1 || writeErr != nil || messages[0].N != len(payload) {
+						t.Fatalf("fragmented IP WriteBatch = %d, %v, N=%d", count, writeErr, messages[0].N)
+					}
+					if info := connection.Info(); info.PacketsSent != 1 || info.BytesSent != uint64(len(payload)) {
+						t.Fatalf("successful fragmented IP statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
+					}
+				}
+				if after := stack.outbound.len(); after != before+1 {
+					t.Fatalf("fragmented IP write changed queue depth from %d to %d, want %d", before, after, before+1)
+				}
+				if !connection.acceptsError(family.remote) {
+					t.Fatal("fragment prefix did not retain ICMP correlation")
+				}
+				fragments := 0
+				for {
+					entry, ok := stack.outbound.tryDequeue()
+					if !ok {
+						break
+					}
+					packet, parseErr := ParseIPPacket(entry.packet)
+					if parseErr == nil && packet.Source == family.local && packet.Destination == family.remote {
+						if fragment, fragmented := packet.Fragment(); fragmented && fragment.Protocol == 99 {
+							fragments++
+						}
+					}
+					stack.outbound.release(entry)
+				}
+				if fragments != 1 {
+					t.Fatalf("published IP fragment prefix = %d packets, want 1", fragments)
+				}
+			})
+		}
+	}
+}
+
+func TestIPHeaderIncludedWriteQueueExhaustionPolicy(t *testing.T) {
+	for _, policy := range []struct {
+		name          string
+		flags         int
+		receiveErrors bool
+	}{
+		{name: "default"},
+		{name: "default/dontwait", flags: MessageFlagDontWait},
+		{name: "receive-errors", receiveErrors: true},
+		{name: "receive-errors/dontwait", flags: MessageFlagDontWait, receiveErrors: true},
+	} {
+		t.Run(policy.name, func(t *testing.T) {
+			local := netip.MustParseAddr("192.0.2.239")
+			remote := netip.MustParseAddr("198.51.100.239")
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1500})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			netConnection, err := stack.DialIP(context.Background(), "ip4:99", local, remote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			connection := netConnection.(*IPConn)
+			defer connection.Close()
+			if err = connection.SetIPHeaderIncludedOnWrite(true); err != nil {
+				t.Fatal(err)
+			}
+			if err = connection.SetReceiveErrors(policy.receiveErrors); err != nil {
+				t.Fatal(err)
+			}
+			dummy := buildIPPacket(local, remote, 98, []byte{0}, 1, false)
+			fillTestPacketQueue(t, &stack.outbound, dummy)
+			packet := buildIPPacket(local, remote, 99, []byte("header-included"), 2, true)
+			messages := []SocketMessage{{Buffers: [][]byte{packet[:17], packet[17:]}}}
+			count, writeErr := connection.WriteBatch(messages, policy.flags)
+			if policy.receiveErrors {
+				if count != 0 || !errors.Is(writeErr, syscall.ENOBUFS) || messages[0].N != 0 {
+					t.Fatalf("header-included WriteBatch = %d, %v, N=%d; want 0, ENOBUFS, 0", count, writeErr, messages[0].N)
+				}
+			} else if count != 1 || writeErr != nil || messages[0].N != len(packet) {
+				t.Fatalf("header-included WriteBatch = %d, %v, N=%d", count, writeErr, messages[0].N)
+			}
+			if !connection.acceptsError(remote) {
+				t.Fatal("header-included link drop did not retain ICMP correlation")
+			}
+			if after := stack.outbound.len(); after != outboundPacketQueue {
+				t.Fatalf("header-included full-queue write changed depth to %d", after)
+			}
+		})
+	}
+}
+
 func TestIPConnReceiveCapacity(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.120")
 	remote := netip.MustParseAddr("198.51.100.120")

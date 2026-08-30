@@ -136,7 +136,8 @@ type IPConnInfo struct {
 	// combined payload and error queues, not an exact heap-allocation limit.
 	ReceiveQueueCapacity int
 	// ReceiveErrors reports whether asynchronous network errors are reserved
-	// for ReadError instead of being returned by ordinary reads.
+	// for ReadError instead of being returned by ordinary reads and whether
+	// local output-queue exhaustion is reported as ENOBUFS.
 	ReceiveErrors bool
 	// ErrorQueueEntries is the number of asynchronous network errors awaiting
 	// ReadError or, when ReceiveErrors is false, an ordinary read.
@@ -147,9 +148,10 @@ type IPConnInfo struct {
 	// ErrorsDropped counts asynchronous network errors discarded because the
 	// configured receive-buffer budget was exhausted.
 	ErrorsDropped uint64
-	// PacketsSent counts successfully emitted socket messages.
+	// PacketsSent counts successful IP socket write results, including silent
+	// local output-queue loss when ReceiveErrors is false.
 	PacketsSent uint64
-	// BytesSent counts successfully emitted bytes in the write representation.
+	// BytesSent counts bytes represented by those successful writes.
 	BytesSent uint64
 	// PacketsReceived counts socket messages accepted into the receive queue.
 	PacketsReceived uint64
@@ -273,12 +275,12 @@ type ipWriteParameters struct {
 	options          ipPacketOptions
 	pathMTUDiscovery PathMTUDiscovery
 	checksumOffset   int
+	receiveErrors    bool
 	nonUnicast       bool
 }
 
-// ipPayloadWriter emits one prepared protocol payload under a per-call queue
-// wait policy.
-type ipPayloadWriter func(source, target netip.Addr, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast, dontWait bool) error
+// ipPayloadWriter emits one prepared protocol payload without retaining it.
+type ipPayloadWriter func(source, target netip.Addr, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast bool) error
 
 // ListenIP creates an unconnected IPv4 or IPv6 protocol socket. Network must
 // be an IP network with a numeric or well-known protocol, such as ip4:icmp or
@@ -1061,7 +1063,7 @@ func (c *IPConn) WriteToIP(payload []byte, address *net.IPAddr) (int, error) {
 	}
 	var n int
 	if c.ipHeaderIncludedOnWrite.Load() {
-		n, err = c.writeHeaderIncluded(payload, target, netip.Addr{}, ipPacketOptions{}, false)
+		n, err = c.writeHeaderIncluded(payload, target, netip.Addr{}, ipPacketOptions{})
 	} else {
 		n, err = c.writeTo(payload, target, netip.Addr{}, ipPacketOptions{})
 	}
@@ -1079,7 +1081,7 @@ func (c *IPConn) Write(payload []byte) (int, error) {
 	var n int
 	var err error
 	if c.ipHeaderIncludedOnWrite.Load() {
-		n, err = c.writeHeaderIncluded(payload, c.remote, netip.Addr{}, ipPacketOptions{}, false)
+		n, err = c.writeHeaderIncluded(payload, c.remote, netip.Addr{}, ipPacketOptions{})
 	} else {
 		n, err = c.writeTo(payload, c.remote, netip.Addr{}, ipPacketOptions{})
 	}
@@ -1099,7 +1101,7 @@ func (c *IPConn) WritePathMTUProbe(payload []byte) (int, error) {
 	if c.remote.IsMulticast() || c.stack.network.Load().broadcastDestination(c.remote) {
 		return 0, c.operationError("write", syscall.EOPNOTSUPP)
 	}
-	n, err := c.writeToWith(payload, c.remote, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload, false)
+	n, err := c.writeToWith(payload, c.remote, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
 	if err != nil {
 		return n, c.operationError("write", err)
 	}
@@ -1114,7 +1116,7 @@ func (c *IPConn) WritePathMTUProbeTo(payload []byte, target netip.Addr) (int, er
 	if target.IsMulticast() || c.stack.network.Load().broadcastDestination(target) {
 		return 0, c.operationErrorTo("write", ipNetAddr(target), syscall.EOPNOTSUPP)
 	}
-	n, err := c.writeToWith(payload, target, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload, false)
+	n, err := c.writeToWith(payload, target, netip.Addr{}, ipPacketOptions{}, c.writePathMTUProbePayload)
 	if err != nil {
 		return n, c.operationErrorTo("write", ipNetAddr(target), err)
 	}
@@ -1162,7 +1164,7 @@ func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn i
 	}
 	// Match net.IPConn: destination conversion precedes poll state, while an
 	// expired deadline or closed descriptor precedes ancillary-data parsing.
-	if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
+	if err = c.writeError(); err != nil {
 		return 0, 0, c.operationErrorTo("write", netAddress, err)
 	}
 	source, options, err := parseControlMessageForWrite(oob, target.Is6())
@@ -1170,7 +1172,7 @@ func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn i
 		return 0, 0, c.operationErrorTo("write", netAddress, err)
 	}
 	if c.ipHeaderIncludedOnWrite.Load() {
-		n, err = c.writeHeaderIncluded(payload, target, source, options, false)
+		n, err = c.writeHeaderIncluded(payload, target, source, options)
 	} else {
 		n, err = c.writeTo(payload, target, source, options)
 	}
@@ -1181,19 +1183,19 @@ func (c *IPConn) WriteMsgIP(payload, oob []byte, address *net.IPAddr) (n, oobn i
 }
 
 // WriteBatch writes a prefix of IP protocol messages using scatter/gather
-// payloads. MessageFlagDontWait bypasses packet-queue waiting; other flags are
+// payloads. MessageFlagDontWait is accepted for Linux compatibility; device
+// admission is already nonblocking for every datagram write. Other flags are
 // unsupported.
 func (c *IPConn) WriteBatch(messages []SocketMessage, flags int) (int, error) {
 	if flags&^MessageFlagDontWait != 0 {
 		return 0, c.operationError("write", syscall.EOPNOTSUPP)
 	}
-	dontWait := flags&MessageFlagDontWait != 0
 	if c.ipHeaderIncludedOnWrite.Load() {
-		return c.writeHeaderIncludedBatch(messages, dontWait)
+		return c.writeHeaderIncludedBatch(messages)
 	}
 	for index := range messages {
 		message := &messages[index]
-		n, oobn, err := c.writeBatchMessage(message, dontWait)
+		n, oobn, err := c.writeBatchMessage(message)
 		if err != nil {
 			// sendmmsg reports a completed prefix without the error that stopped
 			// the next message. A retry starting at index exposes that error.
@@ -1209,7 +1211,7 @@ func (c *IPConn) WriteBatch(messages []SocketMessage, flags int) (int, error) {
 
 // writeBatchMessage validates one destination and sends a scatter/gather
 // payload through the ordinary ancillary-data and output policy.
-func (c *IPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int, int, error) {
+func (c *IPConn) writeBatchMessage(message *SocketMessage) (int, int, error) {
 	var target netip.Addr
 	var address net.Addr
 	if c.remote.IsValid() {
@@ -1245,27 +1247,27 @@ func (c *IPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int, 
 		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), syscall.EMSGSIZE)
 	}
 	if len(message.Buffers) == 1 {
-		if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
+		if err = c.writeError(); err != nil {
 			return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 		}
 		source, options, parseErr := parseControlMessageForWrite(message.OOB, validated.Is6())
 		if parseErr != nil {
 			return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), parseErr)
 		}
-		n, writeErr := c.writeToWith(message.Buffers[0], validated, source, options, c.writePayload, dontWait)
+		n, writeErr := c.writeToWith(message.Buffers[0], validated, source, options, c.writePayload)
 		if writeErr != nil {
 			return n, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), writeErr)
 		}
 		return n, len(message.OOB), nil
 	}
-	if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
+	if err = c.writeError(); err != nil {
 		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	source, options, err := parseControlMessageForWrite(message.OOB, validated.Is6())
 	if err != nil {
 		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
-	n, err := c.writeBuffersTo(message.Buffers, payloadSize, validated, source, options, dontWait)
+	n, err := c.writeBuffersTo(message.Buffers, payloadSize, validated, source, options)
 	if err != nil {
 		return n, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
@@ -1274,10 +1276,10 @@ func (c *IPConn) writeBatchMessage(message *SocketMessage, dontWait bool) (int, 
 
 // writeHeaderIncludedBatch writes complete IP packets after WriteBatch has
 // selected the header-included representation once for the whole operation.
-func (c *IPConn) writeHeaderIncludedBatch(messages []SocketMessage, dontWait bool) (int, error) {
+func (c *IPConn) writeHeaderIncludedBatch(messages []SocketMessage) (int, error) {
 	for index := range messages {
 		message := &messages[index]
-		n, oobn, err := c.writeHeaderIncludedBatchMessage(message, dontWait)
+		n, oobn, err := c.writeHeaderIncludedBatchMessage(message)
 		if err != nil {
 			if index != 0 {
 				return index, nil
@@ -1290,7 +1292,7 @@ func (c *IPConn) writeHeaderIncludedBatch(messages []SocketMessage, dontWait boo
 }
 
 // writeHeaderIncludedBatchMessage validates and writes one complete IP packet.
-func (c *IPConn) writeHeaderIncludedBatchMessage(message *SocketMessage, dontWait bool) (int, int, error) {
+func (c *IPConn) writeHeaderIncludedBatchMessage(message *SocketMessage) (int, int, error) {
 	var target netip.Addr
 	var address net.Addr
 	if c.remote.IsValid() {
@@ -1321,7 +1323,7 @@ func (c *IPConn) writeHeaderIncludedBatchMessage(message *SocketMessage, dontWai
 	if payloadSize > 65535 {
 		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), syscall.EMSGSIZE)
 	}
-	if err = (socketWriteState{datagram: &c.datagramSocketWriteControl}).err(); err != nil {
+	if err = c.writeError(); err != nil {
 		return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
 	source, options, err := parseControlMessageForWrite(message.OOB, validated.Is6())
@@ -1337,7 +1339,7 @@ func (c *IPConn) writeHeaderIncludedBatchMessage(message *SocketMessage, dontWai
 			return 0, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 		}
 	}
-	n, err := c.writeHeaderIncluded(payload, validated, source, options, dontWait)
+	n, err := c.writeHeaderIncluded(payload, validated, source, options)
 	if err != nil {
 		return n, 0, c.operationErrorTo("write", c.writeBatchErrorAddress(address), err)
 	}
@@ -1356,13 +1358,13 @@ func (c *IPConn) writeBatchErrorAddress(address net.Addr) net.Addr {
 // writeTo selects a source, repairs ICMPv6 checksum, and emits one ordinary
 // fragmentable payload.
 func (c *IPConn) writeTo(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
-	return c.writeToWith(payload, target, packetInfoSource, options, c.writePayload, false)
+	return c.writeToWith(payload, target, packetInfoSource, options, c.writePayload)
 }
 
 // writeHeaderIncluded validates and queues one caller-supplied IPv4 or IPv6
 // packet. target selects the route while the supplied IP header remains the
 // packet delivered on the wire, matching Linux header-included raw sockets.
-func (c *IPConn) writeHeaderIncluded(input []byte, target, packetInfoSource netip.Addr, options ipPacketOptions, dontWait bool) (int, error) {
+func (c *IPConn) writeHeaderIncluded(input []byte, target, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
 	parameters, err := c.prepareWrite(target, packetInfoSource, options)
 	if err != nil {
 		return 0, err
@@ -1374,7 +1376,6 @@ func (c *IPConn) writeHeaderIncluded(input []byte, target, packetInfoSource neti
 	if err != nil {
 		return 0, err
 	}
-	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
 	if parameters.nonUnicast {
 		c.mu.Lock()
 		_, external, loopback, policyErr := nonUnicastOutputPolicy(parameters.target, c.multicastHopLimit, c.multicastLoopback, c.broadcast, ipPacketOptions{hopLimit: hopLimit, hopLimitSet: true})
@@ -1382,18 +1383,19 @@ func (c *IPConn) writeHeaderIncluded(input []byte, target, packetInfoSource neti
 		if policyErr != nil {
 			return 0, policyErr
 		}
-		err = c.stack.writeNonUnicastPacketUntil(len(packet), external, loopback, state, func(destination []byte) bool {
+		err = c.stack.tryWriteNonUnicastPacket(len(packet), external, loopback, func(destination []byte) bool {
 			copy(destination, packet)
 			return true
 		})
 	} else {
-		err = c.stack.writeCompletePacketUntil(packet, parameters.target, state)
+		err = c.stack.tryWriteCompletePacket(packet, parameters.target)
 	}
+	if !parameters.nonUnicast && datagramWriteNeedsCorrelation(err) {
+		c.rememberTarget(packetTarget)
+	}
+	err = datagramLinkWriteError(err, parameters.receiveErrors)
 	if err != nil {
 		return 0, err
-	}
-	if !parameters.nonUnicast {
-		c.rememberTarget(packetTarget)
 	}
 	c.packetsSent.Add(1)
 	c.bytesSent.Add(uint64(len(input)))
@@ -1444,8 +1446,8 @@ func (c *IPConn) prepareWrite(target, packetInfoSource netip.Addr, options ipPac
 	if err != nil {
 		return ipWriteParameters{}, err
 	}
-	writeState, options, pathMTUDiscovery, checksumOffset := c.writeStateAndOptions(options)
-	if err = writeState.err(); err != nil {
+	options, pathMTUDiscovery, checksumOffset, receiveErrors := c.writeOptions(options)
+	if err = c.writeError(); err != nil {
 		return ipWriteParameters{}, err
 	}
 	requestedSource := c.local
@@ -1465,7 +1467,8 @@ func (c *IPConn) prepareWrite(target, packetInfoSource netip.Addr, options ipPac
 	}
 	return ipWriteParameters{
 		source: source, target: target, options: options,
-		pathMTUDiscovery: pathMTUDiscovery, checksumOffset: checksumOffset, nonUnicast: nonUnicast,
+		pathMTUDiscovery: pathMTUDiscovery, checksumOffset: checksumOffset,
+		receiveErrors: receiveErrors, nonUnicast: nonUnicast,
 	}, nil
 }
 
@@ -1491,7 +1494,7 @@ func setIPv6PayloadChecksum(payload []byte, source, target netip.Addr, protocol 
 
 // writeToWith keeps routing, checksums, deadlines, accounting, and ICMP
 // correlation shared between ordinary writes and PLPMTUD probes.
-func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write ipPayloadWriter, dontWait bool) (int, error) {
+func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource netip.Addr, options ipPacketOptions, write ipPayloadWriter) (int, error) {
 	parameters, err := c.prepareWrite(target, packetInfoSource, options)
 	if err != nil {
 		return 0, err
@@ -1502,15 +1505,16 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource
 			return 0, err
 		}
 	}
-	err = write(parameters.source, parameters.target, payload, parameters.options, parameters.pathMTUDiscovery, parameters.nonUnicast, dontWait)
+	linkErr := write(parameters.source, parameters.target, payload, parameters.options, parameters.pathMTUDiscovery, parameters.nonUnicast)
+	if !parameters.nonUnicast && datagramWriteNeedsCorrelation(linkErr) {
+		c.rememberTarget(parameters.target)
+	}
+	err = datagramLinkWriteError(linkErr, parameters.receiveErrors)
 	if err != nil {
 		if errors.Is(err, syscall.EMSGSIZE) {
 			return 0, syscall.EMSGSIZE
 		}
 		return 0, err
-	}
-	if !parameters.nonUnicast {
-		c.rememberTarget(parameters.target)
 	}
 	c.packetsSent.Add(1)
 	c.bytesSent.Add(uint64(len(payload)))
@@ -1520,7 +1524,7 @@ func (c *IPConn) writeToWith(payload []byte, target netip.Addr, packetInfoSource
 // writeBuffersTo sends one validated scatter/gather protocol payload. A
 // fitting unicast packet is assembled directly in queue-owned storage;
 // fragmentation and non-unicast output retain the established path.
-func (c *IPConn) writeBuffersTo(buffers [][]byte, payloadSize int, target, packetInfoSource netip.Addr, options ipPacketOptions, dontWait bool) (int, error) {
+func (c *IPConn) writeBuffersTo(buffers [][]byte, payloadSize int, target, packetInfoSource netip.Addr, options ipPacketOptions) (int, error) {
 	parameters, err := c.prepareWrite(target, packetInfoSource, options)
 	if err != nil {
 		return 0, err
@@ -1540,19 +1544,20 @@ func (c *IPConn) writeBuffersTo(buffers [][]byte, payloadSize int, target, packe
 		if checksumErr := setIPv6PayloadChecksum(payload, parameters.source, parameters.target, c.protocol, parameters.checksumOffset); checksumErr != nil {
 			return 0, checksumErr
 		}
-		err = c.writeNonUnicastPayload(parameters.source, parameters.target, payload, parameters.options, parameters.pathMTUDiscovery, dontWait)
+		err = c.writeNonUnicastPayload(parameters.source, parameters.target, payload, parameters.options, parameters.pathMTUDiscovery)
 	} else {
 		mtu, fragmentation := c.stack.pathMTUOutputPolicy(parameters.target, parameters.pathMTUDiscovery)
-		err = c.writePayloadBuffersForMTU(parameters.source, parameters.target, buffers, payloadSize, parameters.options, fragmentation, mtu, parameters.checksumOffset, dontWait)
+		err = c.writePayloadBuffersForMTU(parameters.source, parameters.target, buffers, payloadSize, parameters.options, fragmentation, mtu, parameters.checksumOffset)
 	}
+	if !parameters.nonUnicast && datagramWriteNeedsCorrelation(err) {
+		c.rememberTarget(parameters.target)
+	}
+	err = datagramLinkWriteError(err, parameters.receiveErrors)
 	if err != nil {
 		if errors.Is(err, syscall.EMSGSIZE) {
 			return 0, syscall.EMSGSIZE
 		}
 		return 0, err
-	}
-	if !parameters.nonUnicast {
-		c.rememberTarget(parameters.target)
 	}
 	c.packetsSent.Add(1)
 	c.bytesSent.Add(uint64(payloadSize))
@@ -1561,19 +1566,18 @@ func (c *IPConn) writeBuffersTo(buffers [][]byte, payloadSize int, target, packe
 
 // writePayload emits ordinary output against the confirmed path MTU and
 // permits source fragmentation.
-func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast, dontWait bool) error {
+func (c *IPConn) writePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery, nonUnicast bool) error {
 	if nonUnicast {
-		return c.writeNonUnicastPayload(source, target, payload, options, pathMTUDiscovery, dontWait)
+		return c.writeNonUnicastPayload(source, target, payload, options, pathMTUDiscovery)
 	}
-	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
 	mtu, fragmentation := c.stack.pathMTUOutputPolicy(target, pathMTUDiscovery)
-	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, fragmentation, options, mtu, state)
+	return c.stack.tryWriteIPSocketPayloadForMTU(source, target, c.protocol, payload, fragmentation, options, mtu)
 }
 
 // writePayloadBuffersForMTU is the allocation-free scatter/gather form of
 // writePayload for a fitting packet. Fragmentation joins the payload once and
 // then uses the existing fragment writer.
-func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers [][]byte, payloadSize int, options ipPacketOptions, fragmentation sourceFragmentation, mtu, checksumOffset int, dontWait bool) error {
+func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers [][]byte, payloadSize int, options ipPacketOptions, fragmentation sourceFragmentation, mtu, checksumOffset int) error {
 	headerSize := ipHeaderSize(source, target, payloadSize)
 	if headerSize == 0 {
 		return syscall.EMSGSIZE
@@ -1589,8 +1593,7 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 		if err = setIPv6PayloadChecksum(payload, source, target, c.protocol, checksumOffset); err != nil {
 			return err
 		}
-		state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
-		return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, fragmentation, options, mtu, state)
+		return c.stack.tryWriteIPSocketPayloadForMTU(source, target, c.protocol, payload, fragmentation, options, mtu)
 	}
 	if source.Is6() && !options.flowLabelSet {
 		var prefix [6]byte
@@ -1603,8 +1606,7 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 		identification = uint16(c.stack.ipv4ID.Add(1))
 	}
 	queue, loopback := c.stack.outputQueueFor(target)
-	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
-	slot, err := c.stack.reservePacketUntil(queue, loopback, state)
+	slot, err := c.stack.tryReservePacket(queue)
 	if err != nil {
 		return err
 	}
@@ -1634,9 +1636,8 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 
 // writePathMTUProbePayload emits explicitly unfragmented output against the
 // first-hop MTU.
-func (c *IPConn) writePathMTUProbePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, _ PathMTUDiscovery, _, dontWait bool) error {
-	state := socketWriteState{datagram: &c.datagramSocketWriteControl, dontWait: dontWait}
-	return c.stack.writeIPPayloadUntilOptionsForMTU(source, target, c.protocol, payload, sourceFragmentation{dontFragment: true}, options, c.stack.network.Load().mtu, state)
+func (c *IPConn) writePathMTUProbePayload(source, target netip.Addr, payload []byte, options ipPacketOptions, _ PathMTUDiscovery, _ bool) error {
+	return c.stack.tryWriteIPSocketPayloadForMTU(source, target, c.protocol, payload, sourceFragmentation{dontFragment: true}, options, c.stack.network.Load().mtu)
 }
 
 // Close unregisters the protocol socket and wakes blocked operations.
@@ -1916,7 +1917,7 @@ func (c *IPConn) SetReadDeadline(deadline time.Time) error {
 	return nil
 }
 
-// SetWriteDeadline updates pending and future writes.
+// SetWriteDeadline sets the deadline checked before future writes.
 func (c *IPConn) SetWriteDeadline(deadline time.Time) error {
 	c.mu.Lock()
 	select {
@@ -1953,8 +1954,9 @@ func (c *IPConn) SetReadBuffer(bytes int) error {
 }
 
 // SetReceiveErrors controls whether asynchronous network errors are reserved
-// for ReadError. When disabled, the default, ordinary reads return queued
-// errors after any already queued payloads.
+// for ReadError and whether local output-queue exhaustion fails writes with
+// ENOBUFS. When disabled, the default, ordinary reads return queued errors
+// after any already queued payloads and local link-queue loss is silent.
 func (c *IPConn) SetReceiveErrors(enabled bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1969,7 +1971,8 @@ func (c *IPConn) SetReceiveErrors(enabled bool) error {
 }
 
 // ReceiveErrors reports whether asynchronous errors are reserved for
-// ReadError instead of being returned by ordinary reads.
+// ReadError instead of being returned by ordinary reads and whether local
+// output-queue exhaustion is reported as ENOBUFS.
 func (c *IPConn) ReceiveErrors() (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2003,8 +2006,9 @@ func (c *IPConn) ReadError() (*net.OpError, error) {
 	return queued.err, nil
 }
 
-// SetWriteBuffer is a validated no-op because writes are synchronously handed
-// to the embedding packet device.
+// SetWriteBuffer is a validated no-op because IP writes make one immediate
+// bounded link-queue admission attempt and retain no per-socket transmit
+// buffer to resize.
 func (c *IPConn) SetWriteBuffer(bytes int) error {
 	if bytes <= 0 {
 		return c.setOperationError(syscall.EINVAL)
@@ -2108,7 +2112,8 @@ func (c *IPConn) SetFlowLabel(label uint32) error {
 	}
 }
 
-// rememberTarget records a successful write for later ICMP quote validation.
+// rememberTarget records a validated unicast destination whose output either
+// succeeded or may have published a fragment prefix for later ICMP validation.
 func (c *IPConn) rememberTarget(target netip.Addr) {
 	target = target.Unmap()
 	if c.remote.IsValid() {
@@ -2184,16 +2189,16 @@ func (c *IPConn) deliverError(target netip.Addr, err error) {
 	c.mu.Unlock()
 }
 
-// writeStateAndOptions reads the output defaults, PMTU policy, and raw IPv6
-// checksum offset and returns the independent deadline and close signals
-// observed by a blocked host-queue write.
-func (c *IPConn) writeStateAndOptions(options ipPacketOptions) (socketWriteState, ipPacketOptions, PathMTUDiscovery, int) {
+// writeOptions snapshots the output defaults, PMTU policy, raw IPv6 checksum
+// offset, and local-error reporting mode for one nonblocking admission attempt.
+func (c *IPConn) writeOptions(options ipPacketOptions) (ipPacketOptions, PathMTUDiscovery, int, bool) {
 	c.mu.Lock()
 	options = options.withDefaults(c.defaultOptions)
 	pathMTUDiscovery := c.pathMTUDiscovery
 	checksumOffset := c.ipv6ChecksumOffset
+	receiveErrors := c.receiveErrors
 	c.mu.Unlock()
-	return socketWriteState{datagram: &c.datagramSocketWriteControl}, options, pathMTUDiscovery, checksumOffset
+	return options, pathMTUDiscovery, checksumOffset, receiveErrors
 }
 
 // operationError wraps an error for the bound or connected socket.

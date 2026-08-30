@@ -13,6 +13,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
@@ -1076,6 +1077,9 @@ func testUDPLatencyDuringTCPDeviceBottleneck(t *testing.T, algorithm string, fai
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = listener.(*UDPConn).SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { _ = listener.Close() })
 	echoDone := make(chan struct{})
 	go func() {
@@ -1086,13 +1090,25 @@ func testUDPLatencyDuringTCPDeviceBottleneck(t *testing.T, algorithm string, fai
 			if readErr != nil {
 				return
 			}
-			if _, writeErr := listener.WriteTo(buffer[:n], address); writeErr != nil {
-				return
+			for {
+				if _, writeErr := listener.WriteTo(buffer[:n], address); writeErr == nil {
+					break
+				} else if !errors.Is(writeErr, syscall.ENOBUFS) {
+					return
+				}
+				select {
+				case <-listener.(*UDPConn).closed:
+					return
+				case <-time.After(time.Millisecond):
+				}
 			}
 		}
 	}()
 	udpConnection, err := client.DialUDP(context.Background(), "udp4", netip.AddrPort{}, listener.LocalAddr().(*net.UDPAddr).AddrPort())
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err = udpConnection.(*UDPConn).SetReceiveErrors(true); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -1115,11 +1131,22 @@ func testUDPLatencyDuringTCPDeviceBottleneck(t *testing.T, algorithm string, fai
 	response := make([]byte, len(request))
 	for sequence := 0; sequence < 32; sequence++ {
 		binary.BigEndian.PutUint64(request, uint64(sequence))
-		started := time.Now()
-		_ = udpConnection.SetDeadline(started.Add(5 * time.Second))
-		if _, err = udpConnection.Write(request); err != nil {
-			t.Fatal(err)
+		admissionDeadline := time.Now().Add(5 * time.Second)
+		var started time.Time
+		for {
+			started = time.Now()
+			if _, err = udpConnection.Write(request); err == nil {
+				break
+			}
+			if !errors.Is(err, syscall.ENOBUFS) {
+				t.Fatal(err)
+			}
+			if time.Now().After(admissionDeadline) {
+				t.Fatal("UDP bottleneck packet could not acquire device admission")
+			}
+			time.Sleep(time.Millisecond)
 		}
+		_ = udpConnection.SetReadDeadline(started.Add(5 * time.Second))
 		if _, err = io.ReadFull(udpConnection, response); err != nil {
 			t.Fatal(err)
 		}

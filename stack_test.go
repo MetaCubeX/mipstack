@@ -257,60 +257,6 @@ func TestStackClosePreventsCacheRepopulation(t *testing.T) {
 	}
 }
 
-func TestPacketQueueWaitDoesNotSerializeWriteDeadlines(t *testing.T) {
-	local := netip.MustParseAddr("192.0.2.1")
-	remote := netip.MustParseAddr("192.0.2.2")
-	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = stack.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = stack.Close() })
-	packet := buildIPPacket(local, remote, 99, []byte{1}, 0, true)
-	for index := 0; index < outboundPacketQueue; index++ {
-		if err = stack.writePacketUntil(packet, socketWriteState{}); err != nil {
-			t.Fatalf("fill packet %d: %v", index, err)
-		}
-
-	}
-	firstStarted := make(chan struct{})
-	firstDone := make(chan error, 1)
-	firstClosed := make(chan struct{})
-	go func() {
-		close(firstStarted)
-		writeErr := stack.writePacketUntil(packet, socketWriteState{closed: firstClosed})
-		firstDone <- writeErr
-	}()
-	<-firstStarted
-
-	deadline := time.Now().Add(25 * time.Millisecond)
-	var secondControl datagramSocketWriteControl
-	secondControl.writeDeadline.set(deadline)
-	startedAt := time.Now()
-	err = stack.writePacketUntil(packet, socketWriteState{datagram: &secondControl})
-	if !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("second queue write = %v, want deadline exceeded", err)
-	}
-	if elapsed := time.Since(startedAt); elapsed > 250*time.Millisecond {
-		t.Fatalf("second queue deadline was delayed by first writer: %v", elapsed)
-	}
-
-	buffer := make([]byte, 1500)
-	if _, err = stack.Read([][]byte{buffer}, make([]int, 1), 0); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err = <-firstDone:
-		if err != nil {
-			t.Fatalf("first queue write = %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("first queue write did not resume after dequeue")
-	}
-}
-
 func TestMonotonicStampRoundTripAndClamping(t *testing.T) {
 	epoch := time.Unix(100, 123)
 	value := epoch.Add(250*time.Millisecond + 456*time.Nanosecond)
@@ -570,9 +516,6 @@ func TestFullLoopbackQueueDoesNotBlock(t *testing.T) {
 	packet := buildIPPacket(local, local, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
 	if err = stack.tryWritePacket(packet); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("tryWritePacket to full loopback queue = %v, want ErrResourceLimit", err)
-	}
-	if err = stack.writePacketUntil(packet, socketWriteState{}); !errors.Is(err, ErrResourceLimit) {
-		t.Fatalf("writePacketUntil to full loopback queue = %v, want ErrResourceLimit", err)
 	}
 }
 
@@ -848,46 +791,6 @@ func TestPacketQueueReleaseDoesNotAllocateDepartureState(t *testing.T) {
 	}
 }
 
-func TestPacketQueueConcurrentWritersMakeBoundedProgress(t *testing.T) {
-	local := netip.MustParseAddr("192.0.2.15")
-	remote := netip.MustParseAddr("192.0.2.16")
-	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stack.Close()
-	if err = stack.Start(); err != nil {
-		t.Fatal(err)
-	}
-	packet := buildIPPacket(local, remote, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
-	const writers = 1024
-	errorsCh := make(chan error, writers)
-	start := make(chan struct{})
-	for index := 0; index < writers; index++ {
-		go func() {
-			<-start
-			errorsCh <- stack.writePacketUntil(packet, socketWriteState{})
-		}()
-	}
-	close(start)
-	buffer := make([]byte, 1500)
-	for received := 0; received < writers; {
-		count, readErr := stack.Read([][]byte{buffer}, []int{0}, 0)
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		received += count
-	}
-	for index := 0; index < writers; index++ {
-		if writeErr := <-errorsCh; writeErr != nil {
-			t.Fatal(writeErr)
-		}
-	}
-	if stack.outbound.len() != 0 || len(stack.outbound.free) != cap(stack.outbound.free) {
-		t.Fatalf("queue did not release every slot: packets=%d free=%d", stack.outbound.len(), len(stack.outbound.free))
-	}
-}
-
 func TestTryWritePacketsCloseBeforeBatchPublication(t *testing.T) {
 	stack, err := New(Config{
 		LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/24")},
@@ -997,7 +900,6 @@ func TestDatagramSocketLayouts(t *testing.T) {
 	}{
 		{name: "UDPConn", got: unsafe.Sizeof(UDPConn{}), want: 288},
 		{name: "IPConn", got: unsafe.Sizeof(IPConn{}), want: 288},
-		{name: "socket write state", got: unsafe.Sizeof(socketWriteState{}), want: 24},
 		{name: "datagram write control", got: unsafe.Sizeof(datagramSocketWriteControl{}), want: 16},
 		{name: "datagram socket error state", got: unsafe.Sizeof(datagramSocketErrorState{}), want: 64},
 		{name: "datagram deadline state", got: unsafe.Sizeof(datagramSocketDeadlineState{}), want: 16},
@@ -1382,125 +1284,123 @@ func TestExpiredDeadlinePrecedesQueuedIO(t *testing.T) {
 	})
 }
 
-func TestPendingDatagramWriteDeadlineUpdates(t *testing.T) {
-	local := netip.MustParseAddr("192.0.2.1")
-	remote := netip.MustParseAddr("192.0.2.2")
-	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stack.Close()
-	if err = stack.Start(); err != nil {
-		t.Fatal(err)
-	}
-	udpConnection, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(local, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer udpConnection.Close()
-	ipConnection, err := stack.ListenIP(context.Background(), "ip4:99", local)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ipConnection.Close()
-	fillTestPacketQueue(t, &stack.outbound, []byte{0})
-
-	t.Run("UDP write", func(t *testing.T) {
-		testMutableDeadline(t, udpConnection.SetWriteDeadline, func() (int, error) {
-			return udpConnection.WriteTo([]byte("query"), net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 53)))
-		})
-	})
-	t.Run("IP write", func(t *testing.T) {
-		testMutableDeadline(t, ipConnection.SetWriteDeadline, func() (int, error) {
-			return ipConnection.WriteTo([]byte("query"), ipNetAddr(remote))
-		})
-	})
-}
-
-func TestDatagramCloseWakesBlockedWrite(t *testing.T) {
+func TestDatagramWriteQueueExhaustionPolicy(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.41")
 	remote := netip.MustParseAddr("192.0.2.42")
-
-	t.Run("UDP", func(t *testing.T) {
-		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer stack.Close()
-		if err = stack.Start(); err != nil {
-			t.Fatal(err)
-		}
-		packetConnection, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(local, 0))
-		if err != nil {
-			t.Fatal(err)
-		}
-		connection := packetConnection.(*UDPConn)
-		fillTestPacketQueue(t, &stack.outbound, []byte{0})
-		done := make(chan error, 1)
-		started := make(chan struct{})
-		go func() {
-			close(started)
-			_, writeErr := connection.WriteTo([]byte("query"), net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 53)))
-			done <- writeErr
-		}()
-		<-started
-		select {
-		case writeErr := <-done:
-			t.Fatalf("UDP WriteTo did not block on the full queue: %v", writeErr)
-		case <-time.After(20 * time.Millisecond):
-		}
-		if err = connection.Close(); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case writeErr := <-done:
-			if !errors.Is(writeErr, net.ErrClosed) {
-				t.Fatalf("UDP WriteTo after Close = %v", writeErr)
+	for _, test := range []struct {
+		name       string
+		open       func(*Stack) (net.PacketConn, error)
+		target     net.Addr
+		configure  func(net.PacketConn, bool) error
+		statistics func(net.PacketConn) (uint64, uint64)
+		correlated func(net.PacketConn) bool
+	}{
+		{
+			name: "UDP",
+			open: func(stack *Stack) (net.PacketConn, error) {
+				return stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(local, 0))
+			},
+			target: net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 53)),
+			configure: func(connection net.PacketConn, enabled bool) error {
+				return connection.(*UDPConn).SetReceiveErrors(enabled)
+			},
+			statistics: func(connection net.PacketConn) (uint64, uint64) {
+				info := connection.(*UDPConn).Info()
+				return info.PacketsSent, info.BytesSent
+			},
+			correlated: func(connection net.PacketConn) bool {
+				return connection.(*UDPConn).acceptsError(netip.AddrPortFrom(remote, 53))
+			},
+		},
+		{
+			name: "IP",
+			open: func(stack *Stack) (net.PacketConn, error) {
+				return stack.ListenIP(context.Background(), "ip4:99", local)
+			},
+			target: ipNetAddr(remote),
+			configure: func(connection net.PacketConn, enabled bool) error {
+				return connection.(*IPConn).SetReceiveErrors(enabled)
+			},
+			statistics: func(connection net.PacketConn) (uint64, uint64) {
+				info := connection.(*IPConn).Info()
+				return info.PacketsSent, info.BytesSent
+			},
+			correlated: func(connection net.PacketConn) bool {
+				return connection.(*IPConn).acceptsError(remote)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
+			if err != nil {
+				t.Fatal(err)
 			}
-		case <-time.After(time.Second):
-			t.Fatal("UDP Close did not wake blocked WriteTo")
-		}
-	})
-
-	t.Run("IP", func(t *testing.T) {
-		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer stack.Close()
-		if err = stack.Start(); err != nil {
-			t.Fatal(err)
-		}
-		connection, err := stack.ListenIP(context.Background(), "ip4:99", local)
-		if err != nil {
-			t.Fatal(err)
-		}
-		fillTestPacketQueue(t, &stack.outbound, []byte{0})
-		done := make(chan error, 1)
-		started := make(chan struct{})
-		go func() {
-			close(started)
-			_, writeErr := connection.WriteTo([]byte("query"), ipNetAddr(remote))
-			done <- writeErr
-		}()
-		<-started
-		select {
-		case writeErr := <-done:
-			t.Fatalf("IP WriteTo did not block on the full queue: %v", writeErr)
-		case <-time.After(20 * time.Millisecond):
-		}
-		if err = connection.Close(); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case writeErr := <-done:
-			if !errors.Is(writeErr, net.ErrClosed) {
-				t.Fatalf("IP WriteTo after Close = %v", writeErr)
+			defer stack.Close()
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
 			}
-		case <-time.After(time.Second):
-			t.Fatal("IP Close did not wake blocked WriteTo")
-		}
-	})
+			connection, err := test.open(stack)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fillTestPacketQueue(t, &stack.outbound, []byte{0})
+			payload := []byte("query")
+			write := func() deadlineOperationResult {
+				done := make(chan deadlineOperationResult, 1)
+				go func() {
+					bytes, writeErr := connection.WriteTo(payload, test.target)
+					done <- deadlineOperationResult{bytes: bytes, err: writeErr}
+				}()
+				select {
+				case result := <-done:
+					return result
+				case <-time.After(time.Second):
+					t.Fatal("datagram write waited for unavailable device capacity")
+					return deadlineOperationResult{}
+				}
+			}
+
+			if err = connection.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			before := stack.outbound.len()
+			if result := write(); result.bytes != len(payload) || result.err != nil {
+				t.Fatalf("default full-queue WriteTo = %d, %v", result.bytes, result.err)
+			}
+			if after := stack.outbound.len(); after != before {
+				t.Fatalf("default full-queue write changed queue depth from %d to %d", before, after)
+			}
+			if packets, bytes := test.statistics(connection); packets != 1 || bytes != uint64(len(payload)) {
+				t.Fatalf("default full-queue statistics = %d packets, %d bytes", packets, bytes)
+			}
+			if !test.correlated(connection) {
+				t.Fatal("successful local queue drop did not retain ICMP correlation")
+			}
+
+			if err = test.configure(connection, true); err != nil {
+				t.Fatal(err)
+			}
+			if result := write(); result.bytes != 0 || !errors.Is(result.err, syscall.ENOBUFS) {
+				t.Fatalf("extended-error full-queue WriteTo = %d, %v", result.bytes, result.err)
+			}
+			if packets, bytes := test.statistics(connection); packets != 1 || bytes != uint64(len(payload)) {
+				t.Fatalf("extended-error statistics = %d packets, %d bytes", packets, bytes)
+			}
+
+			if err = connection.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if result := write(); result.bytes != 0 || !errors.Is(result.err, os.ErrDeadlineExceeded) {
+				t.Fatalf("expired-deadline WriteTo = %d, %v", result.bytes, result.err)
+			}
+			if err = connection.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if result := write(); result.bytes != 0 || !errors.Is(result.err, net.ErrClosed) {
+				t.Fatalf("closed WriteTo = %d, %v", result.bytes, result.err)
+			}
+		})
+	}
 }
 
 func TestPendingTCPWriteDeadlineUpdates(t *testing.T) {

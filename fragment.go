@@ -2,7 +2,6 @@ package mipstack
 
 import (
 	"encoding/binary"
-	"errors"
 	"net/netip"
 	"sort"
 	"syscall"
@@ -1220,9 +1219,11 @@ func (s *Stack) tryWriteIPPayloadForMTU(source, target netip.Addr, protocol byte
 	return nil
 }
 
-// writeIPPayloadUntilOptionsForMTU emits output against an explicit packet
-// ceiling while preserving socket deadline and closure behavior.
-func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, protocol byte, payload []byte, fragmentation sourceFragmentation, options ipPacketOptions, mtu int, state socketWriteState) error {
+// tryWriteIPSocketPayloadForMTU attempts socket output against an explicit
+// packet ceiling without retaining caller payload. Unlike stack-owned control
+// output, external source fragments are admitted separately and may leave a
+// published prefix when later device capacity is unavailable.
+func (s *Stack) tryWriteIPSocketPayloadForMTU(source, target netip.Addr, protocol byte, payload []byte, fragmentation sourceFragmentation, options ipPacketOptions, mtu int) error {
 	if source.Is6() && !options.flowLabelSet {
 		options.flowLabel = s.automaticFlowLabel(source, target, protocol, payload)
 		options.flowLabelSet = true
@@ -1237,7 +1238,7 @@ func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, prot
 			identification = uint16(s.ipv4ID.Add(1))
 		}
 		queue, loopback := s.outputQueueFor(target)
-		slot, err := s.reservePacketUntil(queue, loopback, state)
+		slot, err := s.tryReservePacket(queue)
 		if err != nil {
 			return err
 		}
@@ -1258,7 +1259,7 @@ func (s *Stack) writeIPPayloadUntilOptionsForMTU(source, target netip.Addr, prot
 	if err := s.ipFragmentLayoutForMTU(source, target, len(payload), fragmentation, options, mtu, &layout); err != nil {
 		return err
 	}
-	return s.writeIPFragmentsUntilLayout(source, target, protocol, payload, nil, layout, state)
+	return s.tryWriteIPFragmentsLayout(source, target, protocol, payload, nil, layout)
 }
 
 // writeIPPayload atomically queues one best-effort protocol response or its
@@ -1271,15 +1272,23 @@ func (s *Stack) writeIPPayload(source, target netip.Addr, protocol byte, payload
 	return s.tryWriteIPPayloadForMTU(source, target, protocol, payload, fragmentation, ipPacketOptions{}, s.mtuFor(target))
 }
 
-// writeIPFragmentsUntilLayout writes a validated fragment layout directly into
-// reserved queue storage. first and second are adjacent logical payload regions;
-// this lets UDP prepend its virtual header without gathering the datagram.
-func (s *Stack) writeIPFragmentsUntilLayout(source, target netip.Addr, protocol byte, first, second []byte, layout ipFragmentLayout, state socketWriteState) error {
+// tryWriteIPFragmentsLayout streams a validated fragment layout directly into
+// immediately available external queue storage. first and second are adjacent
+// logical payload regions, allowing UDP to prepend its virtual header without
+// gathering the datagram. A published external prefix is not rolled back when
+// a later fragment is dropped. Loopback reserves the complete materialized set
+// so its reassembler never receives a capacity-truncated datagram.
+func (s *Stack) tryWriteIPFragmentsLayout(source, target netip.Addr, protocol byte, first, second []byte, layout ipFragmentLayout) error {
 	payloadSize := len(first) + len(second)
 	if payloadSize != int(layout.payloadSize) {
 		return syscall.EMSGSIZE
 	}
-	if state.dontWait {
+	ranges, valid := newFragmentRangeCursor(int(layout.payloadSize), int(layout.fragmentCapacity))
+	if !valid {
+		return syscall.EMSGSIZE
+	}
+	queue, loopback := s.outputQueueFor(target)
+	if loopback {
 		payload := first
 		if len(second) != 0 {
 			payload = make([]byte, payloadSize)
@@ -1290,19 +1299,10 @@ func (s *Stack) writeIPFragmentsUntilLayout(source, target netip.Addr, protocol 
 		if len(packets) == 0 {
 			return syscall.EMSGSIZE
 		}
-		err := s.tryWritePackets(packets)
-		if errors.Is(err, ErrResourceLimit) {
-			return syscall.EAGAIN
-		}
-		return err
+		return s.tryWritePacketsTo(packets, queue, true)
 	}
-	ranges, valid := newFragmentRangeCursor(int(layout.payloadSize), int(layout.fragmentCapacity))
-	if !valid {
-		return syscall.EMSGSIZE
-	}
-	queue, loopback := s.outputQueueFor(target)
 	for offset, size, more, ok := ranges.next(); ok; offset, size, more, ok = ranges.next() {
-		slot, err := s.reservePacketUntil(queue, loopback, state)
+		slot, err := s.tryReservePacket(queue)
 		if err != nil {
 			return err
 		}
