@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -100,6 +103,128 @@ func TestIPConnectedWriteBatchInterop(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestIPHeaderIncludedStoppedDeviceReadInterop verifies that global
+// complete-packet defaults retain immediate raw-socket writes and labeled-flow
+// fairness while the embedding reader is stopped, then resume delivery to a
+// real peer.
+func TestIPHeaderIncludedStoppedDeviceReadInterop(t *testing.T) {
+	family := interopFamilies[1]
+	bridgeStopped := make(chan struct{})
+	releaseBridge := make(chan struct{})
+	var bridgeArmed atomic.Bool
+	var stopOnce, releaseOnce sync.Once
+	network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+		families: []interopFamily{family}, mtu: 1500,
+		ip: mipstack.IPSocketDefaults{
+			IPHeaderIncludedOnRead:  true,
+			IPHeaderIncludedOnWrite: true,
+		},
+		mipstackToGVisor: func([]byte) bool {
+			if bridgeArmed.Load() {
+				stopOnce.Do(func() {
+					close(bridgeStopped)
+					<-releaseBridge
+				})
+			}
+			return true
+		},
+	})
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseBridge) }) })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	connection, err := network.mipstack.DialIP(ctx, family.rawNetwork, family.mipstackAddress, family.gvisorAddress)
+	if err != nil {
+		t.Fatalf("dial complete-packet mipstack socket: %v", err)
+	}
+	defer connection.Close()
+	if info := connection.(*mipstack.IPConn).Info(); !info.IPHeaderIncludedOnRead || !info.IPHeaderIncludedOnWrite {
+		t.Fatalf("global complete-packet defaults were not inherited: %+v", info)
+	}
+
+	var queue waiter.Queue
+	peer, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, interopRawIPProtocol, &queue)
+	if tcpipErr != nil {
+		t.Fatalf("create gVisor complete-packet endpoint: %s", tcpipErr.String())
+	}
+	defer peer.Close()
+	peer.SocketOptions().SetHeaderIncluded(true)
+	if tcpipErr = peer.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+		t.Fatalf("bind gVisor complete-packet endpoint: %s", tcpipErr.String())
+	}
+	if tcpipErr = peer.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+		t.Fatalf("connect gVisor complete-packet endpoint: %s", tcpipErr.String())
+	}
+	entry, notifications := registerReadable(&queue)
+	defer queue.EventUnregister(&entry)
+
+	makePacket := func(flowLabel uint32, payload []byte) []byte {
+		t.Helper()
+		packet, marshalErr := (mipstack.IPPacket{
+			Source: family.mipstackAddress, Destination: family.gvisorAddress,
+			Protocol: int(interopRawIPProtocol), HopLimit: 37, FlowLabel: flowLabel, Payload: payload,
+		}).AppendBinary(nil)
+		if marshalErr != nil {
+			t.Fatalf("marshal complete packet: %v", marshalErr)
+		}
+		return packet
+	}
+	bulk := makePacket(0x11111, []byte("complete-packet-pressure"))
+	late := makePacket(0x22222, []byte("late-complete-packet-flow"))
+	bridgeArmed.Store(true)
+	if written, writeErr := connection.Write(bulk); writeErr != nil || written != len(bulk) {
+		t.Fatalf("write bridge-stop complete packet: n=%d, error=%v", written, writeErr)
+	}
+	select {
+	case <-bridgeStopped:
+	case <-ctx.Done():
+		t.Fatal("mipstack complete-packet bridge did not stop")
+	}
+
+	overloaded := make(chan error, 1)
+	go func() {
+		for write := 0; write < 2048; write++ {
+			written, writeErr := connection.Write(bulk)
+			if writeErr != nil {
+				overloaded <- writeErr
+				return
+			}
+			if written != len(bulk) {
+				overloaded <- fmt.Errorf("short complete-packet write: %d", written)
+				return
+			}
+		}
+		overloaded <- nil
+	}()
+	select {
+	case overloadErr := <-overloaded:
+		if overloadErr != nil {
+			t.Fatalf("stopped-read complete-packet overload: %v", overloadErr)
+		}
+	case <-time.After(2 * time.Second):
+		releaseOnce.Do(func() { close(releaseBridge) })
+		t.Fatal("complete-packet writes blocked while Stack.Read was stopped")
+	}
+	if written, writeErr := connection.Write(late); writeErr != nil || written != len(late) {
+		t.Fatalf("late complete-packet write: n=%d, error=%v", written, writeErr)
+	}
+
+	releaseOnce.Do(func() { close(releaseBridge) })
+	foundLate := false
+	for read := 0; read < 3; read++ {
+		received, _, readErr := readGVisorEndpoint(ctx, peer, notifications, 1500)
+		if readErr != nil {
+			t.Fatalf("read recovered gVisor complete packet: %v", readErr)
+		}
+		if bytes.Equal(received, late) {
+			foundLate = true
+			break
+		}
+	}
+	if !foundLate {
+		t.Fatal("late complete-packet flow was not served after device-read recovery")
 	}
 }
 

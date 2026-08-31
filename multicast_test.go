@@ -2679,7 +2679,8 @@ func TestFragmentedNonUnicastLocalCopiesAreAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = stack.Close() })
-	packets := buildIPv4Fragments(local, remote, ProtocolUDP, bytes.Repeat([]byte{0x6d}, 1200), 600, 91)
+	payload := bytes.Repeat([]byte{0x6d}, 1200)
+	packets := buildIPv4Fragments(local, remote, ProtocolUDP, payload, 600, 91)
 	if len(packets) < 2 {
 		t.Fatal("test payload did not produce multiple fragments")
 	}
@@ -2690,7 +2691,8 @@ func TestFragmentedNonUnicastLocalCopiesAreAtomic(t *testing.T) {
 		}
 	}
 	beforeLocal := stack.loopback.len()
-	if err := stack.tryWriteNonUnicastPackets(packets, true, true); err != nil {
+	flow := outputFlowKey{hash: 1}
+	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow); err != nil {
 		t.Fatalf("external non-unicast write with full local copy queue: %v", err)
 	}
 	if after := stack.loopback.len(); after != beforeLocal {
@@ -2712,28 +2714,44 @@ func TestFragmentedNonUnicastLocalCopiesAreAtomic(t *testing.T) {
 		}
 	}
 	beforeExternal := stack.outbound.len()
-	if err := stack.tryWriteNonUnicastPackets(packets, true, true); !errors.Is(err, ErrResourceLimit) {
-		t.Fatalf("capacity-truncated external non-unicast write = %v, want ErrResourceLimit", err)
+	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow); err != nil {
+		t.Fatalf("external non-unicast write over published backlog: %v", err)
 	}
 	if after := stack.outbound.len(); after != beforeExternal+1 {
-		t.Fatalf("external fragment prefix changed queue depth from %d to %d, want %d", beforeExternal, after, beforeExternal+1)
+		t.Fatalf("external fragment sequence changed queue depth from %d to %d, want %d", beforeExternal, after, beforeExternal+1)
 	}
 	if after := stack.loopback.len(); after != beforeLocal {
-		t.Fatalf("capacity-truncated local copy changed queue depth from %d to %d", beforeLocal, after)
+		t.Fatalf("full local copy queue changed depth from %d to %d", beforeLocal, after)
 	}
-	if err := stack.tryWriteNonUnicastPackets(packets, false, true); err != nil {
+	if err := stack.tryWriteNonUnicastPackets(packets, false, true, flow); err != nil {
 		t.Fatalf("local-only non-unicast write with full queue: %v", err)
 	}
 	if after := stack.loopback.len(); after != beforeLocal {
 		t.Fatalf("local-only fragment failure changed queue depth from %d to %d", beforeLocal, after)
 	}
 
+	var reassembly IPPacketReassembly
+	var reassembled IPPacket
+	complete := false
 	for {
 		entry, ok := stack.outbound.tryDequeue()
 		if !ok {
 			break
 		}
+		packet, parseErr := ParseIPPacket(entry.packet)
+		if parseErr == nil {
+			if fragment, fragmented := packet.Fragment(); fragmented && fragment.Protocol == ProtocolUDP {
+				var addErr error
+				reassembled, complete, addErr = reassembly.Add(packet)
+				if addErr != nil {
+					t.Fatal(addErr)
+				}
+			}
+		}
 		stack.outbound.release(entry)
+	}
+	if !complete || !bytes.Equal(reassembled.Payload, payload) {
+		t.Fatalf("reassembled external multicast fragments = complete %t payload %x", complete, reassembled.Payload)
 	}
 	// Model Close winning after external publication but before the local copy
 	// is admitted. Queue closure must not be hidden by successful link output.
@@ -2744,7 +2762,7 @@ func TestFragmentedNonUnicastLocalCopiesAreAtomic(t *testing.T) {
 	}); !errors.Is(err, ErrClosed) {
 		t.Fatalf("external packet with closed local queue = %v, want ErrClosed", err)
 	}
-	if err := stack.tryWriteNonUnicastPackets(packets, true, true); !errors.Is(err, ErrClosed) {
+	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow); !errors.Is(err, ErrClosed) {
 		t.Fatalf("external write with closed local queue = %v, want ErrClosed", err)
 	}
 }

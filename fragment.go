@@ -1151,8 +1151,8 @@ func (s *Stack) ipFragmentLayoutForMTU(source, target netip.Addr, payloadSize in
 }
 
 // buildIPFragmentPackets materializes a validated layout in independently
-// owned storage. Nonblocking writers use it to reserve every fragment before
-// any part of the datagram becomes visible.
+// owned storage for paths that need a complete fragment sequence. Admission
+// and publication semantics remain the caller's responsibility.
 func buildIPFragmentPackets(source, target netip.Addr, protocol byte, payload []byte, layout ipFragmentLayout) [][]byte {
 	if len(payload) != int(layout.payloadSize) {
 		return nil
@@ -1175,8 +1175,8 @@ func buildIPFragmentPackets(source, target netip.Addr, protocol byte, payload []
 
 // writeBestEffortIPPayloadForMTU writes a fitting payload directly into
 // queue-owned packet storage and streams source fragments through the shared
-// fragment writer when the payload exceeds the path MTU. Output capacity drops
-// the unavailable packet or fragment suffix without becoming a caller error.
+// fragment writer when the payload exceeds the path MTU. Link admission remains
+// best effort and does not turn local packet loss into a caller error.
 func (s *Stack) writeBestEffortIPPayloadForMTU(source, target netip.Addr, protocol byte, payload []byte, fragmentation sourceFragmentation, options ipPacketOptions, mtu int) error {
 	headerSize := ipHeaderSize(source, target, len(payload))
 	if headerSize == 0 {
@@ -1203,6 +1203,9 @@ func (s *Stack) writeBestEffortIPPayloadForMTU(source, target netip.Addr, protoc
 	}
 	queue, loopback := s.outputQueueFor(target)
 	slot, err := s.tryReservePacket(queue)
+	if err == ErrResourceLimit {
+		slot, err = s.replaceBestEffortPacket(queue)
+	}
 	if err != nil {
 		if err == ErrResourceLimit {
 			return nil
@@ -1225,8 +1228,8 @@ func (s *Stack) writeBestEffortIPPayloadForMTU(source, target netip.Addr, protoc
 
 // tryWriteIPSocketPayloadForMTU attempts socket output against an explicit
 // packet ceiling without retaining caller payload. Unlike stack-owned control
-// output, external source fragments are admitted separately and may leave a
-// published prefix when later device capacity is unavailable.
+// output, external source fragments are admitted separately; overload may
+// discard any queued fragment, and a later failure leaves survivors published.
 func (s *Stack) tryWriteIPSocketPayloadForMTU(source, target netip.Addr, protocol byte, payload []byte, fragmentation sourceFragmentation, options ipPacketOptions, mtu int) error {
 	if source.Is6() && !options.flowLabelSet {
 		options.flowLabel = s.automaticFlowLabel(source, target, protocol, payload)
@@ -1243,6 +1246,9 @@ func (s *Stack) tryWriteIPSocketPayloadForMTU(source, target netip.Addr, protoco
 		}
 		queue, loopback := s.outputQueueFor(target)
 		slot, err := s.tryReservePacket(queue)
+		if err == ErrResourceLimit {
+			slot, err = s.replaceBestEffortPacket(queue)
+		}
 		if err != nil {
 			return err
 		}
@@ -1277,11 +1283,11 @@ func (s *Stack) writeIPPayload(source, target netip.Addr, protocol byte, payload
 }
 
 // tryWriteIPFragmentsLayout streams a validated fragment layout directly into
-// immediately available external queue storage. first and second are adjacent
-// logical payload regions, allowing UDP to prepend its virtual header without
-// gathering the datagram. A published external prefix is not rolled back when
-// a later fragment is dropped. Loopback reserves the complete materialized set
-// so its reassembler never receives a capacity-truncated datagram.
+// bounded external queue storage. first and second are adjacent logical payload
+// regions, allowing UDP to prepend its virtual header without gathering the
+// datagram. Each external fragment has independent link admission. Loopback
+// reserves the complete materialized set so its reassembler never receives a
+// capacity-truncated datagram.
 func (s *Stack) tryWriteIPFragmentsLayout(source, target netip.Addr, protocol byte, first, second []byte, layout ipFragmentLayout) error {
 	payloadSize := len(first) + len(second)
 	if payloadSize != int(layout.payloadSize) {
@@ -1305,8 +1311,16 @@ func (s *Stack) tryWriteIPFragmentsLayout(source, target netip.Addr, protocol by
 		}
 		return s.tryWriteLoopbackPackets(packets)
 	}
+	prefix := first
+	if len(prefix) == 0 {
+		prefix = second
+	}
+	flow := queue.ipFlowKey(source, target, protocol, layout.options.flowLabel, prefix)
 	for offset, size, more, ok := ranges.next(); ok; offset, size, more, ok = ranges.next() {
 		slot, err := s.tryReservePacket(queue)
+		if err == ErrResourceLimit {
+			slot, err = s.replaceBestEffortPacket(queue)
+		}
 		if err != nil {
 			return err
 		}
@@ -1317,7 +1331,7 @@ func (s *Stack) tryWriteIPFragmentsLayout(source, target netip.Addr, protocol by
 			return syscall.EMSGSIZE
 		}
 		copyIPPayloadParts(packet[int(layout.headerSize):], offset, first, second)
-		if !queue.enqueueReservedPacket(slot, packet, reusable) {
+		if !queue.enqueueReservedPacketForFlow(slot, packet, reusable, flow) {
 			return ErrClosed
 		}
 		s.recordOutput(loopback)

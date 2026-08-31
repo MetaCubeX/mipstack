@@ -4702,6 +4702,94 @@ func TestTCPPathMTURetransmissionSurvivesStoppedDeviceRead(t *testing.T) {
 	}
 }
 
+// TestTCPPathMTURetransmissionRemainsDueAfterDeviceDeparture overlaps a PMTU
+// reduction with an existing loss-timer host-queue wait for the same packet
+// generation.
+func TestTCPPathMTURetransmissionRemainsDueAfterDeviceDeparture(t *testing.T) {
+	_, stack, connection := newManuallyPumpedTCPConnection(t)
+	defer connection.Close()
+
+	before := connection.Info()
+	beforeStats := stack.Stats()
+	payload := bytes.Repeat([]byte{0x4d}, before.MaximumSegmentSize)
+	if n, err := connection.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	waitFor(t, time.Second, func() bool { return stack.outbound.len() == 1 })
+	held := make([]uint16, 0, cap(stack.outbound.free)-1)
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free)-1 {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free)-1)
+	}
+
+	var departureWaiter *packetQueueDepartureWaiter
+	waitFor(t, before.RetransmissionTimeout+time.Second, func() bool {
+		waiters := stack.outbound.departureWaiters.Load()
+		if waiters == nil {
+			return false
+		}
+		for index := range waiters.slots {
+			if waiter := waiters.slots[index].Load(); waiter != nil {
+				departureWaiter = waiter
+				return true
+			}
+		}
+		return false
+	})
+	const reducedMTU = 1000
+	local := connection.key.local.Addr()
+	if err := stack.UpdateConfig(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())},
+		MTU:            reducedMTU,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	blocked := connection.Info()
+	if blocked.PathMTU != reducedMTU || blocked.Retransmissions != before.Retransmissions || blocked.RetransmissionRecovery {
+		t.Fatalf("queue-resident path-MTU recovery = before:%+v blocked:%+v", before, blocked)
+	}
+
+	entry, available := stack.outbound.tryDequeue()
+	if !available {
+		t.Fatal("queue-resident TCP data was unavailable")
+	}
+	originalWire := consumeTestPacket(&stack.outbound, entry)
+	if len(originalWire) <= reducedMTU {
+		t.Fatalf("original queued packet length = %d, want > %d", len(originalWire), reducedMTU)
+	}
+	_, departed := departureWaiter.departedTime(stack.timestampEpoch)
+	if !departed {
+		t.Fatal("path-MTU target dequeue did not record device departure")
+	}
+	retransmissionEntry, available := waitTestPacketEntry(&stack.outbound, before.RetransmissionTimeout+time.Second)
+	if !available {
+		t.Fatal("path-MTU retransmission did not resume after device departure")
+	}
+	retransmissionWire := append([]byte(nil), retransmissionEntry.packet...)
+	defer stack.outbound.release(retransmissionEntry)
+	if len(retransmissionWire) > reducedMTU {
+		t.Fatalf("path-MTU retransmission length = %d, want <= %d", len(retransmissionWire), reducedMTU)
+	}
+	after := connection.Info()
+	if after.Retransmissions != before.Retransmissions+1 || after.RetransmissionRecovery || after.FastRecovery {
+		t.Fatalf("published path-MTU retransmission = before:%+v after:%+v", before, after)
+	}
+	if afterStats := stack.Stats(); afterStats.TCPTailLossProbes != beforeStats.TCPTailLossProbes {
+		t.Fatalf("path-MTU departure emitted %d tail-loss probes, want 0", afterStats.TCPTailLossProbes-beforeStats.TCPTailLossProbes)
+	}
+}
+
 func TestTCPImmediateACKReplacesDelayedACKWhileDeviceReadStopped(t *testing.T) {
 	link, stack, connection := newManuallyPumpedTCPConnection(t)
 	defer connection.Close()

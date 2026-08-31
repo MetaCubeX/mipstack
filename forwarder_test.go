@@ -1918,7 +1918,7 @@ func TestTCPForwarderAcceptResumesAfterFullPacketQueue(t *testing.T) {
 	}
 }
 
-func TestUDPForwarderReplyPublishesAvailableFragments(t *testing.T) {
+func TestUDPForwarderFragmentedReplyIsBestEffort(t *testing.T) {
 	owned := netip.MustParseAddr("192.0.2.110")
 	remote := netip.MustParseAddr("192.0.2.111")
 	target := netip.MustParseAddr("198.51.100.110")
@@ -1946,7 +1946,7 @@ func TestUDPForwarderReplyPublishesAvailableFragments(t *testing.T) {
 		t.Fatalf("fragmented Reply with one slot = %v", err)
 	}
 	if got := stack.outbound.len(); got != before+1 {
-		t.Fatalf("best-effort UDP fragment prefix changed queue depth from %d to %d, want %d", before, got, before+1)
+		t.Fatalf("best-effort fragmented UDP reply changed queue depth from %d to %d, want %d", before, got, before+1)
 	}
 }
 
@@ -2882,8 +2882,11 @@ func TestICMPForwarderReplyIPPacketFragmentation(t *testing.T) {
 			stack := newForwarderTestStack(t, test.local, true)
 			result := make(chan error, 1)
 			quoted := bytes.Repeat([]byte{0x5a}, 2500)
+			var fittingFlow, terminalFlow outputFlowKey
 			forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
 				reply := makeForwarderICMPErrorPacket(test.target, test.remote, quoted)
+				payloadOffset := 20
+				protocol := byte(ProtocolICMPv4)
 				if test.remote.Is4() {
 					options := []byte{7, 7, 8, 0, 0, 0, 0, 148, 4, 0, 0, 0}
 					headerSize := 20 + len(options)
@@ -2893,6 +2896,7 @@ func TestICMPForwarderReplyIPPacketFragmentation(t *testing.T) {
 					copy(withOptions[headerSize:], reply[20:])
 					withOptions[0] = 0x40 | byte(headerSize/4)
 					reply = withOptions
+					payloadOffset = headerSize
 				} else {
 					// RFC 4443 limits ICMPv6 errors to 1280 bytes. Use an
 					// informational Echo Reply to exercise legal IPv6 source
@@ -2901,7 +2905,12 @@ func TestICMPForwarderReplyIPPacketFragmentation(t *testing.T) {
 					extension := []byte{ProtocolICMPv6, 0, 0, 0, 0, 0, 0, 0}
 					reply[6] = 60
 					reply = append(append(reply[:40:40], extension...), reply[40:]...)
+					payloadOffset = 48
+					protocol = ProtocolICMPv6
 				}
+				fittingFlow = outputHashedFlowKey(outputPacketFlowHash(stack.outbound.scheduler.secret, reply))
+				selector := outputTransportSelector(protocol, reply[payloadOffset:])
+				terminalFlow = outputHashedFlowKey(outputIPFlowHash(stack.outbound.scheduler.secret, test.target, test.remote, protocol, 0, selector))
 				result <- request.ReplyIPPacket(reply)
 			})
 			if err != nil {
@@ -2921,6 +2930,15 @@ func TestICMPForwarderReplyIPPacketFragmentation(t *testing.T) {
 			}
 			if err = <-result; err != nil {
 				t.Fatal(err)
+			}
+			if fittingFlow != terminalFlow {
+				t.Fatalf("fitting ReplyIPPacket flow = %+v, want terminal flow %+v", fittingFlow, terminalFlow)
+			}
+			stack.outbound.scheduler.mu.Lock()
+			queued := stack.outbound.scheduler.flows[terminalFlow]
+			stack.outbound.scheduler.mu.Unlock()
+			if queued == nil || queued.head < 0 {
+				t.Fatal("source-fragmented ReplyIPPacket was not assigned to its fitting terminal flow")
 			}
 			var reassembled []byte
 			fragments := 0
@@ -2996,6 +3014,14 @@ func TestICMPForwarderReplyIPPacketIPv6AtomicFragment(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !test.noncanonical {
+				selector := outputTransportSelector(ProtocolICMPv6, reply[48:])
+				want := outputHashedFlowKey(outputIPFlowHash(stack.outbound.scheduler.secret, target, remote, ProtocolICMPv6, 0, selector))
+				stack.outbound.scheduler.mu.Lock()
+				queued := stack.outbound.scheduler.flows[want]
+				stack.outbound.scheduler.mu.Unlock()
+				if queued == nil || queued.head < 0 {
+					t.Fatal("fitting ReplyIPPacket was not assigned to its terminal ICMP flow")
+				}
 				output := readForwarderTestPacket(t, stack)
 				if output[6] != 44 || output[40] != ProtocolICMPv6 || output[41] != 0 || binary.BigEndian.Uint16(output[42:44]) != 0 || binary.BigEndian.Uint32(output[44:48]) != test.identification {
 					t.Fatalf("fitting atomic Fragment header = %x", output[40:48])

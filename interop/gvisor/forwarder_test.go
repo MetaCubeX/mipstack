@@ -825,7 +825,7 @@ func TestICMPForwarderReplyIPPacketInterop(t *testing.T) {
 					results := make(chan result, 1)
 					forwarder, err := mipstack.NewICMPForwarder(network.mipstack, mipstack.ICMPForwarderOptions{}, func(request *mipstack.ICMPForwarderRequest) {
 						echo := makeICMPEcho(family, true, identifier, sequence, payload, family.forwardAddress, family.gvisorAddress)
-						packet := makeInteropICMPPacket(family, family.forwardAddress, family.gvisorAddress, echo)
+						packet := makeInteropICMPPacket(family, family.forwardAddress, family.gvisorAddress, echo, true)
 						result := result{packet: packet}
 						if detached {
 							result.err = request.ReplyIPPacket(packet)
@@ -995,20 +995,24 @@ func makeInteropICMPErrorPacket(family interopFamily, source, target netip.Addr,
 		icmpHeader.SetType(header.ICMPv4DstUnreachable)
 		icmpHeader.SetCode(1)
 		icmpHeader.SetChecksum(^checksum.Checksum(icmp, 0))
-		return makeInteropICMPPacket(family, source, target, icmp)
+		return makeInteropICMPPacket(family, source, target, icmp, false)
 	}
 	icmpHeader := header.ICMPv6(icmp[:8])
 	icmpHeader.SetType(header.ICMPv6DstUnreachable)
 	icmpHeader.SetCode(1)
 	icmpHeader.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{Header: icmpHeader, Src: gvisorAddress(source), Dst: gvisorAddress(target), PayloadCsum: checksum.Checksum(icmp[8:], 0), PayloadLen: len(icmp) - 8}))
-	return makeInteropICMPPacket(family, source, target, icmp)
+	return makeInteropICMPPacket(family, source, target, icmp, false)
 }
 
-// makeInteropICMPPacket wraps one complete ICMP message in the corresponding
-// minimal IP header for ReplyIPPacket.
-func makeInteropICMPPacket(family interopFamily, source, target netip.Addr, message []byte) []byte {
+// makeInteropICMPPacket wraps one complete ICMP message for ReplyIPPacket.
+// Selected IPv6 Echo tests carry a Hop-by-Hop header so interop also covers
+// upper-layer discovery beyond the fixed IPv6 header.
+func makeInteropICMPPacket(family interopFamily, source, target netip.Addr, message []byte, ipv6HopByHop bool) []byte {
 	protocol := uint8(header.ICMPv6ProtocolNumber)
 	headerSize := header.IPv6MinimumSize
+	if ipv6HopByHop && source.Is6() {
+		headerSize += 8
+	}
 	if source.Is4() {
 		protocol = uint8(header.ICMPv4ProtocolNumber)
 		headerSize = header.IPv4MinimumSize
@@ -1018,6 +1022,9 @@ func makeInteropICMPPacket(family interopFamily, source, target netip.Addr, mess
 		ip := header.IPv4(packet[:headerSize])
 		ip.Encode(&header.IPv4Fields{TotalLength: uint16(len(packet)), TTL: 37, Protocol: protocol, SrcAddr: gvisorAddress(source), DstAddr: gvisorAddress(target)})
 		ip.SetChecksum(^ip.CalculateChecksum())
+	} else if ipv6HopByHop {
+		header.IPv6(packet[:header.IPv6MinimumSize]).Encode(&header.IPv6Fields{PayloadLength: uint16(8 + len(message)), TransportProtocol: tcpip.TransportProtocolNumber(header.IPv6HopByHopOptionsExtHdrIdentifier), HopLimit: 37, SrcAddr: gvisorAddress(source), DstAddr: gvisorAddress(target)})
+		packet[header.IPv6MinimumSize] = protocol
 	} else {
 		header.IPv6(packet[:headerSize]).Encode(&header.IPv6Fields{PayloadLength: uint16(len(message)), TransportProtocol: tcpip.TransportProtocolNumber(protocol), HopLimit: 37, SrcAddr: gvisorAddress(source), DstAddr: gvisorAddress(target)})
 	}

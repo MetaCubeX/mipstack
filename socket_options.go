@@ -162,8 +162,8 @@ type acceptQueueSocketOption socketOptionOverride[int]
 // synBacklogSocketOption stores one stateful TCP handshake limit.
 type synBacklogSocketOption socketOptionOverride[int]
 
-// receiveErrorsSocketOption stores one UDP or IP error-delivery and local-output
-// reporting policy.
+// receiveErrorsSocketOption stores one UDP or IP error-delivery and
+// output-admission reporting policy.
 type receiveErrorsSocketOption socketOptionBoolOverride
 
 // pathMTUDiscoverySocketOption stores one UDP or IP PMTU-discovery policy.
@@ -619,10 +619,11 @@ func (option synBacklogSocketOption) apply(set socketOptionSet, use socketOption
 
 // ReceiveErrors controls whether newly created UDP and IP sockets reserve
 // asynchronous errors for ReadError instead of returning them from ordinary
-// reads after queued payloads. It also makes local output-queue exhaustion fail
-// writes with ENOBUFS. It is valid for the UDP and IP creation methods on
-// ListenConfig and Dialer, and for UDPForwarderRequest.Accept and
-// UDPForwarderRequest.Listen.
+// reads after queued payloads. It also makes failure to admit unicast output,
+// or the external-link copy of multicast or broadcast output, fail writes with
+// ENOBUFS. Receive-side non-unicast loopback copies remain best effort. It is
+// valid for the UDP and IP creation methods on ListenConfig and Dialer, and for
+// UDPForwarderRequest.Accept and UDPForwarderRequest.Listen.
 func (SocketOptionFactory) ReceiveErrors(enabled bool) SocketOption {
 	return receiveErrorsSocketOption(newSocketOptionBoolOverride(enabled))
 }

@@ -176,6 +176,11 @@ func TestPacketDeviceConcurrentCloseAndPublish(t *testing.T) {
 			t.Fatal(err)
 		}
 		packet := buildIPPacket(local, remote, ProtocolUDP, make([]byte, udpHeaderSize), uint16(round), false)
+		for index := 0; index < outboundPacketQueue; index++ {
+			if writeErr := stack.tryWritePacket(packet); writeErr != nil {
+				t.Fatalf("round %d fill packet %d: %v", round, index, writeErr)
+			}
+		}
 		start := make(chan struct{})
 		publish := make(chan struct{})
 		var ready, writers sync.WaitGroup

@@ -901,8 +901,7 @@ func (r *UDPForwarderRequest) Listen(options ...SocketOption) (*UDPConn, error) 
 // terminal action, but every call must finish before the handler returns. Each
 // call uses the current Config.UDP output defaults and makes one immediate
 // best-effort output attempt. Local output congestion may discard the datagram
-// or a suffix of its source fragments without error. Other errors may be
-// retried.
+// or any of its source fragments without error. Other errors may be retried.
 func (r *UDPForwarderRequest) Reply(payload []byte) (int, error) {
 	return r.replyFrom(payload, r.flow.Destination)
 }
@@ -975,7 +974,7 @@ func (r *IPForwarderRequest) Message() IPForwarderMessage {
 // to Source. Calls may be repeated or concurrent before a later terminal action
 // and must finish before the handler returns. Each call uses the current
 // Config.IP output defaults and makes one immediate best-effort output attempt.
-// Local output congestion may discard the payload or a suffix of its source
+// Local output congestion may discard the payload or any of its source
 // fragments without error. Other errors may be retried.
 func (r *IPForwarderRequest) Reply(payload []byte) error {
 	if err := r.beginReply(); err != nil {
@@ -1037,8 +1036,7 @@ func (r *ICMPForwarderRequest) IPPacket() []byte { return r.packet.original }
 // terminal action, but every call must finish before the handler returns. The
 // stack copies payload, recalculates its checksum, and makes one immediate
 // best-effort output attempt. Local output congestion may discard the message
-// or a suffix of its source fragments without error. Other errors may be
-// retried.
+// or any of its source fragments without error. Other errors may be retried.
 func (r *ICMPForwarderRequest) Reply(payload []byte) error {
 	return r.reply(payload, false)
 }
@@ -1083,7 +1081,7 @@ func (r *ICMPForwarderRequest) writeReply(payload []byte, owned bool) error {
 // An IPv6 atomic Fragment header is preserved when the packet fits; when
 // fragmentation is required, it is replaced by the emitted fragment sequence
 // instead of nesting another header. Output does not wait for capacity; local
-// congestion may discard the packet or a suffix of its source fragments without
+// congestion may discard the packet or any of its source fragments without
 // error. The method may be retried after other validation or output failures
 // and does not prevent a later terminal action.
 func (r *ICMPForwarderRequest) ReplyIPPacket(packet []byte) error {
@@ -1896,8 +1894,8 @@ func (r *UDPForwarderResponder) RestrictToReplies() error {
 
 // Reply makes one immediate best-effort output attempt for a reverse-flow
 // datagram from Destination to Source. Use ReplyFrom to select a different
-// source. Local output congestion may discard the datagram or a suffix of its
-// source fragments without error. Calls may be repeated or concurrent while
+// source. Local output congestion may discard the datagram or any of its source
+// fragments without error. Calls may be repeated or concurrent while
 // the responder is active or restricted to replies, with no ordering guarantee
 // between concurrent calls. Any call may be retried after failure; each call
 // revalidates the forwarder and current destination policy and copies payload
@@ -2074,8 +2072,8 @@ func (r *IPForwarderResponder) RestrictToReplies() error {
 }
 
 // Reply makes one immediate best-effort output attempt for a reverse protocol
-// payload. Local output congestion may discard the payload or a suffix of its
-// source fragments without error. Calls may be repeated or concurrent until a
+// payload. Local output congestion may discard the payload or any of its source
+// fragments without error. Calls may be repeated or concurrent until a
 // terminal action or while restricted to replies, with no ordering guarantee
 // between concurrent calls. Failed calls may be retried, and Drop or Reject may
 // follow any number of replies while the responder remains active.
@@ -2222,8 +2220,8 @@ func (r *ICMPForwarderResponder) RestrictToReplies() error {
 }
 
 // Reply makes one immediate best-effort output attempt for a reverse ICMP
-// message. Local output congestion may discard the message or a suffix of its
-// source fragments without error. Calls may be repeated or concurrent until a
+// message. Local output congestion may discard the message or any of its source
+// fragments without error. Calls may be repeated or concurrent until a
 // terminal action or while restricted to replies, with no ordering guarantee
 // between concurrent calls. Any call may be retried after failure; each call
 // revalidates the forwarder and current destination policy and copies payload
@@ -2258,7 +2256,7 @@ func (r *ICMPForwarderResponder) writeReply(payload []byte, owned bool) error {
 // restricted to replies. The packet is copied before return, concurrent calls
 // have no ordering guarantee, and a failed call may be retried or followed by
 // Drop or Reject while the responder remains active. Local output congestion
-// may discard the packet or a suffix of its source fragments without error. It
+// may discard the packet or any of its source fragments without error. It
 // reports net.ErrClosed after a terminal action or when the originating
 // forwarder is closed.
 func (r *ICMPForwarderResponder) ReplyIPPacket(packet []byte) error {

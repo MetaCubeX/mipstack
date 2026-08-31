@@ -223,7 +223,9 @@ type DatagramSocketDefaults struct {
 	ReceiveBuffer int
 	// ReceiveErrors reserves asynchronous network errors for ReadError instead
 	// of returning them from ordinary reads after queued payloads. It also makes
-	// local output-queue exhaustion fail a UDP or IP write with ENOBUFS.
+	// failure to admit unicast output, or the external-link copy of multicast or
+	// broadcast output, fail a UDP or IP write with ENOBUFS. Receive-side
+	// non-unicast loopback copies remain best effort.
 	ReceiveErrors bool
 	// PathMTUDiscovery selects the Linux-compatible source-fragmentation and
 	// destination-PMTU policy. The zero value is PathMTUDiscoveryDont.
@@ -939,6 +941,9 @@ const (
 	outputFlowNew
 	// outputFlowOld marks a ready flow that consumed its initial priority.
 	outputFlowOld
+	// outputFlowOldDue marks one old flow waiting behind the current new-flow
+	// cohort for a starvation-prevention service turn.
+	outputFlowOldDue
 	// outputFlowUnused marks an available fixed scheduler entry.
 	outputFlowUnused
 )
@@ -969,13 +974,14 @@ type outputFlow struct {
 }
 
 // outputFlowKey uses a TCP connection's stack-local identity when available
-// and a keyed packet hash for connectionless traffic.
+// and a keyed packet hash for connectionless traffic. Its zero value asks the
+// scheduler to derive the key from the serialized packet.
 type outputFlowKey struct {
 	tcp  uint64
 	hash uint64
 }
 
-// outputFlowList is an intrusive FIFO of scheduler flows in one state.
+// outputFlowList is an intrusive FIFO used by ready and retained flow states.
 type outputFlowList struct {
 	first *outputFlow
 	last  *outputFlow
@@ -1126,11 +1132,11 @@ func (s *fairPacketScheduler) reactivateFlow(flow *outputFlow) {
 	s.newFlows.append(flow)
 }
 
-// enqueue publishes entry to its scheduler flow.
-func (s *fairPacketScheduler) enqueue(entry packetQueueEntry, flowID uint64) {
-	key := outputFlowKey{tcp: flowID}
-	if flowID == 0 {
-		key.hash = outputPacketFlowHash(s.secret, entry.packet)
+// enqueue publishes entry to its scheduler flow. TCP and source-fragmented
+// packet sequences supply a key; ordinary packets are classified here.
+func (s *fairPacketScheduler) enqueue(entry packetQueueEntry, key outputFlowKey) {
+	if key == (outputFlowKey{}) {
+		key = outputHashedFlowKey(outputPacketFlowHash(s.secret, entry.packet))
 	}
 	s.mu.Lock()
 	flow := s.lastFlow
@@ -1165,15 +1171,110 @@ func (s *fairPacketScheduler) detachFlow(flow *outputFlow) {
 	s.detached.append(flow)
 }
 
+// scheduleOldFlowTurn places one eligible old-flow service turn behind the
+// current new-flow cohort. Later arrivals join behind it, so they cannot starve
+// old backlog, while flows already granted initial priority retain their order.
+func (s *fairPacketScheduler) scheduleOldFlowTurn() {
+	for s.oldFlows.first != nil {
+		flow := s.oldFlows.first
+		if flow.head < 0 {
+			s.oldFlows.remove(flow)
+			s.detachFlow(flow)
+			continue
+		}
+		if flow.credit <= 0 {
+			flow.credit += s.quantum
+			s.oldFlows.remove(flow)
+			s.oldFlows.append(flow)
+			continue
+		}
+		s.oldFlows.remove(flow)
+		flow.state = outputFlowOldDue
+		s.newFlows.append(flow)
+		return
+	}
+}
+
+// demoteNewFlow moves a flow that consumed its initial priority to the old-flow list.
+func (s *fairPacketScheduler) demoteNewFlow(flow *outputFlow) {
+	s.newFlows.remove(flow)
+	s.scheduleOldFlowTurn()
+	flow.state = outputFlowOld
+	s.oldFlows.append(flow)
+}
+
+// removeHead removes one packet without applying service credit or changing
+// the flow's ready-list position. The caller holds s.mu.
+func (s *fairPacketScheduler) removeHead(flow *outputFlow) packetQueueEntry {
+	slot := flow.head
+	node := &s.nodes[slot]
+	flow.head = node.next
+	if flow.head < 0 {
+		flow.tail = -1
+	}
+	entry := node.entry
+	node.entry, node.next = packetQueueEntry{}, -1
+	s.queued--
+	return entry
+}
+
+// dropFromFattestFlow removes the oldest packet from the flow retaining the
+// most queued bytes. This extends flow fairness to overload admission while
+// dropping only the one packet needed by the incoming best-effort publisher.
+func (s *fairPacketScheduler) dropFromFattestFlow() (packetQueueEntry, bool) {
+	s.mu.Lock()
+	var fattest *outputFlow
+	largestBacklog := 0
+	// Queue capacity bounds the complete walk to 256 packet nodes. Deriving
+	// byte totals only on overload keeps ordinary service free of this accounting.
+	for index := range s.store {
+		flow := &s.store[index]
+		if flow.state == outputFlowUnused || flow.head < 0 {
+			continue
+		}
+		backlog := 0
+		for slot := flow.head; slot >= 0; slot = s.nodes[slot].next {
+			backlog += len(s.nodes[slot].entry.packet)
+		}
+		if fattest == nil || backlog > largestBacklog {
+			fattest = flow
+			largestBacklog = backlog
+		}
+	}
+	if fattest == nil {
+		s.mu.Unlock()
+		return packetQueueEntry{}, false
+	}
+	entry := s.removeHead(fattest)
+	if fattest.head < 0 {
+		// Empty flows follow the lifecycle they would have reached after service;
+		// a due old flow has already consumed its new-flow priority.
+		switch fattest.state {
+		case outputFlowNew:
+			s.newFlows.remove(fattest)
+			fattest.state = outputFlowOld
+			s.oldFlows.append(fattest)
+		case outputFlowOldDue:
+			s.newFlows.remove(fattest)
+			s.detachFlow(fattest)
+		default:
+			s.oldFlows.remove(fattest)
+			s.detachFlow(fattest)
+		}
+	}
+	s.mu.Unlock()
+	return entry, true
+}
+
 // selectList returns the highest-priority nonempty ready list.
-func (s *fairPacketScheduler) selectList() (*outputFlowList, uint8) {
+func (s *fairPacketScheduler) selectList() *outputFlowList {
 	if s.newFlows.first != nil {
-		return &s.newFlows, outputFlowNew
+		return &s.newFlows
 	}
 	if s.oldFlows.first != nil {
-		return &s.oldFlows, outputFlowOld
+		return &s.oldFlows
 	}
-	return nil, outputFlowDetached
+	return nil
 }
 
 // tryDequeue removes one immediately schedulable packet.
@@ -1186,52 +1287,60 @@ func (s *fairPacketScheduler) tryDequeue() (packetQueueEntry, bool) {
 func (s *fairPacketScheduler) tryDequeueAndSignal(signalRemaining bool) (packetQueueEntry, bool) {
 	s.mu.Lock()
 	for s.queued != 0 {
-		list, state := s.selectList()
+		list := s.selectList()
 		if list == nil {
 			s.mu.Unlock()
 			return packetQueueEntry{}, false
 		}
 		flow := list.first
+		state := flow.state
 		if flow.head < 0 {
-			list.remove(flow)
 			if state == outputFlowNew {
-				flow.state = outputFlowOld
-				s.oldFlows.append(flow)
+				s.demoteNewFlow(flow)
 			} else {
+				list.remove(flow)
 				s.detachFlow(flow)
 			}
 			continue
 		}
 		if flow.credit <= 0 {
 			flow.credit += s.quantum
-			list.remove(flow)
-			flow.state = outputFlowOld
-			s.oldFlows.append(flow)
+			if state == outputFlowOldDue {
+				continue
+			}
+			if state == outputFlowNew {
+				s.demoteNewFlow(flow)
+			} else {
+				list.remove(flow)
+				s.oldFlows.append(flow)
+			}
 			continue
 		}
-		slot := flow.head
-		node := &s.nodes[slot]
-		flow.head = node.next
-		if flow.head < 0 {
-			flow.tail = -1
-		}
-		entry := node.entry
-		node.entry, node.next = packetQueueEntry{}, -1
+		entry := s.removeHead(flow)
 		flow.credit -= len(entry.packet)
-		s.queued--
-		if flow.head < 0 {
+		if state == outputFlowOldDue && flow.head < 0 {
 			list.remove(flow)
-			if state == outputFlowNew {
-				flow.state = outputFlowOld
-				s.oldFlows.append(flow)
-			} else {
-				s.detachFlow(flow)
-			}
-		} else if flow.credit <= 0 {
+			s.detachFlow(flow)
+		} else if state == outputFlowOldDue && flow.credit <= 0 {
 			flow.credit += s.quantum
 			list.remove(flow)
 			flow.state = outputFlowOld
 			s.oldFlows.append(flow)
+		} else if flow.head < 0 {
+			if state == outputFlowNew {
+				s.demoteNewFlow(flow)
+			} else {
+				list.remove(flow)
+				s.detachFlow(flow)
+			}
+		} else if flow.credit <= 0 {
+			flow.credit += s.quantum
+			if state == outputFlowNew {
+				s.demoteNewFlow(flow)
+			} else {
+				list.remove(flow)
+				s.oldFlows.append(flow)
+			}
 		}
 		if signalRemaining && s.queued != 0 {
 			// Keep readiness level-triggered when callers read only one packet at
@@ -1278,28 +1387,54 @@ func outputHashWord(hash, value uint64) uint64 {
 	return hash
 }
 
-// outputTransportSelector extracts the stable four-byte discriminator used by
-// locally generated TCP, UDP, and ICMP traffic. ICMP checksums and echo
-// sequence numbers vary per message; type, code, and identifier do not.
-func outputTransportSelector(protocol byte, payload []byte) uint32 {
-	if protocol == ProtocolICMPv4 || protocol == ProtocolICMPv6 {
-		var selector [4]byte
-		if len(payload) >= 2 {
-			selector[0], selector[1] = payload[0], payload[1]
-		}
-		if len(payload) >= 6 {
-			copy(selector[2:4], payload[4:6])
-		}
-		return binary.BigEndian.Uint32(selector[:])
-	}
-	if len(payload) >= 4 {
-		return binary.BigEndian.Uint32(payload[:4])
-	}
-	return 0
+// outputICMPIdentifierProtocol maps the ICMP message types whose bytes 4..5
+// carry an identifier to the protocol that defines that layout. A byte index
+// covers every possible type without a bounds check in the output hot path.
+var outputICMPIdentifierProtocol = [256]byte{
+	ICMPv4TypeEchoReply:   ProtocolICMPv4,
+	ICMPv4TypeEchoRequest: ProtocolICMPv4,
+	13:                    ProtocolICMPv4, // Timestamp Request.
+	14:                    ProtocolICMPv4, // Timestamp Reply.
+	ICMPv6TypeEchoRequest: ProtocolICMPv6,
+	ICMPv6TypeEchoReply:   ProtocolICMPv6,
 }
 
-// outputPacketFlowHash classifies locally generated traffic without fully
-// parsing or validating a packet that the stack has just constructed.
+// outputTransportSelector extracts ports from TCP and UDP, and type, code,
+// and any identifier defined by ICMP Echo or IPv4 Timestamp messages. Other
+// payload fields do not split one flow as their values change.
+func outputTransportSelector(protocol byte, payload []byte) uint32 {
+	if protocol == ProtocolTCP || protocol == ProtocolUDP {
+		if len(payload) >= 4 {
+			return binary.BigEndian.Uint32(payload)
+		}
+		return 0
+	}
+	if len(payload) < 2 || protocol != ProtocolICMPv4 && protocol != ProtocolICMPv6 {
+		return 0
+	}
+	selector := uint32(payload[0])<<24 | uint32(payload[1])<<16
+	if len(payload) >= 6 && outputICMPIdentifierProtocol[payload[0]] == protocol {
+		selector |= uint32(payload[4])<<8 | uint32(payload[5])
+	}
+	return selector
+}
+
+// outputTransportFlowWord combines one upper-layer protocol and its selector
+// without aliasing another protocol-selector pair.
+func outputTransportFlowWord(protocol byte, selector uint32) uint64 {
+	return uint64(protocol)<<32 | uint64(selector)
+}
+
+// outputFragmentFlowWord keeps fragment identification outside the transport
+// selector namespace while retaining the protocol carried by the datagram.
+func outputFragmentFlowWord(protocol byte, identification uint32) uint64 {
+	return uint64(1)<<63 | uint64(protocol)<<32 | uint64(identification)
+}
+
+// outputPacketFlowHash derives scheduler identity from a complete wire packet
+// when its producer has no semantic flow key. It reads only fields needed for
+// fairness and retains base-header classification when an IPv6 extension chain
+// cannot be traversed safely.
 func outputPacketFlowHash(secret [16]byte, packet []byte) uint64 {
 	hash := binary.LittleEndian.Uint64(secret[0:8]) ^ 0x6a09e667f3bcc909
 	seed := binary.LittleEndian.Uint64(secret[8:16])
@@ -1319,13 +1454,17 @@ func outputPacketFlowHash(secret [16]byte, packet []byte) uint64 {
 		addresses := binary.BigEndian.Uint64(packet[12:20])
 		hash = outputHashWord(hash, addresses)
 		protocol := packet[9]
-		hash = outputHashWord(hash, uint64(protocol))
 		headerSize := int(packet[0]&0x0f) * 4
 		fragment := binary.BigEndian.Uint16(packet[6:8])
 		if fragment&0x3fff != 0 {
-			hash = outputHashWord(hash, uint64(binary.BigEndian.Uint16(packet[4:6])))
-		} else if headerSize >= 20 && headerSize < len(packet) {
-			hash = outputHashWord(hash, uint64(outputTransportSelector(protocol, packet[headerSize:])))
+			identification := uint32(binary.BigEndian.Uint16(packet[4:6]))
+			hash = outputHashWord(hash, outputFragmentFlowWord(protocol, identification))
+		} else {
+			var selector uint32
+			if headerSize >= 20 && headerSize < len(packet) {
+				selector = outputTransportSelector(protocol, packet[headerSize:])
+			}
+			hash = outputHashWord(hash, outputTransportFlowWord(protocol, selector))
 		}
 	case 6:
 		if len(packet) < 40 {
@@ -1337,20 +1476,23 @@ func outputPacketFlowHash(secret [16]byte, packet []byte) uint64 {
 		for offset := 8; offset < 40; offset += 8 {
 			hash = outputHashWord(hash, binary.BigEndian.Uint64(packet[offset:offset+8]))
 		}
-		protocol := packet[6]
-		hash = outputHashWord(hash, uint64(protocol))
 		flowLabel := uint32(packet[1]&0x0f)<<16 | uint32(binary.BigEndian.Uint16(packet[2:4]))
 		if flowLabel != 0 {
-			hash = outputHashWord(hash, uint64(flowLabel))
-		} else if protocol == IPv6ExtensionHeaderFragment && len(packet) >= 48 {
-			// Locally fragmented packets carry the Fragment header directly
-			// after the IPv6 header. Offset and M differ between fragments, so
-			// use Next Header and Identification to keep one datagram ordered.
-			hash = outputHashWord(hash, uint64(packet[40]))
-			hash = outputHashWord(hash, uint64(binary.BigEndian.Uint32(packet[44:48])))
-		} else if len(packet) > 40 {
-			hash = outputHashWord(hash, uint64(outputTransportSelector(protocol, packet[40:])))
+			// RFC 6437 permits the fixed IPv6-header triplet to identify a
+			// labeled flow even when fragmentation or extensions hide transport.
+			return outputHashWord(hash, uint64(flowLabel))
 		}
+		protocol := packet[6]
+		if isTraversableIPv6ExtensionHeader(protocol) {
+			if extensionHash, valid := outputIPv6ExtensionPacketFlowHash(hash, packet); valid {
+				return extensionHash
+			}
+		}
+		var selector uint32
+		if len(packet) > 40 {
+			selector = outputTransportSelector(protocol, packet[40:])
+		}
+		hash = outputHashWord(hash, outputTransportFlowWord(protocol, selector))
 	default:
 		limit := len(packet)
 		if limit > 40 {
@@ -1363,8 +1505,75 @@ func outputPacketFlowHash(secret [16]byte, packet []byte) uint64 {
 	return hash
 }
 
-// packetQueueEntry couples one packet with its fixed queue slot. The entry is
-// stored inline in the bounded channel and does not allocate per packet.
+// outputIPv6ExtensionPacketFlowHash traverses a zero-label extension chain
+// after the caller has hashed the IPv6 version and addresses. Non-atomic
+// fragments use the Fragment header's Next Header and Identification, while
+// atomic fragments retain ordinary transport flow semantics. Invalid chains
+// ask the caller to retain its stable base-header classification.
+func outputIPv6ExtensionPacketFlowHash(hash uint64, packet []byte) (uint64, bool) {
+	next, offset := packet[6], 40
+	for isTraversableIPv6ExtensionHeader(next) {
+		headerType := next
+		length, valid := ipv6ExtensionHeaderLength(headerType, packet[offset:])
+		if !valid {
+			return 0, false
+		}
+		header := packet[offset : offset+length]
+		if headerType == IPv6ExtensionHeaderFragment {
+			field := binary.BigEndian.Uint16(header[2:4])
+			if field&0x0006 != 0 {
+				return 0, false
+			}
+			if field&0xfff9 != 0 {
+				word := outputFragmentFlowWord(header[0], binary.BigEndian.Uint32(header[4:8]))
+				return outputHashWord(hash, word), true
+			}
+		}
+		next, offset = header[0], offset+length
+	}
+	selector := outputTransportSelector(next, packet[offset:])
+	return outputHashWord(hash, outputTransportFlowWord(next, selector)), true
+}
+
+// outputIPFlowHash classifies output from semantic fields available before
+// source fragmentation. Nonzero IPv6 labels use the fixed-header triplet from
+// RFC 6437; unlabeled packets retain the transport identity when later
+// fragments omit it or caller-supplied IPv6 extension headers precede it.
+func outputIPFlowHash(secret [16]byte, source, target netip.Addr, protocol byte, flowLabel uint32, selector uint32) uint64 {
+	hash := binary.LittleEndian.Uint64(secret[0:8]) ^ 0x6a09e667f3bcc909
+	seed := binary.LittleEndian.Uint64(secret[8:16])
+	if source.Is4() {
+		sourceBytes, targetBytes := source.As4(), target.As4()
+		hash = outputHashWord(hash, 4^seed)
+		addresses := uint64(binary.BigEndian.Uint32(sourceBytes[:]))<<32 | uint64(binary.BigEndian.Uint32(targetBytes[:]))
+		hash = outputHashWord(hash, addresses)
+		return outputHashWord(hash, outputTransportFlowWord(protocol, selector))
+	}
+	sourceBytes, targetBytes := source.As16(), target.As16()
+	hash = outputHashWord(hash, 6^seed)
+	hash = outputHashWord(hash, binary.BigEndian.Uint64(sourceBytes[0:8]))
+	hash = outputHashWord(hash, binary.BigEndian.Uint64(sourceBytes[8:16]))
+	hash = outputHashWord(hash, binary.BigEndian.Uint64(targetBytes[0:8]))
+	hash = outputHashWord(hash, binary.BigEndian.Uint64(targetBytes[8:16]))
+	if flowLabel != 0 {
+		return outputHashWord(hash, uint64(flowLabel))
+	}
+	return outputHashWord(hash, outputTransportFlowWord(protocol, selector))
+}
+
+// outputHashedFlowKey reserves the zero key as the request for wire
+// classification. Mapping a zero hash to one keeps that sentinel out of the
+// keyed connectionless namespace.
+func outputHashedFlowKey(hash uint64) outputFlowKey {
+	if hash == 0 {
+		hash = 1
+	}
+	return outputFlowKey{hash: hash}
+}
+
+// packetQueueEntry couples one packet with its fixed queue slot. FIFO queues
+// store it in a bounded channel and fair queues store it in the matching fixed
+// scheduler node, so neither path allocates per packet.
 type packetQueueEntry struct {
 	packet   []byte
 	slot     uint16
@@ -1639,6 +1848,29 @@ func (q *packetQueue) tryReserve() (uint16, bool) {
 	}
 }
 
+// replaceBestEffort reclaims one already-published packet from the fattest
+// flow. FIFO queues and capacity held by unpublished reservations retain
+// strict bounded admission.
+func (q *packetQueue) replaceBestEffort() (uint16, bool) {
+	if q.scheduler == nil {
+		return 0, false
+	}
+	// A reader can return capacity before overload handling acquires the
+	// scheduler. Prefer that slot to discarding an otherwise deliverable packet.
+	if slot, ok := q.tryReserve(); ok {
+		return slot, true
+	}
+	entry, ok := q.scheduler.dropFromFattestFlow()
+	if !ok {
+		return 0, false
+	}
+	if q.depart(entry.slot) {
+		q.completeDeparture(entry.slot)
+	}
+	q.releaseBuffer(entry.packet, entry.reusable)
+	return entry.slot, true
+}
+
 // releaseReserved returns a slot that was acquired but not published.
 func (q *packetQueue) releaseReserved(slot uint16) { q.free <- slot }
 
@@ -1649,7 +1881,7 @@ func (q *packetQueue) releaseReserved(slot uint16) { q.free <- slot }
 // when queue closure wins the publication race.
 func (q *packetQueue) enqueueReservedTCP(slot uint16, packet []byte, reusable bool, flowID uint64, loopback bool) (ticket packetQueueTicket, published bool) {
 	queuedAt := monotonicStampAt(q.epoch, time.Now())
-	generation, published := q.publishReserved(slot, packet, reusable, flowID)
+	generation, published := q.publishReserved(slot, packet, reusable, outputFlowKey{tcp: flowID})
 	return packetQueueTicket{token: packetQueueTicketToken(slot, generation, loopback), queuedAt: queuedAt}, published
 }
 
@@ -1657,13 +1889,20 @@ func (q *packetQueue) enqueueReservedTCP(slot uint16, packet []byte, reusable bo
 // loss tracking and therefore avoids reading the clock. It reports whether
 // publication completed before queue closure.
 func (q *packetQueue) enqueueReservedPacket(slot uint16, packet []byte, reusable bool) bool {
-	_, published := q.publishReserved(slot, packet, reusable, 0)
+	_, published := q.publishReserved(slot, packet, reusable, outputFlowKey{})
+	return published
+}
+
+// enqueueReservedPacketForFlow publishes a packet using the caller's semantic
+// identity. A zero flow lets the scheduler classify the serialized packet.
+func (q *packetQueue) enqueueReservedPacketForFlow(slot uint16, packet []byte, reusable bool, flow outputFlowKey) bool {
+	_, published := q.publishReserved(slot, packet, reusable, flow)
 	return published
 }
 
 // publishReserved marks and publishes one already-reserved slot. A publisher
 // that raced with close removes any late publication without making Close wait.
-func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool, flowID uint64) (uint64, bool) {
+func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool, flow outputFlowKey) (uint64, bool) {
 	state := q.slots[slot].Load()
 	generation := (state>>packetQueueSlotGenerationShift + 1) & packetQueueTicketGenerationMask
 	if generation == 0 {
@@ -1674,13 +1913,23 @@ func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool,
 	if q.scheduler == nil {
 		q.packets <- entry
 	} else {
-		q.scheduler.enqueue(entry, flowID)
+		q.scheduler.enqueue(entry, flow)
 	}
 	if q.closed.Load() {
 		q.discard()
 		return generation, false
 	}
 	return generation, true
+}
+
+// ipFlowKey classifies one packet sequence from the fields retained across
+// source fragmentation. payload begins with the upper-layer header.
+func (q *packetQueue) ipFlowKey(source, target netip.Addr, protocol byte, flowLabel uint32, payload []byte) outputFlowKey {
+	if q.scheduler == nil {
+		return outputFlowKey{}
+	}
+	selector := outputTransportSelector(protocol, payload)
+	return outputHashedFlowKey(outputIPFlowHash(q.scheduler.secret, source, target, protocol, flowLabel, selector))
 }
 
 // dequeue waits for one schedulable packet or stack closure.
@@ -3000,10 +3249,13 @@ func (s *Stack) localEndpointFor(network string, remote, requested netip.AddrPor
 // Outbound capacity is finite. If the embedding device stops calling Read,
 // TCP retains protocol work until capacity returns while its socket send-buffer
 // and deadline rules remain in force. UDP and IP writes make one immediate
-// admission attempt: local queue loss is successful by default and reports
-// ENOBUFS when the socket's ReceiveErrors policy is enabled. Best-effort
-// control output may be discarded. Resuming Read releases capacity for pending
-// TCP work.
+// admission attempt. Published backlog is replaced according to the same
+// byte-fair flow state used for service. Failure to admit unicast output or an
+// external-link non-unicast copy is successful by default and reports ENOBUFS
+// when the socket's ReceiveErrors policy is enabled. Receive-side non-unicast
+// loopback copies remain independently best effort. Best-effort control output
+// may displace queued backlog or be discarded. Resuming Read releases capacity
+// for pending TCP work.
 //
 // Read may run concurrently with Write and with other Read calls. Each queued
 // packet is assigned to at most one call, but concurrent calls have no relative
@@ -3099,7 +3351,7 @@ func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 // for device space.
 func (s *Stack) tryWritePacket(packet []byte) error {
 	queue, loopback := s.outputQueue(packet)
-	return s.tryWritePacketTo(packet, queue, loopback)
+	return s.tryWritePacketToFlow(packet, queue, loopback, outputFlowKey{})
 }
 
 // tryWriteCompletePacket queues a caller-owned complete packet using an
@@ -3107,16 +3359,21 @@ func (s *Stack) tryWritePacket(packet []byte) error {
 // through a send address that differs from the destination in the IP header.
 func (s *Stack) tryWriteCompletePacket(packet []byte, routeTarget netip.Addr) error {
 	queue, loopback := s.outputQueueFor(routeTarget)
-	return s.tryWritePacketTo(packet, queue, loopback)
+	return s.tryWritePacketToFlow(packet, queue, loopback, outputFlowKey{})
 }
 
-// tryWritePacketTo publishes one packet to an already selected output queue.
-func (s *Stack) tryWritePacketTo(packet []byte, queue *packetQueue, loopback bool) error {
+// tryWritePacketToFlow publishes one packet to an already selected queue. A
+// zero flow asks the queue to classify the wire packet; a nonzero flow retains
+// a semantic identity shared by a source-fragmented sequence.
+func (s *Stack) tryWritePacketToFlow(packet []byte, queue *packetQueue, loopback bool, flow outputFlowKey) error {
 	slot, err := s.tryReservePacket(queue)
+	if err == ErrResourceLimit {
+		slot, err = s.replaceBestEffortPacket(queue)
+	}
 	if err != nil {
 		return err
 	}
-	if !queue.enqueueReservedPacket(slot, packet, false) {
+	if !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
 		return ErrClosed
 	}
 	s.recordOutput(loopback)
@@ -3143,18 +3400,32 @@ func (s *Stack) tryReservePacket(queue *packetQueue) (uint16, error) {
 	}
 }
 
-// tryWritePackets queues packets that all select the same output queue. Link
-// output publishes the immediately available prefix in wire order. Loopback
-// retains all-or-none admission so the local reassembler cannot observe a
-// capacity-truncated sequence.
-func (s *Stack) tryWritePackets(packets [][]byte) error {
+// replaceBestEffortPacket handles the cold full-queue admission path after an
+// ordinary reservation attempt failed.
+func (s *Stack) replaceBestEffortPacket(queue *packetQueue) (uint16, error) {
+	if slot, ok := queue.replaceBestEffort(); ok {
+		return slot, nil
+	}
+	select {
+	case <-s.closeCh:
+		return 0, ErrClosed
+	default:
+		return 0, ErrResourceLimit
+	}
+}
+
+// tryWritePackets queues packets that all select the same output queue and
+// semantic link flow. Link output applies bounded admission to each packet in
+// wire order. Loopback ignores flow and retains all-or-none admission so the
+// local reassembler cannot observe a capacity-truncated sequence.
+func (s *Stack) tryWritePackets(packets [][]byte, flow outputFlowKey) error {
 	if len(packets) == 0 {
 		return nil
 	}
-	if len(packets) == 1 {
-		return s.tryWritePacket(packets[0])
-	}
 	queue, loopback := s.outputQueue(packets[0])
+	if len(packets) == 1 {
+		return s.tryWritePacketToFlow(packets[0], queue, loopback, flow)
+	}
 	if loopback {
 		return s.tryWriteLoopbackPackets(packets)
 	}
@@ -3164,16 +3435,14 @@ func (s *Stack) tryWritePackets(packets [][]byte) error {
 	default:
 	}
 	for _, packet := range packets {
-		slot, ok := queue.tryReserve()
-		if !ok {
-			select {
-			case <-s.closeCh:
-				return ErrClosed
-			default:
-				return ErrResourceLimit
-			}
+		slot, err := s.tryReservePacket(queue)
+		if err == ErrResourceLimit {
+			slot, err = s.replaceBestEffortPacket(queue)
 		}
-		if !queue.enqueueReservedPacket(slot, packet, false) {
+		if err != nil {
+			return err
+		}
+		if !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
 			return ErrClosed
 		}
 		s.recordOutput(false)
@@ -3265,10 +3534,11 @@ func (c *datagramSocketWriteControl) writeError() error {
 	}
 }
 
-// datagramLinkWriteError applies the local device-queue policy at the socket
-// boundary. A datagram accepted by the socket may be lost at the link without
-// changing its successful message-oriented write result. Extended-error mode
-// instead exposes local queue exhaustion as Linux ENOBUFS.
+// datagramLinkWriteError applies the socket-visible output-queue policy. A
+// datagram accepted by the socket may be lost at the link without changing its
+// successful message-oriented write result. Extended-error mode instead
+// exposes a socket-visible admission failure as Linux ENOBUFS; receive-side
+// non-unicast loopback admission is handled independently.
 func datagramLinkWriteError(err error, receiveErrors bool) error {
 	if err != ErrResourceLimit {
 		return err
@@ -3281,8 +3551,8 @@ func datagramLinkWriteError(err error, receiveErrors bool) error {
 
 // datagramWriteNeedsCorrelation reports whether a validated unicast write may
 // produce a later ICMP quote. Resource exhaustion is included conservatively
-// because a fragmented write may have published a prefix before the queue
-// became full.
+// because a fragmented write may have published packets before a later
+// admission failure.
 func datagramWriteNeedsCorrelation(err error) bool {
 	return err == nil || err == ErrResourceLimit
 }

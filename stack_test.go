@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -809,7 +810,7 @@ func TestTryWriteLoopbackPacketsCloseBeforeBatchPublication(t *testing.T) {
 	}
 	stack.loopback.batchMu.Lock()
 	writeResult := make(chan error, 1)
-	go func() { writeResult <- stack.tryWritePackets(packets) }()
+	go func() { writeResult <- stack.tryWritePackets(packets, outputFlowKey{}) }()
 	wantFree := cap(stack.loopback.free) - len(packets)
 	waitFor(t, time.Second, func() bool { return len(stack.loopback.free) == wantFree })
 
@@ -1374,17 +1375,57 @@ func TestDatagramWriteQueueExhaustionPolicy(t *testing.T) {
 				t.Fatalf("default full-queue statistics = %d packets, %d bytes", packets, bytes)
 			}
 			if !test.correlated(connection) {
-				t.Fatal("successful local queue drop did not retain ICMP correlation")
+				t.Fatal("published-backlog write did not retain ICMP correlation")
 			}
 
 			if err = test.configure(connection, true); err != nil {
 				t.Fatal(err)
 			}
-			if result := write(); result.bytes != 0 || !errors.Is(result.err, syscall.ENOBUFS) {
-				t.Fatalf("extended-error full-queue WriteTo = %d, %v", result.bytes, result.err)
+			if result := write(); result.bytes != len(payload) || result.err != nil {
+				t.Fatalf("extended-error published-backlog WriteTo = %d, %v", result.bytes, result.err)
 			}
-			if packets, bytes := test.statistics(connection); packets != 1 || bytes != uint64(len(payload)) {
-				t.Fatalf("extended-error statistics = %d packets, %d bytes", packets, bytes)
+			if packets, bytes := test.statistics(connection); packets != 2 || bytes != uint64(2*len(payload)) {
+				t.Fatalf("published-backlog statistics = %d packets, %d bytes", packets, bytes)
+			}
+			validPackets := 0
+			for {
+				entry, available := stack.outbound.tryDequeue()
+				if !available {
+					break
+				}
+				if _, parseErr := ParseIPPacket(entry.packet); parseErr == nil {
+					validPackets++
+				}
+				stack.outbound.release(entry)
+			}
+			if validPackets != 2 {
+				t.Fatalf("published-backlog writes retained %d packets, want 2", validPackets)
+			}
+			held := make([]uint16, cap(stack.outbound.free))
+			for index := range held {
+				slot, reserved := stack.outbound.tryReserve()
+				if !reserved {
+					t.Fatalf("unpublished reservation %d was unavailable", index)
+				}
+				held[index] = slot
+			}
+			if result := write(); result.bytes != 0 || !errors.Is(result.err, syscall.ENOBUFS) {
+				t.Fatalf("extended-error unreclaimable-capacity WriteTo = %d, %v", result.bytes, result.err)
+			}
+			if packets, bytes := test.statistics(connection); packets != 2 || bytes != uint64(2*len(payload)) {
+				t.Fatalf("unreclaimable-capacity statistics = %d packets, %d bytes", packets, bytes)
+			}
+			if err = test.configure(connection, false); err != nil {
+				t.Fatal(err)
+			}
+			if result := write(); result.bytes != len(payload) || result.err != nil {
+				t.Fatalf("default unreclaimable-capacity WriteTo = %d, %v", result.bytes, result.err)
+			}
+			if packets, bytes := test.statistics(connection); packets != 3 || bytes != uint64(3*len(payload)) {
+				t.Fatalf("default unreclaimable-capacity statistics = %d packets, %d bytes", packets, bytes)
+			}
+			for _, slot := range held {
+				stack.outbound.releaseReserved(slot)
 			}
 
 			if err = connection.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
@@ -1398,6 +1439,98 @@ func TestDatagramWriteQueueExhaustionPolicy(t *testing.T) {
 			}
 			if result := write(); result.bytes != 0 || !errors.Is(result.err, net.ErrClosed) {
 				t.Fatalf("closed WriteTo = %d, %v", result.bytes, result.err)
+			}
+		})
+	}
+}
+
+func TestDatagramWriteSameFlowReplacementIsSuccessful(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.43")
+	remote := netip.MustParseAddr("192.0.2.44")
+	for _, test := range []struct {
+		name       string
+		open       func(*Stack) (net.PacketConn, error)
+		target     net.Addr
+		configure  func(net.PacketConn, bool) error
+		statistics func(net.PacketConn) (uint64, uint64)
+	}{
+		{
+			name: "UDP",
+			open: func(stack *Stack) (net.PacketConn, error) {
+				return stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(local, 0))
+			},
+			target: net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 53)),
+			configure: func(connection net.PacketConn, enabled bool) error {
+				return connection.(*UDPConn).SetReceiveErrors(enabled)
+			},
+			statistics: func(connection net.PacketConn) (uint64, uint64) {
+				info := connection.(*UDPConn).Info()
+				return info.PacketsSent, info.BytesSent
+			},
+		},
+		{
+			name: "IP",
+			open: func(stack *Stack) (net.PacketConn, error) {
+				return stack.ListenIP(context.Background(), "ip4:99", local)
+			},
+			target: ipNetAddr(remote),
+			configure: func(connection net.PacketConn, enabled bool) error {
+				return connection.(*IPConn).SetReceiveErrors(enabled)
+			},
+			statistics: func(connection net.PacketConn) (uint64, uint64) {
+				info := connection.(*IPConn).Info()
+				return info.PacketsSent, info.BytesSent
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stack.Close() })
+			connection, err := test.open(stack)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = connection.Close() })
+			oldPayload := []byte("same-flow-old")
+			for index := 0; index < outboundPacketQueue; index++ {
+				if n, writeErr := connection.WriteTo(oldPayload, test.target); writeErr != nil || n != len(oldPayload) {
+					t.Fatalf("initial WriteTo %d = %d, %v", index, n, writeErr)
+				}
+			}
+			if err = test.configure(connection, true); err != nil {
+				t.Fatal(err)
+			}
+			newPayload := []byte("same-flow-new")
+			if n, writeErr := connection.WriteTo(newPayload, test.target); n != len(newPayload) || writeErr != nil {
+				t.Fatalf("same-flow replacement WriteTo = %d, %v", n, writeErr)
+			}
+			if packets, bytesSent := test.statistics(connection); packets != outboundPacketQueue+1 || bytesSent != outboundPacketQueue*uint64(len(oldPayload))+uint64(len(newPayload)) {
+				t.Fatalf("same-flow replacement statistics = %d packets, %d bytes", packets, bytesSent)
+			}
+			oldCount, newCount := 0, 0
+			for {
+				entry, available := stack.outbound.tryDequeue()
+				if !available {
+					break
+				}
+				switch {
+				case bytes.HasSuffix(entry.packet, oldPayload):
+					oldCount++
+				case bytes.HasSuffix(entry.packet, newPayload):
+					newCount++
+				default:
+					t.Fatalf("unexpected same-flow packet %x", entry.packet)
+				}
+				stack.outbound.release(entry)
+			}
+			if oldCount != outboundPacketQueue-1 || newCount != 1 {
+				t.Fatalf("same-flow replacement queue = old %d, new %d; want %d, 1", oldCount, newCount, outboundPacketQueue-1)
 			}
 		})
 	}
@@ -1759,6 +1892,528 @@ func TestFairPacketQueueUsesByteCredit(t *testing.T) {
 	}
 }
 
+func TestFairPacketQueueBestEffortAdmissionDropsFattestFlow(t *testing.T) {
+	const capacity = 8
+	source := netip.MustParseAddr("192.0.2.8")
+	target := netip.MustParseAddr("198.51.100.8")
+	bulk := testOutputUDPPacket(source, target, 12000, 53, 1400)
+	sparse := testOutputUDPPacket(source, target, 12001, 53, 128)
+	late := testOutputUDPPacket(source, target, 12002, 53, 128)
+	var queue packetQueue
+	queue.initFair(capacity, time.Now(), 1500, [16]byte{8})
+	for index := 0; index < capacity; index++ {
+		packet := sparse
+		if index < 3 {
+			packet = bulk
+		}
+		enqueueTestOutputPacket(t, &queue, packet)
+	}
+	slot, ok := queue.replaceBestEffort()
+	if !ok {
+		t.Fatal("late flow could not reclaim published backlog")
+	}
+	if !queue.enqueueReservedPacket(slot, late, false) {
+		t.Fatal("late flow was not admitted from published backlog")
+	}
+	counts := map[uint16]int{}
+	for {
+		entry, available := queue.tryDequeue()
+		if !available {
+			break
+		}
+		counts[binary.BigEndian.Uint16(entry.packet[20:22])]++
+		queue.release(entry)
+	}
+	// The three large packets hold more bytes than the five small packets, so
+	// byte-fair admission must select that flow despite its lower packet count.
+	if counts[12000] != 2 || counts[12001] != 5 || counts[12002] != 1 {
+		t.Fatalf("queue after overload admission = %v", counts)
+	}
+	if available := len(queue.free); available != capacity {
+		t.Fatalf("free slots after drain = %d, want %d", available, capacity)
+	}
+}
+
+func TestFairPacketQueueBestEffortAdmissionRemovesDueFlow(t *testing.T) {
+	const (
+		capacity = 11
+		mtu      = 1500
+	)
+	oldPacket := make([]byte, mtu)
+	oldPacket[0] = 1
+	newPacket := make([]byte, 64)
+	newPacket[0] = 2
+	var queue packetQueue
+	queue.initFair(capacity, time.Now(), mtu, [16]byte{9})
+	for index := 0; index < capacity; index++ {
+		slot, ok := queue.tryReserve()
+		if !ok || !queue.enqueueReservedPacketForFlow(slot, oldPacket, false, outputHashedFlowKey(1)) {
+			t.Fatalf("old-flow packet %d was not published", index)
+		}
+	}
+	for index := 0; index < 10; index++ {
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			t.Fatalf("initial packet %d was not schedulable", index)
+		}
+		if entry.packet[0] != 1 {
+			t.Fatalf("initial packet marker %d = %d, want 1", index, entry.packet[0])
+		}
+		queue.release(entry)
+	}
+	slot, ok := queue.tryReserve()
+	if !ok || !queue.enqueueReservedPacketForFlow(slot, newPacket, false, outputHashedFlowKey(2)) {
+		t.Fatal("new-flow packet was not published")
+	}
+	entry, ok := queue.tryDequeue()
+	if !ok {
+		t.Fatal("new-flow packet was not schedulable")
+	}
+	if entry.packet[0] != 2 {
+		t.Fatalf("new-flow marker = %d, want 2", entry.packet[0])
+	}
+	queue.release(entry)
+	for index := 0; index < 10; index++ {
+		slot, ok = queue.tryReserve()
+		if !ok || !queue.enqueueReservedPacketForFlow(slot, newPacket, false, outputHashedFlowKey(2)) {
+			t.Fatalf("filler packet %d was not published", index)
+		}
+	}
+	slot, ok = queue.replaceBestEffort()
+	replacementPacket := make([]byte, 64)
+	replacementPacket[0] = 3
+	if !ok || !queue.enqueueReservedPacketForFlow(slot, replacementPacket, false, outputHashedFlowKey(3)) {
+		t.Fatal("due old-flow packet was not replaced")
+	}
+	entry, ok = queue.tryDequeue()
+	if !ok {
+		t.Fatal("replacement packet was not schedulable")
+	}
+	if entry.packet[0] != 3 {
+		t.Fatalf("replacement marker = %d, want 3", entry.packet[0])
+	}
+	queue.release(entry)
+	for index := 0; index < 10; index++ {
+		entry, ok = queue.tryDequeue()
+		if !ok {
+			t.Fatalf("filler packet %d was not schedulable", index)
+		}
+		if entry.packet[0] != 2 {
+			t.Fatalf("filler marker %d = %d, want 2", index, entry.packet[0])
+		}
+		queue.release(entry)
+	}
+	if available := len(queue.free); available != capacity {
+		t.Fatalf("free slots after due-flow replacement = %d, want %d", available, capacity)
+	}
+}
+
+func TestFairPacketQueueContinuousNewFlowsDoNotStarveOldFlow(t *testing.T) {
+	const (
+		capacity = 64
+		mtu      = 1500
+	)
+	oldPacket := make([]byte, mtu)
+	oldPacket[0] = 1
+	newPacket := make([]byte, 64)
+	newPacket[0] = 2
+	var queue packetQueue
+	queue.initFair(capacity, time.Now(), mtu, [16]byte{9})
+	for index := 0; index < capacity; index++ {
+		slot, ok := queue.tryReserve()
+		if !ok {
+			t.Fatalf("old-flow reservation %d was unavailable", index)
+		}
+		if _, published := queue.enqueueReservedTCP(slot, oldPacket, false, 1, false); !published {
+			t.Fatalf("old-flow packet %d was not published", index)
+		}
+	}
+	// Consume the initial burst so the still-backlogged flow enters old_flows.
+	for index := 0; index < 10; index++ {
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			t.Fatalf("initial old-flow packet %d was not schedulable", index)
+		}
+		if entry.packet[0] != 1 {
+			t.Fatalf("initial old-flow marker %d = %d, want 1", index, entry.packet[0])
+		}
+		queue.release(entry)
+	}
+	servedOldAt := -1
+	for flow := 0; flow < 32; flow++ {
+		slot, ok := queue.tryReserve()
+		if !ok {
+			t.Fatalf("new-flow reservation %d was unavailable", flow)
+		}
+		key := outputHashedFlowKey(uint64(flow + 2))
+		if !queue.enqueueReservedPacketForFlow(slot, newPacket, false, key) {
+			t.Fatalf("new-flow packet %d was not published", flow)
+		}
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			t.Fatalf("packet %d was not schedulable", flow)
+		}
+		if entry.packet[0] == 1 && servedOldAt < 0 {
+			servedOldAt = flow
+		}
+		queue.release(entry)
+	}
+	if servedOldAt < 0 || servedOldAt > 1 {
+		t.Fatalf("existing backlogged flow was first served at read %d, want <= 1", servedOldAt)
+	}
+	for {
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			break
+		}
+		queue.release(entry)
+	}
+}
+
+func TestFairPacketQueueContinuousNewFlowsPreserveByteCredit(t *testing.T) {
+	const (
+		capacity  = 256
+		mtu       = 1500
+		readCount = 192
+	)
+	largePacket := make([]byte, mtu)
+	largePacket[0] = 1
+	smallPacket := make([]byte, 500)
+	smallPacket[0] = 2
+	newPacket := make([]byte, 64)
+	newPacket[0] = 3
+	var queue packetQueue
+	queue.initFair(capacity, time.Now(), mtu, [16]byte{10})
+	for index := 0; index < 100; index++ {
+		slot, ok := queue.tryReserve()
+		if !ok || !queue.enqueueReservedPacketForFlow(slot, largePacket, false, outputHashedFlowKey(1)) {
+			t.Fatalf("large old-flow packet %d was not published", index)
+		}
+	}
+	for index := 0; index < 156; index++ {
+		slot, ok := queue.tryReserve()
+		if !ok || !queue.enqueueReservedPacketForFlow(slot, smallPacket, false, outputHashedFlowKey(2)) {
+			t.Fatalf("small old-flow packet %d was not published", index)
+		}
+	}
+	initial := [2]int{}
+	for index := 0; index < 40; index++ {
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			t.Fatalf("initial packet %d was not schedulable", index)
+		}
+		if entry.packet[0] < 1 || entry.packet[0] > 2 {
+			t.Fatalf("initial packet marker %d = %d, want 1 or 2", index, entry.packet[0])
+		}
+		initial[entry.packet[0]-1]++
+		queue.release(entry)
+	}
+	if initial != [2]int{10, 30} {
+		t.Fatalf("initial flow service = %v, want [10 30]", initial)
+	}
+	servedBytes := [2]int{}
+	for flow := 0; flow < readCount; flow++ {
+		slot, ok := queue.tryReserve()
+		if !ok {
+			t.Fatalf("new-flow reservation %d was unavailable", flow)
+		}
+		key := outputHashedFlowKey(uint64(flow + 1000))
+		if !queue.enqueueReservedPacketForFlow(slot, newPacket, false, key) {
+			t.Fatalf("new-flow packet %d was not published", flow)
+		}
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			t.Fatalf("packet %d was not schedulable", flow)
+		}
+		if marker := entry.packet[0]; marker == 1 || marker == 2 {
+			servedBytes[marker-1] += len(entry.packet)
+		}
+		queue.release(entry)
+	}
+	difference := servedBytes[0] - servedBytes[1]
+	if difference < 0 {
+		difference = -difference
+	}
+	if servedBytes[0] == 0 || servedBytes[1] == 0 || difference > 2*mtu {
+		t.Fatalf("old-flow byte service under new-flow pressure = %v", servedBytes)
+	}
+	for {
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			break
+		}
+		queue.release(entry)
+	}
+	if available := len(queue.free); available != capacity {
+		t.Fatalf("free slots after drain = %d, want %d", available, capacity)
+	}
+}
+
+func TestFairPacketQueueBestEffortAdmissionPreservesUnpublishedReservations(t *testing.T) {
+	const capacity = 8
+	var queue packetQueue
+	queue.initFair(capacity, time.Now(), 1500, [16]byte{9})
+	reservations := make([]uint16, capacity)
+	for index := range reservations {
+		slot, ok := queue.tryReserve()
+		if !ok {
+			t.Fatalf("reservation %d was unavailable", index)
+		}
+		reservations[index] = slot
+	}
+	if _, ok := queue.replaceBestEffort(); ok {
+		t.Fatal("best-effort admission stole an unpublished reservation")
+	}
+	if depth := queue.len(); depth != 0 {
+		t.Fatalf("unpublished reservations created %d queued packets", depth)
+	}
+	for _, slot := range reservations {
+		queue.releaseReserved(slot)
+	}
+}
+
+func TestFairPacketQueueBestEffortAdmissionDepartsTCPBacklog(t *testing.T) {
+	const capacity = 8
+	source := netip.MustParseAddr("192.0.2.9")
+	target := netip.MustParseAddr("198.51.100.9")
+	tcpPacket := buildTestTCP(source, target, 443, 52000, 1, 1, TCPFlagACK, 65535, nil, make([]byte, 128))
+	udpPacket := testOutputUDPPacket(source, target, 52001, 53, 128)
+	epoch := time.Now()
+	stack := &Stack{timestampEpoch: epoch}
+	stack.outbound.initFair(capacity, epoch, 1500, [16]byte{10})
+	queue := &stack.outbound
+	tickets := make([]packetQueueTicket, capacity)
+	for index := range tickets {
+		slot, ok := queue.tryReserve()
+		if !ok {
+			t.Fatalf("TCP reservation %d was unavailable", index)
+		}
+		var published bool
+		tickets[index], published = queue.enqueueReservedTCP(slot, tcpPacket, false, 1, false)
+		if !published {
+			t.Fatalf("TCP packet %d was not published", index)
+		}
+	}
+	notify := make(chan struct{}, 1)
+	waiter := tickets[0].departureWaiter(stack, notify)
+	if waiter == nil {
+		t.Fatal("oldest TCP ticket was not pending")
+	}
+	slot, ok := queue.replaceBestEffort()
+	if !ok {
+		t.Fatal("UDP packet could not reclaim published TCP backlog")
+	}
+	if !queue.enqueueReservedPacket(slot, udpPacket, false) {
+		t.Fatal("UDP packet did not replace published TCP backlog")
+	}
+	select {
+	case <-notify:
+	default:
+		t.Fatal("replaced TCP backlog did not notify its departure waiter")
+	}
+	if _, departed := waiter.departedTime(epoch); !departed {
+		t.Fatal("replaced TCP backlog did not record its departure time")
+	}
+	pending := 0
+	for _, ticket := range tickets {
+		if ticket.pendingIn(queue) {
+			pending++
+		}
+	}
+	if pending != capacity-1 {
+		t.Fatalf("pending TCP tickets = %d, want %d", pending, capacity-1)
+	}
+	for {
+		entry, available := queue.tryDequeue()
+		if !available {
+			break
+		}
+		queue.release(entry)
+	}
+}
+
+func TestStackSinglePacketReadAdmitsLateUDPFlow(t *testing.T) {
+	const mtu = 1400
+	source := netip.MustParseAddr("192.0.2.10")
+	target := netip.MustParseAddr("198.51.100.10")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(source, 32)}, MTU: mtu})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	tcpPacket := buildTestTCP(source, target, 443, 52000, 1, 1, TCPFlagACK, 65535, nil, make([]byte, mtu-40))
+	for index := 0; index < outboundPacketQueue; index++ {
+		slot, ok := stack.outbound.tryReserve()
+		if !ok {
+			t.Fatalf("TCP reservation %d was unavailable", index)
+		}
+		if _, published := stack.outbound.enqueueReservedTCP(slot, tcpPacket, false, 1, false); !published {
+			t.Fatalf("TCP packet %d was not published", index)
+		}
+	}
+	connection, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(source, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	targetAddress := netip.AddrPortFrom(target, 53)
+	if n, writeErr := connection.WriteTo([]byte("late"), net.UDPAddrFromAddrPort(targetAddress)); writeErr != nil || n != 4 {
+		t.Fatalf("late UDP WriteTo = %d, %v", n, writeErr)
+	}
+	buffer := [][]byte{make([]byte, mtu)}
+	sizes := make([]int, 1)
+	foundAt := -1
+	for rank := 0; rank <= 10; rank++ {
+		count, readErr := stack.Read(buffer, sizes, 0)
+		if readErr != nil || count != 1 {
+			t.Fatalf("single-packet Read %d = %d, %v", rank, count, readErr)
+		}
+		packet, parseErr := ParseIPPacket(buffer[0][:sizes[0]])
+		if parseErr == nil && packet.Protocol == ProtocolUDP {
+			datagram, datagramErr := packet.UDPDatagram()
+			if datagramErr == nil && datagram.Source == connection.LocalAddr().(*net.UDPAddr).AddrPort() {
+				foundAt = rank
+				break
+			}
+		}
+	}
+	if foundAt < 0 {
+		t.Fatal("late UDP flow was not served within the TCP flow's initial byte credit")
+	}
+}
+
+func TestStackSinglePacketReadKeepsOutputFlowsFairUnderOverload(t *testing.T) {
+	const (
+		mtu       = 1400
+		readCount = 2048
+	)
+	local := netip.MustParseAddr("192.0.2.12")
+	remote := netip.MustParseAddr("198.51.100.12")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: mtu})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	tcpPacket := buildTestTCP(local, remote, 443, 52000, 1, 1, TCPFlagACK, 65535, nil, make([]byte, 96))
+	for index := 0; index < outboundPacketQueue; index++ {
+		slot, ok := stack.outbound.tryReserve()
+		if !ok {
+			t.Fatalf("initial TCP reservation %d was unavailable", index)
+		}
+		if _, published := stack.outbound.enqueueReservedTCP(slot, tcpPacket, false, 1, false); !published {
+			t.Fatalf("initial TCP packet %d was not published", index)
+		}
+	}
+	udpConnections := make([]net.PacketConn, 2)
+	for index := range udpConnections {
+		udpConnections[index], err = stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(local, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		connection := udpConnections[index]
+		t.Cleanup(func() { _ = connection.Close() })
+	}
+	ipConnections := make([]net.PacketConn, 2)
+	ipNetworks := [...]string{"ip4:252", "ip4:253"}
+	for index := range ipConnections {
+		ipConnections[index], err = stack.ListenIP(context.Background(), ipNetworks[index], local)
+		if err != nil {
+			t.Fatal(err)
+		}
+		connection := ipConnections[index]
+		t.Cleanup(func() { _ = connection.Close() })
+	}
+	payload := make([]byte, 64)
+	udpTarget := net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 53))
+	ipTarget := ipNetAddr(remote)
+	buffer := [][]byte{make([]byte, mtu)}
+	sizes := make([]int, 1)
+	served := make([]int, 5)
+	servedBytes := make([]int, len(served))
+	udpPorts := []uint16{
+		udpConnections[0].LocalAddr().(*net.UDPAddr).AddrPort().Port(),
+		udpConnections[1].LocalAddr().(*net.UDPAddr).AddrPort().Port(),
+	}
+	for read := 0; read < readCount; read++ {
+		for index, connection := range udpConnections {
+			payload[0] = byte(index)
+			if n, writeErr := connection.WriteTo(payload, udpTarget); writeErr != nil || n != len(payload) {
+				t.Fatalf("UDP flow %d write before Read %d = %d, %v", index, read, n, writeErr)
+			}
+		}
+		for index, connection := range ipConnections {
+			payload[0] = byte(index + len(udpConnections))
+			if n, writeErr := connection.WriteTo(payload, ipTarget); writeErr != nil || n != len(payload) {
+				t.Fatalf("IP flow %d write before Read %d = %d, %v", index, read, n, writeErr)
+			}
+		}
+		count, readErr := stack.Read(buffer, sizes, 0)
+		if readErr != nil || count != 1 {
+			t.Fatalf("single-packet Read %d = %d, %v", read, count, readErr)
+		}
+		packet, parseErr := ParseIPPacket(buffer[0][:sizes[0]])
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		switch packet.Protocol {
+		case ProtocolTCP:
+			served[0]++
+			servedBytes[0] += sizes[0]
+		case ProtocolUDP:
+			datagram, datagramErr := packet.UDPDatagram()
+			if datagramErr != nil {
+				t.Fatal(datagramErr)
+			}
+			switch datagram.Source.Port() {
+			case udpPorts[0]:
+				served[1]++
+				servedBytes[1] += sizes[0]
+			case udpPorts[1]:
+				served[2]++
+				servedBytes[2] += sizes[0]
+			default:
+				t.Fatalf("unexpected UDP source port %d", datagram.Source.Port())
+			}
+		case 252:
+			served[3]++
+			servedBytes[3] += sizes[0]
+		case 253:
+			served[4]++
+			servedBytes[4] += sizes[0]
+		default:
+			t.Fatalf("unexpected output protocol %d", packet.Protocol)
+		}
+		slot, ok := stack.outbound.tryReserve()
+		if !ok {
+			t.Fatalf("TCP refill reservation after Read %d was unavailable", read)
+		}
+		if _, published := stack.outbound.enqueueReservedTCP(slot, tcpPacket, false, 1, false); !published {
+			t.Fatalf("TCP refill after Read %d was not published", read)
+		}
+	}
+	minimumBytes, maximumBytes := servedBytes[0], servedBytes[0]
+	for flow, count := range served {
+		if count == 0 {
+			t.Fatalf("output flow %d was starved: %v", flow, served)
+		}
+		if servedBytes[flow] < minimumBytes {
+			minimumBytes = servedBytes[flow]
+		}
+		if servedBytes[flow] > maximumBytes {
+			maximumBytes = servedBytes[flow]
+		}
+	}
+	if maximumBytes-minimumBytes > 12*mtu {
+		t.Fatalf("single-packet overload byte service is disproportionate: packets %v bytes %v", served, servedBytes)
+	}
+}
+
 func TestStackReadFairQueueBoundsLateUDPFlowService(t *testing.T) {
 	const (
 		mtu              = 1400
@@ -1837,6 +2492,159 @@ func TestStackReadFairQueueBoundsLateUDPFlowService(t *testing.T) {
 	}
 }
 
+func TestSemanticFlowKeyMatchesWireClassification(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		source, target netip.Addr
+		options        ipPacketOptions
+	}{
+		{name: "IPv4", source: netip.MustParseAddr("192.0.2.11"), target: netip.MustParseAddr("198.51.100.11")},
+		{name: "IPv6-zero-flow-label", source: netip.MustParseAddr("2001:db8::11"), target: netip.MustParseAddr("2001:db8:1::11")},
+		{name: "IPv6", source: netip.MustParseAddr("2001:db8::11"), target: netip.MustParseAddr("2001:db8:1::11"),
+			options: ipPacketOptions{flowLabel: 0x12345, flowLabelSet: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const opaqueProtocol = 253
+			datagram := mustTestWire((UDPDatagram{
+				Source: netip.AddrPortFrom(test.source, 12000), Destination: netip.AddrPortFrom(test.target, 53), Payload: make([]byte, 2000),
+			}).MarshalBinary())
+			unfragmented := buildIPPacketWithOptions(test.source, test.target, ProtocolUDP, datagram, 1, false, test.options)
+			var queue packetQueue
+			queue.initFair(8, time.Now(), 1500, [16]byte{11})
+			wireKey := outputHashedFlowKey(outputPacketFlowHash(queue.scheduler.secret, unfragmented))
+			semanticKey := queue.ipFlowKey(test.source, test.target, ProtocolUDP, test.options.flowLabel, datagram)
+			if wireKey != semanticKey {
+				t.Fatalf("UDP flow keys differ: wire=%+v semantic=%+v", wireKey, semanticKey)
+			}
+
+			protocol, echoType := byte(ProtocolICMPv4), byte(ICMPv4TypeEchoRequest)
+			if test.source.Is6() {
+				protocol, echoType = ProtocolICMPv6, ICMPv6TypeEchoRequest
+			}
+			echo := make([]byte, 8)
+			echo[0] = echoType
+			binary.BigEndian.PutUint16(echo[4:6], 0x1234)
+			unfragmented = buildIPPacketWithOptions(test.source, test.target, protocol, echo, 1, false, test.options)
+			wireKey = outputHashedFlowKey(outputPacketFlowHash(queue.scheduler.secret, unfragmented))
+			semanticKey = queue.ipFlowKey(test.source, test.target, protocol, test.options.flowLabel, echo)
+			if wireKey != semanticKey {
+				t.Fatalf("ICMP flow keys differ: wire=%+v semantic=%+v", wireKey, semanticKey)
+			}
+
+			unfragmented = buildIPPacketWithOptions(test.source, test.target, opaqueProtocol, nil, 1, false, test.options)
+			emptyWireKey := outputHashedFlowKey(outputPacketFlowHash(queue.scheduler.secret, unfragmented))
+			semanticKey = queue.ipFlowKey(test.source, test.target, opaqueProtocol, test.options.flowLabel, nil)
+			if emptyWireKey != semanticKey {
+				t.Fatalf("empty opaque flow keys differ: wire=%+v semantic=%+v", emptyWireKey, semanticKey)
+			}
+			opaquePayload := []byte{1, 2, 3, 4}
+			unfragmented = buildIPPacketWithOptions(test.source, test.target, opaqueProtocol, opaquePayload, 1, false, test.options)
+			wireKey = outputHashedFlowKey(outputPacketFlowHash(queue.scheduler.secret, unfragmented))
+			semanticKey = queue.ipFlowKey(test.source, test.target, opaqueProtocol, test.options.flowLabel, opaquePayload)
+			if wireKey != semanticKey || wireKey != emptyWireKey {
+				t.Fatalf("opaque payload split one flow: wire=%+v semantic=%+v empty=%+v", wireKey, semanticKey, emptyWireKey)
+			}
+		})
+	}
+}
+
+func TestTryWritePacketsPreservesSinglePacketFlow(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.12")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	packet := testOutputUDPPacket(local, netip.MustParseAddr("198.51.100.12"), 12000, 53, 64)
+	flow := outputFlowKey{hash: 1}
+	wireFlow := outputHashedFlowKey(outputPacketFlowHash(stack.outbound.scheduler.secret, packet))
+	if flow == wireFlow {
+		t.Fatal("test semantic flow unexpectedly matches wire classification")
+	}
+	if err = stack.tryWritePackets([][]byte{packet}, flow); err != nil {
+		t.Fatal(err)
+	}
+
+	stack.outbound.scheduler.mu.Lock()
+	semantic := stack.outbound.scheduler.flows[flow]
+	classified := stack.outbound.scheduler.flows[wireFlow]
+	stack.outbound.scheduler.mu.Unlock()
+	if semantic == nil || semantic.head < 0 {
+		t.Fatal("single-packet sequence was not assigned to its semantic flow")
+	}
+	if classified != nil {
+		t.Fatal("single-packet sequence was reclassified from its semantic flow")
+	}
+}
+
+func TestConnectionTCPControlPreservesOutputFlow(t *testing.T) {
+	local := netip.MustParseAddrPort("192.0.2.15:12000")
+	remote := netip.MustParseAddrPort("198.51.100.15:443")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local.Addr(), 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	connection := newTCPConn(stack, "tcp4", tcpKey{local: local, remote: remote}, 1500, tcpSocketOptionSet{})
+	if err = connection.tryWriteTCPControl(1, 1, TCPFlagACK, 4096, nil); err != nil {
+		t.Fatal(err)
+	}
+	flow := outputFlowKey{tcp: connection.outputFlowID}
+
+	stack.outbound.scheduler.mu.Lock()
+	queued := stack.outbound.scheduler.flows[flow]
+	stack.outbound.scheduler.mu.Unlock()
+	if queued == nil || queued.head < 0 {
+		t.Fatal("connection control packet was not assigned to the connection output flow")
+	}
+
+	statelessRemote := netip.MustParseAddrPort("198.51.100.16:443")
+	if err = stack.tryWriteTCPControl(local.Addr(), statelessRemote.Addr(), local.Port(), statelessRemote.Port(), 1, 1, TCPFlagRST|TCPFlagACK, 0, nil, nil, 1500, 0, 0, 0, false, outputFlowKey{}); err != nil {
+		t.Fatal(err)
+	}
+	packet, err := buildTCPPacketInto(make([]byte, 40), local.Addr(), statelessRemote.Addr(), local.Port(), statelessRemote.Port(), 1, 1, TCPFlagRST|TCPFlagACK, 0, nil, nil, 1500, 0, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireFlow := outputHashedFlowKey(outputPacketFlowHash(stack.outbound.scheduler.secret, packet))
+	stack.outbound.scheduler.mu.Lock()
+	queued = stack.outbound.scheduler.flows[wireFlow]
+	stack.outbound.scheduler.mu.Unlock()
+	if queued == nil || queued.head < 0 {
+		t.Fatal("stateless control packet was not classified from its wire tuple")
+	}
+}
+
+func TestSemanticFlowKeyUsesTransportIdentityAcrossDatagrams(t *testing.T) {
+	for _, addresses := range [][2]netip.Addr{
+		{netip.MustParseAddr("192.0.2.13"), netip.MustParseAddr("198.51.100.13")},
+		{netip.MustParseAddr("2001:db8::13"), netip.MustParseAddr("2001:db8:1::13")},
+	} {
+		marshalDatagram := func(sourcePort uint16, marker byte) []byte {
+			payload := make([]byte, 2000)
+			payload[len(payload)-1] = marker
+			return mustTestWire((UDPDatagram{
+				Source: netip.AddrPortFrom(addresses[0], sourcePort), Destination: netip.AddrPortFrom(addresses[1], 53), Payload: payload,
+			}).MarshalBinary())
+		}
+		first := marshalDatagram(12000, 0)
+		second := marshalDatagram(12000, 1)
+		other := marshalDatagram(12001, 0)
+
+		var queue packetQueue
+		queue.initFair(8, time.Now(), 1500, [16]byte{13})
+		firstKey := queue.ipFlowKey(addresses[0], addresses[1], ProtocolUDP, 0, first)
+		if secondKey := queue.ipFlowKey(addresses[0], addresses[1], ProtocolUDP, 0, second); secondKey != firstKey {
+			t.Fatalf("%s payload change split one transport flow: first=%+v second=%+v", addresses[0], firstKey, secondKey)
+		}
+		if otherKey := queue.ipFlowKey(addresses[0], addresses[1], ProtocolUDP, 0, other); otherKey == firstKey {
+			t.Fatalf("%s source ports share semantic flow key %+v", addresses[0], firstKey)
+		}
+	}
+}
+
 func TestOutputPacketFlowHashSeparatesTransportTuples(t *testing.T) {
 	secret := [16]byte{3}
 	for _, addresses := range [][2]netip.Addr{
@@ -1858,6 +2666,65 @@ func TestOutputPacketFlowHashSeparatesTransportTuples(t *testing.T) {
 	}
 }
 
+func TestOutputFlowSelectorsUseOnlyProtocolFields(t *testing.T) {
+	if got := outputTransportSelector(ProtocolICMPv4, nil); got != 0 {
+		t.Fatalf("empty ICMPv4 selector = %#x, want zero", got)
+	}
+	ports := []byte{0x12, 0x34, 0x56, 0x78}
+	if got, want := outputTransportSelector(ProtocolUDP, ports), uint32(0x12345678); got != want {
+		t.Fatalf("port selector = %#x, want %#x", got, want)
+	}
+	source := netip.MustParseAddr("192.0.2.14")
+	target := netip.MustParseAddr("198.51.100.14")
+	firstRaw := buildIPPacket(source, target, 99, ports, 0, true)
+	secondRaw := buildIPPacket(source, target, 99, []byte{0x87, 0x65, 0x43, 0x21}, 0, true)
+	secret := [16]byte{14}
+	if first, second := outputPacketFlowHash(secret, firstRaw), outputPacketFlowHash(secret, secondRaw); first != second {
+		t.Fatalf("opaque raw payload split one flow: first=%x second=%x", first, second)
+	}
+
+	echo := []byte{ICMPv4TypeEchoRequest, 0, 0, 0, 0x12, 0x34, 0x56, 0x78}
+	if got, want := outputTransportSelector(ProtocolICMPv4, echo), uint32(0x08001234); got != want {
+		t.Fatalf("ICMPv4 Echo selector = %#x, want %#x", got, want)
+	}
+	echo[6]++
+	if got, want := outputTransportSelector(ProtocolICMPv4, echo), uint32(0x08001234); got != want {
+		t.Fatalf("ICMPv4 Echo sequence changed selector to %#x, want %#x", got, want)
+	}
+	errorMessage := []byte{3, 4, 0, 0, 0x12, 0x34, 0x56, 0x78}
+	if got, want := outputTransportSelector(ProtocolICMPv4, errorMessage), uint32(0x03040000); got != want {
+		t.Fatalf("ICMPv4 error selector = %#x, want %#x", got, want)
+	}
+	timestamp := []byte{13, 0, 0, 0, 0x12, 0x34}
+	if got, want := outputTransportSelector(ProtocolICMPv4, timestamp), uint32(0x0d001234); got != want {
+		t.Fatalf("ICMPv4 Timestamp selector = %#x, want %#x", got, want)
+	}
+}
+
+func TestOutputPacketFlowHashSeparatesIPv4FragmentsFromTransport(t *testing.T) {
+	source := netip.MustParseAddr("192.0.2.4")
+	target := netip.MustParseAddr("198.51.100.4")
+	secret := [16]byte{4}
+	const identification = 53
+	datagram := mustTestWire((UDPDatagram{
+		Source: netip.AddrPortFrom(source, 0), Destination: netip.AddrPortFrom(target, identification), Payload: make([]byte, 3000),
+	}).MarshalBinary())
+	fragments := buildIPv4Fragments(source, target, ProtocolUDP, datagram, 1280, identification)
+	if len(fragments) < 2 {
+		t.Fatal("test datagram was not fragmented")
+	}
+	want := outputPacketFlowHash(secret, fragments[0])
+	for index, fragment := range fragments[1:] {
+		if got := outputPacketFlowHash(secret, fragment); got != want {
+			t.Fatalf("fragment %d hash = %x, want %x", index+1, got, want)
+		}
+	}
+	unfragmented := buildIPPacket(source, target, ProtocolUDP, datagram, 0, true)
+	if got := outputPacketFlowHash(secret, unfragmented); got == want {
+		t.Fatalf("IPv4 fragment identification aliased transport selector %x", got)
+	}
+}
+
 func TestOutputPacketFlowHashKeepsIPv6FragmentsTogether(t *testing.T) {
 	source := netip.MustParseAddr("2001:db8::4")
 	target := netip.MustParseAddr("2001:db8:1::4")
@@ -1875,6 +2742,155 @@ func TestOutputPacketFlowHashKeepsIPv6FragmentsTogether(t *testing.T) {
 	other := buildIPv6FragmentsWithOptions(source, target, ProtocolUDP, make([]byte, 3000), 1280, 0x12345679, ipPacketOptions{})
 	if got := outputPacketFlowHash(secret, other[0]); got == want {
 		t.Fatalf("different fragment identifications share hash %x", got)
+	}
+}
+
+func TestOutputPacketFlowHashTraversesIPv6Extensions(t *testing.T) {
+	source := netip.MustParseAddr("2001:db8::17")
+	target := netip.MustParseAddr("2001:db8:1::17")
+	secret := [16]byte{17}
+	flowHash := func(packet []byte) uint64 {
+		t.Helper()
+		return outputPacketFlowHash(secret, packet)
+	}
+	hop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	if err := hop.SetOptions(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	marshal := func(sourcePort uint16, payloadSize int, headers ...IPv6ExtensionHeader) []byte {
+		t.Helper()
+		datagram := mustTestWire((UDPDatagram{
+			Source: netip.AddrPortFrom(source, sourcePort), Destination: netip.AddrPortFrom(target, 53), Payload: make([]byte, payloadSize),
+		}).MarshalBinary())
+		packet := IPPacket{Source: source, Destination: target, HopLimit: 64}
+		if err := packet.SetIPv6ExtensionHeaders(headers, ProtocolUDP, datagram); err != nil {
+			t.Fatal(err)
+		}
+		return mustTestWire(packet.MarshalBinary())
+	}
+
+	first := marshal(12000, 32, hop)
+	longer := marshal(12000, 128, hop)
+	other := marshal(12001, 32, hop)
+	if got, want := flowHash(first), outputIPFlowHash(secret, source, target, ProtocolUDP, 0, 12000<<16|53); got != want {
+		t.Fatalf("extension flow hash = %x, want semantic hash %x", got, want)
+	}
+	if got, want := flowHash(longer), flowHash(first); got != want {
+		t.Fatalf("extension payload length split one flow: got %x, want %x", got, want)
+	}
+	if got, want := flowHash(other), flowHash(first); got == want {
+		t.Fatalf("extension transport tuples share hash %x", got)
+	}
+
+	firstAtomic, secondAtomic := IPv6ExtensionHeader{}, IPv6ExtensionHeader{}
+	if err := firstAtomic.SetFragment(0, false, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondAtomic.SetFragment(0, false, 2); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := flowHash(marshal(12000, 32, hop, secondAtomic)), flowHash(marshal(12000, 32, hop, firstAtomic)); got != want {
+		t.Fatalf("atomic fragment identification split transport flow: got %x, want %x", got, want)
+	}
+
+	destination := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderDestination}
+	if err := destination.SetOptions(nil); err != nil {
+		t.Fatal(err)
+	}
+	routing := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderRouting, Data: make([]byte, 7)}
+	datagram := mustTestWire((UDPDatagram{
+		Source: netip.AddrPortFrom(source, 12000), Destination: netip.AddrPortFrom(target, 53), Payload: make([]byte, 3000),
+	}).MarshalBinary())
+	packet := IPPacket{Source: source, Destination: target, HopLimit: 64}
+	if err := packet.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{hop, routing, destination}, ProtocolUDP, datagram); err != nil {
+		t.Fatal(err)
+	}
+	fragments, err := packet.MarshalFragments(1280, 0x12345678)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := flowHash(fragments[0])
+	for index, fragment := range fragments[1:] {
+		if got := flowHash(fragment); got != want {
+			t.Fatalf("extension fragment %d hash = %x, want %x", index+1, got, want)
+		}
+	}
+	otherFragments, err := packet.MarshalFragments(1280, 0x12345679)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := flowHash(otherFragments[0]); got == want {
+		t.Fatalf("different extension fragment identifications share hash %x", got)
+	}
+	collidingFragments, err := packet.MarshalFragments(1280, 12000<<16|53)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unfragmented := mustTestWire(packet.MarshalBinary())
+	if fragmented, complete := flowHash(collidingFragments[0]), flowHash(unfragmented); fragmented == complete {
+		t.Fatalf("fragment identification aliased transport selector %x", fragmented)
+	}
+
+	malformed := append([]byte(nil), first[:41]...)
+	malformed[40] = 1
+	otherMalformed := append([]byte(nil), malformed...)
+	otherMalformed[40] = 2
+	if got, fallback := flowHash(malformed), flowHash(otherMalformed); got != fallback {
+		t.Fatalf("malformed extension variants hash to %x and %x, want stable base-header fallback", got, fallback)
+	}
+	reserved := append([]byte(nil), marshal(12000, 32, hop, firstAtomic)...)
+	reserved[51] = 0x02
+	otherReserved := append([]byte(nil), reserved...)
+	otherReserved[51] = 0x04
+	if got, fallback := flowHash(reserved), flowHash(otherReserved); got != fallback {
+		t.Fatalf("reserved Fragment variants hash to %x and %x, want stable base-header fallback", got, fallback)
+	}
+	directReserved := marshal(12000, 32, firstAtomic)
+	directReserved[43] = 0x02
+	otherDirectReserved := marshal(12000, 32, secondAtomic)
+	otherDirectReserved[43] = 0x04
+	if got, fallback := flowHash(directReserved), flowHash(otherDirectReserved); got != fallback {
+		t.Fatalf("direct reserved Fragment variants hash to %x and %x, want stable base-header fallback", got, fallback)
+	}
+}
+
+func TestOutputPacketFlowHashUsesIPv6FlowLabelTriplet(t *testing.T) {
+	source := netip.MustParseAddr("2001:db8::18")
+	target := netip.MustParseAddr("2001:db8:1::18")
+	secret := [16]byte{18}
+	const flowLabel = 0x12345
+	datagram := mustTestWire((UDPDatagram{
+		Source: netip.AddrPortFrom(source, 12000), Destination: netip.AddrPortFrom(target, 53), Payload: make([]byte, 3000),
+	}).MarshalBinary())
+	hop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	if err := hop.SetOptions(nil); err != nil {
+		t.Fatal(err)
+	}
+	packet := IPPacket{Source: source, Destination: target, HopLimit: 64, FlowLabel: flowLabel}
+	if err := packet.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{hop}, ProtocolUDP, datagram); err != nil {
+		t.Fatal(err)
+	}
+	wire := mustTestWire(packet.MarshalBinary())
+	want := outputIPFlowHash(secret, source, target, ProtocolUDP, flowLabel, 12000<<16|53)
+	if got := outputPacketFlowHash(secret, wire); got != want {
+		t.Fatalf("labeled extension packet hash = %x, want triplet hash %x", got, want)
+	}
+	fragments, err := packet.MarshalFragments(1280, 0x12345678)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, fragment := range fragments {
+		if got := outputPacketFlowHash(secret, fragment); got != want {
+			t.Fatalf("labeled fragment %d hash = %x, want triplet hash %x", index, got, want)
+		}
+	}
+	if got := outputIPFlowHash(secret, source, target, ProtocolICMPv6, flowLabel, 0); got != want {
+		t.Fatalf("same labeled IPv6 flow with another protocol hashes to %x, want %x", got, want)
+	}
+	packet.FlowLabel++
+	if got := outputPacketFlowHash(secret, mustTestWire(packet.MarshalBinary())); got == want {
+		t.Fatalf("different IPv6 flow labels share hash %x", got)
 	}
 }
 
@@ -1912,6 +2928,57 @@ func TestOutputPacketFlowHashKeepsICMPEchoSequenceTogether(t *testing.T) {
 	}
 }
 
+var benchmarkOutputPacketFlowHash uint64
+
+func BenchmarkOutputPacketFlowHash(b *testing.B) {
+	source4 := netip.MustParseAddr("192.0.2.19")
+	target4 := netip.MustParseAddr("198.51.100.19")
+	source6 := netip.MustParseAddr("2001:db8::19")
+	target6 := netip.MustParseAddr("2001:db8:1::19")
+	datagram := mustTestWire((UDPDatagram{
+		Source: netip.AddrPortFrom(source6, 12000), Destination: netip.AddrPortFrom(target6, 53), Payload: make([]byte, 1200),
+	}).MarshalBinary())
+	hop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	if err := hop.SetOptions(nil); err != nil {
+		b.Fatal(err)
+	}
+	extensionPacket := IPPacket{Source: source6, Destination: target6, HopLimit: 64}
+	if err := extensionPacket.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{hop}, ProtocolUDP, datagram); err != nil {
+		b.Fatal(err)
+	}
+	tcp4, err := buildTCPPacketInto(make([]byte, 40), source4, target4, 12000, 443, 1, 1, TCPFlagRST|TCPFlagACK, 0, nil, nil, 1500, 0, 0, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	tcp6, err := buildTCPPacketInto(make([]byte, 60), source6, target6, 12000, 443, 1, 1, TCPFlagRST|TCPFlagACK, 0, nil, nil, 1500, 0, 0, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, benchmark := range []struct {
+		name   string
+		packet []byte
+	}{
+		{name: "IPv4-empty", packet: buildIPPacket(source4, target4, 253, nil, 0, true)},
+		{name: "IPv4-TCP", packet: tcp4},
+		{name: "IPv4-UDP", packet: testOutputUDPPacket(source4, target4, 12000, 53, 1200)},
+		{name: "IPv6-empty", packet: buildIPPacket(source6, target6, 253, nil, 0, true)},
+		{name: "IPv6-TCP", packet: tcp6},
+		{name: "IPv6-UDP", packet: buildIPPacket(source6, target6, ProtocolUDP, datagram, 0, true)},
+		{name: "IPv6-hop-by-hop", packet: mustTestWire(extensionPacket.MarshalBinary())},
+		{name: "IPv6-labeled", packet: buildIPPacketWithOptions(source6, target6, ProtocolUDP, datagram, 0, true,
+			ipPacketOptions{flowLabel: 0x12345, flowLabelSet: true})},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			secret := [16]byte{19}
+			b.SetBytes(int64(len(benchmark.packet)))
+			b.ReportAllocs()
+			for iteration := 0; iteration < b.N; iteration++ {
+				benchmarkOutputPacketFlowHash = outputPacketFlowHash(secret, benchmark.packet)
+			}
+		})
+	}
+}
+
 func TestFairPacketQueueReusesBoundedFlowStorage(t *testing.T) {
 	source := netip.MustParseAddr("192.0.2.4")
 	target := netip.MustParseAddr("198.51.100.4")
@@ -1931,6 +2998,30 @@ func TestFairPacketQueueReusesBoundedFlowStorage(t *testing.T) {
 	}
 	if got := len(queue.scheduler.flows); got > 4 {
 		t.Fatalf("retained flow map grew to %d, want <= 4", got)
+	}
+	for index := 0; index < cap(queue.free); index++ {
+		packet := testOutputUDPPacket(source, target, uint16(14000+index), 53, 64)
+		enqueueTestOutputPacket(t, &queue, packet)
+	}
+	for round := 0; round < 128; round++ {
+		packet := testOutputUDPPacket(source, target, uint16(15000+round), 53, 64)
+		slot, ok := queue.replaceBestEffort()
+		if !ok || !queue.enqueueReservedPacket(slot, packet, false) {
+			t.Fatalf("overload flow %d was not admitted", round)
+		}
+	}
+	for {
+		entry, ok := queue.tryDequeue()
+		if !ok {
+			break
+		}
+		queue.release(entry)
+	}
+	if got := len(queue.scheduler.store); got != 4 {
+		t.Fatalf("overload flow storage grew to %d, want 4", got)
+	}
+	if got := len(queue.scheduler.flows); got > 4 {
+		t.Fatalf("overload flow map grew to %d, want <= 4", got)
 	}
 }
 
@@ -2014,6 +3105,55 @@ func BenchmarkPacketQueueScheduling(b *testing.B) {
 						b.Fatal("output queue unexpectedly empty")
 					}
 					queue.release(entry)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkPacketQueueOverloadAdmission(b *testing.B) {
+	source := netip.MustParseAddr("192.0.2.15")
+	target := netip.MustParseAddr("198.51.100.15")
+	packet := testOutputUDPPacket(source, target, 14000, 443, 1400)
+	const capacity = 256
+
+	b.Run("reject-full", func(b *testing.B) {
+		var queue packetQueue
+		queue.initFair(capacity, time.Now(), 1500, [16]byte{15})
+		for index := 0; index < capacity; index++ {
+			slot, ok := queue.tryReserve()
+			if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, outputFlowKey{tcp: 1}) {
+				b.Fatal("failed to fill output queue")
+			}
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for iteration := 0; iteration < b.N; iteration++ {
+			if _, ok := queue.tryReserve(); ok {
+				b.Fatal("full output queue admitted a slot")
+			}
+		}
+	})
+
+	for _, flows := range []int{1, 64} {
+		b.Run(fmt.Sprintf("replace-fattest-%d", flows), func(b *testing.B) {
+			var queue packetQueue
+			queue.initFair(capacity, time.Now(), 1500, [16]byte{15})
+			for index := 0; index < capacity; index++ {
+				slot, ok := queue.tryReserve()
+				flow := outputFlowKey{tcp: uint64(index%flows + 1)}
+				if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
+					b.Fatal("failed to fill output queue")
+				}
+			}
+			b.SetBytes(int64(len(packet)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				slot, ok := queue.replaceBestEffort()
+				flow := outputFlowKey{tcp: uint64(iteration%flows + 1)}
+				if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
+					b.Fatal("failed to replace published backlog")
 				}
 			}
 		})

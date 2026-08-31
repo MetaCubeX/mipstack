@@ -1497,7 +1497,11 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 	datagram := make([]byte, udpSize)
 	marshalUDPDatagram(datagram, source, target, sourcePort, targetPort, payload)
 	packets := buildIPFragmentPackets(source, target, ProtocolUDP, datagram, layout)
-	return c.stack.tryWriteNonUnicastPackets(packets, external, loopback)
+	var flow outputFlowKey
+	if external {
+		flow = c.stack.outbound.ipFlowKey(source, target, ProtocolUDP, layout.options.flowLabel, datagram)
+	}
+	return c.stack.tryWriteNonUnicastPackets(packets, external, loopback, flow)
 }
 
 // writeNonUnicastPayload is the raw-protocol counterpart of UDP multicast and
@@ -1543,13 +1547,17 @@ func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byt
 		return err
 	}
 	packets := buildIPFragmentPackets(source, target, c.protocol, payload, layout)
-	return c.stack.tryWriteNonUnicastPackets(packets, external, loopback)
+	var flow outputFlowKey
+	if external {
+		flow = c.stack.outbound.ipFlowKey(source, target, c.protocol, layout.options.flowLabel, payload)
+	}
+	return c.stack.tryWriteNonUnicastPackets(packets, external, loopback, flow)
 }
 
 // tryWriteNonUnicastPacket serializes one unfragmented packet directly into
-// queue-owned storage. External and local admission are independent: a full
-// link queue is reported to the socket policy while local delivery remains
-// best effort, matching a kernel multicast receive queue.
+// queue-owned storage. External and local admission are independent: a link
+// admission failure is reported to the socket policy while local delivery
+// remains best effort, matching a kernel multicast receive queue.
 func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, marshal func([]byte) bool) error {
 	if !external && !loopback {
 		return nil
@@ -1558,6 +1566,9 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 	var externalErr error
 	if external {
 		externalSlot, externalErr = s.tryReservePacket(&s.outbound)
+		if externalErr == ErrResourceLimit {
+			externalSlot, externalErr = s.replaceBestEffortPacket(&s.outbound)
+		}
 		if externalErr == ErrClosed {
 			return externalErr
 		}
@@ -1622,18 +1633,18 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 	return externalErr
 }
 
-// tryWriteNonUnicastPackets admits external fragments in wire order and the
-// local copy as one complete sequence. Link output may retain a published
-// prefix when capacity runs out, as ordinary IP fragmentation does, while a
+// tryWriteNonUnicastPackets admits one semantic flow's external fragments in
+// wire order and the local copy as one complete sequence. External link
+// admission may discard any queued fragment as ordinary packet loss, while a
 // local reassembler never receives a capacity-truncated datagram.
-func (s *Stack) tryWriteNonUnicastPackets(packets [][]byte, external, loopback bool) error {
+func (s *Stack) tryWriteNonUnicastPackets(packets [][]byte, external, loopback bool, flow outputFlowKey) error {
 	if len(packets) == 0 || !external && !loopback {
 		return nil
 	}
 	var externalErr error
 	if external {
 		for _, packet := range packets {
-			if externalErr = s.tryWritePacketTo(packet, &s.outbound, false); externalErr != nil {
+			if externalErr = s.tryWritePacketToFlow(packet, &s.outbound, false, flow); externalErr != nil {
 				break
 			}
 		}

@@ -901,7 +901,7 @@ func TestIPFragmentMaterializedAndQueuedOutputMatch(t *testing.T) {
 	}
 }
 
-func TestDirectFragmentOutputPreservesPublishedPrefix(t *testing.T) {
+func TestDirectFragmentOutputReclaimsPublishedBacklog(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.44")
 	remote := netip.MustParseAddr("198.51.100.44")
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 68})
@@ -919,26 +919,34 @@ func TestDirectFragmentOutputPreservesPublishedPrefix(t *testing.T) {
 		}
 	}
 	stack.ipv4ID.Store(100)
-	err = stack.tryWriteIPSocketPayloadForMTU(local, remote, ProtocolUDP, make([]byte, 96), sourceFragmentation{allow: true}, ipPacketOptions{}, 68)
-	if !errors.Is(err, ErrResourceLimit) {
-		t.Fatalf("fragmented write error = %v, want ErrResourceLimit", err)
+	payload := make([]byte, 96)
+	err = stack.tryWriteIPSocketPayloadForMTU(local, remote, ProtocolUDP, payload, sourceFragmentation{allow: true}, ipPacketOptions{}, 68)
+	if err != nil {
+		t.Fatalf("fragmented write over published backlog: %v", err)
 	}
-	fragments := 0
+	var reassembly IPPacketReassembly
+	var reassembled IPPacket
+	complete := false
 	for {
 		entry, ok := stack.outbound.tryDequeue()
 		if !ok {
 			break
 		}
-		if len(entry.packet) >= 20 && entry.packet[9] == ProtocolUDP && binary.BigEndian.Uint16(entry.packet[6:8])&0x2000 != 0 {
-			fragments++
+		packet, parseErr := ParseIPPacket(entry.packet)
+		if parseErr == nil && packet.Protocol == ProtocolUDP {
 			if identification := binary.BigEndian.Uint16(entry.packet[4:6]); identification != 101 {
-				t.Fatalf("partial fragment ID = %d, want 101", identification)
+				t.Fatalf("fragment ID = %d, want 101", identification)
+			}
+			var addErr error
+			reassembled, complete, addErr = reassembly.Add(packet)
+			if addErr != nil {
+				t.Fatal(addErr)
 			}
 		}
 		stack.outbound.release(entry)
 	}
-	if fragments != 1 {
-		t.Fatalf("published fragments = %d, want 1", fragments)
+	if !complete || reassembled.Protocol != ProtocolUDP || !bytes.Equal(reassembled.Payload, payload) {
+		t.Fatalf("reassembled direct fragment output = complete %t protocol %d payload %x", complete, reassembled.Protocol, reassembled.Payload)
 	}
 }
 

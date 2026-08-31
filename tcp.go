@@ -4588,7 +4588,7 @@ func (s *Stack) rejectTCPSegment(key tcpKey, segment tcpSegment) error {
 		}
 		flags |= TCPFlagACK
 	}
-	err := s.tryWriteTCPControl(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, acknowledgement, flags, 0, nil, nil, s.mtuFor(key.remote.Addr()), 0, 0, 0, false)
+	err := s.tryWriteTCPControl(key.local.Addr(), key.remote.Addr(), key.local.Port(), key.remote.Port(), sequence, acknowledgement, flags, 0, nil, nil, s.mtuFor(key.remote.Addr()), 0, 0, 0, false, outputFlowKey{})
 	if err == ErrResourceLimit {
 		return nil
 	}
@@ -4840,9 +4840,10 @@ func buildTCPPacketViewInto(packet []byte, source, target netip.Addr, sourcePort
 	return packet, nil
 }
 
-// tryWriteTCPControl builds one best-effort stack-owned control segment in its
-// final queue buffer without waiting for device capacity.
-func (s *Stack) tryWriteTCPControl(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte, flowLabel uint32, flowLabelSet bool) error {
+// tryWriteTCPControl builds one best-effort control segment in its final queue
+// buffer without waiting for device capacity. Stateful callers retain their
+// connection flow; a zero flow classifies stateless output from the wire tuple.
+func (s *Stack) tryWriteTCPControl(source, target netip.Addr, sourcePort, targetPort uint16, sequence, acknowledgement uint32, flags byte, window uint16, options, payload []byte, mtu int, trafficClass, ecn byte, flowLabel uint32, flowLabelSet bool, flow outputFlowKey) error {
 	if source.Is6() && !flowLabelSet {
 		flowLabel = s.network.Load().tcpDefaults.FlowLabel
 		if flowLabel == 0 {
@@ -4855,6 +4856,9 @@ func (s *Stack) tryWriteTCPControl(source, target netip.Addr, sourcePort, target
 	}
 	queue, loopback := s.outputQueueFor(target)
 	slot, err := s.tryReservePacket(queue)
+	if err == ErrResourceLimit {
+		slot, err = s.replaceBestEffortPacket(queue)
+	}
 	if err != nil {
 		return err
 	}
@@ -4865,7 +4869,7 @@ func (s *Stack) tryWriteTCPControl(source, target netip.Addr, sourcePort, target
 		queue.releaseReserved(slot)
 		return err
 	}
-	if !queue.enqueueReservedPacket(slot, built, reusable) {
+	if !queue.enqueueReservedPacketForFlow(slot, built, reusable, flow) {
 		return ErrClosed
 	}
 	s.recordOutput(loopback)
@@ -7626,8 +7630,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			hostQueued := false
 			usesDeliveryRate := state.controller.usesDeliveryRate()
 			if usesDeliveryRate && total-offset < state.peerMSS && len(state.outstanding) != 0 {
-				// The output queue is FIFO. If this connection's newest range has
-				// left it, every older range from the connection has left as well.
+				// The scheduler preserves FIFO order within each flow. If this
+				// connection's newest range has left, every older range from the
+				// same connection has left as well.
 				hostQueued = state.outstanding[len(state.outstanding)-1].hostQueue.pending(c.stack)
 			}
 			if usesDeliveryRate && tcpRateApplicationLimited(total-offset, hostQueued, congestionFlight, state.congestionWindow, state.fastRecovery, state.peerSACK, state.outstanding, state.peerMSS) {
@@ -7994,8 +7999,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		return nil
 	}
 	// drainPersistOutput publishes one expired zero-window probe. Publication
-	// statistics and backoff advance only after the probe becomes visible, so a
-	// full device queue cannot manufacture probes or shorten their intervals.
+	// statistics, retry accounting, and backoff advance only after the probe
+	// becomes visible, so a full device queue cannot manufacture probes or
+	// shorten their intervals.
 	drainPersistOutput := func(first tcpOutputReservation) error {
 		outputWindow := newTCPOutputWindow(first)
 		if !tcpPersistOutputPending(state) {
@@ -8026,6 +8032,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		probeSentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
 		state.commitAcknowledgment(window, right, false)
 		c.stack.stats.tcpZeroWindowProbes.Add(1)
+		if c.applicationReceiveClosed() {
+			state.sendTimer.persistAttempts++
+		}
 		state.persist = false
 		state.sendTimer.persistRTO *= 2
 		if state.sendTimer.persistRTO > tcpMaximumRTO {
@@ -8359,7 +8368,12 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			if departed || !matchingTarget {
 				hostQueueWait = nil
 				hostQueueWaitTicket = packetQueueTicket{}
-				if departed && matchingTarget && state.retransmissionKind != tcpRetransmissionPathMTU {
+				if state.retransmit && state.retransmissionKind == tcpRetransmissionPathMTU {
+					// PMTU resegmentation is immediate transport work independent
+					// of the superseded loss-clock wait. Retain that reason so the
+					// returned capacity cannot turn it into an RTO or TLP.
+					state.retransmissionDeadline = time.Time{}
+				} else if departed && matchingTarget {
 					// This generation remained queue-owned at its earlier loss
 					// deadline. Reselect its loss clocks from exact departure while
 					// preserving current ACK/SACK state.
@@ -8917,11 +8931,8 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			// The zero deadline distinguishes it from the next scheduled probe.
 			state.persist = true
 			state.sendTimer.baseDeadline = time.Time{}
-			if c.applicationReceiveClosed() {
-				state.sendTimer.persistAttempts++
-				if state.sendTimer.persistAttempts > tcpMaximumRTOs {
-					return os.ErrDeadlineExceeded
-				}
+			if c.applicationReceiveClosed() && state.sendTimer.persistAttempts >= tcpMaximumRTOs {
+				return os.ErrDeadlineExceeded
 			}
 			if err := drainPersistOutput(tcpOutputReservation{}); err != nil {
 				return err
@@ -9061,6 +9072,7 @@ func (c *TCPConn) tryWriteTCPControl(sequence, acknowledgement uint32, flags byt
 	return c.stack.tryWriteTCPControl(
 		c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(),
 		sequence, acknowledgement, flags, window, options, nil, c.mtu, uint8(c.trafficClass.Load()), 0, c.flowLabel, true,
+		outputFlowKey{tcp: c.outputFlowID},
 	)
 }
 

@@ -551,40 +551,41 @@ func TestUDPFragmentedWriteQueueExhaustionPolicy(t *testing.T) {
 			payload := bytes.Repeat([]byte{0x71}, 1200)
 			message := []SocketMessage{{Buffers: [][]byte{payload}, Addr: net.UDPAddrFromAddrPort(remote)}}
 			count, writeErr := connection.WriteBatch(message, test.flags)
-			if test.receiveErrors {
-				if count != 0 || !errors.Is(writeErr, syscall.ENOBUFS) || message[0].N != 0 {
-					t.Fatalf("fragmented WriteBatch = %d, %v, N=%d; want 0, ENOBUFS, 0", count, writeErr, message[0].N)
-				}
-				if info := connection.Info(); info.PacketsSent != 0 || info.BytesSent != 0 {
-					t.Fatalf("failed fragmented write statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
-				}
-			} else {
-				if count != 1 || writeErr != nil || message[0].N != len(payload) {
-					t.Fatalf("fragmented WriteBatch = %d, %v, N=%d", count, writeErr, message[0].N)
-				}
-				if info := connection.Info(); info.PacketsSent != 1 || info.BytesSent != uint64(len(payload)) {
-					t.Fatalf("successful fragmented write statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
-				}
+			if count != 1 || writeErr != nil || message[0].N != len(payload) {
+				t.Fatalf("fragmented WriteBatch = %d, %v, N=%d", count, writeErr, message[0].N)
+			}
+			if info := connection.Info(); info.PacketsSent != 1 || info.BytesSent != uint64(len(payload)) {
+				t.Fatalf("successful fragmented write statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
 			}
 			if after := stack.outbound.len(); after != before+1 {
 				t.Fatalf("fragmented write changed queue depth from %d to %d, want %d", before, after, before+1)
 			}
-			fragments := 0
+			var reassembly IPPacketReassembly
+			var reassembled IPPacket
+			complete := false
 			for {
 				entry, ok := stack.outbound.tryDequeue()
 				if !ok {
 					break
 				}
-				if len(entry.packet) >= 20 && entry.packet[9] == ProtocolUDP && binary.BigEndian.Uint16(entry.packet[6:8])&0x2000 != 0 {
-					fragments++
+				packet, parseErr := ParseIPPacket(entry.packet)
+				if parseErr == nil {
+					if fragment, fragmented := packet.Fragment(); fragmented && fragment.Protocol == ProtocolUDP {
+						var addErr error
+						reassembled, complete, addErr = reassembly.Add(packet)
+						if addErr != nil {
+							t.Fatal(addErr)
+						}
+					}
 				}
 				stack.outbound.release(entry)
 			}
-			if fragments != 1 {
-				t.Fatalf("published fragment prefix = %d packets, want 1", fragments)
+			datagram, datagramErr := reassembled.UDPDatagram()
+			if !complete || datagramErr != nil || !bytes.Equal(datagram.Payload, payload) {
+				t.Fatalf("reassembled fragmented WriteBatch = complete %t datagram %+v error %v", complete, datagram, datagramErr)
 			}
 			if !connection.acceptsError(remote) {
-				t.Fatal("fragment prefix did not retain ICMP correlation")
+				t.Fatal("fragmented write did not retain ICMP correlation")
 			}
 		})
 	}

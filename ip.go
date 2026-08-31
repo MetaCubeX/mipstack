@@ -137,7 +137,8 @@ type IPConnInfo struct {
 	ReceiveQueueCapacity int
 	// ReceiveErrors reports whether asynchronous network errors are reserved
 	// for ReadError instead of being returned by ordinary reads and whether
-	// local output-queue exhaustion is reported as ENOBUFS.
+	// failure to admit unicast or external-link non-unicast output is reported
+	// as ENOBUFS.
 	ReceiveErrors bool
 	// ErrorQueueEntries is the number of asynchronous network errors awaiting
 	// ReadError or, when ReceiveErrors is false, an ordinary read.
@@ -148,8 +149,10 @@ type IPConnInfo struct {
 	// ErrorsDropped counts asynchronous network errors discarded because the
 	// configured receive-buffer budget was exhausted.
 	ErrorsDropped uint64
-	// PacketsSent counts successful IP socket write results, including silent
-	// local output-queue loss when ReceiveErrors is false.
+	// PacketsSent counts successful IP socket write results. It includes writes
+	// silently lost during bounded output admission under the default
+	// ReceiveErrors policy and remains cumulative if bounded link scheduling
+	// later drops a packet.
 	PacketsSent uint64
 	// BytesSent counts bytes represented by those successful writes.
 	BytesSent uint64
@@ -1607,6 +1610,9 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 	}
 	queue, loopback := c.stack.outputQueueFor(target)
 	slot, err := c.stack.tryReservePacket(queue)
+	if err == ErrResourceLimit {
+		slot, err = c.stack.replaceBestEffortPacket(queue)
+	}
 	if err != nil {
 		return err
 	}
@@ -1954,9 +1960,11 @@ func (c *IPConn) SetReadBuffer(bytes int) error {
 }
 
 // SetReceiveErrors controls whether asynchronous network errors are reserved
-// for ReadError and whether local output-queue exhaustion fails writes with
-// ENOBUFS. When disabled, the default, ordinary reads return queued errors
-// after any already queued payloads and local link-queue loss is silent.
+// for ReadError. It also makes a write fail with ENOBUFS when unicast output or
+// the external-link copy of multicast or broadcast output cannot be admitted.
+// Receive-side non-unicast loopback copies remain best effort. When disabled,
+// the default, ordinary reads return queued errors after any already queued
+// payloads and an immediate output admission failure is silent.
 func (c *IPConn) SetReceiveErrors(enabled bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1971,8 +1979,8 @@ func (c *IPConn) SetReceiveErrors(enabled bool) error {
 }
 
 // ReceiveErrors reports whether asynchronous errors are reserved for
-// ReadError instead of being returned by ordinary reads and whether local
-// output-queue exhaustion is reported as ENOBUFS.
+// ReadError instead of being returned by ordinary reads and whether failure to
+// admit unicast or external-link non-unicast output is reported as ENOBUFS.
 func (c *IPConn) ReceiveErrors() (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2113,7 +2121,7 @@ func (c *IPConn) SetFlowLabel(label uint32) error {
 }
 
 // rememberTarget records a validated unicast destination whose output either
-// succeeded or may have published a fragment prefix for later ICMP validation.
+// succeeded or may have published source fragments for later ICMP validation.
 func (c *IPConn) rememberTarget(target netip.Addr) {
 	target = target.Unmap()
 	if c.remote.IsValid() {

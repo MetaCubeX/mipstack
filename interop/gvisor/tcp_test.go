@@ -110,28 +110,24 @@ func TestTCPStoppedDeviceReadInterop(t *testing.T) {
 		t.Fatal("mipstack output bridge did not stop")
 	}
 
-	type saturationResult struct {
-		admitted int
-		err      error
-	}
-	saturated := make(chan saturationResult, 1)
+	overloaded := make(chan error, 1)
 	go func() {
 		payload := []byte("queue-pressure")
-		for admitted := 0; admitted < 2048; admitted++ {
+		for write := 0; write < 2048; write++ {
 			if written, err := udpConnection.Write(payload); err != nil {
-				saturated <- saturationResult{admitted: admitted, err: err}
+				overloaded <- err
 				return
 			} else if written != len(payload) {
-				saturated <- saturationResult{admitted: admitted, err: fmt.Errorf("short UDP write: %d", written)}
+				overloaded <- fmt.Errorf("short UDP write: %d", written)
 				return
 			}
 		}
-		saturated <- saturationResult{admitted: 2048, err: errors.New("device queue did not saturate")}
+		overloaded <- nil
 	}()
 	select {
-	case result := <-saturated:
-		if result.admitted < 128 || !errors.Is(result.err, syscall.ENOBUFS) {
-			t.Fatalf("stopped-read saturation = %d admitted, %v", result.admitted, result.err)
+	case err := <-overloaded:
+		if err != nil {
+			t.Fatalf("stopped-read overload: %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		releaseOnce.Do(func() { close(releaseBridge) })

@@ -168,7 +168,8 @@ type UDPConnInfo struct {
 	ReceiveQueueCapacity int
 	// ReceiveErrors reports whether asynchronous network errors are reserved
 	// for ReadError instead of being returned by ordinary reads and whether
-	// local output-queue exhaustion is reported as ENOBUFS.
+	// failure to admit unicast or external-link non-unicast output is reported
+	// as ENOBUFS.
 	ReceiveErrors bool
 	// ErrorQueueEntries is the number of asynchronous network errors awaiting
 	// ReadError or, when ReceiveErrors is false, an ordinary read.
@@ -179,8 +180,10 @@ type UDPConnInfo struct {
 	// ErrorsDropped counts asynchronous network errors discarded because the
 	// configured receive-buffer budget was exhausted.
 	ErrorsDropped uint64
-	// PacketsSent counts successful UDP socket write results, including silent
-	// local output-queue loss when ReceiveErrors is false.
+	// PacketsSent counts successful UDP socket write results. It includes writes
+	// silently lost during bounded output admission under the default
+	// ReceiveErrors policy and remains cumulative if bounded link scheduling
+	// later drops a packet.
 	PacketsSent uint64
 	// BytesSent counts payload bytes represented by those successful writes.
 	BytesSent uint64
@@ -1500,8 +1503,8 @@ func (c *UDPConn) writeDatagram(source, target netip.Addr, sourcePort, targetPor
 }
 
 // writeBestEffortUDPDatagram queues one forwarder reply without waiting for
-// device capacity. Output capacity drops the unavailable datagram or fragment
-// suffix without becoming a caller error.
+// device capacity. Output congestion may discard the datagram or any of its
+// source fragments without becoming a caller error.
 func (s *Stack) writeBestEffortUDPDatagram(source, target netip.Addr, sourcePort, targetPort uint16, payload []byte, options ipPacketOptions, pathMTUDiscovery PathMTUDiscovery) error {
 	udpSize := udpHeaderSize + len(payload)
 	if udpSize > 65535 {
@@ -1523,6 +1526,9 @@ func (s *Stack) writeBestEffortUDPDatagram(source, target netip.Addr, sourcePort
 		}
 		queue, loopback := s.outputQueueFor(target)
 		slot, err := s.tryReservePacket(queue)
+		if err == ErrResourceLimit {
+			slot, err = s.replaceBestEffortPacket(queue)
+		}
 		if err != nil {
 			if err == ErrResourceLimit {
 				return nil
@@ -1585,6 +1591,9 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 		}
 		queue, loopback := c.stack.outputQueueFor(target)
 		slot, err := c.stack.tryReservePacket(queue)
+		if err == ErrResourceLimit {
+			slot, err = c.stack.replaceBestEffortPacket(queue)
+		}
 		if err != nil {
 			return err
 		}
@@ -1644,6 +1653,9 @@ func (c *UDPConn) writeDatagramBuffersForMTU(source, target netip.Addr, sourcePo
 	}
 	queue, loopback := c.stack.outputQueueFor(target)
 	slot, err := c.stack.tryReservePacket(queue)
+	if err == ErrResourceLimit {
+		slot, err = c.stack.replaceBestEffortPacket(queue)
+	}
 	if err != nil {
 		return err
 	}
@@ -1693,7 +1705,7 @@ func marshalUDPHeaderFields(header []byte, sourcePort, targetPort uint16, length
 }
 
 // rememberTarget records a validated unicast destination whose output either
-// succeeded or may have published a fragment prefix for ICMP tuple validation.
+// succeeded or may have published source fragments for ICMP tuple validation.
 // The oldest entries are discarded when the bound is reached.
 func (c *UDPConn) rememberTarget(target netip.AddrPort) {
 	target = netip.AddrPortFrom(target.Addr().Unmap(), target.Port())
@@ -1976,9 +1988,11 @@ func (c *UDPConn) SetReadBuffer(bytes int) error {
 }
 
 // SetReceiveErrors controls whether asynchronous network errors are reserved
-// for ReadError and whether local output-queue exhaustion fails writes with
-// ENOBUFS. When disabled, the default, ordinary reads return queued errors
-// after any already queued datagrams and local link-queue loss is silent.
+// for ReadError. It also makes a write fail with ENOBUFS when unicast output or
+// the external-link copy of multicast or broadcast output cannot be admitted.
+// Receive-side non-unicast loopback copies remain best effort. When disabled,
+// the default, ordinary reads return queued errors after any already queued
+// datagrams and an immediate output admission failure is silent.
 func (c *UDPConn) SetReceiveErrors(enabled bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1993,8 +2007,8 @@ func (c *UDPConn) SetReceiveErrors(enabled bool) error {
 }
 
 // ReceiveErrors reports whether asynchronous errors are reserved for
-// ReadError instead of being returned by ordinary reads and whether local
-// output-queue exhaustion is reported as ENOBUFS.
+// ReadError instead of being returned by ordinary reads and whether failure to
+// admit unicast or external-link non-unicast output is reported as ENOBUFS.
 func (c *UDPConn) ReceiveErrors() (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

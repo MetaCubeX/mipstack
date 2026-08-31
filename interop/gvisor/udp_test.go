@@ -124,8 +124,15 @@ func TestUDPStoppedDeviceReadInterop(t *testing.T) {
 	connected, peer := openUDPPair(t, ctx, network, family, true)
 	defer connected.Close()
 	defer peer.Close()
+	lateConnected, latePeer := openUDPPairAt(t, ctx, network, family, true, 42003, 42004)
+	defer lateConnected.Close()
+	defer latePeer.Close()
 	udpConnection := connected.(*mipstack.UDPConn)
 	if err := udpConnection.SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
+	lateUDPConnection := lateConnected.(*mipstack.UDPConn)
+	if err := lateUDPConnection.SetReceiveErrors(true); err != nil {
 		t.Fatal(err)
 	}
 	if written, err := udpConnection.Write([]byte("bridge-stop")); err != nil || written != len("bridge-stop") {
@@ -137,78 +144,43 @@ func TestUDPStoppedDeviceReadInterop(t *testing.T) {
 		t.Fatal("mipstack output bridge did not stop")
 	}
 
-	type saturationResult struct {
-		admitted int
-		err      error
-	}
-	saturated := make(chan saturationResult, 1)
+	overloaded := make(chan error, 1)
 	go func() {
 		payload := []byte("queue-pressure")
-		for admitted := 0; admitted < 2048; admitted++ {
+		for write := 0; write < 2048; write++ {
 			if written, err := udpConnection.Write(payload); err != nil {
-				saturated <- saturationResult{admitted: admitted, err: err}
+				overloaded <- err
 				return
 			} else if written != len(payload) {
-				saturated <- saturationResult{admitted: admitted, err: fmt.Errorf("short UDP write: %d", written)}
+				overloaded <- fmt.Errorf("short UDP write: %d", written)
 				return
 			}
 		}
-		saturated <- saturationResult{admitted: 2048, err: errors.New("device queue did not saturate")}
+		overloaded <- nil
 	}()
 	select {
-	case result := <-saturated:
-		if result.admitted < 128 || !errors.Is(result.err, syscall.ENOBUFS) {
-			t.Fatalf("stopped-read saturation = %d admitted, %v", result.admitted, result.err)
+	case err := <-overloaded:
+		if err != nil {
+			t.Fatalf("stopped-read overload: %v", err)
 		}
 	case <-time.After(2 * time.Second):
 		releaseOnce.Do(func() { close(releaseBridge) })
 		t.Fatal("UDP writes blocked while Stack.Read was stopped")
 	}
 
-	recovered := make(chan error, 1)
-	go func() {
-		buffer := make([]byte, 64)
-		if err := peer.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-			recovered <- err
-			return
-		}
-		for {
-			read, _, err := peer.ReadFrom(buffer)
-			if err != nil {
-				recovered <- err
-				return
-			}
-			if string(buffer[:read]) == "after-recovery" {
-				recovered <- nil
-				return
-			}
-		}
-	}()
-	releaseOnce.Do(func() { close(releaseBridge) })
-	for {
-		written, err := udpConnection.Write([]byte("after-recovery"))
-		if err == nil {
-			if written != len("after-recovery") {
-				t.Fatalf("recovery UDP write = %d bytes", written)
-			}
-			break
-		}
-		if !errors.Is(err, syscall.ENOBUFS) {
-			t.Fatalf("recovery UDP write: %v", err)
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatal("device queue did not recover")
-		case <-time.After(time.Millisecond):
-		}
+	latePayload := []byte("late-flow")
+	written, err := lateUDPConnection.Write(latePayload)
+	if err != nil || written != len(latePayload) {
+		t.Fatalf("late-flow UDP write = %d, %v", written, err)
 	}
-	select {
-	case err := <-recovered:
-		if err != nil {
-			t.Fatalf("read recovered gVisor UDP endpoint: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("gVisor did not receive UDP after device-read recovery")
+	if err = latePeer.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	releaseOnce.Do(func() { close(releaseBridge) })
+	buffer := make([]byte, 64)
+	read, _, err := latePeer.ReadFrom(buffer)
+	if err != nil || !bytes.Equal(buffer[:read], latePayload) {
+		t.Fatalf("late-flow gVisor UDP read = %q, %v", buffer[:read], err)
 	}
 }
 
@@ -1136,10 +1108,13 @@ func udpHeaderOffset(packet []byte) (int, bool) {
 // selected stack owning the connected side.
 func openUDPPair(t *testing.T, ctx context.Context, network *interopNetwork, family interopFamily, mipstackConnected bool) (net.Conn, net.PacketConn) {
 	t.Helper()
-	const (
-		mipstackPort = 42001
-		gvisorPort   = 42002
-	)
+	return openUDPPairAt(t, ctx, network, family, mipstackConnected, 42001, 42002)
+}
+
+// openUDPPairAt is the port-selectable form used by tests that need multiple
+// simultaneous flows on one interop network.
+func openUDPPairAt(t *testing.T, ctx context.Context, network *interopNetwork, family interopFamily, mipstackConnected bool, mipstackPort, gvisorPort uint16) (net.Conn, net.PacketConn) {
+	t.Helper()
 
 	if mipstackConnected {
 		gvisorLocal := gvisorFullAddress(family.gvisorAddress, gvisorPort)

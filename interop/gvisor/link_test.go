@@ -156,6 +156,9 @@ type interopNetworkOptions struct {
 	// tcp supplies mipstack defaults for tests that exercise a particular TCP
 	// transport policy. Its zero value retains the package defaults.
 	tcp mipstack.TCPSocketDefaults
+	// ip supplies mipstack defaults for tests that exercise protocol-socket
+	// representation or output policy. Its zero value retains package defaults.
+	ip mipstack.IPSocketDefaults
 	// forwarding enables gVisor unicast forwarding for every selected family.
 	forwarding bool
 	// mipstackToGVisor and gvisorToMipstack optionally observe or drop packets
@@ -211,6 +214,7 @@ func newInteropNetworkWithOptions(t *testing.T, options interopNetworkOptions) *
 		MTU:            mtu,
 		Promiscuous:    options.promiscuous,
 		TCP:            options.tcp,
+		IP:             options.ip,
 	})
 	if err != nil {
 		t.Fatalf("create mipstack: %v", err)

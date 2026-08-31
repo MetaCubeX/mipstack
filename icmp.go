@@ -977,7 +977,11 @@ func (s *Stack) writeICMPForwarderIPPacket(request ipPacket, reply icmpForwarder
 	if err != nil {
 		return err
 	}
-	err = s.tryWritePackets(packets)
+	var flow outputFlowKey
+	if len(packets) > 1 {
+		flow = s.outbound.ipFlowKey(reply.parsed.source, reply.parsed.target, reply.parsed.protocol, reply.parsed.flowLabel, reply.parsed.payload)
+	}
+	err = s.tryWritePackets(packets, flow)
 	if err == ErrResourceLimit {
 		return nil
 	}

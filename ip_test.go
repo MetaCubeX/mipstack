@@ -1102,6 +1102,72 @@ func TestIPConnIPv6ChecksumHeaderIncludedOwnership(t *testing.T) {
 	}
 }
 
+func TestIPHeaderIncludedOutputPreservesIPv6ExtensionFlow(t *testing.T) {
+	local := netip.MustParseAddr("2001:db8::156")
+	remote := netip.MustParseAddr("2001:db8:1::156")
+	multicast := netip.MustParseAddr("ff05::156")
+	stack, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)},
+		MTU:            1500,
+		IP:             IPSocketDefaults{IPHeaderIncludedOnWrite: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection, err := stack.ListenIP(context.Background(), "ip6:udp", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+
+	hop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	if err = hop.SetOptions(nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name       string
+		target     netip.Addr
+		sourcePort uint16
+	}{
+		{name: "unicast", target: remote, sourcePort: 12000},
+		{name: "multicast", target: multicast, sourcePort: 12001},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			datagram := mustTestWire((UDPDatagram{
+				Source:      netip.AddrPortFrom(local, test.sourcePort),
+				Destination: netip.AddrPortFrom(test.target, 53),
+				Payload:     []byte("header-included-flow"),
+			}).MarshalBinary())
+			packet := IPPacket{Source: local, Destination: test.target, HopLimit: 64}
+			if setErr := packet.SetIPv6ExtensionHeaders([]IPv6ExtensionHeader{hop}, ProtocolUDP, datagram); setErr != nil {
+				t.Fatal(setErr)
+			}
+			wire := mustTestWire(packet.MarshalBinary())
+			want := outputHashedFlowKey(outputIPFlowHash(stack.outbound.scheduler.secret, local, test.target, ProtocolUDP, 0, uint32(test.sourcePort)<<16|53))
+			if classified := outputHashedFlowKey(outputPacketFlowHash(stack.outbound.scheduler.secret, wire)); classified != want {
+				t.Fatalf("header-included packet classified as %x, want transport flow %x", classified.hash, want.hash)
+			}
+			if written, writeErr := connection.WriteTo(wire, ipNetAddr(test.target)); writeErr != nil || written != len(wire) {
+				t.Fatalf("header-included write = %d, %v", written, writeErr)
+			}
+
+			stack.outbound.scheduler.mu.Lock()
+			queued := stack.outbound.scheduler.flows[want]
+			stack.outbound.scheduler.mu.Unlock()
+			if queued == nil || queued.head < 0 {
+				t.Fatal("header-included packet was not assigned to its transport flow")
+			}
+			if emitted := readOutboundPacket(t, stack); !bytes.Equal(emitted, wire) {
+				t.Fatalf("header-included output:\n got %x\nwant %x", emitted, wire)
+			}
+		})
+	}
+}
+
 func TestIPHeaderIncludedLinuxKnownAnswers(t *testing.T) {
 	source4 := netip.MustParseAddr("192.0.2.154")
 	target4 := netip.MustParseAddr("198.51.100.154")
@@ -1896,28 +1962,21 @@ func TestIPFragmentedWriteQueueExhaustionPolicy(t *testing.T) {
 				payload := bytes.Repeat([]byte{0x72}, family.payloadSize)
 				messages := []SocketMessage{{Buffers: [][]byte{payload[:37], payload[37:]}}}
 				count, writeErr := connection.WriteBatch(messages, policy.flags)
-				if policy.receiveErrors {
-					if count != 0 || !errors.Is(writeErr, syscall.ENOBUFS) || messages[0].N != 0 {
-						t.Fatalf("fragmented IP WriteBatch = %d, %v, N=%d; want 0, ENOBUFS, 0", count, writeErr, messages[0].N)
-					}
-					if info := connection.Info(); info.PacketsSent != 0 || info.BytesSent != 0 {
-						t.Fatalf("failed fragmented IP statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
-					}
-				} else {
-					if count != 1 || writeErr != nil || messages[0].N != len(payload) {
-						t.Fatalf("fragmented IP WriteBatch = %d, %v, N=%d", count, writeErr, messages[0].N)
-					}
-					if info := connection.Info(); info.PacketsSent != 1 || info.BytesSent != uint64(len(payload)) {
-						t.Fatalf("successful fragmented IP statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
-					}
+				if count != 1 || writeErr != nil || messages[0].N != len(payload) {
+					t.Fatalf("fragmented IP WriteBatch = %d, %v, N=%d", count, writeErr, messages[0].N)
+				}
+				if info := connection.Info(); info.PacketsSent != 1 || info.BytesSent != uint64(len(payload)) {
+					t.Fatalf("successful fragmented IP statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
 				}
 				if after := stack.outbound.len(); after != before+1 {
 					t.Fatalf("fragmented IP write changed queue depth from %d to %d, want %d", before, after, before+1)
 				}
 				if !connection.acceptsError(family.remote) {
-					t.Fatal("fragment prefix did not retain ICMP correlation")
+					t.Fatal("fragmented write did not retain ICMP correlation")
 				}
-				fragments := 0
+				var reassembly IPPacketReassembly
+				var reassembled IPPacket
+				complete := false
 				for {
 					entry, ok := stack.outbound.tryDequeue()
 					if !ok {
@@ -1926,13 +1985,17 @@ func TestIPFragmentedWriteQueueExhaustionPolicy(t *testing.T) {
 					packet, parseErr := ParseIPPacket(entry.packet)
 					if parseErr == nil && packet.Source == family.local && packet.Destination == family.remote {
 						if fragment, fragmented := packet.Fragment(); fragmented && fragment.Protocol == 99 {
-							fragments++
+							var addErr error
+							reassembled, complete, addErr = reassembly.Add(packet)
+							if addErr != nil {
+								t.Fatal(addErr)
+							}
 						}
 					}
 					stack.outbound.release(entry)
 				}
-				if fragments != 1 {
-					t.Fatalf("published IP fragment prefix = %d packets, want 1", fragments)
+				if !complete || reassembled.Protocol != 99 || !bytes.Equal(reassembled.Payload, payload) {
+					t.Fatalf("reassembled fragmented IP WriteBatch = complete %t protocol %d payload %x", complete, reassembled.Protocol, reassembled.Payload)
 				}
 			})
 		}
@@ -1978,18 +2041,26 @@ func TestIPHeaderIncludedWriteQueueExhaustionPolicy(t *testing.T) {
 			packet := buildIPPacket(local, remote, 99, []byte("header-included"), 2, true)
 			messages := []SocketMessage{{Buffers: [][]byte{packet[:17], packet[17:]}}}
 			count, writeErr := connection.WriteBatch(messages, policy.flags)
-			if policy.receiveErrors {
-				if count != 0 || !errors.Is(writeErr, syscall.ENOBUFS) || messages[0].N != 0 {
-					t.Fatalf("header-included WriteBatch = %d, %v, N=%d; want 0, ENOBUFS, 0", count, writeErr, messages[0].N)
-				}
-			} else if count != 1 || writeErr != nil || messages[0].N != len(packet) {
+			if count != 1 || writeErr != nil || messages[0].N != len(packet) {
 				t.Fatalf("header-included WriteBatch = %d, %v, N=%d", count, writeErr, messages[0].N)
 			}
 			if !connection.acceptsError(remote) {
-				t.Fatal("header-included link drop did not retain ICMP correlation")
+				t.Fatal("header-included write did not retain ICMP correlation")
 			}
 			if after := stack.outbound.len(); after != outboundPacketQueue {
 				t.Fatalf("header-included full-queue write changed depth to %d", after)
+			}
+			found := false
+			for {
+				entry, available := stack.outbound.tryDequeue()
+				if !available {
+					break
+				}
+				found = found || bytes.Equal(entry.packet, packet)
+				stack.outbound.release(entry)
+			}
+			if !found {
+				t.Fatal("header-included packet was not admitted over published backlog")
 			}
 		})
 	}
@@ -2413,6 +2484,67 @@ func BenchmarkIPPacketWrite(b *testing.B) {
 		if count, readErr := stack.Read(buffers, sizes, 0); readErr != nil || count != 1 {
 			b.Fatalf("Stack.Read = %d, %v", count, readErr)
 		}
+	}
+}
+
+func BenchmarkIPHeaderIncludedWrite(b *testing.B) {
+	local := netip.MustParseAddr("2001:db8::247")
+	remote := netip.MustParseAddr("2001:db8:1::247")
+	datagram := mustTestWire((UDPDatagram{
+		Source: netip.AddrPortFrom(local, 14000), Destination: netip.AddrPortFrom(remote, 443), Payload: make([]byte, 1200),
+	}).MarshalBinary())
+	hop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
+	if err := hop.SetOptions(nil); err != nil {
+		b.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		headers   []IPv6ExtensionHeader
+		flowLabel uint32
+	}{
+		{name: "base-header"},
+		{name: "hop-by-hop", headers: []IPv6ExtensionHeader{hop}},
+		{name: "base-header/labeled", flowLabel: 0x12345},
+		{name: "hop-by-hop/labeled", headers: []IPv6ExtensionHeader{hop}, flowLabel: 0x12345},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			stack, err := New(Config{
+				LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)},
+				IP:             IPSocketDefaults{IPHeaderIncludedOnWrite: true},
+			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				b.Fatal(err)
+			}
+			connection, err := stack.DialIP(context.Background(), "ip6:udp", netip.Addr{}, remote)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() {
+				_ = connection.Close()
+				_ = stack.Close()
+			})
+			packet := IPPacket{Source: local, Destination: remote, HopLimit: 64, FlowLabel: test.flowLabel}
+			if err = packet.SetIPv6ExtensionHeaders(test.headers, ProtocolUDP, datagram); err != nil {
+				b.Fatal(err)
+			}
+			wire := mustTestWire(packet.MarshalBinary())
+			b.SetBytes(int64(len(wire)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				if written, writeErr := connection.Write(wire); writeErr != nil || written != len(wire) {
+					b.Fatalf("Write = %d, %v", written, writeErr)
+				}
+				entry, ok := stack.outbound.tryDequeue()
+				if !ok {
+					b.Fatal("header-included write did not queue output")
+				}
+				stack.outbound.release(entry)
+			}
+		})
 	}
 }
 
