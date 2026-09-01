@@ -2540,8 +2540,8 @@ func (s *multicastState) sendIGMPPacket(target netip.Addr, payload []byte, route
 	}
 	packet := make([]byte, headerSize+len(payload))
 	marshalPublicIPPacket(packet, packetValue, headerSize, true)
-	// A compatibility change may invalidate this generation while the packet is
-	// serialized; do not publish the obsolete report afterward.
+	// Recheck generation cancellation after serialization and before best-effort
+	// publication.
 	select {
 	case <-cancel:
 		return
@@ -2568,8 +2568,8 @@ func (s *multicastState) sendMLDPacket(target netip.Addr, payload []byte, cancel
 	marshalPublicICMPMessage(packet[48:], ICMPMessage{
 		Source: source, Destination: target, Type: payload[0], Code: payload[1], Body: payload[4:],
 	})
-	// A compatibility change may invalidate this generation while the packet is
-	// serialized; do not publish the obsolete report afterward.
+	// Recheck generation cancellation after serialization and before best-effort
+	// publication.
 	select {
 	case <-cancel:
 		return

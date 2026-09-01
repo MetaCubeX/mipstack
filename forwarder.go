@@ -741,19 +741,16 @@ func (r *TCPForwarderRequest) closeDone() {
 }
 
 // Accept creates a passive TCP endpoint and blocks until the handshake
-// completes, ctx is canceled, or the stack closes. Outbound backpressure is
-// part of that handshake wait: Accept waits for capacity while cancellation
-// and stack closure remain effective. It reports ErrResourceLimit only when
-// Config.MaxTCPConnections prevents endpoint creation. The accepted connection
-// preserves the original destination in LocalAddr and the sender in RemoteAddr.
-// The handler must wait for Accept to return before returning itself. Once
-// Accept returns, the connection is independent of both the request and the
-// forwarder: the handler may return immediately or hand the connection to
-// another goroutine, and closing the forwarder does not close it. Options are
-// validated before the request is claimed and are not retained; an invalid
-// option leaves the request available for another action. After validation
-// succeeds, Accept consumes the request even when endpoint creation or the
-// handshake returns an error.
+// completes, ctx is canceled, or the stack closes. The accepted connection
+// preserves the original destination in LocalAddr and the sender in
+// RemoteAddr. The handler must wait for Accept to return before returning
+// itself. Once Accept returns, the connection is independent of both the
+// request and the forwarder: the handler may return immediately or hand the
+// connection to another goroutine, and closing the forwarder does not close
+// it. Options are validated before the request is claimed and are not
+// retained; an invalid option leaves the request available for another
+// action. After validation succeeds, Accept consumes the request even when
+// endpoint creation or the handshake returns an error.
 func (r *TCPForwarderRequest) Accept(ctx context.Context, options ...SocketOption) (*TCPConn, error) {
 	if ctx == nil {
 		panic("nil Context")

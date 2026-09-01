@@ -463,11 +463,14 @@ func newTestStack(t testing.TB, local, remote netip.Addr) (*testPacketLink, *Sta
 	return link, stack
 }
 
-// newManuallyPumpedTCPConnection completes a real wire handshake while the
+// newManuallyPumpedTCPConnections completes real wire handshakes while the
 // test owns every device dequeue. Callers can therefore stop and resume
 // Stack.Read at an exact packet-generation boundary.
-func newManuallyPumpedTCPConnection(t *testing.T) (*testPacketLink, *Stack, *TCPConn) {
+func newManuallyPumpedTCPConnections(t *testing.T, count int) (*testPacketLink, *Stack, []*TCPConn) {
 	t.Helper()
+	if count < 1 {
+		t.Fatal("manually pumped TCP connection count must be positive")
+	}
 	local := netip.MustParseAddr("192.0.2.111")
 	remote := netip.MustParseAddr("192.0.2.112")
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1400})
@@ -487,44 +490,61 @@ func newManuallyPumpedTCPConnection(t *testing.T) (*testPacketLink, *Stack, *TCP
 		connection net.Conn
 		err        error
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	t.Cleanup(cancel)
-	dialed := make(chan dialResult, 1)
-	go func() {
-		connection, dialErr := stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 8080))
-		dialed <- dialResult{connection: connection, err: dialErr}
-	}()
-	for {
-		select {
-		case result := <-dialed:
-			if result.err != nil {
-				t.Fatal(result.err)
-			}
-			connection := result.connection.(*TCPConn)
-			for {
-				entry, available := stack.outbound.tryDequeue()
-				if !available {
-					break
+	connections := make([]*TCPConn, count)
+	for index := range connections {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		t.Cleanup(cancel)
+		dialed := make(chan dialResult, 1)
+		go func(port uint16) {
+			connection, dialErr := stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, port))
+			dialed <- dialResult{connection: connection, err: dialErr}
+		}(uint16(8080 + index))
+		connected := false
+		for !connected {
+			select {
+			case result := <-dialed:
+				cancel()
+				if result.err != nil {
+					t.Fatal(result.err)
 				}
+				connections[index] = result.connection.(*TCPConn)
+				connected = true
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			default:
+			}
+			entry, available := stack.outbound.tryDequeue()
+			if !available && !connected {
+				entry, available = waitTestPacketEntry(&stack.outbound, 10*time.Millisecond)
+			}
+			if available {
 				if err = link.handleOutboundPacket(consumeTestPacket(&stack.outbound, entry)); err != nil {
 					t.Fatal(err)
 				}
 			}
-			// Info is actor-serialized and proves that the handshake loop has
-			// handed ownership to the established actor before output stops.
-			_ = connection.Info()
-			return link, stack, connection
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
-		default:
 		}
-		entry, available := waitTestPacketEntry(&stack.outbound, 10*time.Millisecond)
-		if available {
+		for {
+			entry, available := stack.outbound.tryDequeue()
+			if !available {
+				break
+			}
 			if err = link.handleOutboundPacket(consumeTestPacket(&stack.outbound, entry)); err != nil {
 				t.Fatal(err)
 			}
 		}
+		// Info is actor-serialized and proves that the handshake loop has
+		// handed ownership to the established actor before output stops.
+		_ = connections[index].Info()
 	}
+	return link, stack, connections
+}
+
+// newManuallyPumpedTCPConnection is the single-connection form used by tests
+// that stop output at one connection's protocol boundary.
+func newManuallyPumpedTCPConnection(t *testing.T) (*testPacketLink, *Stack, *TCPConn) {
+	t.Helper()
+	link, stack, connections := newManuallyPumpedTCPConnections(t, 1)
+	return link, stack, connections[0]
 }
 
 // run reads packets from the stack and passes them to the emulated peer.

@@ -3023,6 +3023,74 @@ func TestTCPEstablishedActorSurvivesStoppedDeviceRead(t *testing.T) {
 	}
 }
 
+func TestTCPEstablishedActorsShareReturnedOutputCapacity(t *testing.T) {
+	const flows = 8
+	_, stack, connections := newManuallyPumpedTCPConnections(t, flows)
+	for _, connection := range connections {
+		defer connection.Close()
+	}
+
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
+
+	wantPorts := make(map[uint16]struct{}, flows)
+	for index, connection := range connections {
+		port := connection.key.local.Port()
+		wantPorts[port] = struct{}{}
+		before := connection.Info()
+		payload := bytes.Repeat([]byte{byte(index)}, 32*1024)
+		if n, err := connection.Write(payload); err != nil || n != len(payload) {
+			t.Fatalf("flow %d Write = %d, %v", index, n, err)
+		}
+		blocked := connection.Info()
+		if blocked.BytesSent != before.BytesSent || blocked.SendBufferSize < len(payload) {
+			t.Fatalf("flow %d changed transmission state without capacity: before=%+v blocked=%+v", index, before, blocked)
+		}
+	}
+
+	last := len(held) - 1
+	stack.outbound.releaseReserved(held[last])
+	held = held[:last]
+	served := make(map[uint16]int, flows)
+	deadline := time.Now().Add(2 * time.Second)
+	for packets := 0; len(served) != flows && packets < 4*flows && time.Now().Before(deadline); packets++ {
+		entry, available := waitTestPacketEntry(&stack.outbound, time.Until(deadline))
+		if !available {
+			break
+		}
+		packet, valid := parseIPPacket(consumeTestPacket(&stack.outbound, entry))
+		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
+			t.Fatal("returned capacity published a non-TCP packet")
+		}
+		headerSize := int(packet.payload[12]>>4) * 4
+		if headerSize < tcpHeaderSize || headerSize >= len(packet.payload) {
+			t.Fatal("returned capacity published a TCP control packet instead of queued data")
+		}
+		port := binary.BigEndian.Uint16(packet.payload[0:2])
+		if _, wanted := wantPorts[port]; !wanted {
+			t.Fatalf("returned capacity served unexpected TCP source port %d", port)
+		}
+		served[port]++
+	}
+	if len(served) != flows {
+		t.Fatalf("returned output capacity served %d of %d TCP actors within %d packets: %v", len(served), flows, 4*flows, served)
+	}
+}
+
 func TestTCPPersistProbeSurvivesStoppedDeviceRead(t *testing.T) {
 	for _, test := range []struct {
 		name         string

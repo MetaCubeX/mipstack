@@ -2634,10 +2634,10 @@ func TestNewQueriesFollowActiveCompatibilityMode(t *testing.T) {
 	})
 }
 
-// TestCompatibilityChangeReplacesDroppedReportGeneration verifies that a
-// report discarded under device pressure cannot make a later compatibility
-// change emit the obsolete report form after capacity returns.
-func TestCompatibilityChangeReplacesDroppedReportGeneration(t *testing.T) {
+// TestCompatibilityChangeReplacesReportGenerationUnderDevicePressure verifies
+// that a compatibility change cancels remaining current-version report state
+// after the report worker has advanced it against a full device queue.
+func TestCompatibilityChangeReplacesReportGenerationUnderDevicePressure(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.117")
 	querier := netip.MustParseAddr("192.0.2.118")
 	group := netip.MustParseAddr("239.117.0.1")
@@ -2649,7 +2649,13 @@ func TestCompatibilityChangeReplacesDroppedReportGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
-	time.Sleep(5 * time.Millisecond)
+	state := stack.multicast.(*multicastState)
+	waitFor(t, time.Second, func() bool {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		pending := state.retransmissions[group]
+		return pending == nil || pending.modeRemaining < multicastDefaultRobustness
+	})
 	query := buildMulticastTestIGMPQuery(querier, netip.MustParseAddr("224.0.0.1"), netip.IPv4Unspecified(), 1, nil, true)
 	if _, err = stack.Write([][]byte{query}, 0); err != nil {
 		t.Fatal(err)

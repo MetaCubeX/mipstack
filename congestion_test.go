@@ -1134,10 +1134,9 @@ func testUDPLatencyDuringTCPDeviceBottleneck(t *testing.T, algorithm string, fai
 	response := make([]byte, len(request))
 	for sequence := 0; sequence < 32; sequence++ {
 		binary.BigEndian.PutUint64(request, uint64(sequence))
-		admissionDeadline := time.Now().Add(5 * time.Second)
-		var started time.Time
+		started := time.Now()
+		admissionDeadline := started.Add(5 * time.Second)
 		for {
-			started = time.Now()
 			if _, err = udpConnection.Write(request); err == nil {
 				break
 			}
