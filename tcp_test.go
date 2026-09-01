@@ -3520,10 +3520,15 @@ func TestTCPSACKRecoverySurvivesStoppedDeviceRead(t *testing.T) {
 			return TCPConnInfo{}
 		}
 	}
-	// The first request can be answered before the coalesced inbound batch. The
-	// second proves that all SACK feedback and its failed publication completed.
-	_ = responsiveInfo()
-	blocked := responsiveInfo()
+	// Info is answered before the queued receive batch in an actor turn. An
+	// empty-queue snapshot therefore includes every SACK injected above.
+	var blocked TCPConnInfo
+	for {
+		blocked = responsiveInfo()
+		if blocked.InboundQueueBytes == 0 {
+			break
+		}
+	}
 	if !blocked.FastRecovery {
 		t.Fatalf("SACK feedback did not enter fast recovery: %+v", blocked)
 	}
@@ -6120,11 +6125,13 @@ func TestTCPConnectionMemoryLayout(t *testing.T) {
 		{"TCPConn", unsafe.Sizeof(TCPConn{}), 696},
 		{"socketDeadline", unsafe.Sizeof(socketDeadline{}), 16},
 		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1520},
+		{"tcpRACKSample", unsafe.Sizeof(tcpRACKSample{}), 48},
 		{"tcpEstablishedLivenessState", unsafe.Sizeof(tcpEstablishedLivenessState{}), 72},
 		{"tcpEstablishedPathMTUState", unsafe.Sizeof(tcpEstablishedPathMTUState{}), 120},
 		{"tcpRecoveryUndo", unsafe.Sizeof(tcpRecoveryUndo{}), 80},
 		{"tcpRecoveryTransportState", unsafe.Sizeof(tcpRecoveryTransportState{}), 56},
 		{"tcpCongestionController", unsafe.Sizeof(tcpCongestionController{}), 472},
+		{"CongestionRateSample", unsafe.Sizeof(CongestionRateSample{}), 136},
 	} {
 		if test.got != test.want {
 			t.Errorf("%s size = %d, want %d; reassess per-connection allocation classes", test.name, test.got, test.want)
@@ -6296,6 +6303,55 @@ func TestRACKCanDetectLostRetransmission(t *testing.T) {
 	markRACKLoss(outstanding, delivered, base.Add(15*time.Millisecond), 10*time.Millisecond, base)
 	if !outstanding[0].state.has(sentTCPSegmentRACKLost) || outstanding[0].state.has(sentTCPSegmentSACKRetried) {
 		t.Fatalf("lost retransmission state = lost %t retried %t", outstanding[0].state.has(sentTCPSegmentRACKLost), outstanding[0].state.has(sentTCPSegmentSACKRetried))
+	}
+}
+
+// TestRACKPreservesTransmissionOrderAcrossClockTies verifies that a low-
+// sequence retransmission remains newer than an earlier forward flight even
+// when the host clock does not advance, while later delivery can still prove
+// that retransmission lost.
+func TestRACKPreservesTransmissionOrderAcrossClockTies(t *testing.T) {
+	base := time.Unix(100, 0)
+	var transport tcpEstablishedState
+	original := testPacketQueueTicketAt(base, base)
+	retransmission := testPacketQueueTicketAt(base, base)
+	originalOrder := transport.recordTransmission(original)
+	retransmissionOrder := transport.recordTransmission(retransmission)
+	if got := retransmission.queuedTime(base); !got.Equal(base) {
+		t.Fatalf("clock-tied queue publication time = %v, want %v", got, base)
+	}
+	if !tcpSequenceGreater(retransmissionOrder, originalOrder) {
+		t.Fatalf("clock-tied transmission order = %d after %d", retransmissionOrder, originalOrder)
+	}
+	if later := newerRACKSample(
+		tcpRACKSample{sentAt: base, end: 200, order: originalOrder},
+		tcpRACKSample{sentAt: base, end: 300, order: originalOrder},
+	); later.end != 300 {
+		t.Fatalf("same-transmission clock tie selected end %d, want 300", later.end)
+	}
+	segment := sentTCPSegment{
+		sequence:          100,
+		end:               200,
+		state:             sentTCPSegmentTransmitted | sentTCPSegmentRetransmitted | sentTCPSegmentSACKRetried,
+		hostQueue:         retransmission,
+		transmissionOrder: retransmissionOrder,
+	}
+	delivered := tcpRACKSample{sentAt: original.queuedTime(base), end: 300, order: originalOrder, rtt: time.Millisecond}
+	outstanding := []sentTCPSegment{segment}
+	if markRACKLoss(outstanding, delivered, retransmission.queuedTime(base).Add(time.Millisecond), 0, base); outstanding[0].state.has(sentTCPSegmentRACKLost) {
+		t.Fatal("RACK treated an earlier clock-tied flight as newer than its retransmission")
+	}
+
+	later := testPacketQueueTicketAt(base, base)
+	delivered.order = transport.recordTransmission(later)
+	delivered.sentAt = later.queuedTime(base)
+	if !markRACKLoss(outstanding, delivered, later.queuedTime(base).Add(time.Millisecond), 0, base) || !outstanding[0].state.has(sentTCPSegmentRACKLost) || outstanding[0].state.has(sentTCPSegmentSACKRetried) {
+		t.Fatalf("later delivery did not mark the retransmission lost: state=%#x", outstanding[0].state)
+	}
+
+	transport.transmissionOrder = ^uint32(0)
+	if wrapped := transport.recordTransmission(later); wrapped != 1 || !tcpClockTieTransmissionAfter(wrapped, 0, ^uint32(0), 0) {
+		t.Fatalf("wrapped transmission order = %d, want 1 after %d", wrapped, uint32(^uint32(0)))
 	}
 }
 
@@ -6625,6 +6681,23 @@ func TestTCPPartialSACKSplitsScoreboard(t *testing.T) {
 	}
 	if ranges, bytes := tcpSACKedState(outstanding); ranges != 1 || bytes != 100 {
 		t.Fatalf("partial SACK aggregate = %d ranges/%d bytes, want 1/100", ranges, bytes)
+	}
+}
+
+// TestTCPSACKOrdersSplitRangesWithinOneTransmission verifies that scoreboard
+// pieces sharing one publication retain RFC 8985's ending-sequence order.
+func TestTCPSACKOrdersSplitRangesWithinOneTransmission(t *testing.T) {
+	epoch := time.Unix(100, 0)
+	outstanding := []sentTCPSegment{{
+		sequence: 100, end: 400, state: sentTCPSegmentTransmitted,
+		hostQueue: testPacketQueueTicketAt(epoch, epoch), transmissionOrder: 7,
+	}}
+	_, _, _, _, latest, _ := applyTCPSACK(outstanding, []TCPSACKBlock{
+		{LeftEdge: 150, RightEdge: 200},
+		{LeftEdge: 300, RightEdge: 350},
+	}, epoch)
+	if latest.order != 7 || latest.end != 350 {
+		t.Fatalf("latest split SACK transmission = order %d end %d, want order 7 end 350", latest.order, latest.end)
 	}
 }
 

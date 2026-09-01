@@ -95,15 +95,15 @@ When the fixed link queue is full of published packets, flow-aware admission
 prevents an earlier bulk flow from excluding later UDP, IP, and control flows
 from the scheduler.
 
-The link queue is finite. If `Stack.Read` stops, TCP retains protocol output until
-capacity returns while its actors remain responsive and stream writes continue
-to obey their send-buffer and deadline rules. UDP and IP socket writes instead
-make one immediate bounded admission attempt. Failure to admit unicast output
-or an external-link non-unicast copy is silent by default and reports `ENOBUFS`
-when `ReceiveErrors` is enabled. Receive-side multicast and broadcast loopback
-copies remain independently best effort. Best-effort control packets may
-displace queued backlog or be discarded, and `Stack.Write` itself does not wait
-for outbound capacity.
+The link queue is finite. If `Stack.Read` stops, TCP retains protocol output
+until capacity returns while its actors remain responsive and stream writes
+continue to obey their send-buffer and deadline rules. UDP and IP socket
+writes instead make one immediate bounded admission attempt. Failure to admit
+unicast output or an external-link non-unicast copy is silent by default and
+reports `ENOBUFS` when `ReceiveErrors` is enabled. Receive-side multicast and
+broadcast loopback copies remain independently best effort. Best-effort control
+packets may displace queued backlog or be discarded, and `Stack.Write` itself
+does not wait for outbound capacity.
 
 For integration with userspace packet-device consumers, `Stack` also provides
 `MTU`, `Name`, and `BatchSize`. `LocalAddresses` returns an independent

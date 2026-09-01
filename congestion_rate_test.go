@@ -27,6 +27,29 @@ func TestTCPDeliveryRateSampleUsesLongerPipelinePhase(t *testing.T) {
 	}
 }
 
+func TestTCPDeliveryRateSampleUsesClockTieTransmissionOrder(t *testing.T) {
+	stamp := monotonicStamp(time.Second) + 1
+	earlier := sentTCPSegment{
+		end:               300,
+		hostQueue:         packetQueueTicket{queuedAt: stamp},
+		transmissionOrder: 1,
+		delivery:          tcpDeliverySnapshot{firstSent: 1, deliveredStamp: 1, deliveredFlags: 100},
+	}
+	later := sentTCPSegment{
+		end:               200,
+		hostQueue:         packetQueueTicket{queuedAt: stamp},
+		transmissionOrder: 2,
+		delivery:          tcpDeliverySnapshot{firstSent: 2, deliveredStamp: 2, deliveredFlags: 200},
+	}
+	var sample tcpDeliveryRateSample
+	sample.observe(earlier)
+	sample.observe(later)
+	sample.observe(earlier)
+	if sample.priorDelivered != 200 || sample.lastSent != stamp || sample.lastEnd != 200 || sample.lastOrder != 2 {
+		t.Fatalf("clock-tied delivery selection = delivered %d sent %d end %d order %d", sample.priorDelivered, sample.lastSent, sample.lastEnd, sample.lastOrder)
+	}
+}
+
 func TestTCPDeliveryRateSampleRejectsSACKReneging(t *testing.T) {
 	controller := newTCPCongestionController(CongestionControlBBR)
 	sample := tcpDeliveryRateSample{

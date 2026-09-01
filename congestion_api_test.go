@@ -636,9 +636,8 @@ func TestSentTCPSegmentLayout(t *testing.T) {
 	if offset := unsafe.Offsetof(segment.congestionPacketState); offset != 40 {
 		t.Fatalf("congestion packet state offset = %d, want 40", offset)
 	}
-	tailSlack := unsafe.Sizeof(segment) - unsafe.Offsetof(segment.delivery) - unsafe.Sizeof(segment.delivery)
-	if tailSlack != 4 {
-		t.Fatalf("sent TCP segment tail slack = %d, want 4", tailSlack)
+	if offset := unsafe.Offsetof(segment.transmissionOrder); offset != 60 {
+		t.Fatalf("transmission order offset = %d, want 60", offset)
 	}
 }
 

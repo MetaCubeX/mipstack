@@ -1596,7 +1596,7 @@ type packetQueue struct {
 	closed           atomic.Bool
 }
 
-// loopbackQueue adds atomic multi-packet publication to the common packet
+// loopbackQueue adds all-or-none multi-packet admission to the common packet
 // queue so the local reassembler never observes a capacity-truncated fragment
 // sequence.
 type loopbackQueue struct {
@@ -2097,8 +2097,9 @@ func (q *loopbackQueue) close() {
 	q.batchMu.Unlock()
 }
 
-// tryWritePackets atomically queues one complete packet sequence for local
-// delivery.
+// tryWritePackets reserves a complete local packet sequence before publishing
+// its first member. Multi-packet publishers do not interleave with each other,
+// and close cannot split an admitted sequence.
 func (q *loopbackQueue) tryWritePackets(packets [][]byte, closeCh <-chan struct{}) error {
 	if len(packets) == 0 {
 		return nil
@@ -3450,8 +3451,8 @@ func (s *Stack) tryWritePackets(packets [][]byte, flow outputFlowKey) error {
 	return nil
 }
 
-// tryWriteLoopbackPackets atomically publishes one complete local packet
-// sequence and records every successfully admitted packet.
+// tryWriteLoopbackPackets admits one complete local packet sequence or none of
+// it and records every successfully admitted packet.
 func (s *Stack) tryWriteLoopbackPackets(packets [][]byte) error {
 	if err := s.loopback.tryWritePackets(packets, s.closeCh); err != nil {
 		return err

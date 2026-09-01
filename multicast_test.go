@@ -2675,11 +2675,11 @@ func TestCompatibilityChangeReplacesReportGenerationUnderDevicePressure(t *testi
 	}
 }
 
-func TestFragmentedNonUnicastLocalCopiesAreAtomic(t *testing.T) {
+func TestFragmentedNonUnicastLocalCopiesUseAllOrNoneAdmission(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.119")
 	remote := netip.MustParseAddr("198.51.100.119")
 	// Keep the stack inactive so its loopback worker cannot consume the dummy
-	// packets while this white-box test observes an atomic queue transition.
+	// packets while this white-box test observes all-or-none queue admission.
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 24)}, MTU: 600})
 	if err != nil {
 		t.Fatal(err)

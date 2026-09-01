@@ -950,7 +950,7 @@ func TestDirectFragmentOutputReclaimsPublishedBacklog(t *testing.T) {
 	}
 }
 
-func TestDirectFragmentedLoopbackOutputIsAtomic(t *testing.T) {
+func TestDirectFragmentedLoopbackOutputUsesAllOrNoneAdmission(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.45")
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 68})
 	if err != nil {

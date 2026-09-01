@@ -1757,12 +1757,12 @@ func (f *ICMPForwarder) closeFromStack() {
 // Detach transfers one UDP request out of the synchronous handler lifetime.
 // On success it removes the request from the forwarder's pending set and
 // returns a caller-owned flow and payload snapshot. The responder points back
-// to the originating forwarder's state for output and Done, but the forwarder does not
-// retain the responder or impose a capacity or timeout. The caller may hand it
-// to another goroutine or discard it without a terminal action. Detach itself
-// is the request's action and consumes the request even when it returns an
-// error. It may be called after any number of Reply or ReplyFrom attempts; the
-// responder remains available for further replies.
+// to the originating forwarder's state for output and Done, but the forwarder
+// does not retain the responder or impose a capacity or timeout. The caller
+// may hand it to another goroutine or discard it without a terminal action.
+// Detach itself is the request's action and consumes the request even when it
+// returns an error. It may be called after any number of Reply or ReplyFrom
+// attempts; the responder remains available for further replies.
 func (r *UDPForwarderRequest) Detach() (*UDPForwarderResponder, error) {
 	_, ok := r.claim()
 	if !ok {

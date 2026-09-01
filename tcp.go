@@ -1373,9 +1373,9 @@ func sentTCPSegmentInitialState(limited, cwr, mtuProbe, schedulerLimited bool) s
 //	16..39  first-send time and host-queue ticket
 //	40..47  controller-owned CongestionEvent.PacketState
 //	48..59  delivery-rate snapshot
-//	60..63  tail padding
+//	60..63  transmission order
 //
-// Blank fields make both padding regions explicit; layout tests enforce the
+// The blank field makes header alignment explicit; layout tests enforce the
 // offsets. The packet state is opaque to TCP and belongs to the transmission
 // generation that produced it. Methods use pointer receivers so hot ACK paths
 // do not copy the complete cache-line-sized record.
@@ -1390,7 +1390,7 @@ type sentTCPSegment struct {
 	hostQueue             packetQueueTicket
 	congestionPacketState uint64
 	delivery              tcpDeliverySnapshot
-	_                     [4]byte
+	transmissionOrder     uint32
 }
 
 // dataSize returns the application bytes covered by this sequence range.
@@ -1838,10 +1838,12 @@ func (h *tcpRetransmissionHistory) match(block TCPSACKBlock) (bool, bool) {
 }
 
 // tcpRACKSample identifies the newest transmission known to have been
-// delivered. RFC 8985 orders equal transmit timestamps by sequence number.
+// delivered. order supplements RFC 8985's sequence tie-break when a coarse
+// clock gives a later retransmission the same timestamp as its original flight.
 type tcpRACKSample struct {
 	sentAt        time.Time
 	end           uint32
+	order         uint32
 	rtt           time.Duration
 	timestamp     uint32
 	retransmitted bool
@@ -1918,8 +1920,8 @@ type tcpEstablishedState struct {
 	rackReorderingScale, rackDSACKRound uint32
 	rackReorderPersist                  int
 	ecnHoldUntil                        time.Time
-	lastDataSent, cwndUsageStamp        monotonicStamp
-	cwndUsed                            uint32
+	lastTransmission, cwndUsageStamp    monotonicStamp
+	cwndUsed, transmissionOrder         uint32
 	receiveAutoTune, sendAutoTune       tcpBufferAutoTune
 	hyStart                             tcpHyStart
 	// Recovery helpers remain nil until their corresponding loss evidence is
@@ -2509,6 +2511,19 @@ func (s *tcpEstablishedState) measureReceiveMSS(segment *tcpSegment) {
 		return
 	}
 	s.lastReceiveSegmentSize = uint16(segmentSize)
+}
+
+// recordTransmission retains the physical publication time and assigns an
+// exact actor-local order for protocols that must distinguish clock ties. Zero
+// remains reserved for records constructed without actor publication. The
+// bounded live scoreboard makes wrapping comparison unambiguous.
+func (s *tcpEstablishedState) recordTransmission(ticket packetQueueTicket) uint32 {
+	s.lastTransmission = ticket.queuedAt
+	s.transmissionOrder++
+	if s.transmissionOrder == 0 {
+		s.transmissionOrder = 1
+	}
+	return s.transmissionOrder
 }
 
 // observeSentData enters ping-pong mode when an application response is
@@ -6843,7 +6858,7 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 				state.observeRACKReordering(oldest.end, oldest.isRetransmitted())
 			}
 			transmittedAt := oldest.transmittedAt(c.stack.timestampEpoch)
-			candidate := tcpRACKSample{sentAt: transmittedAt, end: oldest.end, rtt: elapsedRTTSampleAt(transmittedAt, receivedAt), timestamp: oldest.timestamp, retransmitted: oldest.isRetransmitted()}
+			candidate := tcpRACKSample{sentAt: transmittedAt, end: oldest.end, order: oldest.transmissionOrder, rtt: elapsedRTTSampleAt(transmittedAt, receivedAt), timestamp: oldest.timestamp, retransmitted: oldest.isRetransmitted()}
 			state.rackLatestDelivered = newerRACKSample(state.rackLatestDelivered, validRACKSample(candidate, state.rtt.minimum, timestampEcho))
 			if !sampledRTT && !ambiguousRTT && !oldest.isRetransmitted() {
 				rttSample = elapsedRTTSampleAt(transmittedAt, receivedAt)
@@ -6878,7 +6893,7 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 				state.observeRACKReordering(ack, state.outstanding[0].isRetransmitted())
 			}
 			transmittedAt := state.outstanding[0].transmittedAt(c.stack.timestampEpoch)
-			candidate := tcpRACKSample{sentAt: transmittedAt, end: ack, rtt: elapsedRTTSampleAt(transmittedAt, receivedAt), timestamp: state.outstanding[0].timestamp, retransmitted: state.outstanding[0].isRetransmitted()}
+			candidate := tcpRACKSample{sentAt: transmittedAt, end: ack, order: state.outstanding[0].transmissionOrder, rtt: elapsedRTTSampleAt(transmittedAt, receivedAt), timestamp: state.outstanding[0].timestamp, retransmitted: state.outstanding[0].isRetransmitted()}
 			state.rackLatestDelivered = newerRACKSample(state.rackLatestDelivered, validRACKSample(candidate, state.rtt.minimum, timestampEcho))
 			trimAcknowledgedTCPSegment(&state.outstanding[0], ack)
 		}
@@ -7300,9 +7315,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			state.ecnHoldUntil = time.Time{}
 		}
 		nowStamp := monotonicStampAt(c.stack.timestampEpoch, now)
-		if congestionFlight == 0 && state.lastDataSent != 0 && time.Duration(nowStamp-state.lastDataSent) > state.rtt.rto && !state.controller.customWindowValidation() {
+		if congestionFlight == 0 && state.lastTransmission != 0 && time.Duration(nowStamp-state.lastTransmission) > state.rtt.rto && !state.controller.customWindowValidation() {
 			state.slowStartThreshold = tcpCurrentSlowStartThreshold(state.congestionWindow, state.slowStartThreshold)
-			state.congestionWindow = tcpRestartWindow(state.congestionWindow, state.peerMSS, time.Duration(nowStamp-state.lastDataSent), state.rtt.rto)
+			state.congestionWindow = tcpRestartWindow(state.congestionWindow, state.peerMSS, time.Duration(nowStamp-state.lastTransmission), state.rtt.rto)
 			state.cwndUsed = 0
 			state.cwndUsageStamp = nowStamp
 			state.hyStart.restartRound(state.sendNext)
@@ -7389,6 +7404,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			return outputWindow, false, false, err
 		}
 		hostQueue := published.hostQueue
+		transmissionOrder := state.recordTransmission(hostQueue)
 		if published.carriesCWR {
 			c.sendCWR = false
 		}
@@ -7403,7 +7419,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		// argument even when it is no longer congestion flight.
 		rate, updatedWindow := state.controller.onDataSend(payload.size, state.peerMSS, sentAt, hostQueue.queuedAt, windowFlight, state.congestionWindow, congestionFlight, state.rtt.srtt, state.slowStartThreshold)
 		state.congestionWindow = updatedWindow
-		state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: next, flags: flags, timestamp: published.timestamp, state: sentTCPSegmentInitialState(limitedTransmit, published.carriesCWR, probe, state.controller.schedulerLimited()), firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, congestionPacketState: state.controller.transmissionState(), delivery: rate}, offset+payload.size < total)
+		state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: next, flags: flags, timestamp: published.timestamp, state: sentTCPSegmentInitialState(limitedTransmit, published.carriesCWR, probe, state.controller.schedulerLimited()), firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, congestionPacketState: state.controller.transmissionState(), delivery: rate, transmissionOrder: transmissionOrder}, offset+payload.size < total)
 		state.bytesSent += uint64(payload.size)
 		if probe {
 			state.pathMTUState.discovery.sent(transmitMTU, state.sendNext, next)
@@ -7414,7 +7430,6 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			state.prrOut += uint64(payload.size)
 		}
 		state.sendNext = next
-		state.lastDataSent = hostQueue.queuedAt
 		livenessDirty = true
 		return outputWindow, true, false, nil
 	}
@@ -7648,12 +7663,13 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 						return err
 					}
 					hostQueue := published.hostQueue
+					transmissionOrder := state.recordTransmission(hostQueue)
 					sentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
 					if dsackSent {
 						state.haveRecentDSACK = false
 					}
 					state.commitAcknowledgment(window, right, len(options) != 0)
-					state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: state.sendNext + 1, flags: TCPFlagACK | TCPFlagFIN, timestamp: published.timestamp, state: sentTCPSegmentTransmitted, firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue}, false)
+					state.appendOutstanding(sentTCPSegment{sequence: state.sendNext, end: state.sendNext + 1, flags: TCPFlagACK | TCPFlagFIN, timestamp: published.timestamp, state: sentTCPSegmentTransmitted, firstSent: sentAt.Sub(c.stack.timestampEpoch), hostQueue: hostQueue, transmissionOrder: transmissionOrder}, false)
 					state.sendNext++
 					// Only the endpoint that closes first, or closes simultaneously,
 					// enters TIME-WAIT. A FIN sent after the peer's FIN is LAST-ACK.
@@ -7685,6 +7701,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			return outputWindow, blocked, err
 		}
 		hostQueue := published.hostQueue
+		transmissionOrder := state.recordTransmission(hostQueue)
 		state.recordRetransmission(oldest.sequence, oldest.end)
 		if state.undo != nil {
 			state.undo.recordRetransmission(oldest.sequence, oldest.end, published.timestamp, repeated)
@@ -7692,6 +7709,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		state.commitAcknowledgment(window, right, false)
 		oldest.timestamp = published.timestamp
 		oldest.hostQueue = hostQueue
+		oldest.transmissionOrder = transmissionOrder
 		oldest.advanceTransmissionGeneration()
 		oldest.state.set(sentTCPSegmentSACKRetried, true)
 		oldest.state.set(sentTCPSegmentRACKLost, false)
@@ -7740,6 +7758,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			return outputWindow, blocked, err
 		}
 		hostQueue := published.hostQueue
+		transmissionOrder := state.recordTransmission(hostQueue)
 		state.recordRetransmission(segment.sequence, segment.end)
 		if state.undo != nil {
 			state.undo.recordRetransmission(segment.sequence, segment.end, published.timestamp, segment.isRetransmitted())
@@ -7751,6 +7770,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		segment.state.set(sentTCPSegmentCWR, false)
 		segment.timestamp = published.timestamp
 		segment.hostQueue = hostQueue
+		segment.transmissionOrder = transmissionOrder
 		state.controller.notePacketLoss(segment, recordTCPSegmentLoss(segment, true), false, time.Now(), state.congestionWindow, state.slowStartThreshold, state.ordinaryFlight(), state.peerMSS, state.rtt.srtt)
 		segment.advanceTransmissionGeneration()
 		segment.state.set(sentTCPSegmentSACKRetried, true)
@@ -7815,11 +7835,13 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				return err
 			}
 			hostQueue := published.hostQueue
+			transmissionOrder := state.recordTransmission(hostQueue)
 			state.recordRetransmission(segment.sequence, segment.end)
 			sentAt := hostQueue.queuedTime(c.stack.timestampEpoch)
 			state.commitAcknowledgment(window, right, false)
 			segment.timestamp = published.timestamp
 			segment.hostQueue = hostQueue
+			segment.transmissionOrder = transmissionOrder
 			probeSentAt = sentAt
 			segment.advanceTransmissionGeneration()
 			c.noteRetransmission()
@@ -7948,6 +7970,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			return outputWindow, blocked, err
 		}
 		hostQueue := published.hostQueue
+		transmissionOrder := state.recordTransmission(hostQueue)
 		state.recordRetransmission(segment.sequence, segment.end)
 		if state.undo != nil {
 			state.undo.recordRetransmission(segment.sequence, segment.end, published.timestamp, repeated)
@@ -7959,6 +7982,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 		segment.state.set(sentTCPSegmentCWR, false)
 		segment.timestamp = published.timestamp
 		segment.hostQueue = hostQueue
+		segment.transmissionOrder = transmissionOrder
 		segment.advanceTransmissionGeneration()
 		segment.state.set(sentTCPSegmentRACKLost, false)
 		segment.state.set(sentTCPSegmentSACKRetried, true)
@@ -9166,8 +9190,8 @@ type tcpOutputSequenceRange struct {
 }
 
 // tcpPublishedTransmission contains wire metadata returned only after a packet
-// is visible to Stack.Read. Protocol state remains with the actor and is
-// committed by the action-specific caller.
+// is published to the selected output queue. Protocol state remains with the
+// actor and is committed by the action-specific caller.
 type tcpPublishedTransmission struct {
 	hostQueue  packetQueueTicket
 	timestamp  uint32
@@ -9245,8 +9269,8 @@ var errTCPOutputRouteChanged = errors.New("mipstack: TCP output route changed")
 
 // publishReservedTCP validates, serializes, and publishes one segment through
 // an actor-owned slot. A nonempty sequenceRange is exposed after all fallible
-// construction and immediately before the packet becomes visible to
-// Stack.Read. The reservation is consumed on every return.
+// construction and immediately before the packet is published to the selected
+// output queue. The reservation is consumed on every return.
 func (c *TCPConn) publishReservedTCP(sequence, acknowledgement uint32, flags byte, window uint16, options []byte, payload *tcpPayloadView, mtu int, trafficClass, ecn byte, reservation tcpOutputReservation, sequenceRange tcpOutputSequenceRange) (packetQueueTicket, error) {
 	_, _, packetSize, err := tcpPacketLayout(c.key.local.Addr(), c.key.remote.Addr(), options, payload.size, mtu)
 	if err != nil {
@@ -10009,7 +10033,7 @@ func applyTCPSACK(outstanding []sentTCPSegment, blocks []TCPSACKBlock, epoch tim
 				if !segment.state.has(sentTCPSegmentSACKed) {
 					newInformation = true
 					newlySACKed = append(newlySACKed, *segment)
-					latest = newerRACKSample(latest, tcpRACKSample{sentAt: segment.transmittedAt(epoch), end: segment.end, timestamp: segment.timestamp, retransmitted: segment.isRetransmitted()})
+					latest = newerRACKSample(latest, tcpRACKSample{sentAt: segment.transmittedAt(epoch), end: segment.end, order: segment.transmissionOrder, timestamp: segment.timestamp, retransmitted: segment.isRetransmitted()})
 					// A range contributes delivery-rate metadata only on its first
 					// SACK or cumulative ACK, matching tcp_rate_skb_delivered.
 					segment.delivery.deliveredStamp = 0
@@ -10415,14 +10439,25 @@ func rackReorderingWindow(minimumRTT, smoothedRTT time.Duration, scale uint32) t
 	return window
 }
 
+// tcpClockTieTransmissionAfter compares distinct actor publications by exact
+// order. A zero order denotes a record without actor publication, while equal
+// orders identify ranges from the same publication; both retain RFC 8985's
+// ending-sequence rule.
+func tcpClockTieTransmissionAfter(order, end, previousOrder, previousEnd uint32) bool {
+	if order != previousOrder && order != 0 && previousOrder != 0 {
+		return tcpSequenceGreater(order, previousOrder)
+	}
+	return tcpSequenceGreater(end, previousEnd)
+}
+
 // newerRACKSample returns the later transmission under RFC 8985's transmit
-// time ordering. Sequence order disambiguates timestamps with equal clock
-// granularity.
+// time ordering. Exact publication order disambiguates a coarse-clock tie,
+// including a later low-sequence retransmission.
 func newerRACKSample(current, candidate tcpRACKSample) tcpRACKSample {
 	if candidate.sentAt.IsZero() {
 		return current
 	}
-	if candidate.sentAt.After(current.sentAt) || candidate.sentAt.Equal(current.sentAt) && tcpSequenceGreater(candidate.end, current.end) {
+	if candidate.sentAt.After(current.sentAt) || candidate.sentAt.Equal(current.sentAt) && tcpClockTieTransmissionAfter(candidate.order, candidate.end, current.order, current.end) {
 		return candidate
 	}
 	return current
@@ -10452,7 +10487,7 @@ func validRACKSample(sample tcpRACKSample, minimumRTT time.Duration, timestampEc
 // owning stack's timestamp epoch for the segment's compact queue stamp.
 func rackDeliveredAfter(delivered tcpRACKSample, segment sentTCPSegment, epoch time.Time) bool {
 	transmittedAt := segment.transmittedAt(epoch)
-	return delivered.sentAt.After(transmittedAt) || delivered.sentAt.Equal(transmittedAt) && tcpSequenceGreater(delivered.end, segment.end)
+	return delivered.sentAt.After(transmittedAt) || delivered.sentAt.Equal(transmittedAt) && tcpClockTieTransmissionAfter(delivered.order, delivered.end, segment.transmissionOrder, segment.end)
 }
 
 // rackAdvanceForwardACK updates RFC 8985's highest newly delivered sequence
