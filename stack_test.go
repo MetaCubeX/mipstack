@@ -3109,6 +3109,26 @@ func BenchmarkPacketQueueScheduling(b *testing.B) {
 			}
 		})
 	}
+	// Cover one-packet publication and dequeue without accumulated backlog.
+	b.Run("drr-single-interleaved", func(b *testing.B) {
+		var queue packetQueue
+		queue.initFair(capacity, time.Now(), 1500, [16]byte{5})
+		b.SetBytes(int64(len(packet)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for iteration := 0; iteration < b.N; iteration++ {
+			slot, ok := queue.tryReserve()
+			if !ok {
+				b.Fatal("output queue unexpectedly full")
+			}
+			_, _ = queue.enqueueReservedTCP(slot, packet, false, 1, false)
+			entry, ok := queue.tryDequeue()
+			if !ok {
+				b.Fatal("output queue unexpectedly empty")
+			}
+			queue.release(entry)
+		}
+	})
 }
 
 func BenchmarkPacketQueueOverloadAdmission(b *testing.B) {

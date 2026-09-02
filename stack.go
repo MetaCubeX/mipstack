@@ -1198,7 +1198,10 @@ func (s *fairPacketScheduler) scheduleOldFlowTurn() {
 // demoteNewFlow moves a flow that consumed its initial priority to the old-flow list.
 func (s *fairPacketScheduler) demoteNewFlow(flow *outputFlow) {
 	s.newFlows.remove(flow)
-	s.scheduleOldFlowTurn()
+	// No starvation-prevention turn exists until an older flow is present.
+	if s.oldFlows.first != nil {
+		s.scheduleOldFlowTurn()
+	}
 	flow.state = outputFlowOld
 	s.oldFlows.append(flow)
 }
