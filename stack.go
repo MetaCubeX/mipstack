@@ -223,9 +223,10 @@ type DatagramSocketDefaults struct {
 	ReceiveBuffer int
 	// ReceiveErrors reserves asynchronous network errors for ReadError instead
 	// of returning them from ordinary reads after queued payloads. It also makes
-	// failure to admit unicast output, or the external-link copy of multicast or
-	// broadcast output, fail a UDP or IP write with ENOBUFS. Receive-side
-	// non-unicast loopback copies remain best effort.
+	// an immediate failure to admit unicast output, or the external-link copy of
+	// multicast or broadcast output, fail a UDP or IP write with ENOBUFS. It does
+	// not report packets displaced after admission. Receive-side non-unicast
+	// loopback copies remain best effort.
 	ReceiveErrors bool
 	// PathMTUDiscovery selects the Linux-compatible source-fragmentation and
 	// destination-PMTU policy. The zero value is PathMTUDiscoveryDont.
@@ -394,10 +395,19 @@ type StackStats struct {
 	PromiscuousInboundPackets uint64
 	// InvalidSourcePackets is the unaccepted subset with a prohibited source.
 	InvalidSourcePackets uint64
-	// OutboundPackets counts complete packets accepted by the device queue.
+	// OutboundPackets counts complete packets accepted by the device queue,
+	// including packets later displaced under overload.
 	OutboundPackets uint64
+	// OutboundQueueDrops counts individual packets rejected by or displaced from
+	// the bounded queue consumed by Read. It excludes shutdown cleanup and loss
+	// after Read returns a packet.
+	OutboundQueueDrops uint64
 	// LoopbackPackets counts locally routed packets that bypassed the link.
 	LoopbackPackets uint64
+	// LoopbackQueueDrops counts individual packets rejected by the bounded local
+	// delivery queue. An all-or-none fragmented sequence counts each rejected
+	// fragment; shutdown cleanup is excluded.
+	LoopbackQueueDrops uint64
 	// ActiveTCPConnections includes handshakes, established flows, and
 	// TIME_WAIT actors.
 	ActiveTCPConnections uint64
@@ -503,6 +513,8 @@ type stackCounters struct {
 	fragmentEvictions           atomic.Uint64
 	fragmentTimeouts            atomic.Uint64
 	rateLimitedControlResponses atomic.Uint64
+	outboundQueueDrops          atomic.Uint64
+	loopbackQueueDrops          atomic.Uint64
 }
 
 // controlResponseClass separates independent control-plane token buckets.
@@ -1853,15 +1865,11 @@ func (q *packetQueue) tryReserve() (uint16, bool) {
 
 // replaceBestEffort reclaims one already-published packet from the fattest
 // flow. FIFO queues and capacity held by unpublished reservations retain
-// strict bounded admission.
+// strict bounded admission. The caller must retry ordinary reservation first
+// so a concurrently released slot wins over displacement.
 func (q *packetQueue) replaceBestEffort() (uint16, bool) {
 	if q.scheduler == nil {
 		return 0, false
-	}
-	// A reader can return capacity before overload handling acquires the
-	// scheduler. Prefer that slot to discarding an otherwise deliverable packet.
-	if slot, ok := q.tryReserve(); ok {
-		return slot, true
 	}
 	entry, ok := q.scheduler.dropFromFattestFlow()
 	if !ok {
@@ -2122,6 +2130,11 @@ func (q *loopbackQueue) tryWritePackets(packets [][]byte, closeCh <-chan struct{
 		if !ok {
 			for _, acquired := range slots[:reserved] {
 				q.releaseReserved(acquired)
+			}
+			select {
+			case <-closeCh:
+				return ErrClosed
+			default:
 			}
 			return ErrResourceLimit
 		}
@@ -2649,7 +2662,9 @@ func (s *Stack) Stats() StackStats {
 		PromiscuousInboundPackets:   s.stats.promiscuousInboundPackets.Load(),
 		InvalidSourcePackets:        s.stats.invalidSourcePackets.Load(),
 		OutboundPackets:             s.stats.outboundPackets.Load(),
+		OutboundQueueDrops:          s.stats.outboundQueueDrops.Load(),
 		LoopbackPackets:             s.stats.loopbackPackets.Load(),
+		LoopbackQueueDrops:          s.stats.loopbackQueueDrops.Load(),
 		ActiveTCPConnections:        s.stats.activeTCPConnections.Load(),
 		ActiveTCPListeners:          s.stats.activeTCPListeners.Load(),
 		ActiveUDPSockets:            s.stats.activeUDPSockets.Load(),
@@ -3253,13 +3268,15 @@ func (s *Stack) localEndpointFor(network string, remote, requested netip.AddrPor
 // Outbound capacity is finite. If the embedding device stops calling Read,
 // TCP retains protocol work until capacity returns while its socket send-buffer
 // and deadline rules remain in force. UDP and IP writes make one immediate
-// admission attempt. Published backlog is replaced according to the same
-// byte-fair flow state used for service. Failure to admit unicast output or an
-// external-link non-unicast copy is successful by default and reports ENOBUFS
-// when the socket's ReceiveErrors policy is enabled. Receive-side non-unicast
-// loopback copies remain independently best effort. Best-effort control output
-// may displace queued backlog or be discarded. Resuming Read releases capacity
-// for pending TCP work.
+// admission attempt. Under overload, nonblocking datagram and control output
+// may displace queued packets or be discarded while the scheduler preserves
+// progress across flows. Failure to admit unicast output or an external-link
+// non-unicast copy is successful by default and reports ENOBUFS when the
+// socket's ReceiveErrors policy is enabled; that policy does not report later
+// displacement. Receive-side non-unicast loopback copies remain independently
+// best effort. A successful socket write therefore does not guarantee that
+// every resulting packet will be returned by Read. Resuming Read releases
+// capacity for pending TCP work.
 //
 // Read may run concurrently with Write and with other Read calls. Each queued
 // packet is assigned to at most one call, but concurrent calls have no relative
@@ -3407,15 +3424,34 @@ func (s *Stack) tryReservePacket(queue *packetQueue) (uint16, error) {
 // replaceBestEffortPacket handles the cold full-queue admission path after an
 // ordinary reservation attempt failed.
 func (s *Stack) replaceBestEffortPacket(queue *packetQueue) (uint16, error) {
+	// A reader can return capacity between the caller's failed reservation and
+	// overload handling. Prefer that slot to discarding a deliverable packet.
+	if slot, ok := queue.tryReserve(); ok {
+		return slot, nil
+	}
 	if slot, ok := queue.replaceBestEffort(); ok {
+		s.recordQueueDrops(queue, 1)
 		return slot, nil
 	}
 	select {
 	case <-s.closeCh:
 		return 0, ErrClosed
 	default:
+		// No published entry could be reclaimed, so the candidate itself is
+		// the packet rejected by bounded admission.
+		s.recordQueueDrops(queue, 1)
 		return 0, ErrResourceLimit
 	}
+}
+
+// recordQueueDrops attributes rejected or displaced packets to the selected
+// external-link or local-delivery queue.
+func (s *Stack) recordQueueDrops(queue *packetQueue, count uint64) {
+	if queue == &s.loopback.packetQueue {
+		s.stats.loopbackQueueDrops.Add(count)
+		return
+	}
+	s.stats.outboundQueueDrops.Add(count)
 }
 
 // tryWritePackets queues packets that all select the same output queue and
@@ -3458,6 +3494,9 @@ func (s *Stack) tryWritePackets(packets [][]byte, flow outputFlowKey) error {
 // it and records every successfully admitted packet.
 func (s *Stack) tryWriteLoopbackPackets(packets [][]byte) error {
 	if err := s.loopback.tryWritePackets(packets, s.closeCh); err != nil {
+		if err == ErrResourceLimit {
+			s.stats.loopbackQueueDrops.Add(uint64(len(packets)))
+		}
 		return err
 	}
 	s.stats.loopbackPackets.Add(uint64(len(packets)))

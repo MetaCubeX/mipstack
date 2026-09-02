@@ -518,6 +518,29 @@ func TestFullLoopbackQueueDoesNotBlock(t *testing.T) {
 	if err = stack.tryWritePacket(packet); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("tryWritePacket to full loopback queue = %v, want ErrResourceLimit", err)
 	}
+	if got := stack.Stats().LoopbackQueueDrops; got != 1 {
+		t.Fatalf("full loopback queue drops = %d, want 1", got)
+	}
+}
+
+// TestPacketQueueLayouts keeps stack-level observability from expanding the
+// hot queue metadata used by every packet publication and departure.
+func TestPacketQueueLayouts(t *testing.T) {
+	if unsafe.Sizeof(uintptr(0)) != 8 {
+		t.Skip("64-bit layout assertion")
+	}
+	for _, test := range []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{name: "packet queue", got: unsafe.Sizeof(packetQueue{}), want: 96},
+		{name: "loopback queue", got: unsafe.Sizeof(loopbackQueue{}), want: 104},
+	} {
+		if test.got != test.want {
+			t.Errorf("%s size = %d, want %d", test.name, test.got, test.want)
+		}
+	}
 }
 
 func TestPacketQueueTicketTracksDeviceDequeue(t *testing.T) {
@@ -834,6 +857,9 @@ func TestTryWriteLoopbackPacketsCloseBeforeBatchPublication(t *testing.T) {
 	}
 	if got, want := len(stack.loopback.free), cap(stack.loopback.free); got != want {
 		t.Fatalf("closed batch free slots = %d, want %d", got, want)
+	}
+	if got := stack.Stats().LoopbackQueueDrops; got != 0 {
+		t.Fatalf("queue close counted %d loopback drops", got)
 	}
 }
 
@@ -1374,6 +1400,9 @@ func TestDatagramWriteQueueExhaustionPolicy(t *testing.T) {
 			if packets, bytes := test.statistics(connection); packets != 1 || bytes != uint64(len(payload)) {
 				t.Fatalf("default full-queue statistics = %d packets, %d bytes", packets, bytes)
 			}
+			if stats := stack.Stats(); stats.OutboundPackets != 1 || stats.OutboundQueueDrops != 1 {
+				t.Fatalf("default full-queue stack statistics = %+v", stats)
+			}
 			if !test.correlated(connection) {
 				t.Fatal("published-backlog write did not retain ICMP correlation")
 			}
@@ -1386,6 +1415,9 @@ func TestDatagramWriteQueueExhaustionPolicy(t *testing.T) {
 			}
 			if packets, bytes := test.statistics(connection); packets != 2 || bytes != uint64(2*len(payload)) {
 				t.Fatalf("published-backlog statistics = %d packets, %d bytes", packets, bytes)
+			}
+			if stats := stack.Stats(); stats.OutboundPackets != 2 || stats.OutboundQueueDrops != 2 {
+				t.Fatalf("published-backlog stack statistics = %+v", stats)
 			}
 			validPackets := 0
 			for {
@@ -1415,6 +1447,9 @@ func TestDatagramWriteQueueExhaustionPolicy(t *testing.T) {
 			if packets, bytes := test.statistics(connection); packets != 2 || bytes != uint64(2*len(payload)) {
 				t.Fatalf("unreclaimable-capacity statistics = %d packets, %d bytes", packets, bytes)
 			}
+			if stats := stack.Stats(); stats.OutboundPackets != 2 || stats.OutboundQueueDrops != 3 {
+				t.Fatalf("extended-error unreclaimable-capacity stack statistics = %+v", stats)
+			}
 			if err = test.configure(connection, false); err != nil {
 				t.Fatal(err)
 			}
@@ -1423,6 +1458,9 @@ func TestDatagramWriteQueueExhaustionPolicy(t *testing.T) {
 			}
 			if packets, bytes := test.statistics(connection); packets != 3 || bytes != uint64(3*len(payload)) {
 				t.Fatalf("default unreclaimable-capacity statistics = %d packets, %d bytes", packets, bytes)
+			}
+			if stats := stack.Stats(); stats.OutboundPackets != 2 || stats.OutboundQueueDrops != 4 {
+				t.Fatalf("default unreclaimable-capacity stack statistics = %+v", stats)
 			}
 			for _, slot := range held {
 				stack.outbound.releaseReserved(slot)
@@ -1512,6 +1550,9 @@ func TestDatagramWriteSameFlowReplacementIsSuccessful(t *testing.T) {
 			}
 			if packets, bytesSent := test.statistics(connection); packets != outboundPacketQueue+1 || bytesSent != outboundPacketQueue*uint64(len(oldPayload))+uint64(len(newPayload)) {
 				t.Fatalf("same-flow replacement statistics = %d packets, %d bytes", packets, bytesSent)
+			}
+			if stats := stack.Stats(); stats.OutboundPackets != outboundPacketQueue+1 || stats.OutboundQueueDrops != 1 {
+				t.Fatalf("same-flow replacement stack statistics = %+v", stats)
 			}
 			oldCount, newCount := 0, 0
 			for {
@@ -2169,6 +2210,30 @@ func TestFairPacketQueueBestEffortAdmissionPreservesUnpublishedReservations(t *t
 	}
 	for _, slot := range reservations {
 		queue.releaseReserved(slot)
+	}
+}
+
+func TestBestEffortAdmissionDoesNotCountReaderRace(t *testing.T) {
+	const capacity = 1
+	var stack Stack
+	queue := &stack.outbound
+	queue.initFair(capacity, time.Now(), 1500, [16]byte{9})
+	enqueueTestOutputPacket(t, queue, []byte{1})
+	if _, err := stack.tryReservePacket(queue); err != ErrResourceLimit {
+		t.Fatalf("full queue reservation = %v, want ErrResourceLimit", err)
+	}
+	entry, ok := queue.tryDequeue()
+	if !ok {
+		t.Fatal("published packet was unavailable")
+	}
+	queue.release(entry)
+	slot, err := stack.replaceBestEffortPacket(queue)
+	if err != nil {
+		t.Fatalf("concurrently released capacity: %v", err)
+	}
+	queue.releaseReserved(slot)
+	if got := stack.Stats().OutboundQueueDrops; got != 0 {
+		t.Fatalf("concurrently released capacity counted %d queue drops", got)
 	}
 }
 
@@ -3177,5 +3242,29 @@ func BenchmarkPacketQueueOverloadAdmission(b *testing.B) {
 				}
 			}
 		})
+
+		b.Run(fmt.Sprintf("stack-replace-fattest-%d", flows), func(b *testing.B) {
+			var stack Stack
+			queue := &stack.outbound
+			queue.initFair(capacity, time.Now(), 1500, [16]byte{15})
+			for index := 0; index < capacity; index++ {
+				slot, ok := queue.tryReserve()
+				flow := outputFlowKey{tcp: uint64(index%flows + 1)}
+				if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
+					b.Fatal("failed to fill output queue")
+				}
+			}
+			b.SetBytes(int64(len(packet)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				slot, err := stack.replaceBestEffortPacket(queue)
+				flow := outputFlowKey{tcp: uint64(iteration%flows + 1)}
+				if err != nil || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
+					b.Fatal("failed to replace and count published backlog")
+				}
+			}
+		})
+
 	}
 }

@@ -103,7 +103,8 @@ unicast output or an external-link non-unicast copy is silent by default and
 reports `ENOBUFS` when `ReceiveErrors` is enabled. Receive-side multicast and
 broadcast loopback copies remain independently best effort. Best-effort control
 packets may displace queued backlog or be discarded, and `Stack.Write` itself
-does not wait for outbound capacity.
+does not wait for outbound capacity. A successful socket write accepts the
+message but does not guarantee that every resulting packet reaches `Stack.Read`.
 
 For integration with userspace packet-device consumers, `Stack` also provides
 `MTU`, `Name`, and `BatchSize`. `LocalAddresses` returns an independent
@@ -757,9 +758,10 @@ setting, ordinary reads return queued errors after already queued payloads.
 bounded queue-admission attempt. Published backlog is subject to flow-aware
 replacement. Failure to admit unicast output or an external-link non-unicast
 copy reports `ENOBUFS` when enabled and is otherwise a successful message
-write. Receive-side multicast and broadcast loopback copies remain best effort.
-UDP and IP sockets retain no per-socket transmit queue, so `SetWriteBuffer` is
-a validated no-op and a write deadline is checked only before the attempt.
+write. The option does not report packets displaced after admission.
+Receive-side multicast and broadcast loopback copies remain best effort. UDP
+and IP sockets retain no per-socket transmit queue, so `SetWriteBuffer` is a
+validated no-op and a write deadline is checked only before the attempt.
 
 UDP and IP `ReadBatch`/`WriteBatch` also accept Linux-compatible message flags.
 `MessageFlagPeek` preserves an ordinary queued payload, while pending socket
@@ -1097,10 +1099,13 @@ insertion and verification at an even payload offset through `IPv6Checksum`.
 Checksum processing occurs before source fragmentation and after reassembly,
 and does not alter caller-owned header-included writes.
 
-`Stack.Stats` returns a lock-free snapshot of active socket counts, categorized
+`Stack.Stats` returns a lock-free snapshot of active socket counts, separate
+external-link and loopback packet admissions and queue drops, categorized
 IP/TCP packet and actor-queue drops, passive handshake, SYN-cookie and accept
 queue outcomes, retransmission modes, PMTU changes, fragment cleanup, and rate
-limiting.
+limiting. `OutboundQueueDrops` covers admission rejection and replacement;
+`LoopbackQueueDrops` covers local admission rejection. Neither includes loss
+after a packet is returned by `Stack.Read`.
 
 Optional surfaces are arranged for ordinary Go linker reachability rather than
 build tags. A consumer that only dials TCP and listens for UDP does not retain

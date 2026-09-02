@@ -619,10 +619,11 @@ func (option synBacklogSocketOption) apply(set socketOptionSet, use socketOption
 
 // ReceiveErrors controls whether newly created UDP and IP sockets reserve
 // asynchronous errors for ReadError instead of returning them from ordinary
-// reads after queued payloads. It also makes failure to admit unicast output,
-// or the external-link copy of multicast or broadcast output, fail writes with
-// ENOBUFS. Receive-side non-unicast loopback copies remain best effort. It is
-// valid for the UDP and IP creation methods on ListenConfig and Dialer, and for
+// reads after queued payloads. It also makes immediate failure to admit unicast
+// output, or the external-link copy of multicast or broadcast output, fail
+// writes with ENOBUFS. It does not report packets displaced after admission.
+// Receive-side non-unicast loopback copies remain best effort. It is valid for
+// the UDP and IP creation methods on ListenConfig and Dialer, and for
 // UDPForwarderRequest.Accept and UDPForwarderRequest.Listen.
 func (SocketOptionFactory) ReceiveErrors(enabled bool) SocketOption {
 	return receiveErrorsSocketOption(newSocketOptionBoolOverride(enabled))

@@ -948,6 +948,9 @@ func TestDirectFragmentOutputReclaimsPublishedBacklog(t *testing.T) {
 	if !complete || reassembled.Protocol != ProtocolUDP || !bytes.Equal(reassembled.Payload, payload) {
 		t.Fatalf("reassembled direct fragment output = complete %t protocol %d payload %x", complete, reassembled.Protocol, reassembled.Payload)
 	}
+	if stats := stack.Stats(); stats.OutboundPackets < 2 || stats.OutboundQueueDrops+1 != stats.OutboundPackets {
+		t.Fatalf("direct fragment output stack statistics = %+v", stats)
+	}
 }
 
 func TestDirectFragmentedLoopbackOutputUsesAllOrNoneAdmission(t *testing.T) {
@@ -975,6 +978,10 @@ func TestDirectFragmentedLoopbackOutputUsesAllOrNoneAdmission(t *testing.T) {
 	}
 	if after := stack.loopback.len(); after != before {
 		t.Fatalf("failed loopback fragment set changed queue depth from %d to %d", before, after)
+	}
+	payload := append(append([]byte(nil), first...), second...)
+	if got, want := stack.Stats().LoopbackQueueDrops, uint64(len(buildIPFragmentPackets(local, local, 99, payload, layout))); got != want {
+		t.Fatalf("failed loopback fragment drops = %d, want %d", got, want)
 	}
 }
 

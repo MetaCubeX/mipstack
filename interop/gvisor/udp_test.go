@@ -167,6 +167,9 @@ func TestUDPStoppedDeviceReadInterop(t *testing.T) {
 		releaseOnce.Do(func() { close(releaseBridge) })
 		t.Fatal("UDP writes blocked while Stack.Read was stopped")
 	}
+	if stats := network.mipstack.Stats(); stats.OutboundQueueDrops == 0 {
+		t.Fatalf("stopped-read UDP overload reported no outbound queue drops: %+v", stats)
+	}
 
 	latePayload := []byte("late-flow")
 	written, err := lateUDPConnection.Write(latePayload)

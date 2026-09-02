@@ -2696,6 +2696,23 @@ func TestFragmentedNonUnicastLocalCopiesUseAllOrNoneAdmission(t *testing.T) {
 			t.Fatal("loopback queue filled before the expected boundary")
 		}
 	}
+	if !stack.loopback.tryEnqueue(dummy) {
+		t.Fatal("loopback queue could not fill its final slot")
+	}
+	if err := stack.tryWriteNonUnicastPacket(len(dummy), false, true, func(packet []byte) bool {
+		copy(packet, dummy)
+		return true
+	}); err != nil {
+		t.Fatalf("local-only non-unicast packet with full queue: %v", err)
+	}
+	if got := stack.Stats().LoopbackQueueDrops; got != 1 {
+		t.Fatalf("local-only non-unicast packet drops = %d, want 1", got)
+	}
+	entry, ok := stack.loopback.tryDequeue()
+	if !ok {
+		t.Fatal("full loopback queue could not release one packet")
+	}
+	stack.loopback.release(entry)
 	beforeLocal := stack.loopback.len()
 	flow := outputFlowKey{hash: 1}
 	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow); err != nil {
@@ -2706,6 +2723,9 @@ func TestFragmentedNonUnicastLocalCopiesUseAllOrNoneAdmission(t *testing.T) {
 	}
 	if stack.outbound.len() != len(packets) {
 		t.Fatalf("external fragment count = %d, want %d", stack.outbound.len(), len(packets))
+	}
+	if stats := stack.Stats(); stats.OutboundQueueDrops != 0 || stats.LoopbackQueueDrops != uint64(1+len(packets)) {
+		t.Fatalf("external fragments with rejected local copy statistics = %+v", stats)
 	}
 	for {
 		entry, ok := stack.outbound.tryDequeue()
@@ -2729,11 +2749,17 @@ func TestFragmentedNonUnicastLocalCopiesUseAllOrNoneAdmission(t *testing.T) {
 	if after := stack.loopback.len(); after != beforeLocal {
 		t.Fatalf("full local copy queue changed depth from %d to %d", beforeLocal, after)
 	}
+	if stats := stack.Stats(); stats.OutboundQueueDrops != uint64(len(packets)-1) || stats.LoopbackQueueDrops != uint64(1+2*len(packets)) {
+		t.Fatalf("fragment replacement with rejected local copy statistics = %+v", stats)
+	}
 	if err := stack.tryWriteNonUnicastPackets(packets, false, true, flow); err != nil {
 		t.Fatalf("local-only non-unicast write with full queue: %v", err)
 	}
 	if after := stack.loopback.len(); after != beforeLocal {
 		t.Fatalf("local-only fragment failure changed queue depth from %d to %d", beforeLocal, after)
+	}
+	if got, want := stack.Stats().LoopbackQueueDrops, uint64(1+3*len(packets)); got != want {
+		t.Fatalf("local-only fragment drops = %d, want %d", got, want)
 	}
 
 	var reassembly IPPacketReassembly
@@ -2770,6 +2796,33 @@ func TestFragmentedNonUnicastLocalCopiesUseAllOrNoneAdmission(t *testing.T) {
 	}
 	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow); !errors.Is(err, ErrClosed) {
 		t.Fatalf("external write with closed local queue = %v, want ErrClosed", err)
+	}
+	if got, want := stack.Stats().LoopbackQueueDrops, uint64(1+3*len(packets)); got != want {
+		t.Fatalf("closed local queue changed loopback drops to %d, want %d", got, want)
+	}
+}
+
+func TestNonUnicastMarshalFailureDoesNotCountQueueDrop(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.120")
+	remote := netip.MustParseAddr("198.51.100.120")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 24)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	dummy := buildIPPacket(local, remote, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
+	for stack.loopback.len() < cap(stack.loopback.free) {
+		if !stack.loopback.tryEnqueue(dummy) {
+			t.Fatal("loopback queue filled before the expected boundary")
+		}
+	}
+	if err = stack.tryWriteNonUnicastPacket(len(dummy), true, true, func([]byte) bool {
+		return false
+	}); !errors.Is(err, syscall.EMSGSIZE) {
+		t.Fatalf("non-unicast marshal failure = %v, want EMSGSIZE", err)
+	}
+	if stats := stack.Stats(); stats.OutboundPackets != 0 || stats.OutboundQueueDrops != 0 || stats.LoopbackQueueDrops != 0 {
+		t.Fatalf("non-unicast marshal failure statistics = %+v", stats)
 	}
 }
 

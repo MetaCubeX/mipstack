@@ -137,8 +137,8 @@ type IPConnInfo struct {
 	ReceiveQueueCapacity int
 	// ReceiveErrors reports whether asynchronous network errors are reserved
 	// for ReadError instead of being returned by ordinary reads and whether
-	// failure to admit unicast or external-link non-unicast output is reported
-	// as ENOBUFS.
+	// immediate failure to admit unicast or external-link non-unicast output is
+	// reported as ENOBUFS.
 	ReceiveErrors bool
 	// ErrorQueueEntries is the number of asynchronous network errors awaiting
 	// ReadError or, when ReceiveErrors is false, an ordinary read.
@@ -1960,8 +1960,9 @@ func (c *IPConn) SetReadBuffer(bytes int) error {
 }
 
 // SetReceiveErrors controls whether asynchronous network errors are reserved
-// for ReadError. It also makes a write fail with ENOBUFS when unicast output or
-// the external-link copy of multicast or broadcast output cannot be admitted.
+// for ReadError. It also makes a write fail with ENOBUFS when immediate
+// admission of unicast output or the external-link copy of multicast or
+// broadcast output fails. It does not report packets displaced after admission.
 // Receive-side non-unicast loopback copies remain best effort. When disabled,
 // the default, ordinary reads return queued errors after any already queued
 // payloads and an immediate output admission failure is silent.
@@ -1979,8 +1980,9 @@ func (c *IPConn) SetReceiveErrors(enabled bool) error {
 }
 
 // ReceiveErrors reports whether asynchronous errors are reserved for
-// ReadError instead of being returned by ordinary reads and whether failure to
-// admit unicast or external-link non-unicast output is reported as ENOBUFS.
+// ReadError instead of being returned by ordinary reads and whether immediate
+// failure to admit unicast or external-link non-unicast output is reported as
+// ENOBUFS.
 func (c *IPConn) ReceiveErrors() (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

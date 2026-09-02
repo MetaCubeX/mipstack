@@ -1675,6 +1675,9 @@ func TestForwarderOutputActionsDoNotBlockOnFullQueue(t *testing.T) {
 				t.Fatal("full-queue Stack.Write blocked")
 			}
 		}
+		if got := stack.Stats().OutboundQueueDrops; got != 1 {
+			t.Fatalf("full-queue best-effort action counted %d outbound queue drops, want 1", got)
+		}
 	}
 
 	t.Run("TCP Reject", func(t *testing.T) {
@@ -3676,7 +3679,22 @@ func TestUDPForwarderDetachedReplyCanRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	responder := <-detached
-	fillTestPacketQueue(t, &stack.outbound, []byte{0})
+	held := make([]uint16, 0, cap(stack.outbound.free))
+	defer func() {
+		for _, slot := range held {
+			stack.outbound.releaseReserved(slot)
+		}
+	}()
+	for {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			break
+		}
+		held = append(held, slot)
+	}
+	if len(held) != cap(stack.outbound.free) {
+		t.Fatalf("held output slots = %d, want %d", len(held), cap(stack.outbound.free))
+	}
 	replyResult := make(chan error, 1)
 	go func() {
 		_, replyErr := responder.Reply([]byte("answer"))
@@ -3690,13 +3708,13 @@ func TestUDPForwarderDetachedReplyCanRetry(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("full-queue detached UDP Reply blocked")
 	}
-	for {
-		entry, ok := stack.outbound.tryDequeue()
-		if !ok {
-			break
-		}
-		consumeTestPacket(&stack.outbound, entry)
+	if stats := stack.Stats(); stats.OutboundPackets != 0 || stats.OutboundQueueDrops != 1 {
+		t.Fatalf("unreclaimable detached UDP Reply statistics = %+v", stats)
 	}
+	for _, slot := range held {
+		stack.outbound.releaseReserved(slot)
+	}
+	held = nil
 	if _, err = responder.Reply([]byte("answer")); err != nil {
 		t.Fatalf("retry detached UDP Reply: %v", err)
 	}

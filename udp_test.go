@@ -560,6 +560,9 @@ func TestUDPFragmentedWriteQueueExhaustionPolicy(t *testing.T) {
 			if after := stack.outbound.len(); after != before+1 {
 				t.Fatalf("fragmented write changed queue depth from %d to %d, want %d", before, after, before+1)
 			}
+			if stats := stack.Stats(); stats.OutboundPackets < 2 || stats.OutboundQueueDrops+1 != stats.OutboundPackets {
+				t.Fatalf("fragmented write stack statistics = %+v", stats)
+			}
 			var reassembly IPPacketReassembly
 			var reassembled IPPacket
 			complete := false

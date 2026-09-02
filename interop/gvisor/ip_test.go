@@ -207,6 +207,9 @@ func TestIPHeaderIncludedStoppedDeviceReadInterop(t *testing.T) {
 		releaseOnce.Do(func() { close(releaseBridge) })
 		t.Fatal("complete-packet writes blocked while Stack.Read was stopped")
 	}
+	if stats := network.mipstack.Stats(); stats.OutboundQueueDrops == 0 {
+		t.Fatalf("stopped-read complete-packet overload reported no outbound queue drops: %+v", stats)
+	}
 	if written, writeErr := connection.Write(late); writeErr != nil || written != len(late) {
 		t.Fatalf("late complete-packet write: n=%d, error=%v", written, writeErr)
 	}

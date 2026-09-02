@@ -1971,6 +1971,9 @@ func TestIPFragmentedWriteQueueExhaustionPolicy(t *testing.T) {
 				if after := stack.outbound.len(); after != before+1 {
 					t.Fatalf("fragmented IP write changed queue depth from %d to %d, want %d", before, after, before+1)
 				}
+				if stats := stack.Stats(); stats.OutboundPackets < 2 || stats.OutboundQueueDrops+1 != stats.OutboundPackets {
+					t.Fatalf("fragmented IP write stack statistics = %+v", stats)
+				}
 				if !connection.acceptsError(family.remote) {
 					t.Fatal("fragmented write did not retain ICMP correlation")
 				}
@@ -2049,6 +2052,12 @@ func TestIPHeaderIncludedWriteQueueExhaustionPolicy(t *testing.T) {
 			}
 			if after := stack.outbound.len(); after != outboundPacketQueue {
 				t.Fatalf("header-included full-queue write changed depth to %d", after)
+			}
+			if info := connection.Info(); info.PacketsSent != 1 || info.BytesSent != uint64(len(packet)) {
+				t.Fatalf("header-included write statistics = %d packets, %d bytes", info.PacketsSent, info.BytesSent)
+			}
+			if stats := stack.Stats(); stats.OutboundPackets != 1 || stats.OutboundQueueDrops != 1 {
+				t.Fatalf("header-included stack statistics = %+v", stats)
 			}
 			found := false
 			for {

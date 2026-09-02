@@ -2917,6 +2917,9 @@ func TestTCPEstablishedActorSurvivesStoppedDeviceRead(t *testing.T) {
 	if blocked.SendBufferSize < len(payload) {
 		t.Fatalf("buffered bytes = %d, want at least %d", blocked.SendBufferSize, len(payload))
 	}
+	if got := stack.Stats().OutboundQueueDrops; got != 0 {
+		t.Fatalf("TCP capacity wait counted %d outbound queue drops", got)
+	}
 
 	inbound := []byte("peer data while the packet device is not being read")
 	link.mu.Lock()

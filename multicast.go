@@ -1576,16 +1576,25 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 	localSlot, localReserved := uint16(0), false
 	if loopback {
 		localSlot, localReserved = s.loopback.tryReserve()
-	}
-	if !external && !localReserved {
-		select {
-		case <-s.closeCh:
-			return ErrClosed
-		default:
-			return nil
+		if !localReserved {
+			select {
+			case <-s.closeCh:
+				if external && externalErr == nil {
+					s.outbound.releaseReserved(externalSlot)
+				}
+				return ErrClosed
+			default:
+			}
 		}
 	}
+	if !external && !localReserved {
+		s.stats.loopbackQueueDrops.Add(1)
+		return nil
+	}
 	if externalErr != nil && !localReserved {
+		if loopback {
+			s.stats.loopbackQueueDrops.Add(1)
+		}
 		return externalErr
 	}
 	queue := &s.outbound
@@ -1623,6 +1632,10 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 				return ErrClosed
 			}
 			s.recordOutput(true)
+		} else if loopback {
+			// The external copy proves packet construction succeeded; only the
+			// independently best-effort local copy was rejected.
+			s.stats.loopbackQueueDrops.Add(1)
 		}
 		return nil
 	}
