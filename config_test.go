@@ -59,6 +59,111 @@ func TestMTUAndRouteFamilyValidation(t *testing.T) {
 	}
 }
 
+func TestAddresslessPromiscuousConfiguration(t *testing.T) {
+	if _, err := New(Config{}); err == nil {
+		t.Fatal("empty local addresses without promiscuous mode were accepted")
+	}
+	if _, err := New(Config{Promiscuous: true, MTU: 1279}); err == nil {
+		t.Fatal("addressless implicit IPv6 route below the minimum MTU was accepted")
+	}
+	if _, err := New(Config{
+		Promiscuous: true,
+		MTU:         1279,
+		Routes:      []Route{{Destination: netip.MustParsePrefix("2001:db8::/32")}},
+	}); err == nil {
+		t.Fatal("addressless explicit IPv6 route below the minimum MTU was accepted")
+	}
+	if _, err := New(Config{
+		Promiscuous: true,
+		MTU:         1280,
+		Routes: []Route{{
+			Destination: netip.MustParsePrefix("198.51.100.0/24"),
+			Source:      netip.MustParseAddr("192.0.2.1"),
+		}},
+	}); err == nil {
+		t.Fatal("addressless route with a nonlocal source was accepted")
+	}
+	if _, err := New(Config{
+		LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")},
+		Promiscuous:    true,
+		MTU:            1280,
+		Routes:         []Route{{Destination: netip.MustParsePrefix("2001:db8::/32")}},
+	}); err != nil {
+		t.Fatalf("promiscuous source-less route without a local address in its family: %v", err)
+	}
+	ipv4Only, err := New(Config{
+		Promiscuous: true,
+		MTU:         68,
+		Routes:      []Route{{Destination: netip.MustParsePrefix("0.0.0.0/0")}},
+	})
+	if err != nil {
+		t.Fatalf("addressless IPv4-only minimum MTU: %v", err)
+	}
+	_ = ipv4Only.Close()
+
+	stack, err := New(Config{Promiscuous: true, MTU: 1280})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addresses := stack.LocalAddresses(); len(addresses) != 0 {
+		t.Fatalf("addressless local addresses = %v, want none", addresses)
+	}
+	for destination, want := range map[netip.Addr]netip.Prefix{
+		netip.MustParseAddr("198.51.100.1"): netip.MustParsePrefix("0.0.0.0/0"),
+		netip.MustParseAddr("2001:db8::1"):  netip.MustParsePrefix("::/0"),
+	} {
+		route, routeErr := stack.RouteFor(destination)
+		if routeErr != nil || route.Destination != want || route.Source.IsValid() {
+			t.Fatalf("addressless route for %s = %+v, %v, want source-less %s", destination, route, routeErr, want)
+		}
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	families := []struct {
+		name, tcp, udp, ip string
+		remote             netip.Addr
+	}{
+		{name: "IPv4", tcp: "tcp4", udp: "udp4", ip: "ip4:99", remote: netip.MustParseAddr("198.51.100.1")},
+		{name: "IPv6", tcp: "tcp6", udp: "udp6", ip: "ip6:99", remote: netip.MustParseAddr("2001:db8::1")},
+	}
+	for _, family := range families {
+		check := func(operation string, operationErr error) {
+			t.Helper()
+			if !errors.Is(operationErr, syscall.EADDRNOTAVAIL) {
+				t.Errorf("%s %s = %v, want EADDRNOTAVAIL", family.name, operation, operationErr)
+			}
+		}
+		_, operationErr := stack.ListenTCP(ctx, family.tcp, netip.AddrPort{})
+		check("ListenTCP", operationErr)
+		_, operationErr = stack.ListenUDP(ctx, family.udp, netip.AddrPort{})
+		check("ListenUDP", operationErr)
+		_, operationErr = stack.ListenIP(ctx, family.ip, netip.Addr{})
+		check("ListenIP", operationErr)
+		_, operationErr = stack.DialTCP(ctx, family.tcp, netip.AddrPort{}, netip.AddrPortFrom(family.remote, 80))
+		check("DialTCP", operationErr)
+		_, operationErr = stack.DialUDP(ctx, family.udp, netip.AddrPort{}, netip.AddrPortFrom(family.remote, 53))
+		check("DialUDP", operationErr)
+		_, operationErr = stack.DialIP(ctx, family.ip, netip.Addr{}, family.remote)
+		check("DialIP", operationErr)
+	}
+	if err = stack.UpdateConfig(Config{}); err == nil {
+		t.Fatal("UpdateConfig disabled promiscuous mode without adding a local address")
+	}
+
+	unrouted, err := New(Config{Promiscuous: true, MTU: 68, Routes: []Route{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unrouted.Close()
+	if _, err = unrouted.RouteFor(netip.MustParseAddr("198.51.100.1")); !errors.Is(err, syscall.ENETUNREACH) {
+		t.Fatalf("addressless explicit empty route table = %v, want ENETUNREACH", err)
+	}
+}
+
 func TestLocalAddressNormalization(t *testing.T) {
 	ipv4 := netip.MustParsePrefix("192.0.2.15/32")
 	for _, duplicate := range []netip.Prefix{ipv4, netip.MustParsePrefix("2001:db8::15/64")} {

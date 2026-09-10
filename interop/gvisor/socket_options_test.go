@@ -279,7 +279,7 @@ func TestForwarderSocketOptionsInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
 		t.Run(family.name+"/tcp", func(t *testing.T) {
-			network := newForwarderInteropNetwork(t, family, 1500)
+			network := newConfiguredForwarderInteropNetwork(t, family, 1500)
 			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 			defer cancel()
 			accepted := make(chan *mipstack.TCPConn, 1)
@@ -320,7 +320,7 @@ func TestForwarderSocketOptionsInterop(t *testing.T) {
 		})
 
 		t.Run(family.name+"/udp", func(t *testing.T) {
-			network := newForwarderInteropNetwork(t, family, 1500)
+			network := newConfiguredForwarderInteropNetwork(t, family, 1500)
 			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 			defer cancel()
 			accepted := make(chan *mipstack.UDPConn, 1)

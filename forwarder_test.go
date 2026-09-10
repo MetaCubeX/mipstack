@@ -226,6 +226,34 @@ func TestTCPForwarderInterceptsNonlocalDestination(t *testing.T) {
 	if info := forwarder.Info(); !info.Closed || info.Requests != 1 || info.Accepted != 1 || info.Pending != 0 {
 		t.Fatalf("TCP forwarder info = %+v", info)
 	}
+	if err = server.UpdateConfig(Config{Promiscuous: true, MTU: 1400}); err != nil {
+		t.Fatal(err)
+	}
+	if addresses := server.LocalAddresses(); len(addresses) != 0 {
+		t.Fatalf("addressless forwarder local addresses = %v, want none", addresses)
+	}
+	if _, err = listener.Accept(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("ordinary listener survived local-address removal: %v", err)
+	}
+	if _, err = localServer.Read(buffer); !errors.Is(err, syscall.EADDRNOTAVAIL) {
+		t.Fatalf("ordinary TCP connection survived local-address removal: %v", err)
+	}
+	_ = clientConnection.SetDeadline(time.Now().Add(time.Second))
+	_ = serverConnection.SetDeadline(time.Now().Add(time.Second))
+	if _, err = clientConnection.Write([]byte("continued")); err != nil {
+		t.Fatal(err)
+	}
+	n, err = serverConnection.Read(buffer)
+	if err != nil || string(buffer[:n]) != "continued" {
+		t.Fatalf("addressless forwarded TCP request = %q, %v", buffer[:n], err)
+	}
+	if _, err = serverConnection.Write([]byte("retained")); err != nil {
+		t.Fatal(err)
+	}
+	n, err = clientConnection.Read(buffer)
+	if err != nil || string(buffer[:n]) != "retained" {
+		t.Fatalf("addressless forwarded TCP response = %q, %v", buffer[:n], err)
+	}
 	if err = server.UpdateConfig(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(serverAddress, 32)}, MTU: 1400}); err != nil {
 		t.Fatal(err)
 	}
@@ -882,6 +910,15 @@ func TestPromiscuousUpdateClosesForwardedUDP(t *testing.T) {
 	buffer := make([]byte, 8)
 	if _, err = connection.Read(buffer); err != nil {
 		t.Fatal(err)
+	}
+	if err = stack.UpdateConfig(Config{Promiscuous: true, MTU: 1400}); err != nil {
+		t.Fatal(err)
+	}
+	if err = writeTestPacket(stack, buildTestUDP(remote, target, 52001, 52002, []byte("retained"))); err != nil {
+		t.Fatal(err)
+	}
+	if n, readErr := connection.Read(buffer); readErr != nil || string(buffer[:n]) != "retained" {
+		t.Fatalf("addressless forwarded UDP payload = %q, %v", buffer[:n], readErr)
 	}
 	if err = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(owned, 32)}, MTU: 1400}); err != nil {
 		t.Fatal(err)

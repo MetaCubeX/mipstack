@@ -273,7 +273,8 @@ type IPSocketDefaults struct {
 // Config configures a Stack.
 type Config struct {
 	// LocalAddresses lists addresses owned by ordinary sockets and available
-	// for source selection and loopback delivery.
+	// for source selection and loopback delivery. It may be empty only when
+	// Promiscuous is enabled; ordinary sockets then have no usable local family.
 	LocalAddresses []netip.Prefix
 	// AddressProperties optionally marks configured local addresses as
 	// deprecated or temporary for RFC 6724 source selection. Every key must
@@ -287,15 +288,18 @@ type Config struct {
 	// destinations so protocol forwarders can intercept them. Forwarders do not
 	// require Promiscuous for unhandled packets addressed to LocalAddresses.
 	// Enabling Promiscuous without a matching forwarder only admits and silently
-	// drops nonlocal protocol traffic. Ordinary sockets retain
-	// LocalAddresses semantics, and only forwarder-created endpoints or
-	// request-scoped actions may reply from intercepted addresses.
+	// drops nonlocal protocol traffic. Ordinary sockets retain LocalAddresses
+	// semantics. Only forwarder-created endpoints and forwarder actions may emit
+	// from intercepted addresses. LocalAddresses may therefore be empty; ordinary
+	// sockets then cannot bind or select a source.
 	Promiscuous bool
-	// MTU bounds packets emitted by Read. Zero selects 1500.
+	// MTU bounds packets emitted by Read. Zero selects 1500. IPv6 local addresses
+	// or output routes require at least 1280.
 	MTU uint32
 	// Routes optionally restrict admitted unicast destinations and provide a
-	// preferred source. Nil installs one default route per configured address
-	// family; a non-nil empty slice installs no routes.
+	// preferred source. Nil installs one default route per configured local
+	// address family, or both families for an addressless Promiscuous Stack. A
+	// non-nil empty slice installs no routes.
 	Routes []Route
 	// MaxTCPConnections optionally bounds active, handshaking, and TIME_WAIT
 	// connections. Zero leaves the number unbounded; per-listener queues and

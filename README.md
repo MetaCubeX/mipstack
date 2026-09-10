@@ -468,6 +468,15 @@ ordinary wildcard sockets transparent and does not generate automatic replies;
 admitted nonlocal traffic without a matching protocol forwarder is silently
 dropped.
 
+`LocalAddresses` may be empty when `Promiscuous` is enabled. Such a Stack has
+no addresses for ordinary socket binding, source selection, multicast, or
+loopback delivery; only forwarder-created endpoints and forwarder reply or
+reject actions may emit from intercepted addresses. `Routes == nil` installs
+source-less IPv4 and IPv6 default routes in this configuration. An explicit
+route slice can limit return destinations, and a non-nil empty slice permits
+interception but causes forwarder actions requiring a return path to report
+`syscall.ENETUNREACH`.
+
 `NewTCPForwarder`, `NewUDPForwarder`, `NewIPForwarder`, and
 `NewICMPForwarder` install one protocol-specific fallback handler each. All
 four constructors take their own options type so later protocol policy can
@@ -675,10 +684,11 @@ socket creation does not perform another system-random read.
 its zero value does not impose an artificial connection limit. Listener count
 is controlled only by available memory and explicit application creation.
 
-`Config.Routes == nil` installs one default route for each configured address
-family. A non-nil empty route slice deliberately admits only destinations that
-are themselves local. IPv4-only stacks accept MTUs down to 68; configurations
-containing IPv6 require the IPv6 minimum MTU of 1280.
+`Config.Routes == nil` installs one default route for each configured local
+address family, or both families for an addressless promiscuous Stack. A
+non-nil empty route slice deliberately admits only destinations that are
+themselves local. IPv4-only stacks accept MTUs down to 68; configurations with
+IPv6 local addresses or output routes require the IPv6 minimum MTU of 1280.
 `Config.AddressProperties` supplies the deprecated and temporary state that a
 `netip.Prefix` cannot express. Automatic source selection applies the RFC 6724
 same-address, scope, deprecation, label, temporary-address, and longest-prefix

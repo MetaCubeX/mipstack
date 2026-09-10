@@ -153,6 +153,9 @@ type interopNetworkOptions struct {
 	gvisorMTU uint32
 	// promiscuous admits nonlocal destinations to mipstack Forwarders.
 	promiscuous bool
+	// addressless omits mipstack protocol addresses while retaining the selected
+	// families as explicit output routes for transparent Forwarder replies.
+	addressless bool
 	// tcp supplies mipstack defaults for tests that exercise a particular TCP
 	// transport policy. Its zero value retains the package defaults.
 	tcp mipstack.TCPSocketDefaults
@@ -181,8 +184,17 @@ func newFamilyInteropNetwork(t *testing.T, family interopFamily, mtu uint32) *in
 }
 
 // newForwarderInteropNetwork creates a single-family topology that admits
-// nonlocal packet destinations at one explicit MTU.
+// nonlocal packet destinations without configuring a mipstack local address.
 func newForwarderInteropNetwork(t *testing.T, family interopFamily, mtu uint32) *interopNetwork {
+	t.Helper()
+	return newInteropNetworkWithOptions(t, interopNetworkOptions{
+		families: []interopFamily{family}, mtu: mtu, promiscuous: true, addressless: true,
+	})
+}
+
+// newConfiguredForwarderInteropNetwork creates the corresponding topology
+// with one configured local address, preserving ordinary forwarder coverage.
+func newConfiguredForwarderInteropNetwork(t *testing.T, family interopFamily, mtu uint32) *interopNetwork {
 	t.Helper()
 	return newInteropNetworkWithOptions(t, interopNetworkOptions{
 		families: []interopFamily{family}, mtu: mtu, promiscuous: true,
@@ -205,19 +217,41 @@ func newInteropNetworkWithOptions(t *testing.T, options interopNetworkOptions) *
 		gvisorMTU = mtu
 	}
 	localAddresses := make([]netip.Prefix, 0, len(families))
-	for _, family := range families {
-		localAddresses = append(localAddresses, family.mipstackPrefix())
+	if !options.addressless {
+		for _, family := range families {
+			localAddresses = append(localAddresses, family.mipstackPrefix())
+		}
+	}
+	var mipstackRoutes []mipstack.Route
+	if options.addressless {
+		mipstackRoutes = make([]mipstack.Route, 0, len(families))
+		for _, family := range families {
+			destination := netip.PrefixFrom(netip.IPv6Unspecified(), 0)
+			if family.mipstackAddress.Is4() {
+				destination = netip.PrefixFrom(netip.IPv4Unspecified(), 0)
+			}
+			mipstackRoutes = append(mipstackRoutes, mipstack.Route{Destination: destination})
+		}
 	}
 
 	mips, err := mipstack.New(mipstack.Config{
 		LocalAddresses: localAddresses,
 		MTU:            mtu,
 		Promiscuous:    options.promiscuous,
+		Routes:         mipstackRoutes,
 		TCP:            options.tcp,
 		IP:             options.ip,
 	})
 	if err != nil {
 		t.Fatalf("create mipstack: %v", err)
+	}
+	if options.addressless && len(mips.LocalAddresses()) != 0 {
+		_ = mips.Close()
+		t.Fatal("addressless interop stack retained a local address")
+	}
+	if !options.addressless && len(mips.LocalAddresses()) == 0 {
+		_ = mips.Close()
+		t.Fatal("configured interop stack has no local address")
 	}
 	if err = mips.Start(); err != nil {
 		_ = mips.Close()

@@ -99,7 +99,7 @@ func TestTCPForwarderRejectInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
 		t.Run(family.name, func(t *testing.T) {
-			network := newForwarderInteropNetwork(t, family, 1500)
+			network := newConfiguredForwarderInteropNetwork(t, family, 1500)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			type rejectResult struct {
@@ -144,7 +144,7 @@ func TestUDPForwarderRejectInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
 		t.Run(family.name, func(t *testing.T) {
-			network := newForwarderInteropNetwork(t, family, 1500)
+			network := newConfiguredForwarderInteropNetwork(t, family, 1500)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			type rejectResult struct {
@@ -246,7 +246,7 @@ func TestIPForwarderRejectInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
 		t.Run(family.name, func(t *testing.T) {
-			network := newForwarderInteropNetwork(t, family, 1500)
+			network := newConfiguredForwarderInteropNetwork(t, family, 1500)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			replied := make(chan error, 1)
@@ -345,7 +345,7 @@ func TestICMPForwarderRejectInterop(t *testing.T) {
 	for _, family := range interopFamilies {
 		family := family
 		t.Run(family.name, func(t *testing.T) {
-			network := newForwarderInteropNetwork(t, family, 1500)
+			network := newConfiguredForwarderInteropNetwork(t, family, 1500)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			replied := make(chan error, 1)

@@ -20,7 +20,9 @@ type AddressProperties struct {
 
 // Route admits one unicast destination prefix. Source optionally pins the
 // preferred local source address; Metric breaks ties between equal prefixes.
-// The embedding link remains responsible for next-hop selection.
+// A source-less route may also carry transparent forwarder output when
+// Promiscuous is enabled without a same-family local address. The embedding
+// link remains responsible for next-hop selection.
 type Route struct {
 	// Destination is the admitted unicast prefix.
 	Destination netip.Prefix
@@ -213,17 +215,20 @@ func buildNetworkState(config Config) (*networkState, error) {
 			state.addressProperties[normalized] = properties
 		}
 	}
-	if len(state.local) == 0 {
+	addressless := len(state.local) == 0
+	if addressless && !state.promiscuous {
 		return nil, errors.New("mipstack: at least one local address is required")
 	}
-	if mtu < ipv6MinimumMTU {
-		for _, source := range state.sources {
-			if source.Is6() {
-				return nil, errors.New("mipstack: IPv6 requires an MTU of at least 1280")
-			}
+	var haveLocal4, haveLocal6 bool
+	for _, source := range state.sources {
+		if source.Is4() {
+			haveLocal4 = true
+		} else {
+			haveLocal6 = true
 		}
 	}
 	state.routes = make([]Route, 0, len(config.Routes)+2)
+	haveIPv6Output := haveLocal6
 	for _, route := range config.Routes {
 		destination, err := normalizeRoutePrefix(route.Destination)
 		if err != nil {
@@ -240,35 +245,34 @@ func buildNetworkState(config Config) (*networkState, error) {
 		} else {
 			source = netip.Addr{}
 		}
-		state.routes = append(state.routes, Route{Destination: destination, Source: source, Metric: route.Metric})
-	}
-	for _, route := range state.routes {
-		familyAvailable := false
-		for _, source := range state.sources {
-			if source.Is6() == route.Destination.Addr().Is6() {
-				familyAvailable = true
-				break
-			}
+		familyAvailable := haveLocal4
+		if destination.Addr().Is6() {
+			familyAvailable = haveLocal6
+			haveIPv6Output = true
 		}
-		if !familyAvailable {
+		if !familyAvailable && !state.promiscuous {
 			return nil, errors.New("mipstack: route has no local address in its family")
 		}
+		state.routes = append(state.routes, Route{Destination: destination, Source: source, Metric: route.Metric})
 	}
 	if config.Routes == nil {
-		var have4, have6 bool
-		for _, source := range state.sources {
-			if source.Is4() {
-				have4 = true
-			} else {
-				have6 = true
-			}
+		default4, default6 := haveLocal4, haveLocal6
+		if addressless {
+			// Promiscuous admission supports both IP versions. Source-less
+			// defaults let intercepted flows return over the single embedding
+			// link without granting either family to ordinary sockets.
+			default4, default6 = true, true
 		}
-		if have4 {
+		if default4 {
 			state.routes = append(state.routes, Route{Destination: netip.PrefixFrom(netip.IPv4Unspecified(), 0)})
 		}
-		if have6 {
+		if default6 {
 			state.routes = append(state.routes, Route{Destination: netip.PrefixFrom(netip.IPv6Unspecified(), 0)})
+			haveIPv6Output = true
 		}
+	}
+	if mtu < ipv6MinimumMTU && haveIPv6Output {
+		return nil, errors.New("mipstack: IPv6 requires an MTU of at least 1280")
 	}
 	return state, nil
 }
