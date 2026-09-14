@@ -13,19 +13,23 @@ import (
 )
 
 func benchmarkTCPControllerConnection(b *testing.B, algorithm string) (net.Conn, *Stack, *stackBridge) {
+	return benchmarkTCPProfileConnection(b, TCPSocketDefaults{CongestionControl: algorithm})
+}
+
+func benchmarkTCPProfileConnection(b *testing.B, defaults TCPSocketDefaults) (net.Conn, *Stack, *stackBridge) {
 	b.Helper()
 	clientAddress := netip.MustParseAddr("192.0.2.201")
 	serverAddress := netip.MustParseAddr("192.0.2.202")
 	client, err := New(Config{
 		LocalAddresses: []netip.Prefix{netip.PrefixFrom(clientAddress, 32)},
-		TCP:            TCPSocketDefaults{CongestionControl: algorithm},
+		TCP:            defaults,
 	})
 	if err != nil {
 		b.Fatal(err)
 	}
 	server, err := New(Config{
 		LocalAddresses: []netip.Prefix{netip.PrefixFrom(serverAddress, 32)},
-		TCP:            TCPSocketDefaults{CongestionControl: algorithm},
+		TCP:            defaults,
 	})
 	if err != nil {
 		b.Fatal(err)

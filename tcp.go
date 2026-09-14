@@ -86,28 +86,16 @@ const (
 	tcpMaximumReceiveCapacity = 16 * 1024 * 1024
 	// tcpMaximumSendCapacity bounds automatic send-buffer growth under the same policy.
 	tcpMaximumSendCapacity = 16 * 1024 * 1024
-	// tcpReadChunkRetain keeps metadata for a modest receive burst after it
-	// drains without retaining the payload backing or a multi-megabyte array of
-	// slice headers on an idle connection.
-	tcpReadChunkRetain = 64
 	// tcpReusableReceivePayloadLimit keeps one common-MTU receive backing per
 	// connection. Larger packets are released after Read so an occasional jumbo
 	// segment cannot permanently raise the idle memory cost.
 	tcpReusableReceivePayloadLimit = 2048
-	// tcpSendChunkInitial bounds the unused backing retained by an idle
-	// connection after a small write. Later chunks in the same live send window
-	// use tcpSendChunkMinimum so packet construction remains scatter-bounded.
-	tcpSendChunkInitial = 2 * 1024
 	// tcpSendChunkMinimum packs later writes without moving bytes referenced by
 	// retransmission metadata and keeps cross-chunk gathers uncommon on bulk
 	// streams.
 	tcpSendChunkMinimum = 16 * 1024
 	// tcpSendChunkMaximum bounds unused tail capacity in one send chunk.
 	tcpSendChunkMaximum = tcpSendCapacity
-	// tcpReusableSendChunkLimit retains only a modest acknowledged send chunk.
-	// Larger chunks are released so a completed bulk transfer does not pin its
-	// former window.
-	tcpReusableSendChunkLimit = 32 * 1024
 	// tcpMetadataQueueInitial avoids charging every connection for a burst
 	// before one occurs.
 	tcpMetadataQueueInitial = 1
@@ -3473,11 +3461,15 @@ func (b *tcpSendBuffer) append(payload []byte) {
 			var storage []byte
 			// A small retained first chunk cannot be inserted behind a live
 			// chunk: doing so would violate the scatter bound used by view.
-			if b.spare != nil && (len(b.chunks) == 0 || cap(b.spare) >= tcpSendChunkMinimum) {
+			if b.spare != nil && (len(b.chunks) == 0 || cap(b.spare) >= tcpSendChunkMinimum) &&
+				(!tcpFitSmallSendSpare || cap(b.spare) >= tcpSendChunkMinimum || cap(b.spare) >= capacity) {
 				storage = b.spare
 				b.spare = nil
 			}
 			if cap(storage) == 0 {
+				if tcpFitSmallSendSpare {
+					b.spare = nil
+				}
 				storage = make([]byte, capacity)
 				if capacity > tcpSendChunkInitial && capacity <= tcpReusableSendChunkLimit && b.reusableState == tcpSendReusableReleased {
 					b.reusableState = tcpSendReusableConfirmed
