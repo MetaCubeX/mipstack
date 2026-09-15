@@ -6352,6 +6352,8 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 			timerBacklog.consumed()
 			receivedAt := tcpSegmentEventTime(segment, time.Now(), eventTime, c.stack.timestampEpoch)
 			eventTime = receivedAt
+			// Handshake sequence validation uses RFC 9293 SEG.LEN, including
+			// controls that occupy sequence space such as SYN and FIN.
 			segmentLength := uint32(len(segment.payload))
 			if segment.flags&TCPFlagSYN != 0 {
 				segmentLength++
@@ -8392,25 +8394,26 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				// the actor's protocol clock monotonic even if lock acquisition puts
 				// two batches into its FIFO in the opposite timestamp order.
 				state.eventTime = receivedAt
-				segmentLength := uint32(len(segment.payload))
-				if segment.flags&TCPFlagSYN != 0 {
-					segmentLength++
-				}
-				if segment.flags&TCPFlagFIN != 0 {
-					segmentLength++
-				}
+				// RFC 9293 defines SEG.LEN as payload plus SYN/FIN because those
+				// controls consume sequence space. That definition still governs
+				// sequence and acknowledgment accounting elsewhere. Established-state
+				// admission intentionally follows the Linux/gVisor split: the window
+				// limits payload storage, while FIN is validated and consumed below.
+				// Folding FIN back into this length would reject an in-order FIN-only
+				// close at a zero window and defer EOF until the peer's RTO.
+				payloadLength := uint32(len(segment.payload))
 				receiveWindow := state.receiveWindowState.size(state.receiveNext)
 				retransmittedTimeWaitFIN := state.timeWaitArmed && segment.flags&(TCPFlagRST|TCPFlagSYN) == 0 &&
 					segment.flags&(TCPFlagACK|TCPFlagFIN) == TCPFlagACK|TCPFlagFIN &&
 					segment.sequence+uint32(len(segment.payload))+1 == state.receiveNext
-				if !tcpSegmentAcceptable(segment.sequence, segmentLength, state.receiveNext, receiveWindow) {
+				if !tcpSegmentAcceptable(segment.sequence, payloadLength, state.receiveNext, receiveWindow) {
 					if retransmittedTimeWaitFIN {
 						state.trySendACK()
 						state.armClose(time.Now(), tcpTimeWaitDuration)
 						continue
 					}
 					if segment.flags&TCPFlagRST == 0 {
-						if tcpKeepAliveOrWindowProbe(segment, segmentLength, state.receiveNext, receiveWindow) {
+						if tcpKeepAliveOrWindowProbe(segment, payloadLength, state.receiveNext, receiveWindow) {
 							state.trySendACK()
 						} else {
 							sequence := tcpChallengeACKSequence(segment, state.sendUnacknowledged, state.sendNext, state.peerWindow, state.peerScale)
@@ -10757,7 +10760,11 @@ func (c *TCPConn) receiveTCPData(sequence uint32, payload []byte, fin bool, rece
 		}
 		accepted := c.appendReadBuffer(payload, owner, 0)
 		*receiveNext += uint32(accepted)
-		closed := fin && accepted == originalPayloadSize && uint64(originalPayloadSize) < uint64(receiveWindow)
+		// FIN consumes one sequence number after its payload. A FIN-only segment
+		// stores no bytes, so an in-order FIN remains consumable at a zero window;
+		// payload-bearing FIN segments must leave sequence-space room for FIN.
+		closed := fin && accepted == originalPayloadSize &&
+			(originalPayloadSize == 0 || uint64(originalPayloadSize) < uint64(receiveWindow))
 		if closed {
 			*receiveNext++
 		}
@@ -11057,7 +11064,9 @@ func tcpECNStartsRecovery(active bool, acknowledgement, recoveryPoint uint32) bo
 }
 
 // tcpSegmentAcceptable implements the RFC 9293 receive-window tests for a
-// segment's first and last sequence numbers.
+// segment's first and last sequence numbers. Handshake callers pass full
+// SEG.LEN; the Established-state admission caller passes payload length and
+// consumes sequence-space controls in the state machine afterward.
 func tcpSegmentAcceptable(sequence, length, receiveNext, receiveWindow uint32) bool {
 	if receiveWindow == 0 {
 		return length == 0 && sequence == receiveNext

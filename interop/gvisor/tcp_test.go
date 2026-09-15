@@ -1041,6 +1041,90 @@ func TestTCPReceiveWindowReopenInterop(t *testing.T) {
 	}
 }
 
+// TestTCPZeroWindowFINInterop verifies that a FIN-only segment is consumed at
+// RCV.NXT while mipstack's application receive buffer is full. The bridge
+// counts FINs so a delayed close caused by peer retransmission cannot pass.
+func TestTCPZeroWindowFINInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			const receiveCapacity = 1
+			var finCount atomic.Int32
+			finObserved := make(chan struct{}, 1)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				tcp: mipstack.TCPSocketDefaults{ReceiveBuffer: receiveCapacity, MaximumReceiveBuffer: receiveCapacity},
+				gvisorToMipstack: func(packet []byte) bool {
+					tcpHeader, payloadLength, ok := tcpSegment(packet)
+					if ok && payloadLength == 0 && tcpHeader.Flags().Contains(header.TCPFlagFin) &&
+						!tcpHeader.Flags().Contains(header.TCPFlagSyn) {
+						if finCount.Add(1) == 1 {
+							select {
+							case finObserved <- struct{}{}:
+							default:
+							}
+						}
+					}
+					return true
+				},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			client, server, listener := openTCPPair(t, ctx, network, family, true)
+			defer listener.Close()
+			defer client.Close()
+			defer server.Close()
+			connection := server.(*mipstack.TCPConn)
+			deadline := time.Now().Add(5 * time.Second)
+			if err := client.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			if err := server.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			if written, err := client.Write([]byte{'x'}); err != nil || written != 1 {
+				t.Fatalf("gVisor one-byte write = %d, %v", written, err)
+			}
+			windowDeadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(windowDeadline) {
+				info := connection.Info()
+				if info.ReceiveWindow == 0 && info.ReceiveBufferSize == receiveCapacity {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if info := connection.Info(); info.ReceiveWindow != 0 || info.ReceiveBufferSize != receiveCapacity {
+				t.Fatalf("mipstack receive window did not close: window=%d buffered=%d", info.ReceiveWindow, info.ReceiveBufferSize)
+			}
+			closeWriter, ok := client.(interface{ CloseWrite() error })
+			if !ok {
+				t.Fatal("gVisor TCP connection has no CloseWrite")
+			}
+			if err := closeWriter.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-finObserved:
+			case <-time.After(2 * time.Second):
+				t.Fatal("gVisor FIN was not observed")
+			}
+			stateDeadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(stateDeadline) && connection.Info().State != mipstack.TCPStateCloseWait {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if info := connection.Info(); info.State != mipstack.TCPStateCloseWait || finCount.Load() != 1 {
+				t.Fatalf("mipstack close after first FIN = state:%v FINs:%d", info.State, finCount.Load())
+			}
+			if n, err := server.Read(make([]byte, 1)); n != 1 || err != nil {
+				t.Fatalf("buffered byte before EOF = %d, %v", n, err)
+			}
+			if n, err := server.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+				t.Fatalf("zero-window FIN read = %d, %v; want 0, EOF", n, err)
+			}
+		})
+	}
+}
+
 // validateTCPMTUInfo verifies that mipstack retained the configured path MTU
 // and negotiated an MSS that can fit one fixed-header packet on that path.
 func validateTCPMTUInfo(t *testing.T, info mipstack.TCPConnInfo, family interopFamily, mtu uint32) {

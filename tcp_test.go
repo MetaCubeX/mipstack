@@ -8489,6 +8489,107 @@ drained:
 	}
 }
 
+// TestTCPZeroWindowConsumesInOrderFIN verifies that a FIN occupies its own
+// sequence slot and is accepted at RCV.NXT even when no payload window remains.
+func TestTCPZeroWindowConsumesInOrderFIN(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.1")
+	remote := netip.MustParseAddr("192.0.2.2")
+	link, stack := newTestStack(t, local, remote)
+	defer stack.Close()
+	link.echoTCP = true
+	connectionNet, err := (&Dialer{Options: []SocketOption{SocketOptions.ReadBuffer(1)}}).DialTCP(
+		context.Background(), stack, "tcp4", netip.AddrPort{}, netip.AddrPortFrom(remote, 9107))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := connectionNet.(*TCPConn)
+	defer connection.Close()
+
+	link.mu.Lock()
+	peer := link.tcp[connection.key.local.Port()]
+	if peer == nil {
+		link.mu.Unlock()
+		t.Fatal("TCP peer state was not created")
+	}
+	dataSequence, acknowledgement := peer.serverNext, peer.clientNext
+	peer.serverNext++
+	link.echoTCP = false
+	link.mu.Unlock()
+
+	if err := link.deliverTCP(connection.key.remote.Port(), connection.key.local.Port(), dataSequence, acknowledgement, TCPFlagACK|TCPFlagPSH, 65535, nil, []byte{'x'}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		info := connection.Info()
+		return info.ReceiveBufferSize == 1 && info.ReceiveWindow == 0
+	})
+	readACK := func(want uint32) (uint16, byte) {
+		t.Helper()
+		deadline := time.After(time.Second)
+		for {
+			select {
+			case packet := <-link.outbound:
+				parsed, ok := parseIPPacket(packet)
+				if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
+					continue
+				}
+				tcp := parsed.payload
+				headerSize := int(tcp[12]>>4) * 4
+				if headerSize < tcpHeaderSize || headerSize > len(tcp) {
+					continue
+				}
+				if tcp[13]&TCPFlagACK != 0 && binary.BigEndian.Uint32(tcp[8:12]) == want {
+					return binary.BigEndian.Uint16(tcp[14:16]), tcp[13]
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for TCP ACK %d", want)
+				return 0, 0
+			}
+		}
+	}
+	if window, _ := readACK(dataSequence + 1); window != 0 {
+		t.Fatalf("window after filling one-byte receive buffer = %d, want zero", window)
+	}
+
+	// Data plus FIN still requires payload window space and must not close the
+	// stream while the application buffer is full.
+	if err := link.deliverTCP(connection.key.remote.Port(), connection.key.local.Port(), dataSequence+1, acknowledgement, TCPFlagACK|TCPFlagFIN, 65535, nil, []byte{'y'}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return connection.Info().State == TCPStateEstablished })
+	if _, flags := readACK(dataSequence + 1); flags&TCPFlagFIN != 0 {
+		t.Fatal("zero-window data plus FIN unexpectedly closed the stream")
+	}
+
+	// A FIN outside RCV.NXT remains unacceptable with a zero window.
+	if err := link.deliverTCP(connection.key.remote.Port(), connection.key.local.Port(), dataSequence+2, acknowledgement, TCPFlagACK|TCPFlagFIN, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return connection.Info().State == TCPStateEstablished })
+	if _, flags := readACK(dataSequence + 1); flags&TCPFlagFIN != 0 {
+		t.Fatal("out-of-window FIN unexpectedly closed the stream")
+	}
+
+	// The exact in-order FIN is consumed immediately, acknowledged at the next
+	// sequence number, and exposed as EOF without waiting for a retransmission.
+	if err := link.deliverTCP(connection.key.remote.Port(), connection.key.local.Port(), dataSequence+1, acknowledgement, TCPFlagACK|TCPFlagFIN, 65535, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return connection.Info().State == TCPStateCloseWait })
+	if window, _ := readACK(dataSequence + 2); window != 0 {
+		t.Fatalf("window after zero-window FIN = %d, want zero", window)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if n, readErr := connection.Read(make([]byte, 1)); n != 1 || readErr != nil {
+		t.Fatalf("buffered byte before EOF = %d, %v", n, readErr)
+	}
+	if n, readErr := connection.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("zero-window FIN read = %d, %v; want 0, EOF", n, readErr)
+	}
+}
+
 // TestTCPTimestampsPAWSAndMSS verifies timestamp negotiation, PAWS rejection,
 // and data segmentation that leaves room for the negotiated option.
 func TestTCPTimestampsPAWSAndMSS(t *testing.T) {
