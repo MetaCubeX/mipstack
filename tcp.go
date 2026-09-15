@@ -4121,9 +4121,10 @@ func (l *TCPListener) Accept() (net.Conn, error) {
 		return nil, l.operationError("accept", os.ErrDeadlineExceeded)
 	default:
 	}
+	accept := l.accept
 	l.mu.Unlock()
 	select {
-	case connection := <-l.accept:
+	case connection := <-accept:
 		l.mu.Lock()
 		select {
 		case <-l.closed:

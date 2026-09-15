@@ -393,6 +393,75 @@ func TestTCPListenerCloseReleasesPendingOwnership(t *testing.T) {
 	}
 }
 
+// TestTCPListenerAcceptCloseConcurrent exercises the wait window between
+// Accept's listener-state check and its blocking receive while Close releases
+// the listener's accept queue.
+func TestTCPListenerAcceptCloseConcurrent(t *testing.T) {
+	for attempt := 0; attempt < 100; attempt++ {
+		listener := &TCPListener{
+			net: "tcp4", local: netip.MustParseAddrPort("192.0.2.251:443"),
+			accept: make(chan *TCPConn), closed: make(chan struct{}),
+			pending: make(map[*TCPConn]struct{}), handshaking: make(map[*TCPConn]struct{}),
+		}
+		result := make(chan error, 1)
+		started := make(chan struct{})
+		go func() {
+			close(started)
+			_, err := listener.Accept()
+			result <- err
+		}()
+		<-started
+		runtime.Gosched()
+		listener.closeFromStack()
+		select {
+		case err := <-result:
+			if !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("Accept after concurrent Close = %v, want net.ErrClosed", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Accept did not return after concurrent Close")
+		}
+	}
+}
+
+// TestTCPListenerAcceptUnblocksOnPublicClose verifies that a blocked Accept
+// returns the standard closed-listener error through net.Listener.Close.
+func TestTCPListenerAcceptUnblocksOnPublicClose(t *testing.T) {
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.251/32")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	listener, err := stack.ListenTCP(context.Background(), "tcp4", netip.MustParseAddrPort("192.0.2.251:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := listener.Accept()
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("Accept returned before Close: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	if err = listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Accept after Close = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Accept did not return after Close")
+	}
+}
+
 // TestStackCloseEventuallyReleasesTCPBuffers verifies that Stack.Close only
 // signals the actor synchronously but that actor termination releases all
 // payload-bearing connection-owned queues within a bounded interval.
