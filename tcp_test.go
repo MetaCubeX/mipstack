@@ -1140,6 +1140,347 @@ func TestTCPTimeWaitAcceptsRetransmittedFINWithAdditionalFlags(t *testing.T) {
 	})
 }
 
+// TestTCPTimeWaitReplacesAcceptedTupleWithFreshTimestamp verifies Linux-style
+// passive tuple reuse through the RFC 6191 timestamp admission check without
+// creating a second close-state actor. The first accepted connection is fully
+// consumed before the same client port opens a new SYN; the listener must
+// return the replacement instead of waiting for the old two-MSL timer.
+func TestTCPTimeWaitReplacesAcceptedTupleWithFreshTimestamp(t *testing.T) {
+	client, server := newStackPair(t, netip.MustParseAddr("192.0.2.185"), netip.MustParseAddr("192.0.2.186"), 1400)
+	_ = newStackBridge(t, client, server)
+	listener, err := server.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(netip.MustParseAddr("192.0.2.186"), 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	remote := listener.Addr().(*net.TCPAddr).AddrPort()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- connection
+		}
+	}()
+	first, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstServer := <-accepted
+	if firstServer == nil {
+		t.Fatal("first Accept returned no connection")
+	}
+	firstTCP := firstServer.(*TCPConn)
+	firstClient := first.(*TCPConn)
+	if err = firstTCP.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := first.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("first client FIN read = %d, %v", n, readErr)
+	}
+	if err = firstClient.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = firstServer.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := firstServer.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("first server FIN read = %d, %v", n, readErr)
+	}
+	waitFor(t, time.Second, func() bool { return client.Stats().ActiveTCPConnections == 0 })
+	waitFor(t, time.Second, func() bool { return server.Stats().ActiveTCPConnections == 1 })
+	oldLocal := first.LocalAddr().(*net.TCPAddr).AddrPort()
+	serverKey := tcpKey{local: remote, remote: oldLocal}
+	server.mu.Lock()
+	oldServer := server.tcp[serverKey]
+	if oldServer == nil || oldServer.recentTimestamp == 0 {
+		server.mu.Unlock()
+		t.Fatal("server did not retain timestamped TIME-WAIT connection")
+	}
+	oldTimestamp := oldServer.recentTimestamp
+	oldReceiveNext := uint32(firstClient.icmpSequence.Load())
+	if oldReceiveNext == 0 {
+		t.Fatal("client did not publish the final receive sequence")
+	}
+	server.mu.Unlock()
+	if state := oldServer.Info().State; state != TCPStateTimeWait {
+		t.Fatalf("old server state = %v, want TIME-WAIT", state)
+	}
+	first.Close()
+	firstServer.Close()
+	for _, options := range [][]byte{tcpTimestampOptions(oldTimestamp-1, 0), tcpTimestampOptions(oldTimestamp, 0), nil} {
+		staleSYN := buildTestTCP(oldLocal.Addr(), remote.Addr(), oldLocal.Port(), remote.Port(), oldReceiveNext-1, 0,
+			TCPFlagSYN, 65535, options, nil)
+		if err = writeTestPacket(server, staleSYN); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(time.Millisecond)
+	server.mu.Lock()
+	if server.tcp[serverKey] != oldServer {
+		server.mu.Unlock()
+		t.Fatal("stale or equal timestamp replaced TIME-WAIT connection")
+	}
+	server.mu.Unlock()
+	// RFC 1337 requires a TIME-WAIT endpoint to ignore RST. A stale reset
+	// must not remove the tuple and must not turn the next SYN into a new
+	// connection through a different dispatch path.
+	rst := buildTestTCP(oldLocal.Addr(), remote.Addr(), oldLocal.Port(), remote.Port(), 0, 0, TCPFlagRST|TCPFlagACK, 0, nil, nil)
+	if err = writeTestPacket(server, rst); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		server.mu.Lock()
+		defer server.mu.Unlock()
+		return server.tcp[serverKey] == oldServer
+	})
+	// RFC 6191 requires a strictly newer TSval; leave the millisecond wire
+	// clock enough room to advance even on a fast local test run.
+	waitFor(t, time.Second, func() bool { return tcpSequenceGreater(client.tcpTimestamp(), oldTimestamp) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	second, err := client.DialTCP(ctx, "tcp4", oldLocal, remote)
+	if err != nil {
+		t.Fatalf("same-tuple DialTCP = %v", err)
+	}
+	defer second.Close()
+	secondServer, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondServer.Close()
+	if got := second.LocalAddr().(*net.TCPAddr).AddrPort(); got != oldLocal {
+		t.Fatalf("replacement local address = %v, want %v", got, oldLocal)
+	}
+	if state := secondServer.(*TCPConn).Info().State; state != TCPStateEstablished {
+		t.Fatalf("replacement state = %v, want established", state)
+	}
+}
+
+// TestTCPTimeWaitReplacementFailureReleasesCandidate verifies the Linux-style
+// ownership rule after a replacement SYN has been admitted. If the peer then
+// resets the new handshake, the candidate and listener bookkeeping are
+// released without restoring the superseded TIME-WAIT owner.
+func TestTCPTimeWaitReplacementFailureReleasesCandidate(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.189")
+	serverAddress := netip.MustParseAddr("192.0.2.190")
+	client, server := newStackPair(t, clientAddress, serverAddress, 1400)
+	_ = newStackBridge(t, client, server)
+	listener, err := server.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(serverAddress, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	remote := listener.Addr().(*net.TCPAddr).AddrPort()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- connection
+		}
+	}()
+	first, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstServer := <-accepted
+	if firstServer == nil {
+		t.Fatal("first Accept returned no connection")
+	}
+	firstClient := first.(*TCPConn)
+	firstServerTCP := firstServer.(*TCPConn)
+	if err = firstServerTCP.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := first.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("first client FIN read = %d, %v", n, readErr)
+	}
+	if err = firstClient.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = firstServer.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := firstServer.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("first server FIN read = %d, %v", n, readErr)
+	}
+	waitFor(t, time.Second, func() bool { return client.Stats().ActiveTCPConnections == 0 })
+	waitFor(t, time.Second, func() bool { return firstServerTCP.Info().State == TCPStateTimeWait })
+	oldLocal := first.LocalAddr().(*net.TCPAddr).AddrPort()
+	serverKey := tcpKey{local: remote, remote: oldLocal}
+	server.mu.Lock()
+	oldOwner := server.tcp[serverKey]
+	server.mu.Unlock()
+	if oldOwner != firstServerTCP {
+		t.Fatal("server did not retain the accepted TIME-WAIT owner")
+	}
+	newSequence := uint32(firstClient.icmpSequence.Load()) + 1
+	failures := listener.(*TCPListener).Info().HandshakeFailures
+	_ = first.Close()
+	_ = firstServer.Close()
+
+	// No client endpoint owns this tuple now. Its stack therefore resets the
+	// replacement SYN-ACK, exercising passive-handshake failure cleanup.
+	syn := buildTestTCP(oldLocal.Addr(), remote.Addr(), oldLocal.Port(), remote.Port(), newSequence, 0, TCPFlagSYN, 65535, nil, nil)
+	if err = writeTestPacket(server, syn); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return listener.(*TCPListener).Info().HandshakeFailures > failures && server.Stats().ActiveTCPConnections == 0
+	})
+	server.mu.Lock()
+	owner := server.tcp[serverKey]
+	server.mu.Unlock()
+	if owner != nil {
+		t.Fatalf("failed replacement retained tuple owner %p", owner)
+	}
+	listener.(*TCPListener).mu.Lock()
+	pending, handshaking := len(listener.(*TCPListener).pending), len(listener.(*TCPListener).handshaking)
+	listener.(*TCPListener).mu.Unlock()
+	if pending != 0 || handshaking != 0 {
+		t.Fatalf("failed replacement listener ownership = (%d pending, %d handshaking), want zero", pending, handshaking)
+	}
+}
+
+// TestTCPTimeWaitSYNAdmission covers the RFC 1122/6191 sequence and timestamp
+// admission checks: a newer sequence number is sufficient when timestamps are
+// not enabled for the new incarnation, an equal timestamp still needs a newer
+// sequence number, and PAWS rejects an older timestamp while TS.Recent is fresh.
+func TestTCPTimeWaitSYNAdmission(t *testing.T) {
+	now := time.Now()
+	for _, test := range []struct {
+		name                string
+		peerTimestamp       bool
+		recentTimestamp     uint32
+		lastTimestampUpdate time.Time
+		sequence            uint32
+		options             []byte
+		replace             bool
+	}{
+		{name: "new timestamp", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now, sequence: 499, options: tcpTimestampOptions(101, 0), replace: true},
+		{name: "equal timestamp and new sequence", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now, sequence: 501, options: tcpTimestampOptions(100, 0), replace: true},
+		{name: "older timestamp rejected by paws", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now, sequence: 501, options: tcpTimestampOptions(99, 0)},
+		{name: "expired paws and new sequence", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now.Add(-tcpPAWSMaxAge - time.Hour), sequence: 501, options: tcpTimestampOptions(99, 0), replace: true},
+		{name: "new sequence without timestamp", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now, sequence: 501, replace: true},
+		{name: "old sequence without timestamp", peerTimestamp: true, recentTimestamp: 100, lastTimestampUpdate: now, sequence: 499},
+		{name: "timestamp enables new incarnation", peerTimestamp: false, sequence: 499, options: tcpTimestampOptions(101, 0), replace: true},
+		{name: "old sequence and no timestamp", peerTimestamp: false, sequence: 499},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			replaced := false
+			stack := &Stack{tcpTimeWaitReplacer: func(*Stack, *TCPConn, tcpSegment) bool {
+				replaced = true
+				return true
+			}}
+			connection := &TCPConn{stack: stack, peerTimestamp: test.peerTimestamp, recentTimestamp: test.recentTimestamp}
+			state := &tcpEstablishedState{connection: connection, receiveNext: 500, lastTimestampUpdate: test.lastTimestampUpdate}
+			segment := tcpSegment{sequence: test.sequence, flags: TCPFlagSYN, optionLength: uint8(len(test.options))}
+			copy(segment.options[:], test.options)
+			got := state.handleTimeWaitSegment(segment, time.Now())
+			if got != test.replace {
+				t.Fatalf("TIME-WAIT SYN replacement = %v, want %v", got, test.replace)
+			}
+			if replaced != test.replace {
+				t.Fatalf("replacement callback = %v, want %v", replaced, test.replace)
+			}
+		})
+	}
+}
+
+// TestTCPTimeWaitDoesNotLearnTimestampFromOutOfWindow verifies that PAWS
+// state is updated only after TIME-WAIT sequence admission. An old duplicate
+// carrying a newer TSval must not poison TS.Recent and reject a later valid
+// segment, matching Linux's true-TIME-WAIT path.
+func TestTCPTimeWaitDoesNotLearnTimestampFromOutOfWindow(t *testing.T) {
+	now := time.Now()
+	stack := &Stack{}
+	connection := &TCPConn{stack: stack, peerTimestamp: true, recentTimestamp: 100}
+	state := &tcpEstablishedState{
+		connection:          connection,
+		receiveNext:         500,
+		lastACKSent:         500,
+		lastTimestampUpdate: now,
+	}
+	outOfWindow := tcpSegment{sequence: 100, flags: TCPFlagACK, optionLength: 12}
+	copy(outOfWindow.options[:], tcpTimestampOptions(200, 0))
+	state.handleTimeWaitSegment(outOfWindow, now)
+	if connection.recentTimestamp != 100 {
+		t.Fatalf("out-of-window TS.Recent = %d, want 100", connection.recentTimestamp)
+	}
+	inWindow := tcpSegment{sequence: 500, flags: TCPFlagACK, optionLength: 12}
+	copy(inWindow.options[:], tcpTimestampOptions(200, 0))
+	state.handleTimeWaitSegment(inWindow, now)
+	if connection.recentTimestamp != 200 {
+		t.Fatalf("in-window TS.Recent = %d, want 200", connection.recentTimestamp)
+	}
+}
+
+// TestTCPTimeWaitKeepsQueuedAcceptOwner verifies that replacement cannot make
+// Accept return an obsolete connection. A completed connection still waiting
+// in the listener queue therefore blocks tuple reuse until the application
+// consumes that queue entry.
+func TestTCPTimeWaitKeepsQueuedAcceptOwner(t *testing.T) {
+	client, server := newStackPair(t, netip.MustParseAddr("192.0.2.187"), netip.MustParseAddr("192.0.2.188"), 1400)
+	_ = newStackBridge(t, client, server)
+	listener, err := server.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(netip.MustParseAddr("192.0.2.188"), 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	remote := listener.Addr().(*net.TCPAddr).AddrPort()
+	first, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstTCP := first.(*TCPConn)
+	oldLocal := first.LocalAddr().(*net.TCPAddr).AddrPort()
+	serverKey := tcpKey{local: remote, remote: oldLocal}
+	var firstServer *TCPConn
+	waitFor(t, time.Second, func() bool {
+		server.mu.Lock()
+		firstServer = server.tcp[serverKey]
+		server.mu.Unlock()
+		return firstServer != nil
+	})
+	waitFor(t, time.Second, func() bool { return firstServer.Info().State == TCPStateEstablished })
+	if err = firstServer.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := first.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("queued first client FIN read = %d, %v", n, readErr)
+	}
+	if err = firstTCP.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = firstServer.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := firstServer.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("queued first server FIN read = %d, %v", n, readErr)
+	}
+	waitFor(t, time.Second, func() bool { return client.Stats().ActiveTCPConnections == 0 })
+	waitFor(t, time.Second, func() bool { return server.Stats().ActiveTCPConnections == 1 })
+	server.mu.Lock()
+	if server.tcp[serverKey] != firstServer {
+		server.mu.Unlock()
+		t.Fatal("queued connection left the TCP map before Accept")
+	}
+	server.mu.Unlock()
+	if state := firstServer.Info().State; state != TCPStateTimeWait {
+		t.Fatalf("queued server state = %v, want TIME-WAIT", state)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if replacement, dialErr := client.DialTCP(ctx, "tcp4", oldLocal, remote); replacement != nil || !errors.Is(dialErr, context.DeadlineExceeded) {
+		t.Fatalf("queued tuple reuse = (%v, %v), want context deadline", replacement, dialErr)
+	}
+	accepted, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer accepted.Close()
+	if accepted.(*TCPConn) != firstServer {
+		t.Fatal("Accept returned a replacement instead of the queued connection")
+	}
+}
+
 func testTCPHandshake(connection *TCPConn, initialSequence uint32) error {
 	timer := newOwnedTimer()
 	defer timer.close()

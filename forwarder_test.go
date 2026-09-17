@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -260,6 +261,201 @@ func TestTCPForwarderInterceptsNonlocalDestination(t *testing.T) {
 	if _, err = serverConnection.Read(buffer); !errors.Is(err, syscall.EADDRNOTAVAIL) {
 		t.Fatalf("forwarded TCP survived promiscuous disable: %v", err)
 	}
+}
+
+// TestTCPForwarderTimeWaitReplacesTuple verifies that a forwarded passive
+// connection uses the same Linux-style replacement path as a listener. The
+// old TIME-WAIT owner is removed only after the forwarder has admitted the new
+// request, so a full request set cannot silently lose the tuple.
+func TestTCPForwarderTimeWaitReplacesTuple(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.40")
+	serverAddress := netip.MustParseAddr("192.0.2.41")
+	intercepted := netip.MustParseAddr("198.51.100.40")
+	client := newForwarderTestStack(t, clientAddress, false)
+	server := newForwarderTestStack(t, serverAddress, true)
+	newStackBridge(t, client, server)
+	accepted := make(chan *TCPConn, 2)
+	forwarder, err := NewTCPForwarder(server, TCPForwarderOptions{}, func(request *TCPForwarderRequest) {
+		connection, acceptErr := request.Accept(context.Background())
+		if acceptErr == nil {
+			accepted <- connection
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	remote := netip.AddrPortFrom(intercepted, 8080)
+	first, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstServer := <-accepted
+	if firstServer == nil {
+		t.Fatal("forwarder did not accept first connection")
+	}
+	firstClient := first.(*TCPConn)
+	if err = firstServer.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	// The client is the timestamp generator for the peer's negotiated TS.Recent;
+	// waiting for its clock to advance avoids reading actor-owned timestamp
+	// state from the test goroutine.
+	oldTimestamp := client.tcpTimestamp()
+	_ = first.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := first.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("first forwarded client FIN read = %d, %v", n, readErr)
+	}
+	if err = firstClient.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = firstServer.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := firstServer.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("first forwarded server FIN read = %d, %v", n, readErr)
+	}
+	waitFor(t, time.Second, func() bool { return client.Stats().ActiveTCPConnections == 0 })
+	waitFor(t, time.Second, func() bool { return server.Stats().ActiveTCPConnections == 1 })
+	if state := firstServer.Info().State; state != TCPStateTimeWait {
+		t.Fatalf("old forwarded server state = %v, want TIME-WAIT", state)
+	}
+	oldLocal := first.LocalAddr().(*net.TCPAddr).AddrPort()
+	first.Close()
+	firstServer.Close()
+	waitFor(t, time.Second, func() bool { return tcpSequenceGreater(client.tcpTimestamp(), oldTimestamp) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	second, err := client.DialTCP(ctx, "tcp4", oldLocal, remote)
+	if err != nil {
+		t.Fatalf("same-tuple forwarded DialTCP = %v", err)
+	}
+	defer second.Close()
+	select {
+	case secondServer := <-accepted:
+		defer secondServer.Close()
+		if got := secondServer.LocalAddr().(*net.TCPAddr).AddrPort(); got != remote {
+			t.Fatalf("replacement forwarded local address = %v, want %v", got, remote)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("forwarder did not accept replacement connection")
+	}
+}
+
+// TestTCPForwarderTimeWaitFullKeepsOwner verifies that replacement remains
+// transactional with the forwarder's bounded request set. A capacity drop
+// must leave the old TIME-WAIT connection mapped and counted.
+func TestTCPForwarderTimeWaitFullKeepsOwner(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.42")
+	serverAddress := netip.MustParseAddr("192.0.2.43")
+	intercepted := netip.MustParseAddr("198.51.100.42")
+	client := newForwarderTestStack(t, clientAddress, false)
+	server := newForwarderTestStack(t, serverAddress, true)
+	newStackBridge(t, client, server)
+	type acceptResult struct {
+		connection *TCPConn
+		err        error
+	}
+	accepted := make(chan acceptResult, 1)
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	var requests atomic.Uint32
+	forwarder, err := NewTCPForwarder(server, TCPForwarderOptions{MaxInFlight: 1}, func(request *TCPForwarderRequest) {
+		switch requests.Add(1) {
+		case 1:
+			connection, acceptErr := request.Accept(context.Background())
+			accepted <- acceptResult{connection: connection, err: acceptErr}
+		case 2:
+			close(blocked)
+			<-release
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forwarder.Close()
+	remote := netip.AddrPortFrom(intercepted, 8080)
+	first, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := <-accepted
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	firstServer := result.connection
+	if firstServer == nil {
+		t.Fatal("forwarder did not accept first connection")
+	}
+	firstClient := first.(*TCPConn)
+	if err = firstServer.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := first.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("first forwarded client FIN read = %d, %v", n, readErr)
+	}
+	if err = firstClient.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = firstServer.SetReadDeadline(time.Now().Add(time.Second))
+	if n, readErr := firstServer.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("first forwarded server FIN read = %d, %v", n, readErr)
+	}
+	waitFor(t, time.Second, func() bool { return client.Stats().ActiveTCPConnections == 0 })
+	waitFor(t, time.Second, func() bool { return firstServer.Info().State == TCPStateTimeWait })
+	oldLocal := first.LocalAddr().(*net.TCPAddr).AddrPort()
+	serverKey := tcpKey{local: remote, remote: oldLocal}
+	server.mu.Lock()
+	oldOwner := server.tcp[serverKey]
+	server.mu.Unlock()
+	if oldOwner != firstServer {
+		t.Fatal("server did not retain the forwarded TIME-WAIT owner")
+	}
+	newSequence := uint32(firstClient.icmpSequence.Load()) + 1
+	_ = first.Close()
+	_ = firstServer.Close()
+
+	blockerPort := oldLocal.Port() + 1
+	if blockerPort == 0 {
+		blockerPort = oldLocal.Port() - 1
+	}
+	blocker := buildTestTCP(clientAddress, intercepted, blockerPort, remote.Port(), 1000, 0, TCPFlagSYN, 65535, nil, nil)
+	if err = writeTestPacket(server, blocker); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("forwarder handler did not retain the blocker request")
+	}
+	waitFor(t, time.Second, func() bool { return forwarder.Info().Pending == 1 })
+	drops := forwarder.Info().Dropped
+	replacement := buildTestTCP(oldLocal.Addr(), remote.Addr(), oldLocal.Port(), remote.Port(), newSequence, 0, TCPFlagSYN, 65535, nil, nil)
+	if err = writeTestPacket(server, replacement); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool { return forwarder.Info().Dropped > drops })
+	server.mu.Lock()
+	owner := server.tcp[serverKey]
+	server.mu.Unlock()
+	if owner != oldOwner {
+		t.Fatal("full forwarder replaced the TIME-WAIT owner")
+	}
+	if active := server.Stats().ActiveTCPConnections; active != 1 {
+		t.Fatalf("active connections after capacity drop = %d, want 1", active)
+	}
+	if pending := forwarder.Info().Pending; pending != 1 {
+		t.Fatalf("pending requests after capacity drop = %d, want blocker", pending)
+	}
+	close(release)
+	released = true
+	waitFor(t, time.Second, func() bool { return forwarder.Info().Pending == 0 })
 }
 
 func TestTCPForwarderCoalescesPendingSYNs(t *testing.T) {

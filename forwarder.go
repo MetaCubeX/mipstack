@@ -571,6 +571,9 @@ type ICMPForwarderResponder struct {
 type tcpForwarderEndpoints interface {
 	// handleSegment offers one otherwise unhandled SYN to the forwarder.
 	handleSegment(segment tcpSegment, key tcpKey) bool
+	// handleTimeWaitSegment admits a SYN that replaces a passive TIME-WAIT
+	// tuple. It reports false when the bounded request set cannot accept it.
+	handleTimeWaitSegment(segment tcpSegment, key tcpKey) bool
 	// updateConfig invalidates requests no longer admitted by network policy.
 	updateConfig(network *networkState)
 	// closeFromStack cancels pending requests during stack closure.
@@ -639,6 +642,7 @@ func NewTCPForwarder(stack *Stack, options TCPForwarderOptions, handler TCPForwa
 		return nil, syscall.EADDRINUSE
 	}
 	stack.tcpForwarder = forwarder
+	stack.tcpTimeWaitReplacer = replaceTCPTimeWait
 	return forwarder, nil
 }
 
@@ -1236,25 +1240,28 @@ func (f *ICMPForwarder) Info() ForwarderInfo {
 	return f.info(pending, 0)
 }
 
-// handleSegment coalesces one valid initial SYN into the bounded request set.
-func (f *TCPForwarder) handleSegment(segment tcpSegment, key tcpKey) bool {
+// admitSegment coalesces one valid initial SYN into the bounded request set.
+// handled remains true for a duplicate or capacity drop, preserving the
+// normal forwarder dispatch contract; admitted reports whether a request
+// (new or already coalesced) covers the SYN and may replace a passive owner.
+func (f *TCPForwarder) admitSegment(segment tcpSegment, key tcpKey) (handled, admitted bool) {
 	if key.remote.Port() == 0 || segment.flags&TCPFlagSYN == 0 || segment.flags&(TCPFlagACK|TCPFlagRST|TCPFlagFIN) != 0 {
-		return false
+		return false, false
 	}
 	f.mu.Lock()
 	if f.closed.Load() {
 		f.mu.Unlock()
-		return false
+		return false, false
 	}
 	if _, exists := f.requests[key]; exists {
 		f.mu.Unlock()
-		return true
+		return true, true
 	}
 	if len(f.requests) >= f.maxInFlight {
 		f.dropped.Add(1)
 		f.mu.Unlock()
 		f.stack.stats.inboundDroppedPackets.Add(1)
-		return true
+		return true, false
 	}
 	request := &TCPForwarderRequest{forwarder: f, key: key, segment: segment, done: make(chan struct{})}
 	f.requests[key] = request
@@ -1269,7 +1276,20 @@ func (f *TCPForwarder) handleSegment(segment tcpSegment, key tcpKey) bool {
 		}()
 		f.handler(request)
 	}()
-	return true
+	return true, true
+}
+
+// handleSegment coalesces one valid initial SYN into the bounded request set.
+func (f *TCPForwarder) handleSegment(segment tcpSegment, key tcpKey) bool {
+	handled, _ := f.admitSegment(segment, key)
+	return handled
+}
+
+// handleTimeWaitSegment admits a replacement SYN only when the request itself
+// was accepted; a full forwarder leaves the existing TIME-WAIT owner intact.
+func (f *TCPForwarder) handleTimeWaitSegment(segment tcpSegment, key tcpKey) bool {
+	_, admitted := f.admitSegment(segment, key)
+	return admitted
 }
 
 // handlePacket serializes the first undecided datagram for a four-tuple and

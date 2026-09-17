@@ -877,7 +877,9 @@ Batch writes accept `MessageFlagDontWait`; other nonzero write flags return
 
 TCP implements active and passive open, bounded accept and SYN queues,
 concurrent four-tuple demultiplexing, safe local-port reuse for distinct remote
-tuples, and bounded active and TIME_WAIT state. Validated inbound segments wait
+tuples, Linux-style reuse of eligible passive TIME_WAIT tuples using RFC 6191
+sequence and timestamp admission checks, and bounded active and TIME_WAIT
+state. Validated inbound segments wait
 in a dynamically allocated, byte-bounded FIFO, so idle connections do not pay
 for a large channel while high-throughput connections are not constrained by
 an arbitrary segment count. Initial sequence numbers follow RFC 6528: a

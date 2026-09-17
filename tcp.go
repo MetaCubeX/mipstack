@@ -183,6 +183,10 @@ const (
 	// tcpTimeWaitDuration retains a completed tuple for twice the conventional
 	// 30-second maximum segment lifetime.
 	tcpTimeWaitDuration = 60 * time.Second
+	// tcpPAWSMaxAge is the RFC 7323 timestamp lifetime. After a timestamp has
+	// been absent for 24 days, an older TSval no longer proves that a segment is
+	// stale because the peer's timestamp clock may have wrapped.
+	tcpPAWSMaxAge = 24 * 24 * time.Hour
 	// tcpFINWaitDuration bounds orphaned FIN_WAIT_2 resource retention. A
 	// connection retained by an application after CloseWrite has no such
 	// timeout and may continue receiving until the peer closes.
@@ -2254,6 +2258,113 @@ func (s *tcpEstablishedState) connectionState() TCPState {
 	}
 }
 
+// tcpTimeWaitReplacer is populated when a listener or TCP forwarder is
+// installed. The established actor can therefore keep its cold replacement
+// hook without making optional passive-dispatch code reachable in dial-only
+// builds.
+type tcpTimeWaitReplacer func(*Stack, *TCPConn, tcpSegment) bool
+
+// handleTimeWaitSegment owns every control exception that is specific to the
+// retained TIME-WAIT tuple. segment has already been removed from the inbound
+// queue, so its retainedBytes field is zero and the value can be handed to the
+// optional replacement hook without a second wire-only copy. It runs in the
+// established actor, so TS.Recent and close flags remain single-owner state and
+// no second TCP state machine is needed.
+func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, receivedAt time.Time) bool {
+	if segment.flags&TCPFlagRST != 0 {
+		// RFC 1337 prevents a stale reset from assassinating TIME-WAIT. mipstack
+		// keeps this protected behavior unconditionally; unlike Linux with its
+		// default tcp_rfc1337=0, a valid in-window RST never removes this TCB.
+		return false
+	}
+	if segment.flags&TCPFlagSYN != 0 {
+		if segment.flags&(TCPFlagACK|TCPFlagFIN) != 0 {
+			s.trySendChallengeACK()
+			return false
+		}
+		// RFC 1122 permits a new incarnation when its ISN is beyond the
+		// previous receive sequence. RFC 6191 adds the timestamp heuristic:
+		// a newer TSval is sufficient, while an older TSval is rejected by
+		// PAWS only while TS.Recent is fresh. Equal TSvals still use the
+		// sequence-number test. When the old incarnation had no timestamps,
+		// RFC 6191 permits a timestamp-bearing SYN to establish the new one.
+		sequenceNew := tcpSequenceGreater(segment.sequence, s.receiveNext)
+		timestampNew, pawsReject := false, false
+		timestamp, _, present := parseTCPTimestamp(segment.optionBytes())
+		if present {
+			if s.connection.peerTimestamp {
+				pawsReject = receivedAt.Sub(s.lastTimestampUpdate) < tcpPAWSMaxAge &&
+					tcpSequenceLess(timestamp, s.connection.recentTimestamp)
+				timestampNew = !pawsReject && tcpSequenceGreater(timestamp, s.connection.recentTimestamp)
+			} else {
+				// RFC 6191 permits a timestamp-enabled new incarnation to
+				// bypass the old sequence gate when the previous incarnation
+				// did not negotiate timestamps and therefore has no TS.Recent.
+				timestampNew = true
+			}
+		}
+		if pawsReject || !sequenceNew && !timestampNew {
+			// RFC 6191 describes silently dropping this SYN. mipstack follows the
+			// RFC 5961 SYN-injection mitigation instead and emits a rate-limited
+			// challenge ACK, while retaining the old TIME-WAIT owner.
+			s.trySendChallengeACK()
+			return false
+		}
+		// Only a SYN that passed the sequence and timestamp admission checks can
+		// transfer tuple ownership out of this actor turn.
+		if s.connection.stack.tryReplaceTCPTimeWait(s.connection, segment) {
+			return true
+		}
+		s.trySendChallengeACK()
+		return false
+	}
+	// RFC 7323 requires a negotiated timestamp on every non-RST segment and
+	// applies PAWS before ordinary sequence admission. A stale timestamp is
+	// acknowledged without changing the retained tuple; a missing timestamp is
+	// discarded, matching mipstack's strict established-state timestamp policy
+	// rather than Linux's more permissive missing-option handling. SYNs use the
+	// RFC 6191 test above instead of this PAWS path.
+	var timestamp uint32
+	present := false
+	if s.connection.peerTimestamp {
+		timestamp, _, present = parseTCPTimestamp(segment.optionBytes())
+		if !present {
+			return false
+		}
+		if receivedAt.Sub(s.lastTimestampUpdate) < tcpPAWSMaxAge && tcpSequenceLess(timestamp, s.connection.recentTimestamp) {
+			s.trySendACK()
+			return false
+		}
+	}
+	retransmittedFIN := segment.flags&(TCPFlagSYN|TCPFlagRST) == 0 && segment.flags&(TCPFlagACK|TCPFlagFIN) == TCPFlagACK|TCPFlagFIN &&
+		segment.sequence+uint32(len(segment.payload))+1 == s.receiveNext
+	// The FIN retransmission is accepted even when the advertised receive
+	// window is zero: FIN consumes sequence space but carries no data, and
+	// dropping it would defer EOF until the peer's retransmission timeout.
+	if !retransmittedFIN && !tcpSegmentAcceptable(segment.sequence, uint32(len(segment.payload)), s.receiveNext, s.receiveWindowState.size(s.receiveNext)) {
+		s.trySendACK()
+		return false
+	}
+	if present && tcpSequenceLessEqual(segment.sequence, s.lastACKSent) {
+		s.connection.recentTimestamp = timestamp
+		s.lastTimestampUpdate = receivedAt
+	}
+	if retransmittedFIN {
+		s.trySendACK()
+		s.armClose(time.Now(), tcpTimeWaitDuration)
+		return false
+	}
+	// TIME-WAIT does not re-enter the established receive or acknowledgment
+	// state machine. RFC 9293 requires an unacceptable segment in this state to
+	// elicit only an empty ACK, while a pure ACK at RCV.NXT needs no response.
+	// Only a retransmitted FIN above restarts this implementation's expiry;
+	// Linux also refreshes its TIME-WAIT timer for some ACK and PAWS cases.
+	if segment.flags&TCPFlagACK == 0 || segment.sequence != s.receiveNext || len(segment.payload) != 0 {
+		s.trySendACK()
+	}
+	return false
+}
+
 // tcpInfo combines actor-owned protocol state with the connection's locked
 // application-facing state into one consistent diagnostic snapshot.
 func (s *tcpEstablishedState) tcpInfo() TCPConnInfo {
@@ -3709,6 +3820,9 @@ type tcpPassiveEndpoints interface {
 	portListened(local netip.Addr, port uint16) bool
 	// handleSegment dispatches one segment to a listener or SYN-cookie path.
 	handleSegment(stack *Stack, packet ipPacket, segment tcpSegment, key tcpKey) (bool, error)
+	// timeWaitListener selects the listener for an incoming tuple while Stack.mu
+	// is held. It lets the TIME-WAIT path preserve normal listener precedence.
+	timeWaitListener(local, remote netip.AddrPort) *TCPListener
 	// updateConfig closes listeners invalidated by new network policy.
 	updateConfig(stack *Stack, network *networkState)
 	// closeAll closes every listener retained by the dispatcher.
@@ -3930,6 +4044,7 @@ func (s *Stack) listenTCP(ctx context.Context, network string, local netip.AddrP
 	if err = binding.register(passive, listener); err != nil {
 		return wrap(err)
 	}
+	s.tcpTimeWaitReplacer = replaceTCPTimeWait
 	s.stats.activeTCPListeners.Add(1)
 	return listener, nil
 }
@@ -4220,6 +4335,21 @@ func (l *TCPListener) trackHandshake(connection *TCPConn) bool {
 		l.backlogPeak = len(l.handshaking)
 	}
 	return true
+}
+
+// canReplace reports whether a completed connection is no longer owned by the
+// listener's accept queue. Keeping queued connections prevents a later Accept
+// from returning the stale side of a reused tuple.
+func (l *TCPListener) canReplace(connection *TCPConn) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	select {
+	case <-l.closed:
+		return false
+	default:
+	}
+	_, pending := l.pending[connection]
+	return !pending
 }
 
 // trackCompleted retains a completed SYN-cookie connection until Accept
@@ -4572,6 +4702,78 @@ func (s *Stack) handleTCP(packet ipPacket, receivedAt time.Time, localDestinatio
 	return nil
 }
 
+// tryReplaceTCPTimeWait invokes the lazily installed replacement hook. The
+// short read-side lock is paid only by a fresh SYN reaching TIME-WAIT; normal
+// established traffic never consults the optional passive-dispatch path.
+func (s *Stack) tryReplaceTCPTimeWait(connection *TCPConn, segment tcpSegment) bool {
+	s.mu.RLock()
+	replacer := s.tcpTimeWaitReplacer
+	s.mu.RUnlock()
+	if replacer == nil {
+		return false
+	}
+	return replacer(s, connection, segment)
+}
+
+// replaceTCPTimeWait performs one Linux-style passive tuple replacement after
+// the old actor admits a SYN using RFC 6191 sequence and timestamp checks.
+// Listener replacement keeps the active-connection count and map slot stable;
+// forwarder replacement removes the old slot before reusing the existing SYN
+// request path. Like Linux TCP_TW_SYN, a failed new handshake does not restore
+// the old owner, so this intentionally omits RFC 1122 condition 2.
+func replaceTCPTimeWait(s *Stack, connection *TCPConn, segment tcpSegment) bool {
+	key := connection.key
+	s.mu.Lock()
+	if s.tcp[key] != connection {
+		s.mu.Unlock()
+		return false
+	}
+	passive := s.tcpPassive
+	var listener *TCPListener
+	if passive != nil {
+		listener = passive.timeWaitListener(key.local, key.remote)
+	}
+	if listener != nil {
+		if !listener.canReplace(connection) {
+			s.mu.Unlock()
+			return false
+		}
+		listener.synsReceived.Add(1)
+		initialSequence := connection.timeWaitReplacementSequence()
+		replacement := newTCPConn(s, listener.net, key, s.mtuFor(key.remote.Addr()), listener.options)
+		replacement.passive = true
+		replacement.reuseAddress, replacement.reusePort = listener.reuseAddress, listener.reusePort
+		replacement.publishICMPSequenceRange(initialSequence, initialSequence+1)
+		if !listener.trackHandshake(replacement) {
+			s.mu.Unlock()
+			return false
+		}
+		listener.statefulHandshakes.Add(1)
+		// Replacing the map value preserves the active-connection count. The old
+		// actor's deferred removal checks identity and therefore cannot remove
+		// this new connection.
+		s.tcp[key] = replacement
+		s.mu.Unlock()
+		connection.abortWithoutReset(net.ErrClosed)
+		go replacement.runPassive(listener, segment, initialSequence)
+		return true
+	}
+	forwarder := s.tcpForwarder
+	if forwarder == nil {
+		s.mu.Unlock()
+		return false
+	}
+	if forwarder.handleTimeWaitSegment(segment, key) {
+		delete(s.tcp, key)
+		s.stats.activeTCPConnections.Add(^uint64(0))
+		s.mu.Unlock()
+		connection.abortWithoutReset(net.ErrClosed)
+		return true
+	}
+	s.mu.Unlock()
+	return false
+}
+
 // rejectTCPSegment makes one best-effort attempt to emit the RFC 9293 response
 // for an otherwise unhandled segment. Incoming resets never elicit another
 // reset, and output capacity drops the response without becoming a caller
@@ -4679,6 +4881,12 @@ func (state *tcpPassiveState) handleSegment(stack *Stack, packet ipPacket, segme
 		return state.handleSYNCookieACK(stack, segment, key)
 	}
 	return false, nil
+}
+
+// timeWaitListener implements the passive dispatch lookup used by tuple
+// replacement. The caller holds Stack.mu, just as it does for listener().
+func (state *tcpPassiveState) timeWaitListener(local, remote netip.AddrPort) *TCPListener {
+	return state.listener(local, remote)
 }
 
 // handleSYN allocates the ordinary half-open state when capacity permits and
@@ -5004,6 +5212,20 @@ func (c *TCPConn) takeActorWake() uint32 { return c.actorWakeFlags.Swap(0) }
 // upper endpoint.
 func (c *TCPConn) publishICMPSequenceRange(unacknowledged, next uint32) {
 	c.icmpSequence.Store(uint64(unacknowledged)<<32 | uint64(next))
+}
+
+// timeWaitReplacementSequence selects the new local ISN required when a
+// TIME-WAIT tuple is reopened. RFC 1122/RFC 6191 require it to exceed the
+// previous incarnation's largest local sequence; Linux's TCP_TW_SYN path uses
+// tw_snd_nxt+65535+2. The published ICMP range already carries that final
+// send-next value, so the cold replacement path needs no extra per-connection
+// state.
+func (c *TCPConn) timeWaitReplacementSequence() uint32 {
+	sequence := uint32(c.icmpSequence.Load()) + 65535 + 2
+	if sequence == 0 {
+		sequence++
+	}
+	return sequence
 }
 
 // acceptsICMPQuote reports whether the quoted TCP sequence belongs to data,
@@ -8403,15 +8625,13 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				// close at a zero window and defer EOF until the peer's RTO.
 				payloadLength := uint32(len(segment.payload))
 				receiveWindow := state.receiveWindowState.size(state.receiveNext)
-				retransmittedTimeWaitFIN := state.timeWaitArmed && segment.flags&(TCPFlagRST|TCPFlagSYN) == 0 &&
-					segment.flags&(TCPFlagACK|TCPFlagFIN) == TCPFlagACK|TCPFlagFIN &&
-					segment.sequence+uint32(len(segment.payload))+1 == state.receiveNext
-				if !tcpSegmentAcceptable(segment.sequence, payloadLength, state.receiveNext, receiveWindow) {
-					if retransmittedTimeWaitFIN {
-						state.trySendACK()
-						state.armClose(time.Now(), tcpTimeWaitDuration)
-						continue
+				if state.timeWaitArmed {
+					if state.handleTimeWaitSegment(segment, receivedAt) {
+						return nil
 					}
+					continue
+				}
+				if !tcpSegmentAcceptable(segment.sequence, payloadLength, state.receiveNext, receiveWindow) {
 					if segment.flags&TCPFlagRST == 0 {
 						if tcpKeepAliveOrWindowProbe(segment, payloadLength, state.receiveNext, receiveWindow) {
 							state.trySendACK()
@@ -8429,7 +8649,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 						continue
 					}
 					timestampEcho = echo
-					if receivedAt.Sub(state.lastTimestampUpdate) < 24*24*time.Hour && tcpSequenceLess(timestampValue, c.recentTimestamp) {
+					if receivedAt.Sub(state.lastTimestampUpdate) < tcpPAWSMaxAge && tcpSequenceLess(timestampValue, c.recentTimestamp) {
 						state.trySendChallengeACK()
 						continue
 					}

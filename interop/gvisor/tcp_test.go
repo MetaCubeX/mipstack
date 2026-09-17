@@ -64,6 +64,82 @@ func TestTCPInterop(t *testing.T) {
 	}
 }
 
+// TestTCPTimeWaitReuseInterop verifies that a gVisor active opener can reuse
+// the same local port against a mipstack listener while the first server-side
+// incarnation remains in TIME-WAIT. Both handshakes exercise the RFC 6191
+// wire timestamp admission check.
+func TestTCPTimeWaitReuseInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			network := newFamilyInteropNetwork(t, family, 1500)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			const (
+				serverPort = 41011
+				clientPort = 41012
+			)
+			listener, err := network.mipstack.ListenTCP(ctx, family.tcpNetwork, netipAddrPort(family.mipstackAddress, serverPort))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			accept := func() net.Conn {
+				connection, acceptErr := listener.Accept()
+				if acceptErr != nil {
+					t.Fatalf("Accept: %v", acceptErr)
+				}
+				return connection
+			}
+			local := gvisorFullAddress(family.gvisorAddress, clientPort)
+			remote := gvisorFullAddress(family.mipstackAddress, serverPort)
+			first, err := gonet.DialTCPWithBind(ctx, network.gvisor, local, remote, family.networkProtocol)
+			if err != nil {
+				t.Fatalf("first gVisor DialTCPWithBind: %v", err)
+			}
+			firstServer := accept()
+			if err = firstServer.(*mipstack.TCPConn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			_ = first.SetReadDeadline(time.Now().Add(time.Second))
+			if n, readErr := first.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+				t.Fatalf("first gVisor FIN read = %d, %v", n, readErr)
+			}
+			if err = first.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			_ = firstServer.SetReadDeadline(time.Now().Add(time.Second))
+			if n, readErr := firstServer.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+				t.Fatalf("first mipstack FIN read = %d, %v", n, readErr)
+			}
+			deadline := time.Now().Add(time.Second)
+			for firstServer.(*mipstack.TCPConn).Info().State != mipstack.TCPStateTimeWait && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if state := firstServer.(*mipstack.TCPConn).Info().State; state != mipstack.TCPStateTimeWait {
+				t.Fatalf("first mipstack state = %v, want TIME-WAIT", state)
+			}
+			_ = first.Close()
+			_ = firstServer.Close()
+			// gVisor's timestamp clock has millisecond granularity; cross one
+			// tick before reusing the tuple so RFC 6191's newer-TS branch is
+			// deterministic rather than scheduler-dependent.
+			time.Sleep(2 * time.Millisecond)
+
+			second, err := gonet.DialTCPWithBind(ctx, network.gvisor, local, remote, family.networkProtocol)
+			if err != nil {
+				t.Fatalf("same-tuple gVisor DialTCPWithBind: %v", err)
+			}
+			defer second.Close()
+			secondServer := accept()
+			defer secondServer.Close()
+			if got := second.LocalAddr().(*net.TCPAddr).Port; got != clientPort {
+				t.Fatalf("replacement gVisor local port = %d, want %d", got, clientPort)
+			}
+		})
+	}
+}
+
 // TestTCPStoppedDeviceReadInterop verifies that a full embedding-link queue
 // does not couple TCP socket or actor progress to Stack.Read and that the
 // connection resumes without losing either direction when device reads return.

@@ -337,6 +337,11 @@ type Stack struct {
 	icmpForwarder icmpForwarderEndpoints
 	nextPort      [2]automaticPortCursor
 
+	// tcpTimeWaitReplacer is installed lazily by passive TCP endpoints. Keeping
+	// the optional replacement implementation behind this hook lets the linker
+	// remove listener/forwarder tuple-reuse code from dial-only programs.
+	tcpTimeWaitReplacer tcpTimeWaitReplacer
+
 	pathMTUMu sync.RWMutex
 	pathMTU   map[netip.Addr]pathMTUEntry
 
