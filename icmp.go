@@ -1219,7 +1219,7 @@ func (s *Stack) sendAdministrativeUnreachable(packet ipPacket) error {
 	if _, routed := state.routeFor(packet.source); !routed {
 		return syscall.ENETUNREACH
 	}
-	if !s.allowControlResponse(controlResponsePortUnreachable) {
+	if !s.allowControlResponseTo(controlResponsePortUnreachable, packet.source) {
 		return nil
 	}
 	if packet.source.Is4() {
@@ -1240,7 +1240,7 @@ func (s *Stack) sendFragmentReassemblyTimeout(entry *ipPacketReassemblyEntry) er
 		return nil
 	}
 	fragment, ok := parseFragment(state.firstPacket)
-	if !ok || fragment.offset != 0 || packetInvokesICMPError(state.firstPacket) || !s.allowControlResponse(controlResponseFragmentTimeout) {
+	if !ok || fragment.offset != 0 || packetInvokesICMPError(state.firstPacket) || !s.allowControlResponseTo(controlResponseFragmentTimeout, state.source) {
 		return nil
 	}
 	if !state.v6 {
@@ -1491,7 +1491,7 @@ func (s *Stack) sendPortUnreachable(packet ipPacket) error {
 	if _, routed := state.routeFor(packet.source); !routed {
 		return syscall.ENETUNREACH
 	}
-	if !s.allowControlResponse(controlResponsePortUnreachable) {
+	if !s.allowControlResponseTo(controlResponsePortUnreachable, packet.source) {
 		return nil
 	}
 	if packet.source.Is4() {
@@ -1512,7 +1512,7 @@ func (s *Stack) sendProtocolUnreachable(packet ipPacket) error {
 	if _, routed := state.routeFor(packet.source); !routed {
 		return syscall.ENETUNREACH
 	}
-	if !s.allowControlResponse(controlResponseParameterProblem) {
+	if !s.allowControlResponseTo(controlResponseParameterProblem, packet.source) {
 		return nil
 	}
 	if packet.source.Is4() {
@@ -1533,13 +1533,13 @@ func (s *Stack) sendParameterProblem(packet ipPacket) error {
 		if len(packet.original) < 20 || binary.BigEndian.Uint16(packet.original[6:8])&0x1fff != 0 {
 			return nil
 		}
-		if packetInvokesICMPError(packet.original) || !s.allowControlResponse(controlResponseParameterProblem) {
+		if packetInvokesICMPError(packet.original) || !s.allowControlResponseTo(controlResponseParameterProblem, packet.source) {
 			return nil
 		}
 		return s.writeICMPError(packet.target, packet.source, ICMPv4TypeParameterProblem,
 			packet.parameterCode, 0, packet.parameterAt, icmpErrorQuote(packet.original, false))
 	}
-	if packetInvokesICMPError(packet.original) || !s.allowControlResponse(controlResponseParameterProblem) {
+	if packetInvokesICMPError(packet.original) || !s.allowControlResponseTo(controlResponseParameterProblem, packet.source) {
 		return nil
 	}
 	return s.writeICMPError(packet.target, packet.source, ICMPv6TypeParameterProblem,

@@ -7,7 +7,9 @@ import (
 
 // sipHash24 implements SipHash-2-4, a keyed pseudorandom function designed
 // for short inputs. MIPS uses it for RFC 6528 initial sequence numbers,
-// SYN-cookie authentication, and REUSEPORT flow selection. It is kept local
+// SYN-cookie authentication, RFC 6056-style automatic port selection,
+// REUSEPORT flow selection, automatic IPv6 Flow Labels, multicast report
+// randomization, and destination-scoped ICMP error limiting. It is kept local
 // so these features do not add another package's initialization graph.
 func sipHash24(key [16]byte, message []byte) uint64 {
 	length := len(message)

@@ -57,6 +57,23 @@ const (
 	// controlResponseBurst permits short diagnostic bursts without allowing a
 	// packet flood to monopolize the outbound queue.
 	controlResponseBurst = 200
+	// controlResponseTargetRate limits the sustained ICMP error rate for one
+	// normalized destination within a response class. The class-wide bucket
+	// applies the aggregate response limit; RFC 1812 recommends ICMP error rate
+	// limiting and RFC 4443 requires it for ICMPv6 errors.
+	controlResponseTargetRate = controlResponseRate / 4
+	// controlResponseTargetBurst limits the initial ICMP error burst for one
+	// normalized destination within a response class.
+	controlResponseTargetBurst = controlResponseBurst / 4
+	// controlResponseTargetEntries is the number of exact destination entries.
+	// Destinations beyond this table use fixed shared overflow buckets.
+	controlResponseTargetEntries = 64
+	// controlResponseTargetOverflowBuckets is the number of fixed buckets shared
+	// by destinations that do not have an exact table entry.
+	controlResponseTargetOverflowBuckets = 8
+	// controlResponseTargetIdle is the minimum age before an exact destination
+	// slot can be reassigned.
+	controlResponseTargetIdle = time.Minute
 	// recentDestinationMaximum bounds ICMP correlation state for one
 	// connectionless socket.
 	recentDestinationMaximum = 256
@@ -345,13 +362,14 @@ type Stack struct {
 	pathMTUMu sync.RWMutex
 	pathMTU   map[netip.Addr]pathMTUEntry
 
-	ipv4ID          atomic.Uint32
-	ipv6FragmentID  atomic.Uint32
-	nextOutputFlow  atomic.Uint64
-	closeCh         chan struct{}
-	timestampEpoch  time.Time
-	tcpISNSecret    [16]byte
-	flowLabelSecret [16]byte
+	ipv4ID                atomic.Uint32
+	ipv6FragmentID        atomic.Uint32
+	nextOutputFlow        atomic.Uint64
+	closeCh               chan struct{}
+	timestampEpoch        time.Time
+	tcpISNSecret          [16]byte
+	flowLabelSecret       [16]byte
+	controlResponseSecret [16]byte
 
 	fragmentMu    sync.Mutex
 	fragments     map[fragmentKey]*ipPacketReassemblyEntry
@@ -360,7 +378,10 @@ type Stack struct {
 
 	controlMu       sync.Mutex
 	controlLimiters [controlResponseClassCount]tokenBucket
-	stats           stackCounters
+	// controlTargets owns destination-scoped ICMP error limiters and is
+	// allocated lazily when that limiter is first used.
+	controlTargets *controlResponseTargetState
+	stats          stackCounters
 }
 
 // inboundDestinationClass keeps local ownership, non-unicast reception, and
@@ -535,7 +556,8 @@ const (
 	// controlResponseTCPChallengeACK limits RFC 5961 acknowledgements for
 	// suspicious segments on established tuples.
 	controlResponseTCPChallengeACK
-	// controlResponsePortUnreachable limits ICMP errors for unbound UDP ports.
+	// controlResponsePortUnreachable limits ICMP destination-unreachable
+	// responses for unbound ports and administratively rejected traffic.
 	controlResponsePortUnreachable
 	// controlResponseEchoReply limits ICMP echo replies.
 	controlResponseEchoReply
@@ -552,6 +574,41 @@ const (
 type tokenBucket struct {
 	tokens  float64
 	updated time.Time
+}
+
+// refill advances a token bucket to now and caps it at burst. Callers hold the
+// lock that protects the bucket while updating it.
+func (b *tokenBucket) refill(now time.Time, rate, burst float64) {
+	if b.updated.IsZero() {
+		b.tokens = burst
+	} else {
+		b.tokens += now.Sub(b.updated).Seconds() * rate
+		if b.tokens > burst {
+			b.tokens = burst
+		}
+	}
+	b.updated = now
+}
+
+// controlResponseTargetEntry associates one normalized IP destination with a
+// bounded per-destination bucket. An invalid destination marks an unused slot.
+type controlResponseTargetEntry struct {
+	destination netip.Addr
+	bucket      tokenBucket
+}
+
+// controlResponseTargetTable stores exact destination buckets and a fixed
+// overflow partition. Lookup uses bounded linear probing from a keyed slot;
+// destinations without an exact slot use the overflow partition.
+type controlResponseTargetTable struct {
+	entries  [controlResponseTargetEntries]controlResponseTargetEntry
+	overflow [controlResponseTargetOverflowBuckets]tokenBucket
+}
+
+// controlResponseTargetState lazily owns one bounded table per response class.
+// It is reachable only through Stack.controlMu.
+type controlResponseTargetState struct {
+	tables [controlResponseClassCount]*controlResponseTargetTable
 }
 
 // pathMTUEntry is one learned destination MTU and its last confirmation.
@@ -2201,9 +2258,9 @@ func New(config Config) (*Stack, error) {
 		return nil, err
 	}
 	// One OS-random read seeds independent port, fragment-ID, RFC 6528,
-	// flow-label, and output-flow spaces. Per-connection ISNs are derived from
-	// tcpISNSecret.
-	var seed [104]byte
+	// flow-label, control-response, and output-flow spaces. Per-connection ISNs
+	// are derived from tcpISNSecret.
+	var seed [120]byte
 	if _, err = rand.Read(seed[:]); err != nil {
 		return nil, err
 	}
@@ -2224,6 +2281,8 @@ func New(config Config) (*Stack, error) {
 	copy(flowLabelSecret[:], seed[72:88])
 	var outputFlowSecret [16]byte
 	copy(outputFlowSecret[:], seed[88:104])
+	var controlResponseSecret [16]byte
+	copy(controlResponseSecret[:], seed[104:120])
 	stack := &Stack{
 		tcp: make(map[tcpKey]*TCPConn), udp: make(map[udpKey]*UDPConn),
 		nextPort: [2]automaticPortCursor{ports4, ports6}, pathMTU: make(map[netip.Addr]pathMTUEntry),
@@ -2233,6 +2292,7 @@ func New(config Config) (*Stack, error) {
 	stack.loopback.initFIFO(loopbackPacketQueue, timestampEpoch)
 	copy(stack.tcpISNSecret[:], seed[24:40])
 	stack.flowLabelSecret = flowLabelSecret
+	stack.controlResponseSecret = controlResponseSecret
 	stack.ipv4ID.Store(ipv4ID)
 	stack.ipv6FragmentID.Store(ipv6FragmentID)
 	stack.network.Store(state)
@@ -2708,15 +2768,7 @@ func (s *Stack) allowControlResponse(class controlResponseClass) bool {
 	s.controlMu.Lock()
 	now := time.Now()
 	bucket := &s.controlLimiters[class]
-	if bucket.updated.IsZero() {
-		bucket.tokens = controlResponseBurst
-	} else {
-		bucket.tokens += now.Sub(bucket.updated).Seconds() * controlResponseRate
-		if bucket.tokens > controlResponseBurst {
-			bucket.tokens = controlResponseBurst
-		}
-	}
-	bucket.updated = now
+	bucket.refill(now, controlResponseRate, controlResponseBurst)
 	allowed := bucket.tokens >= 1
 	if allowed {
 		bucket.tokens--
@@ -2726,6 +2778,79 @@ func (s *Stack) allowControlResponse(class controlResponseClass) bool {
 		s.stats.rateLimitedControlResponses.Add(1)
 	}
 	return allowed
+}
+
+// allowControlResponseTo applies the class-wide and normalized destination
+// buckets as one decision. destination is the final ICMP destination (the
+// source of the packet that triggered the response). Tokens are consumed only
+// after both buckets admit the response.
+func (s *Stack) allowControlResponseTo(class controlResponseClass, destination netip.Addr) bool {
+	if !destination.IsValid() {
+		return s.allowControlResponse(class)
+	}
+	// Use the canonical wire address form for the limiter key.
+	destination = destination.Unmap().WithZone("")
+
+	s.controlMu.Lock()
+	now := time.Now()
+	global := &s.controlLimiters[class]
+	global.refill(now, controlResponseRate, controlResponseBurst)
+	if global.tokens < 1 {
+		s.controlMu.Unlock()
+		s.stats.rateLimitedControlResponses.Add(1)
+		return false
+	}
+
+	target := s.controlResponseTargetBucketLocked(class, destination, now)
+	target.refill(now, controlResponseTargetRate, controlResponseTargetBurst)
+	if target.tokens < 1 {
+		s.controlMu.Unlock()
+		s.stats.rateLimitedControlResponses.Add(1)
+		return false
+	}
+	global.tokens--
+	target.tokens--
+	s.controlMu.Unlock()
+	return true
+}
+
+// controlResponseTargetBucketLocked returns an exact destination bucket or a
+// fixed overflow bucket. It is called only while Stack.controlMu is held.
+func (s *Stack) controlResponseTargetBucketLocked(class controlResponseClass, destination netip.Addr, now time.Time) *tokenBucket {
+	if s.controlTargets == nil {
+		s.controlTargets = &controlResponseTargetState{}
+	}
+	table := s.controlTargets.tables[class]
+	if table == nil {
+		table = &controlResponseTargetTable{}
+		s.controlTargets.tables[class] = table
+	}
+
+	bytes := destination.As16()
+	// SipHash selects the initial slot for bounded linear probing.
+	hash := uint32(sipHash24(s.controlResponseSecret, bytes[:]))
+	start := int(hash % uint32(len(table.entries)))
+	var stale *controlResponseTargetEntry
+	for offset := range table.entries {
+		entry := &table.entries[(start+offset)%len(table.entries)]
+		if entry.destination == destination {
+			return &entry.bucket
+		}
+		if !entry.destination.IsValid() {
+			entry.destination = destination
+			entry.bucket = tokenBucket{}
+			return &entry.bucket
+		}
+		if stale == nil && now.Sub(entry.bucket.updated) >= controlResponseTargetIdle {
+			stale = entry
+		}
+	}
+	if stale != nil {
+		stale.destination = destination
+		stale.bucket = tokenBucket{}
+		return &stale.bucket
+	}
+	return &table.overflow[hash%uint32(len(table.overflow))]
 }
 
 // Start activates packet and socket I/O and starts background maintenance.

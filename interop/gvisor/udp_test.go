@@ -18,6 +18,8 @@ import (
 	"github.com/metacubex/gvisor/pkg/tcpip/adapters/gonet"
 	"github.com/metacubex/gvisor/pkg/tcpip/checksum"
 	"github.com/metacubex/gvisor/pkg/tcpip/header"
+	"github.com/metacubex/gvisor/pkg/tcpip/stack"
+	"github.com/metacubex/gvisor/pkg/tcpip/transport/raw"
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/udp"
 	"github.com/metacubex/gvisor/pkg/waiter"
 	"github.com/metacubex/mipstack"
@@ -1020,6 +1022,184 @@ func validateControlledIPHeader(t *testing.T, family interopFamily, packet []byt
 	trafficClass, flowLabel := ipHeader.TOS()
 	if ipHeader.HopLimit() != hopLimit || trafficClass != 0xb8 || flowLabel != 0x34567 {
 		t.Fatalf("controlled IPv6 header hop/class/label = %d/%#x/%#x", ipHeader.HopLimit(), trafficClass, flowLabel)
+	}
+}
+
+// TestUDPClosedPortFairnessInterop verifies destination-scoped ICMP error
+// admission through native gVisor UDP and raw ICMP endpoints. Two gVisor source
+// addresses send a closed-port flood to mipstack, and the corresponding raw
+// endpoints must both receive a standards-valid Port Unreachable response.
+func TestUDPClosedPortFairnessInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			network := newFamilyInteropNetwork(t, family, 1500)
+			sourceA, sourceB := netip.MustParseAddr("192.0.2.3"), netip.MustParseAddr("192.0.2.4")
+			if family.mipstackAddress.Is6() {
+				sourceA, sourceB = netip.MustParseAddr("2001:db8::3"), netip.MustParseAddr("2001:db8::4")
+			}
+			for _, source := range []netip.Addr{sourceA, sourceB} {
+				if tcpipErr := network.gvisor.AddProtocolAddress(interopNIC, tcpip.ProtocolAddress{
+					Protocol: family.networkProtocol,
+					AddressWithPrefix: tcpip.AddressWithPrefix{
+						Address: gvisorAddress(source), PrefixLen: family.prefixBits,
+					},
+				}, stack.AddressProperties{}); tcpipErr != nil {
+					t.Fatalf("add gVisor fairness source address %s: %s", source, tcpipErr.String())
+				}
+			}
+
+			type monitor struct {
+				address       netip.Addr
+				endpoint      tcpip.Endpoint
+				notifications <-chan struct{}
+				sourcePort    uint16
+			}
+			monitors := make([]monitor, 0, 2)
+			for _, source := range []netip.Addr{sourceA, sourceB} {
+				var queue waiter.Queue
+				endpoint, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, family.icmpProtocol, &queue)
+				if tcpipErr != nil {
+					t.Fatalf("create gVisor raw ICMP monitor for %s: %s", source, tcpipErr.String())
+				}
+				if tcpipErr = endpoint.Bind(gvisorFullAddress(source, 0)); tcpipErr != nil {
+					endpoint.Close()
+					t.Fatalf("bind gVisor raw ICMP monitor for %s: %s", source, tcpipErr.String())
+				}
+				entry, notifications := registerReadable(&queue)
+				t.Cleanup(func() {
+					queue.EventUnregister(&entry)
+					endpoint.Close()
+				})
+				monitors = append(monitors, monitor{address: source, endpoint: endpoint, notifications: notifications})
+			}
+
+			connections := make([]*gonet.UDPConn, 0, 2)
+			for _, source := range []netip.Addr{sourceA, sourceB} {
+				connection := newGVisorUDPSocket(t, network, family.networkProtocol, gvisorFullAddress(source, 0), func(tcpip.Endpoint) {})
+				connections = append(connections, connection)
+				t.Cleanup(func() { _ = connection.Close() })
+			}
+			for index := range monitors {
+				monitors[index].sourcePort = requireAddrPort(t, connections[index].LocalAddr()).Port()
+			}
+
+			type result struct {
+				monitor monitor
+				packet  []byte
+				remote  tcpip.FullAddress
+				err     error
+			}
+			results := make(chan result, len(monitors))
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			// Start the native gVisor readers before the flood so a valid response
+			// cannot be displaced by earlier responses waiting in one receive queue.
+			for _, current := range monitors {
+				go func(current monitor) {
+					packet, remote, err := readGVisorEndpoint(ctx, current.endpoint, current.notifications, 65535)
+					results <- result{monitor: current, packet: packet, remote: remote, err: err}
+				}(current)
+			}
+
+			target := net.UDPAddrFromAddrPort(netipAddrPort(family.mipstackAddress, 53000))
+			payload := []byte("fairness")
+			const floodPackets = 2048
+			for index := 0; index < floodPackets; index++ {
+				if written, err := connections[0].WriteTo(payload, target); err != nil || written != len(payload) {
+					t.Fatalf("gVisor source A closed-port flood packet %d: n=%d, error=%v", index, written, err)
+				}
+			}
+			if written, err := connections[1].WriteTo(payload, target); err != nil || written != len(payload) {
+				t.Fatalf("gVisor source B closed-port probe: n=%d, error=%v", written, err)
+			}
+
+			for range monitors {
+				current := <-results
+				if current.err != nil {
+					t.Fatalf("read gVisor ICMP response for %s: %v", current.monitor.address, current.err)
+				}
+				validateGVisorClosedPortError(t, family, current.packet, current.remote, current.monitor.address, current.monitor.sourcePort)
+			}
+			if rateLimited := network.mipstack.Stats().RateLimitedControlResponses; rateLimited == 0 {
+				t.Fatal("closed-port flood did not exercise ICMP response rate limiting")
+			}
+		})
+	}
+}
+
+// validateGVisorClosedPortError checks one ICMP Port Unreachable after the
+// packet has been accepted and delivered by gVisor's raw endpoint.
+func validateGVisorClosedPortError(t *testing.T, family interopFamily, packet []byte, remote tcpip.FullAddress, destination netip.Addr, sourcePort uint16) {
+	t.Helper()
+	if family.mipstackAddress.Is4() {
+		if len(packet) < header.IPv4MinimumSize {
+			t.Fatalf("short gVisor IPv4 packet: %d bytes", len(packet))
+		}
+		outer := header.IPv4(packet)
+		headerSize := int(outer.HeaderLength())
+		if headerSize < header.IPv4MinimumSize || len(packet) < headerSize+header.ICMPv4MinimumSize {
+			t.Fatalf("short gVisor IPv4 ICMP packet: %d bytes", len(packet))
+		}
+		if outer.SourceAddress() != gvisorAddress(family.mipstackAddress) || outer.DestinationAddress() != gvisorAddress(destination) || outer.TransportProtocol() != header.ICMPv4ProtocolNumber {
+			t.Fatalf("gVisor IPv4 ICMP outer packet = %v -> %v, protocol %d", outer.SourceAddress(), outer.DestinationAddress(), outer.TransportProtocol())
+		}
+		if checksum.Checksum(packet[:headerSize], 0) != 0xffff {
+			t.Fatal("gVisor IPv4 outer header checksum is invalid")
+		}
+	}
+	message, err := stripGVisorRawHeader(family, packet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.Addr != gvisorAddress(family.mipstackAddress) {
+		t.Fatalf("gVisor ICMP response source = %v, want %v", remote.Addr, family.mipstackAddress)
+	}
+	if family.mipstackAddress.Is4() {
+		if len(message) < header.ICMPv4MinimumSize || checksum.Checksum(message, 0) != 0xffff {
+			t.Fatalf("invalid gVisor ICMPv4 response checksum or length: %d bytes", len(message))
+		}
+		icmpMessage := header.ICMPv4(message)
+		if icmpMessage.Type() != header.ICMPv4DstUnreachable || icmpMessage.Code() != header.ICMPv4PortUnreachable {
+			t.Fatalf("gVisor ICMPv4 response type/code = %d/%d", icmpMessage.Type(), icmpMessage.Code())
+		}
+	} else {
+		if len(message) < header.ICMPv6MinimumSize || !validIPv6RawChecksum(message, family.mipstackAddress, destination, mipstack.ProtocolICMPv6) {
+			t.Fatalf("invalid gVisor ICMPv6 response checksum or length: %d bytes", len(message))
+		}
+		icmpMessage := header.ICMPv6(message)
+		if icmpMessage.Type() != header.ICMPv6DstUnreachable || icmpMessage.Code() != header.ICMPv6PortUnreachable {
+			t.Fatalf("gVisor ICMPv6 response type/code = %d/%d", icmpMessage.Type(), icmpMessage.Code())
+		}
+	}
+	quote := message[8:]
+	if destination.Is4() {
+		if len(quote) < header.IPv4MinimumSize {
+			t.Fatalf("short quoted IPv4 UDP packet: %d bytes", len(quote))
+		}
+		quoted := header.IPv4(quote)
+		if quoted.SourceAddress() != gvisorAddress(destination) || quoted.DestinationAddress() != gvisorAddress(family.mipstackAddress) || quoted.TransportProtocol() != header.UDPProtocolNumber {
+			t.Fatalf("quoted IPv4 UDP packet = %v -> %v, protocol %d", quoted.SourceAddress(), quoted.DestinationAddress(), quoted.TransportProtocol())
+		}
+		if len(quote) < int(quoted.HeaderLength())+header.UDPMinimumSize {
+			t.Fatalf("short quoted IPv4 UDP header: %d bytes", len(quote))
+		}
+		quotedUDP := header.UDP(quote[quoted.HeaderLength():])
+		if quotedUDP.SourcePort() != sourcePort || quotedUDP.DestinationPort() != 53000 {
+			t.Fatalf("quoted IPv4 UDP ports = %d -> %d, want %d -> 53000", quotedUDP.SourcePort(), quotedUDP.DestinationPort(), sourcePort)
+		}
+	} else {
+		if len(quote) < header.IPv6MinimumSize+header.UDPMinimumSize {
+			t.Fatalf("short quoted IPv6 UDP packet: %d bytes", len(quote))
+		}
+		quoted := header.IPv6(quote)
+		if quoted.SourceAddress() != gvisorAddress(destination) || quoted.DestinationAddress() != gvisorAddress(family.mipstackAddress) || quoted.TransportProtocol() != header.UDPProtocolNumber {
+			t.Fatalf("quoted IPv6 UDP packet = %v -> %v, protocol %d", quoted.SourceAddress(), quoted.DestinationAddress(), quoted.TransportProtocol())
+		}
+		quotedUDP := header.UDP(quote[header.IPv6MinimumSize:])
+		if quotedUDP.SourcePort() != sourcePort || quotedUDP.DestinationPort() != 53000 {
+			t.Fatalf("quoted IPv6 UDP ports = %d -> %d, want %d -> 53000", quotedUDP.SourcePort(), quotedUDP.DestinationPort(), sourcePort)
+		}
 	}
 }
 
