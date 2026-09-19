@@ -4489,13 +4489,18 @@ func TestForwarderRejectRequiresReturnRoute(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.120")
 	remote := netip.MustParseAddr("198.51.100.120")
 	for _, test := range []struct {
-		name          string
-		responseClass controlResponseClass
-		register      func(*Stack, chan<- error) (interface{ Close() error }, error)
-		packet        func() []byte
+		name     string
+		exhaust  func(*Stack)
+		register func(*Stack, chan<- error) (interface{ Close() error }, error)
+		packet   func() []byte
 	}{
 		{
-			name: "TCP", responseClass: controlResponseTCPReset,
+			name: "TCP",
+			exhaust: func(stack *Stack) {
+				stack.controlMu.Lock()
+				stack.controlLimiters[controlResponseTCPReset] = tokenBucket{updated: time.Now().Add(time.Hour)}
+				stack.controlMu.Unlock()
+			},
 			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
 				return NewTCPForwarder(stack, TCPForwarderOptions{}, func(request *TCPForwarderRequest) {
 					result <- request.Reject()
@@ -4506,7 +4511,15 @@ func TestForwarderRejectRequiresReturnRoute(t *testing.T) {
 			},
 		},
 		{
-			name: "UDP", responseClass: controlResponsePortUnreachable,
+			name: "UDP",
+			exhaust: func(stack *Stack) {
+				stack.controlMu.Lock()
+				table := stack.icmpErrorLimiterTableLocked(icmpErrorResponsePortUnreachable)
+				future := time.Now().Add(time.Hour)
+				table.aggregate = tokenBucket{updated: future}
+				table.reserveAggregate = tokenBucket{updated: future}
+				stack.controlMu.Unlock()
+			},
 			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
 				return NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
 					result <- request.Reject()
@@ -4515,7 +4528,15 @@ func TestForwarderRejectRequiresReturnRoute(t *testing.T) {
 			packet: func() []byte { return buildTestUDP(remote, local, 53002, 53, []byte("query")) },
 		},
 		{
-			name: "IP", responseClass: controlResponseParameterProblem,
+			name: "IP",
+			exhaust: func(stack *Stack) {
+				stack.controlMu.Lock()
+				table := stack.icmpErrorLimiterTableLocked(icmpErrorResponseParameterProblem)
+				future := time.Now().Add(time.Hour)
+				table.aggregate = tokenBucket{updated: future}
+				table.reserveAggregate = tokenBucket{updated: future}
+				stack.controlMu.Unlock()
+			},
 			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
 				return NewIPForwarder(stack, IPForwarderOptions{}, func(request *IPForwarderRequest) {
 					result <- request.Reject()
@@ -4524,7 +4545,15 @@ func TestForwarderRejectRequiresReturnRoute(t *testing.T) {
 			packet: func() []byte { return buildIPPacket(remote, local, 99, []byte("request"), 1, true) },
 		},
 		{
-			name: "ICMP", responseClass: controlResponsePortUnreachable,
+			name: "ICMP",
+			exhaust: func(stack *Stack) {
+				stack.controlMu.Lock()
+				table := stack.icmpErrorLimiterTableLocked(icmpErrorResponsePortUnreachable)
+				future := time.Now().Add(time.Hour)
+				table.aggregate = tokenBucket{updated: future}
+				table.reserveAggregate = tokenBucket{updated: future}
+				stack.controlMu.Unlock()
+			},
 			register: func(stack *Stack, result chan<- error) (interface{ Close() error }, error) {
 				return NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
 					result <- request.Reject()
@@ -4551,7 +4580,7 @@ func TestForwarderRejectRequiresReturnRoute(t *testing.T) {
 			t.Cleanup(func() { _ = stack.Close() })
 			// Route validation must not be hidden by a concurrently exhausted
 			// control-response limiter.
-			stack.controlLimiters[test.responseClass] = tokenBucket{updated: time.Now().Add(time.Hour)}
+			test.exhaust(stack)
 			result := make(chan error, 1)
 			forwarder, err := test.register(stack, result)
 			if err != nil {

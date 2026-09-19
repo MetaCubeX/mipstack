@@ -1128,6 +1128,127 @@ func TestUDPClosedPortFairnessInterop(t *testing.T) {
 	}
 }
 
+// TestUDPClosedPortMultiSourceFairnessInterop verifies that several native
+// gVisor sources cannot consume every immediately available ICMP error
+// response for unrelated sources. Responses are accepted and decoded by
+// gVisor raw endpoints after traversing the complete packet bridge.
+func TestUDPClosedPortMultiSourceFairnessInterop(t *testing.T) {
+	const (
+		attackerCount = 4
+		attackerBurst = 256
+		victimCount   = 16
+	)
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			network := newFamilyInteropNetwork(t, family, 1500)
+			sources := make([]netip.Addr, attackerCount+victimCount)
+			for index := range sources {
+				if family.mipstackAddress.Is4() {
+					sources[index] = netip.AddrFrom4([4]byte{192, 0, 2, byte(index + 3)})
+				} else {
+					address := [16]byte{0x20, 0x01, 0x0d, 0xb8}
+					address[15] = byte(index + 3)
+					sources[index] = netip.AddrFrom16(address)
+				}
+				if tcpipErr := network.gvisor.AddProtocolAddress(interopNIC, tcpip.ProtocolAddress{
+					Protocol: family.networkProtocol,
+					AddressWithPrefix: tcpip.AddressWithPrefix{
+						Address: gvisorAddress(sources[index]), PrefixLen: family.prefixBits,
+					},
+				}, stack.AddressProperties{}); tcpipErr != nil {
+					t.Fatalf("add gVisor multi-source address %s: %s", sources[index], tcpipErr.String())
+				}
+			}
+
+			type monitor struct {
+				address       netip.Addr
+				endpoint      tcpip.Endpoint
+				notifications <-chan struct{}
+				sourcePort    uint16
+			}
+			monitors := make([]monitor, 0, victimCount)
+			for _, source := range sources[attackerCount:] {
+				var queue waiter.Queue
+				endpoint, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, family.icmpProtocol, &queue)
+				if tcpipErr != nil {
+					t.Fatalf("create gVisor raw ICMP monitor for %s: %s", source, tcpipErr.String())
+				}
+				if tcpipErr = endpoint.Bind(gvisorFullAddress(source, 0)); tcpipErr != nil {
+					endpoint.Close()
+					t.Fatalf("bind gVisor raw ICMP monitor for %s: %s", source, tcpipErr.String())
+				}
+				entry, notifications := registerReadable(&queue)
+				t.Cleanup(func() {
+					queue.EventUnregister(&entry)
+					endpoint.Close()
+				})
+				monitors = append(monitors, monitor{address: source, endpoint: endpoint, notifications: notifications})
+			}
+
+			connections := make([]*gonet.UDPConn, 0, len(sources))
+			for _, source := range sources {
+				connection := newGVisorUDPSocket(t, network, family.networkProtocol, gvisorFullAddress(source, 0), func(tcpip.Endpoint) {})
+				connections = append(connections, connection)
+				t.Cleanup(func() { _ = connection.Close() })
+			}
+			for index := range monitors {
+				monitors[index].sourcePort = requireAddrPort(t, connections[attackerCount+index].LocalAddr()).Port()
+			}
+
+			type result struct {
+				monitor monitor
+				packet  []byte
+				remote  tcpip.FullAddress
+				err     error
+			}
+			results := make(chan result, len(monitors))
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			for _, current := range monitors {
+				go func(current monitor) {
+					packet, remote, err := readGVisorEndpoint(ctx, current.endpoint, current.notifications, 65535)
+					results <- result{monitor: current, packet: packet, remote: remote, err: err}
+				}(current)
+			}
+
+			target := net.UDPAddrFromAddrPort(netipAddrPort(family.mipstackAddress, 53000))
+			payload := []byte("multi-source-fairness")
+			for packet := 0; packet < attackerBurst; packet++ {
+				for source := 0; source < attackerCount; source++ {
+					if written, err := connections[source].WriteTo(payload, target); err != nil || written != len(payload) {
+						t.Fatalf("gVisor attacker %d packet %d: n=%d, error=%v", source, packet, written, err)
+					}
+				}
+			}
+			for index := range monitors {
+				if written, err := connections[attackerCount+index].WriteTo(payload, target); err != nil || written != len(payload) {
+					t.Fatalf("gVisor victim %d probe: n=%d, error=%v", index, written, err)
+				}
+			}
+
+			admitted := false
+			for range monitors {
+				current := <-results
+				if current.err != nil {
+					continue
+				}
+				if !admitted {
+					validateGVisorClosedPortError(t, family, current.packet, current.remote, current.monitor.address, current.monitor.sourcePort)
+					admitted = true
+					cancel()
+				}
+			}
+			if !admitted {
+				t.Fatal("multi-source flood starved every unrelated gVisor source")
+			}
+			if rateLimited := network.mipstack.Stats().RateLimitedControlResponses; rateLimited == 0 {
+				t.Fatal("multi-source flood did not exercise ICMP response rate limiting")
+			}
+		})
+	}
+}
+
 // validateGVisorClosedPortError checks one ICMP Port Unreachable after the
 // packet has been accepted and delivered by gVisor's raw endpoint.
 func validateGVisorClosedPortError(t *testing.T, family interopFamily, packet []byte, remote tcpip.FullAddress, destination netip.Addr, sourcePort uint16) {

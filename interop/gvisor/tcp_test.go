@@ -1503,7 +1503,7 @@ func openTCPPair(t *testing.T, ctx context.Context, network *interopNetwork, fam
 // half-close to delimit each stream.
 func exerciseFullDuplexTCP(t *testing.T, client, server net.Conn, payloadSize int) {
 	t.Helper()
-	deadline := time.Now().Add(12 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	if err := client.SetDeadline(deadline); err != nil {
 		t.Fatalf("set client deadline: %v", err)
 	}

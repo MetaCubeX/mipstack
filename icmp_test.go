@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"math"
 	"net"
 	"net/netip"
 	"reflect"
@@ -2139,32 +2140,37 @@ func TestControlResponseRateLimitAndStats(t *testing.T) {
 	}
 }
 
-// TestControlResponseTargetRateLimitFairness verifies destination-scoped
+// TestICMPErrorTargetRateLimitFairness verifies destination-scoped
 // ICMP-error admission, canonical address keys, and aggregate token handling.
-func TestControlResponseTargetRateLimitFairness(t *testing.T) {
+func TestICMPErrorTargetRateLimitFairness(t *testing.T) {
 	var stack Stack
-	class := controlResponsePortUnreachable
+	class := icmpErrorResponsePortUnreachable
 	sourceA := netip.MustParseAddr("192.0.2.201")
 	sourceB := netip.MustParseAddr("192.0.2.202")
 	now := time.Now()
 	stack.controlMu.Lock()
-	stack.controlLimiters[class] = tokenBucket{tokens: controlResponseBurst, updated: now}
-	targetA := stack.controlResponseTargetBucketLocked(class, sourceA, now)
+	table := stack.icmpErrorLimiterTableLocked(class)
+	table.aggregate = tokenBucket{tokens: icmpErrorAggregateBurst, updated: now}
+	sourceABytes := sourceA.As16()
+	hashA := sipHash24(stack.icmpErrorLimiterSecret, sourceABytes[:])
+	targetA := table.targetBucketLocked(sourceA, hashA, now)
 	*targetA = tokenBucket{tokens: 1, updated: now}
-	targetB := stack.controlResponseTargetBucketLocked(class, sourceB, now)
+	sourceBBytes := sourceB.As16()
+	hashB := sipHash24(stack.icmpErrorLimiterSecret, sourceBBytes[:])
+	targetB := table.targetBucketLocked(sourceB, hashB, now)
 	*targetB = tokenBucket{tokens: 1, updated: now}
 	stack.controlMu.Unlock()
 
-	if !stack.allowControlResponseTo(class, sourceA) {
+	if !stack.allowICMPErrorResponseTo(class, sourceA) {
 		t.Fatal("source A response was unexpectedly limited")
 	}
-	if stack.allowControlResponseTo(class, sourceA) {
+	if stack.allowICMPErrorResponseTo(class, sourceA) {
 		t.Fatal("source A exceeded its destination bucket")
 	}
-	if stack.allowControlResponseTo(class, netip.MustParseAddr("::ffff:192.0.2.201")) {
+	if stack.allowICMPErrorResponseTo(class, netip.MustParseAddr("::ffff:192.0.2.201")) {
 		t.Fatal("IPv4-mapped source A bypassed its destination bucket")
 	}
-	if !stack.allowControlResponseTo(class, sourceB) {
+	if !stack.allowICMPErrorResponseTo(class, sourceB) {
 		t.Fatal("source B was starved by source A")
 	}
 
@@ -2174,15 +2180,18 @@ func TestControlResponseTargetRateLimitFairness(t *testing.T) {
 	var targetRejected Stack
 	now = time.Now()
 	targetRejected.controlMu.Lock()
-	targetBucket := targetRejected.controlResponseTargetBucketLocked(class, sourceA, now)
+	targetTable := targetRejected.icmpErrorLimiterTableLocked(class)
+	targetAddress := sourceA.As16()
+	targetHash := sipHash24(targetRejected.icmpErrorLimiterSecret, targetAddress[:])
+	targetBucket := targetTable.targetBucketLocked(sourceA, targetHash, now)
 	*targetBucket = tokenBucket{updated: now.Add(time.Hour)}
-	targetRejected.controlLimiters[class] = tokenBucket{tokens: 2, updated: now}
+	targetTable.aggregate = tokenBucket{tokens: 2, updated: now}
 	targetRejected.controlMu.Unlock()
-	if targetRejected.allowControlResponseTo(class, sourceA) {
+	if targetRejected.allowICMPErrorResponseTo(class, sourceA) {
 		t.Fatal("empty destination bucket admitted a response")
 	}
 	targetRejected.controlMu.Lock()
-	remaining := targetRejected.controlLimiters[class].tokens
+	remaining := targetTable.aggregate.tokens
 	targetRejected.controlMu.Unlock()
 	if remaining < 1.5 {
 		t.Fatalf("target rejection consumed global token: remaining=%v", remaining)
@@ -2193,71 +2202,284 @@ func TestControlResponseTargetRateLimitFairness(t *testing.T) {
 	var refilled Stack
 	now = time.Now()
 	refilled.controlMu.Lock()
-	refilled.controlLimiters[class] = tokenBucket{updated: now.Add(-time.Second)}
-	refillTarget := refilled.controlResponseTargetBucketLocked(class, sourceA, now.Add(-time.Second))
+	refillTable := refilled.icmpErrorLimiterTableLocked(class)
+	refillTable.aggregate = tokenBucket{updated: now.Add(-time.Second)}
+	refillAddress := sourceA.As16()
+	refillHash := sipHash24(refilled.icmpErrorLimiterSecret, refillAddress[:])
+	refillTarget := refillTable.targetBucketLocked(sourceA, refillHash, now.Add(-time.Second))
 	*refillTarget = tokenBucket{updated: now.Add(-time.Second)}
 	refilled.controlMu.Unlock()
-	if !refilled.allowControlResponseTo(class, sourceA) {
+	if !refilled.allowICMPErrorResponseTo(class, sourceA) {
 		t.Fatal("refilled destination bucket did not admit a response")
 	}
 
-	// A class-wide rejection leaves destination state unallocated.
-	var unallocated Stack
-	unallocated.controlLimiters[class] = tokenBucket{updated: time.Now().Add(time.Hour)}
-	if unallocated.allowControlResponseTo(class, sourceA) {
-		t.Fatal("response passed with an empty global bucket")
-	}
-	if unallocated.controlTargets != nil {
-		t.Fatal("global rejection allocated destination state")
-	}
-
-	// An invalid address retains the legacy class-wide behavior without
-	// allocating a destination table.
+	// An invalid address cannot bypass destination-aware admission or allocate
+	// limiter state.
 	var invalidDestination Stack
-	invalidDestination.controlLimiters[class] = tokenBucket{tokens: 1, updated: time.Now()}
-	if !invalidDestination.allowControlResponseTo(class, netip.Addr{}) {
-		t.Fatal("invalid destination did not use the class-wide limiter")
+	if invalidDestination.allowICMPErrorResponseTo(class, netip.Addr{}) {
+		t.Fatal("invalid destination was admitted")
 	}
-	if invalidDestination.controlTargets != nil {
+	if invalidDestination.icmpErrorLimiters != nil {
 		t.Fatal("invalid destination allocated destination state")
-	}
-
-	// A class-wide rejection leaves the destination token unchanged.
-	stack.controlMu.Lock()
-	target := stack.controlResponseTargetBucketLocked(class, sourceB, time.Now())
-	*target = tokenBucket{tokens: 1, updated: time.Now()}
-	stack.controlLimiters[class] = tokenBucket{tokens: 0, updated: time.Now()}
-	stack.controlMu.Unlock()
-	if stack.allowControlResponseTo(class, sourceB) {
-		t.Fatal("response passed with an empty global bucket")
-	}
-	stack.controlMu.Lock()
-	stack.controlLimiters[class] = tokenBucket{tokens: 1, updated: time.Now()}
-	stack.controlMu.Unlock()
-	if !stack.allowControlResponseTo(class, sourceB) {
-		t.Fatal("destination token was consumed by global rejection")
 	}
 }
 
-// TestControlResponseTargetLimiterUsesDedicatedSecret keeps destination-slot
+// TestICMPErrorReserveIsolationAndEnvelope verifies that keyed reserve leases
+// preserve service for unrelated destinations without bypassing either the
+// per-destination bucket or the class-wide rate and burst envelope.
+func TestICMPErrorReserveIsolationAndEnvelope(t *testing.T) {
+	if icmpErrorAggregateBurst+icmpErrorReserveBurst != controlResponseBurst {
+		t.Fatalf("aggregate and reserve burst = %d, want %d", icmpErrorAggregateBurst+icmpErrorReserveBurst, controlResponseBurst)
+	}
+	if rate := time.Second * icmpErrorReserveBurst / icmpErrorReserveInterval; rate != icmpErrorReserveRate {
+		t.Fatalf("aggregate reserve rate = %v, want %d", rate, icmpErrorReserveRate)
+	}
+
+	var stack Stack
+	stack.timestampEpoch = time.Now()
+	var destinations [icmpErrorReserveBuckets][3]netip.Addr
+	var found [icmpErrorReserveBuckets]int
+	remaining := len(destinations) * len(destinations[0])
+	for value := uint32(1); value < 1<<24 && remaining != 0; value++ {
+		address := netip.AddrFrom4([4]byte{198, byte(value >> 16), byte(value >> 8), byte(value)})
+		addressBytes := address.As16()
+		hash := sipHash24(stack.icmpErrorLimiterSecret, addressBytes[:])
+		first := int(uint32(hash>>32) % icmpErrorReserveBuckets)
+		second := int(uint32(hash>>48) % icmpErrorReserveBuckets)
+		if first != second || found[first] == len(destinations[first]) {
+			continue
+		}
+		destinations[first][found[first]] = address
+		found[first]++
+		remaining--
+	}
+	if remaining != 0 {
+		t.Fatal("could not find reserve-bucket test destinations")
+	}
+
+	// Three destinations with the same candidate pair exercise both collision
+	// fallback and the rule that one destination cannot claim both choices.
+	stack.controlMu.Lock()
+	table := stack.icmpErrorLimiterTableLocked(icmpErrorResponsePortUnreachable)
+	table.aggregate = tokenBucket{tokens: -1000, updated: time.Now()}
+	stack.controlMu.Unlock()
+	first, second, collision := destinations[0][0], destinations[0][1], destinations[0][2]
+	if !stack.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, first) {
+		t.Fatal("first destination did not receive protected service")
+	}
+	stack.controlMu.Lock()
+	firstAddress := first.As16()
+	firstHash := sipHash24(stack.icmpErrorLimiterSecret, firstAddress[:])
+	firstTokens := table.targetBucketLocked(first, firstHash, time.Now()).tokens
+	stack.controlMu.Unlock()
+	if firstTokens >= icmpErrorTargetBurst {
+		t.Fatalf("target tokens after protected admission = %v, want less than %d", firstTokens, icmpErrorTargetBurst)
+	}
+	if stack.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, first) {
+		t.Fatal("one destination consumed both reserve choices")
+	}
+	if !stack.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, second) {
+		t.Fatal("second destination did not use the collision fallback")
+	}
+	if stack.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, collision) {
+		t.Fatal("destination colliding with two occupied reserve slots was admitted")
+	}
+	if victim := destinations[1][0]; !stack.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, victim) {
+		t.Fatal("one occupied pair starved an unrelated destination")
+	}
+
+	// Protected service cannot bypass a target bucket consumed by ordinary
+	// admission.
+	var targetLimited Stack
+	targetLimited.timestampEpoch = time.Now()
+	targetLimited.controlMu.Lock()
+	targetTable := targetLimited.icmpErrorLimiterTableLocked(icmpErrorResponsePortUnreachable)
+	now := time.Now()
+	targetTable.aggregate = tokenBucket{tokens: 1, updated: now}
+	address := first.As16()
+	hash := sipHash24(targetLimited.icmpErrorLimiterSecret, address[:])
+	target := targetTable.targetBucketLocked(first, hash, now)
+	*target = tokenBucket{tokens: 1, updated: now}
+	targetLimited.controlMu.Unlock()
+	if !targetLimited.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, first) {
+		t.Fatal("ordinary service did not consume the available target token")
+	}
+	targetLimited.controlMu.Lock()
+	if target.tokens >= 1 {
+		targetLimited.controlMu.Unlock()
+		t.Fatalf("target tokens after ordinary admission = %v, want less than one", target.tokens)
+	}
+	*target = tokenBucket{updated: time.Now().Add(time.Hour)}
+	now = time.Now()
+	targetTable.aggregate = tokenBucket{tokens: -1000, updated: now}
+	targetTable.reserveAggregate = tokenBucket{tokens: 1, updated: now}
+	targetLimited.controlMu.Unlock()
+	if targetLimited.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, first) {
+		t.Fatal("protected service bypassed an exhausted target bucket")
+	}
+	targetLimited.controlMu.Lock()
+	remainingReserve := targetTable.reserveAggregate.tokens
+	remainingAggregate := targetTable.aggregate.tokens
+	targetLimited.controlMu.Unlock()
+	if remainingReserve < 1 || remainingAggregate < -1000 {
+		t.Fatalf("target rejection consumed aggregate credit: reserve=%v aggregate=%v", remainingReserve, remainingAggregate)
+	}
+
+	// Filling all reserve slots requires one distinct destination per admission.
+	var envelope Stack
+	envelope.timestampEpoch = time.Now()
+	envelope.controlMu.Lock()
+	envelopeTable := envelope.icmpErrorLimiterTableLocked(icmpErrorResponsePortUnreachable)
+	envelopeStart := time.Now()
+	envelopeTable.aggregate = tokenBucket{tokens: -1000, updated: envelopeStart}
+	envelope.controlMu.Unlock()
+	admitted := 0
+	for index := range destinations {
+		for candidate := 0; candidate < icmpErrorReserveGroups; candidate++ {
+			if envelope.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, destinations[index][candidate]) {
+				admitted++
+			}
+		}
+	}
+	if admitted != icmpErrorReserveBurst {
+		t.Fatalf("reserve admissions = %d, want %d", admitted, icmpErrorReserveBurst)
+	}
+	envelope.controlMu.Lock()
+	elapsed := time.Since(envelopeStart)
+	debt := envelopeTable.aggregate.tokens
+	envelopeTable.reserveAggregate = tokenBucket{updated: time.Now().Add(time.Hour)}
+	envelope.controlMu.Unlock()
+	maximumDebt := -1000 - float64(admitted) + elapsed.Seconds()*controlResponseRate + 1e-6
+	if debt > maximumDebt {
+		t.Fatalf("aggregate debt after reserve admissions = %v, want at most %v", debt, maximumDebt)
+	}
+	if envelope.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, destinations[0][2]) {
+		t.Fatal("exhausted reserve admitted another destination")
+	}
+}
+
+// TestICMPErrorReserveProductionIsolation verifies protected admission through
+// the complete UDP-to-ICMP path for both address families after ordinary
+// aggregate credit is exhausted by unrelated destinations.
+func TestICMPErrorReserveProductionIsolation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		local       netip.Addr
+		candidate   func(uint32) netip.Addr
+		protocol    byte
+		messageType byte
+		code        byte
+	}{
+		{
+			name:  "IPv4",
+			local: netip.MustParseAddr("192.0.2.212"),
+			candidate: func(value uint32) netip.Addr {
+				return netip.AddrFrom4([4]byte{198, byte(value >> 16), byte(value >> 8), byte(value)})
+			},
+			protocol:    ProtocolICMPv4,
+			messageType: ICMPv4TypeDestinationUnreachable,
+			code:        ICMPv4DestinationUnreachableCodePort,
+		},
+		{
+			name:  "IPv6",
+			local: netip.MustParseAddr("2001:db8::212"),
+			candidate: func(value uint32) netip.Addr {
+				var address [16]byte
+				address[0], address[1], address[2], address[3] = 0x20, 0x01, 0x0d, 0xb8
+				address[4], address[5], address[6], address[7] = 0, 0, 0, 0x03
+				binary.BigEndian.PutUint32(address[12:], value)
+				return netip.AddrFrom16(address)
+			},
+			protocol:    ProtocolICMPv6,
+			messageType: ICMPv6TypeDestinationUnreachable,
+			code:        ICMPv6DestinationUnreachableCodePort,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.local, test.local.BitLen())}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = stack.Close() })
+
+			var sources [5]netip.Addr
+			remaining := len(sources)
+			for value := uint32(1); value < 1<<24 && remaining != 0; value++ {
+				address := test.candidate(value)
+				addressBytes := address.As16()
+				hash := sipHash24(stack.icmpErrorLimiterSecret, addressBytes[:])
+				first := int(uint32(hash>>32) % icmpErrorReserveBuckets)
+				second := int(uint32(hash>>48) % icmpErrorReserveBuckets)
+				if first != second || first >= len(sources) || sources[first].IsValid() {
+					continue
+				}
+				sources[first] = address
+				remaining--
+			}
+			if remaining != 0 {
+				t.Fatal("could not find reserve-isolation source addresses")
+			}
+
+			stack.controlMu.Lock()
+			table := stack.icmpErrorLimiterTableLocked(icmpErrorResponsePortUnreachable)
+			table.aggregate = tokenBucket{updated: time.Now().Add(time.Hour)}
+			stack.controlMu.Unlock()
+			send := func(source netip.Addr, sourcePort uint16) bool {
+				if err = writeTestPacket(stack, buildTestUDP(source, test.local, sourcePort, 53000, []byte("reserve"))); err != nil {
+					t.Fatal(err)
+				}
+				entry, ok := stack.outbound.tryDequeue()
+				if !ok {
+					return false
+				}
+				response, parsed := parseIPPacket(consumeTestPacket(&stack.outbound, entry))
+				if !parsed || response.protocol != test.protocol || response.target != source || len(response.payload) < 2 || response.payload[0] != test.messageType || response.payload[1] != test.code {
+					t.Fatalf("source %s response = %#v", source, response)
+				}
+				return true
+			}
+			for index, source := range sources[:4] {
+				if !send(source, uint16(44000+index*4)) {
+					t.Fatalf("attacker source %s did not receive protected service", source)
+				}
+				for repeat := 1; repeat < 4; repeat++ {
+					if send(source, uint16(44000+index*4+repeat)) {
+						t.Fatalf("attacker source %s consumed a second protected response", source)
+					}
+				}
+			}
+			if !send(sources[4], 44100) {
+				t.Fatal("unrelated source was starved by protected-service attackers")
+			}
+			if send(sources[4], 44101) {
+				t.Fatal("unrelated source consumed a second protected response")
+			}
+		})
+	}
+}
+
+// TestICMPErrorLimiterUsesDedicatedSecret keeps destination-slot
 // selection independent from the protocol-visible IPv6 Flow Label hash.
-func TestControlResponseTargetLimiterUsesDedicatedSecret(t *testing.T) {
+func TestICMPErrorLimiterUsesDedicatedSecret(t *testing.T) {
 	destination := netip.MustParseAddr("198.51.100.18")
-	class := controlResponsePortUnreachable
+	class := icmpErrorResponsePortUnreachable
 	flowSecret := [16]byte{0x11}
-	controlSecret := [16]byte{0x22}
+	limiterSecret := [16]byte{0x22}
 	address := destination.As16()
 	expectedIndex := func(secret [16]byte) int {
-		return int(uint32(sipHash24(secret, address[:])) % uint32(controlResponseTargetEntries))
+		return int(uint32(sipHash24(secret, address[:])) % uint32(icmpErrorTargetEntries))
 	}
-	if expectedIndex(flowSecret) == expectedIndex(controlSecret) {
+	if expectedIndex(flowSecret) == expectedIndex(limiterSecret) {
 		t.Fatal("test keys selected the same destination slot")
 	}
-	lookupIndex := func(flowSecret, controlSecret [16]byte) int {
-		stack := Stack{flowLabelSecret: flowSecret, controlResponseSecret: controlSecret}
+	lookupIndex := func(flowSecret, limiterSecret [16]byte) int {
+		stack := Stack{flowLabelSecret: flowSecret, icmpErrorLimiterSecret: limiterSecret}
 		stack.controlMu.Lock()
-		stack.controlResponseTargetBucketLocked(class, destination, time.Now())
-		table := stack.controlTargets.tables[class]
+		table := stack.icmpErrorLimiterTableLocked(class)
+		table.targetBucketLocked(destination, sipHash24(limiterSecret, address[:]), time.Now())
 		index := -1
 		for candidate, entry := range table.entries {
 			if entry.destination == destination {
@@ -2269,11 +2491,11 @@ func TestControlResponseTargetLimiterUsesDedicatedSecret(t *testing.T) {
 		return index
 	}
 
-	index := lookupIndex(flowSecret, controlSecret)
-	if index != expectedIndex(controlSecret) {
-		t.Fatalf("destination slot = %d, want slot selected by control-response secret %d", index, expectedIndex(controlSecret))
+	index := lookupIndex(flowSecret, limiterSecret)
+	if index != expectedIndex(limiterSecret) {
+		t.Fatalf("destination slot = %d, want slot selected by ICMP-error limiter secret %d", index, expectedIndex(limiterSecret))
 	}
-	if index != lookupIndex([16]byte{0x33}, controlSecret) {
+	if index != lookupIndex([16]byte{0x33}, limiterSecret) {
 		t.Fatal("changing the Flow Label secret changed destination-slot selection")
 	}
 
@@ -2287,27 +2509,26 @@ func TestControlResponseTargetLimiterUsesDedicatedSecret(t *testing.T) {
 		}
 	}
 	if !foundAlternate {
-		t.Fatal("could not find an alternate control-response slot")
+		t.Fatal("could not find an alternate ICMP-error limiter slot")
 	}
 	if alternateIndex := lookupIndex(flowSecret, alternate); alternateIndex != expectedIndex(alternate) {
-		t.Fatalf("destination slot with alternate control-response secret = %d, want %d", alternateIndex, expectedIndex(alternate))
+		t.Fatalf("destination slot with alternate ICMP-error limiter secret = %d, want %d", alternateIndex, expectedIndex(alternate))
 	}
 }
 
-// TestControlResponseTargetLimiterBounded verifies that destination limiter
+// TestICMPErrorLimiterBounded verifies that destination limiter
 // state remains bounded for arbitrary response destinations.
-func TestControlResponseTargetLimiterBounded(t *testing.T) {
+func TestICMPErrorLimiterBounded(t *testing.T) {
 	var stack Stack
-	class := controlResponseParameterProblem
-	stack.controlLimiters[class] = tokenBucket{tokens: 100000, updated: time.Now()}
-	for index := 0; index < controlResponseTargetEntries+controlResponseTargetOverflowBuckets+16; index++ {
+	class := icmpErrorResponseParameterProblem
+	for index := 0; index < icmpErrorTargetEntries+icmpErrorTargetOverflowBuckets+16; index++ {
 		address := netip.AddrFrom4([4]byte{198, 51, 100, byte(index)})
-		if !stack.allowControlResponseTo(class, address) {
+		if !stack.allowICMPErrorResponseTo(class, address) {
 			t.Fatalf("address %s was unexpectedly limited", address)
 		}
 	}
 	stack.controlMu.Lock()
-	state := stack.controlTargets
+	state := stack.icmpErrorLimiters
 	if state == nil || state.tables[class] == nil {
 		stack.controlMu.Unlock()
 		t.Fatal("source churn did not allocate destination table")
@@ -2327,44 +2548,48 @@ func TestControlResponseTargetLimiterBounded(t *testing.T) {
 		}
 	}
 	stack.controlMu.Unlock()
-	if exact != controlResponseTargetEntries {
-		t.Fatalf("exact target entries = %d, want %d", exact, controlResponseTargetEntries)
+	if exact != icmpErrorTargetEntries {
+		t.Fatalf("exact target entries = %d, want %d", exact, icmpErrorTargetEntries)
 	}
 	if !overflowUsed {
 		t.Fatal("source churn did not use a fixed overflow bucket")
 	}
 }
 
-// TestControlResponseTargetLimiterOverflowCollision verifies that full exact
+// TestICMPErrorLimiterOverflowCollision verifies that full exact
 // tables use shared overflow buckets and that one overflow bucket does not
 // affect destinations assigned to another bucket.
-func TestControlResponseTargetLimiterOverflowCollision(t *testing.T) {
+func TestICMPErrorLimiterOverflowCollision(t *testing.T) {
 	var stack Stack
-	class := controlResponseParameterProblem
+	class := icmpErrorResponseParameterProblem
 	now := time.Now()
 	stack.controlMu.Lock()
-	stack.controlLimiters[class] = tokenBucket{tokens: controlResponseBurst, updated: now}
-	for index := 0; index < controlResponseTargetEntries; index++ {
+	table := stack.icmpErrorLimiterTableLocked(class)
+	table.aggregate = tokenBucket{tokens: icmpErrorAggregateBurst, updated: now}
+	for index := 0; index < icmpErrorTargetEntries; index++ {
 		address := netip.AddrFrom4([4]byte{198, 51, byte(index >> 8), byte(index)})
-		bucket := stack.controlResponseTargetBucketLocked(class, address, now)
-		*bucket = tokenBucket{tokens: controlResponseTargetBurst, updated: now}
+		addressBytes := address.As16()
+		hash := sipHash24(stack.icmpErrorLimiterSecret, addressBytes[:])
+		bucket := table.targetBucketLocked(address, hash, now)
+		*bucket = tokenBucket{tokens: icmpErrorTargetBurst, updated: now}
 	}
-	table := stack.controlTargets.tables[class]
 	exact := 0
 	for _, entry := range table.entries {
 		if entry.destination.IsValid() {
 			exact++
 		}
 	}
-	if exact != controlResponseTargetEntries {
+	if exact != icmpErrorTargetEntries {
 		stack.controlMu.Unlock()
-		t.Fatalf("exact target entries = %d, want %d", exact, controlResponseTargetEntries)
+		t.Fatalf("exact target entries = %d, want %d", exact, icmpErrorTargetEntries)
 	}
 	var first, collision, separate netip.Addr
 	var firstBucket, collisionBucket, separateBucket *tokenBucket
-	for index := controlResponseTargetEntries; index < 65536 && (!first.IsValid() || !collision.IsValid() || !separate.IsValid()); index++ {
+	for index := icmpErrorTargetEntries; index < 65536 && (!first.IsValid() || !collision.IsValid() || !separate.IsValid()); index++ {
 		address := netip.AddrFrom4([4]byte{198, 51, byte(index >> 8), byte(index)})
-		bucket := stack.controlResponseTargetBucketLocked(class, address, now)
+		addressBytes := address.As16()
+		hash := sipHash24(stack.icmpErrorLimiterSecret, addressBytes[:])
+		bucket := table.targetBucketLocked(address, hash, now)
 		switch {
 		case !first.IsValid():
 			first, firstBucket = address, bucket
@@ -2382,21 +2607,21 @@ func TestControlResponseTargetLimiterOverflowCollision(t *testing.T) {
 	*separateBucket = tokenBucket{tokens: 1, updated: now}
 	stack.controlMu.Unlock()
 
-	if !stack.allowControlResponseTo(class, first) {
+	if !stack.allowICMPErrorResponseTo(class, first) {
 		t.Fatalf("first overflow destination %s was unexpectedly limited", first)
 	}
-	if stack.allowControlResponseTo(class, collision) {
+	if stack.allowICMPErrorResponseTo(class, collision) {
 		t.Fatalf("colliding overflow destination %s bypassed its shared bucket", collision)
 	}
-	if !stack.allowControlResponseTo(class, separate) {
+	if !stack.allowICMPErrorResponseTo(class, separate) {
 		t.Fatalf("separate overflow destination %s was limited by another bucket", separate)
 	}
 }
 
-// TestControlResponseTargetLimiterOverflowCollisionProduction verifies the
+// TestICMPErrorLimiterOverflowCollisionProduction verifies the
 // shared-overflow behavior through the real UDP Port Unreachable path for both
 // address families.
-func TestControlResponseTargetLimiterOverflowCollisionProduction(t *testing.T) {
+func TestICMPErrorLimiterOverflowCollisionProduction(t *testing.T) {
 	for _, test := range []struct {
 		name, local       string
 		filled, candidate func(uint32) netip.Addr
@@ -2462,28 +2687,30 @@ func TestControlResponseTargetLimiterOverflowCollisionProduction(t *testing.T) {
 				}
 			}
 
-			for index := uint32(1); index <= controlResponseTargetEntries; index++ {
+			for index := uint32(1); index <= icmpErrorTargetEntries; index++ {
 				send(test.filled(index), uint16(40000+index))
 			}
-			class := controlResponsePortUnreachable
+			class := icmpErrorResponsePortUnreachable
 			stack.controlMu.Lock()
-			table := stack.controlTargets.tables[class]
+			table := stack.icmpErrorLimiters.tables[class]
 			exact := 0
 			for _, entry := range table.entries {
 				if entry.destination.IsValid() {
 					exact++
 				}
 			}
-			if exact != controlResponseTargetEntries {
+			if exact != icmpErrorTargetEntries {
 				stack.controlMu.Unlock()
-				t.Fatalf("exact target entries = %d, want %d", exact, controlResponseTargetEntries)
+				t.Fatalf("exact target entries = %d, want %d", exact, icmpErrorTargetEntries)
 			}
 			now := time.Now()
 			var first, collision, separate netip.Addr
 			var firstBucket, collisionBucket, separateBucket *tokenBucket
 			for index := uint32(65); index < 65536 && (!first.IsValid() || !collision.IsValid() || !separate.IsValid()); index++ {
 				address := test.candidate(index)
-				bucket := stack.controlResponseTargetBucketLocked(class, address, now)
+				addressBytes := address.As16()
+				hash := sipHash24(stack.icmpErrorLimiterSecret, addressBytes[:])
+				bucket := table.targetBucketLocked(address, hash, now)
 				switch {
 				case !first.IsValid():
 					first, firstBucket = address, bucket
@@ -2498,7 +2725,7 @@ func TestControlResponseTargetLimiterOverflowCollisionProduction(t *testing.T) {
 				t.Fatal("could not find both colliding and separate overflow destinations")
 			}
 
-			for index := 0; index < controlResponseTargetBurst; index++ {
+			for index := 0; index < icmpErrorTargetBurst; index++ {
 				send(first, uint16(41000+index))
 			}
 			// Keep the shared bucket exhausted for the collision check while still
@@ -2518,21 +2745,24 @@ func TestControlResponseTargetLimiterOverflowCollisionProduction(t *testing.T) {
 	}
 }
 
-// TestControlResponseTargetLimiterReusesIdleSlot verifies reuse of an inactive
+// TestICMPErrorLimiterReusesIdleSlot verifies reuse of an inactive
 // exact destination entry after the table reaches capacity.
-func TestControlResponseTargetLimiterReusesIdleSlot(t *testing.T) {
+func TestICMPErrorLimiterReusesIdleSlot(t *testing.T) {
 	var stack Stack
-	class := controlResponseFragmentTimeout
-	old := time.Now().Add(-2 * controlResponseTargetIdle)
+	class := icmpErrorResponseFragmentTimeout
+	old := time.Now().Add(-2 * icmpErrorTargetIdle)
 	newAddress := netip.MustParseAddr("203.0.113.250")
 	stack.controlMu.Lock()
-	for index := 0; index < controlResponseTargetEntries; index++ {
+	table := stack.icmpErrorLimiterTableLocked(class)
+	for index := 0; index < icmpErrorTargetEntries; index++ {
 		address := netip.AddrFrom4([4]byte{203, 0, 113, byte(index)})
-		bucket := stack.controlResponseTargetBucketLocked(class, address, old)
+		addressBytes := address.As16()
+		hash := sipHash24(stack.icmpErrorLimiterSecret, addressBytes[:])
+		bucket := table.targetBucketLocked(address, hash, old)
 		*bucket = tokenBucket{tokens: 1, updated: old}
 	}
-	stack.controlResponseTargetBucketLocked(class, newAddress, time.Now())
-	table := stack.controlTargets.tables[class]
+	newAddressBytes := newAddress.As16()
+	table.targetBucketLocked(newAddress, sipHash24(stack.icmpErrorLimiterSecret, newAddressBytes[:]), time.Now())
 	stack.controlMu.Unlock()
 
 	found := false
@@ -2546,14 +2776,14 @@ func TestControlResponseTargetLimiterReusesIdleSlot(t *testing.T) {
 			found = true
 		}
 	}
-	if exact != controlResponseTargetEntries || !found {
-		t.Fatalf("idle target reuse = exact %d, want %d, found new address %v", exact, controlResponseTargetEntries, found)
+	if exact != icmpErrorTargetEntries || !found {
+		t.Fatalf("idle target reuse = exact %d, want %d, found new address %v", exact, icmpErrorTargetEntries, found)
 	}
 }
 
 // TestPortUnreachableRateLimitGlobalAggregate exercises the production UDP
-// error path and verifies that destination buckets cannot bypass the class-wide
-// aggregate limit.
+// error path and verifies that ordinary and reserve admissions retain the
+// class-wide rate and burst envelope.
 func TestPortUnreachableRateLimitGlobalAggregate(t *testing.T) {
 	for _, test := range []struct {
 		name, local string
@@ -2595,50 +2825,49 @@ func TestPortUnreachableRateLimitGlobalAggregate(t *testing.T) {
 			if local.Is6() {
 				wantProtocol = ProtocolICMPv6
 			}
-			for sourceIndex, source := range test.sources {
-				for packetIndex := 0; packetIndex < controlResponseTargetBurst; packetIndex++ {
-					if err = writeTestPacket(stack, buildTestUDP(source, local, uint16(42000+sourceIndex*controlResponseTargetBurst+packetIndex), 53000, []byte("probe"))); err != nil {
+			start := time.Now()
+			admitted := 0
+			for packetIndex := 0; packetIndex < icmpErrorTargetBurst+8; packetIndex++ {
+				for sourceIndex, source := range test.sources {
+					if err = writeTestPacket(stack, buildTestUDP(source, local, uint16(42000+sourceIndex*64+packetIndex), 53000, []byte("probe"))); err != nil {
 						t.Fatal(err)
 					}
 					entry, ok := stack.outbound.tryDequeue()
 					if !ok {
-						t.Fatalf("source %s response %d was unexpectedly limited", source, packetIndex+1)
+						continue
 					}
+					admitted++
 					response, parsed := parseIPPacket(consumeTestPacket(&stack.outbound, entry))
 					if !parsed || response.protocol != wantProtocol || response.target != source || len(response.payload) < 2 || response.payload[0] != test.messageType || response.payload[1] != test.code {
 						t.Fatalf("source %s response = %#v", source, response)
 					}
 				}
 			}
-			// All preceding packets produced and consumed a real ICMP response.
-			// Keep the class bucket exhausted for the final aggregate check.
+			maximum := controlResponseBurst + int(math.Ceil(time.Since(start).Seconds()*controlResponseRate))
+			if admitted < icmpErrorAggregateBurst || admitted > maximum {
+				t.Fatalf("admitted responses = %d, want at least %d and at most %d", admitted, icmpErrorAggregateBurst, maximum)
+			}
 			stack.controlMu.Lock()
-			stack.controlLimiters[controlResponsePortUnreachable] = tokenBucket{updated: time.Now().Add(time.Hour)}
+			table := stack.icmpErrorLimiterTableLocked(icmpErrorResponsePortUnreachable)
+			debt := table.aggregate.tokens
 			stack.controlMu.Unlock()
-			lastSource := netip.AddrFrom4([4]byte{198, 51, 100, 5})
-			if local.Is6() {
-				lastSource = netip.MustParseAddr("2001:db8:1::5")
-			}
-			if err = writeTestPacket(stack, buildTestUDP(lastSource, local, 43000, 53000, []byte("aggregate"))); err != nil {
-				t.Fatal(err)
-			}
-			if entry, ok := stack.outbound.tryDequeue(); ok {
-				stack.outbound.release(entry)
-				t.Fatal("class-wide aggregate admitted a response beyond its burst")
+			minimum := -float64(icmpErrorReserveBurst)
+			if debt < minimum {
+				t.Fatalf("aggregate debt = %v, minimum %v", debt, minimum)
 			}
 		})
 	}
 }
 
-// TestControlResponseTargetLimiterProductionPaths verifies destination-scoped
+// TestICMPErrorLimiterProductionPaths verifies destination-scoped
 // admission at each ICMP error generation path.
-func TestControlResponseTargetLimiterProductionPaths(t *testing.T) {
+func TestICMPErrorLimiterProductionPaths(t *testing.T) {
 	type family struct {
 		name, local, sourceA, sourceB, external string
 	}
 	type path struct {
 		name                           string
-		class                          controlResponseClass
+		class                          icmpErrorResponseClass
 		promiscuous                    bool
 		v4Type, v4Code, v6Type, v6Code byte
 		setup                          func(*testing.T, *Stack)
@@ -2650,7 +2879,7 @@ func TestControlResponseTargetLimiterProductionPaths(t *testing.T) {
 	}
 	paths := []path{
 		{
-			name: "AdministrativeUnreachable", class: controlResponsePortUnreachable, promiscuous: true,
+			name: "AdministrativeUnreachable", class: icmpErrorResponsePortUnreachable, promiscuous: true,
 			v4Type: ICMPv4TypeDestinationUnreachable, v4Code: ICMPv4DestinationUnreachableCodeCommunicationAdministrativelyProhibited,
 			v6Type: ICMPv6TypeDestinationUnreachable, v6Code: ICMPv6DestinationUnreachableCodeAdministrativelyProhibited,
 			setup: func(t *testing.T, stack *Stack) {
@@ -2689,7 +2918,7 @@ func TestControlResponseTargetLimiterProductionPaths(t *testing.T) {
 			},
 		},
 		{
-			name: "FragmentReassemblyTimeout", class: controlResponseFragmentTimeout,
+			name: "FragmentReassemblyTimeout", class: icmpErrorResponseFragmentTimeout,
 			v4Type: ICMPv4TypeTimeExceeded, v4Code: ICMPv4TimeExceededCodeFragmentReassembly,
 			v6Type: ICMPv6TypeTimeExceeded, v6Code: ICMPv6TimeExceededCodeFragmentReassembly,
 			inject: func(t *testing.T, stack *Stack, source, target netip.Addr, identification uint16) {
@@ -2710,7 +2939,7 @@ func TestControlResponseTargetLimiterProductionPaths(t *testing.T) {
 			},
 		},
 		{
-			name: "PortUnreachable", class: controlResponsePortUnreachable,
+			name: "PortUnreachable", class: icmpErrorResponsePortUnreachable,
 			v4Type: ICMPv4TypeDestinationUnreachable, v4Code: ICMPv4DestinationUnreachableCodePort,
 			v6Type: ICMPv6TypeDestinationUnreachable, v6Code: ICMPv6DestinationUnreachableCodePort,
 			inject: func(t *testing.T, stack *Stack, source, target netip.Addr, _ uint16) {
@@ -2720,7 +2949,7 @@ func TestControlResponseTargetLimiterProductionPaths(t *testing.T) {
 			},
 		},
 		{
-			name: "ProtocolUnreachable", class: controlResponseParameterProblem,
+			name: "ProtocolUnreachable", class: icmpErrorResponseParameterProblem,
 			v4Type: ICMPv4TypeDestinationUnreachable, v4Code: ICMPv4DestinationUnreachableCodeProtocol,
 			v6Type: ICMPv6TypeParameterProblem, v6Code: ICMPv6ParameterProblemCodeUnrecognizedNextHeader,
 			inject: func(t *testing.T, stack *Stack, source, target netip.Addr, _ uint16) {
@@ -2730,7 +2959,7 @@ func TestControlResponseTargetLimiterProductionPaths(t *testing.T) {
 			},
 		},
 		{
-			name: "ParameterProblem", class: controlResponseParameterProblem,
+			name: "ParameterProblem", class: icmpErrorResponseParameterProblem,
 			v4Type: ICMPv4TypeParameterProblem, v4Code: ICMPv4ParameterProblemCodePointer,
 			v6Type: ICMPv6TypeParameterProblem, v6Code: ICMPv6ParameterProblemCodeUnrecognizedOption,
 			inject: func(t *testing.T, stack *Stack, source, target netip.Addr, _ uint16) {
@@ -2782,7 +3011,7 @@ func TestControlResponseTargetLimiterProductionPaths(t *testing.T) {
 					wantType, wantCode = path.v6Type, path.v6Code
 				}
 				admissionStart := time.Now()
-				for packetIndex := 0; packetIndex < controlResponseTargetBurst; packetIndex++ {
+				for packetIndex := 0; packetIndex < icmpErrorTargetBurst; packetIndex++ {
 					path.inject(t, stack, sourceA, target, uint16(220+packetIndex))
 					entry, ok := stack.outbound.tryDequeue()
 					if !ok {
@@ -2794,9 +3023,9 @@ func TestControlResponseTargetLimiterProductionPaths(t *testing.T) {
 					}
 				}
 				stack.controlMu.Lock()
-				var table *controlResponseTargetTable
-				if stack.controlTargets != nil {
-					table = stack.controlTargets.tables[path.class]
+				var table *icmpErrorLimiterTable
+				if stack.icmpErrorLimiters != nil {
+					table = stack.icmpErrorLimiters.tables[path.class]
 				}
 				var blocked *tokenBucket
 				if table != nil {
@@ -2818,15 +3047,16 @@ func TestControlResponseTargetLimiterProductionPaths(t *testing.T) {
 				// Account for the refill permitted by the elapsed interval rather than
 				// assuming that every admission occurs at the same instant.
 				if elapsed := time.Since(admissionStart); elapsed < 2*time.Second {
-					maxRefill := elapsed.Seconds() * controlResponseTargetRate
+					maxRefill := elapsed.Seconds() * icmpErrorTargetRate
 					if remaining > maxRefill+1e-6 {
-						t.Fatalf("source %s retained %v destination tokens after %d responses (elapsed %v)", sourceA, remaining, controlResponseTargetBurst, elapsed)
+						t.Fatalf("source %s retained %v destination tokens after %d responses (elapsed %v)", sourceA, remaining, icmpErrorTargetBurst, elapsed)
 					}
 				}
 				// Keep the destination bucket exhausted for the next production
 				// admission check.
 				stack.controlMu.Lock()
-				blocked = stack.controlResponseTargetBucketLocked(path.class, sourceA, time.Now())
+				sourceBytes := sourceA.As16()
+				blocked = table.targetBucketLocked(sourceA, sipHash24(stack.icmpErrorLimiterSecret, sourceBytes[:]), time.Now())
 				*blocked = tokenBucket{updated: time.Now().Add(time.Hour)}
 				stack.controlMu.Unlock()
 				path.inject(t, stack, sourceA, target, 280)
@@ -2886,6 +3116,65 @@ func TestLimitedBroadcastSourceIsDropped(t *testing.T) {
 	}
 	if dropped := stack.Stats().InboundDroppedPackets; dropped != 1 {
 		t.Fatalf("limited-broadcast drops = %d, want 1", dropped)
+	}
+}
+
+// BenchmarkICMPErrorLimiterReject measures target, lease, collision, and fully
+// depleted rejection paths under ICMP error pressure.
+func BenchmarkICMPErrorLimiterReject(b *testing.B) {
+	destination := netip.MustParseAddr("198.51.100.201")
+	for _, test := range []struct {
+		name string
+	}{
+		{name: "OrdinaryTarget"},
+		{name: "SameOwner"},
+		{name: "KeyedCollision"},
+		{name: "ReserveExhausted"},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			stack := Stack{timestampEpoch: time.Now(), icmpErrorLimiterSecret: [16]byte{1, 2, 3, 4}}
+			now := time.Now()
+			future := now.Add(time.Hour)
+			futureStamp := monotonicStampAt(stack.timestampEpoch, future)
+			stack.controlMu.Lock()
+			table := stack.icmpErrorLimiterTableLocked(icmpErrorResponsePortUnreachable)
+			address := destination.As16()
+			hash := sipHash24(stack.icmpErrorLimiterSecret, address[:])
+			switch test.name {
+			case "OrdinaryTarget":
+				table.aggregate = tokenBucket{tokens: icmpErrorAggregateBurst, updated: now}
+				*table.targetBucketLocked(destination, hash, now) = tokenBucket{updated: future}
+			case "SameOwner":
+				table.aggregate = tokenBucket{updated: future}
+				table.reserveAggregate = tokenBucket{tokens: icmpErrorReserveBurst, updated: now}
+				table.reserve[0][uint32(hash>>32)%icmpErrorReserveBuckets] = icmpErrorReserveSlot{
+					availableAt: futureStamp,
+					ownerHash:   hash,
+				}
+			case "KeyedCollision":
+				table.aggregate = tokenBucket{updated: future}
+				table.reserveAggregate = tokenBucket{tokens: icmpErrorReserveBurst, updated: now}
+				table.reserve[0][uint32(hash>>32)%icmpErrorReserveBuckets] = icmpErrorReserveSlot{availableAt: futureStamp, ownerHash: hash + 1}
+				table.reserve[1][uint32(hash>>48)%icmpErrorReserveBuckets] = icmpErrorReserveSlot{availableAt: futureStamp, ownerHash: hash + 2}
+			case "ReserveExhausted":
+				table.aggregate = tokenBucket{updated: future}
+				table.reserveAggregate = tokenBucket{updated: future}
+			}
+			stack.controlMu.Unlock()
+			if stack.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, destination) {
+				b.Fatal("benchmark limiter admitted its setup probe")
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			var allowed bool
+			for index := 0; index < b.N; index++ {
+				allowed = stack.allowICMPErrorResponseTo(icmpErrorResponsePortUnreachable, destination)
+			}
+			if allowed {
+				b.Fatal("exhausted limiter admitted a response")
+			}
+		})
 	}
 }
 

@@ -57,23 +57,40 @@ const (
 	// controlResponseBurst permits short diagnostic bursts without allowing a
 	// packet flood to monopolize the outbound queue.
 	controlResponseBurst = 200
-	// controlResponseTargetRate limits the sustained ICMP error rate for one
-	// normalized destination within a response class. The class-wide bucket
-	// applies the aggregate response limit; RFC 1812 recommends ICMP error rate
-	// limiting and RFC 4443 requires it for ICMPv6 errors.
-	controlResponseTargetRate = controlResponseRate / 4
-	// controlResponseTargetBurst limits the initial ICMP error burst for one
-	// normalized destination within a response class.
-	controlResponseTargetBurst = controlResponseBurst / 4
-	// controlResponseTargetEntries is the number of exact destination entries.
+	// icmpErrorTargetRate limits the sustained ICMP error rate for one
+	// normalized destination. RFC 1812 recommends ICMP error rate limiting and
+	// RFC 4443 requires it for ICMPv6 errors.
+	icmpErrorTargetRate = controlResponseRate / 4
+	// icmpErrorTargetBurst limits the initial ICMP error burst for one
+	// normalized destination.
+	icmpErrorTargetBurst = controlResponseBurst / 4
+	// icmpErrorTargetEntries is the number of exact destination entries.
 	// Destinations beyond this table use fixed shared overflow buckets.
-	controlResponseTargetEntries = 64
-	// controlResponseTargetOverflowBuckets is the number of fixed buckets shared
+	icmpErrorTargetEntries = 64
+	// icmpErrorTargetOverflowBuckets is the number of fixed buckets shared
 	// by destinations that do not have an exact table entry.
-	controlResponseTargetOverflowBuckets = 8
-	// controlResponseTargetIdle is the minimum age before an exact destination
+	icmpErrorTargetOverflowBuckets = 8
+	// icmpErrorTargetIdle is the minimum age before an exact destination
 	// slot can be reassigned.
-	controlResponseTargetIdle = time.Minute
+	icmpErrorTargetIdle = time.Minute
+	// icmpErrorReserveGroups provides separate keyed fallback choices when
+	// aggregate ICMP error credit is exhausted.
+	icmpErrorReserveGroups = 2
+	// icmpErrorReserveBuckets partitions each fallback group so one destination
+	// cannot consume every protected response.
+	icmpErrorReserveBuckets = 16
+	// icmpErrorReserveRate bounds all protected service to the same sustained
+	// share available to one exact destination.
+	icmpErrorReserveRate = icmpErrorTargetRate
+	// icmpErrorReserveBurst is the aggregate number of immediately available
+	// protected responses.
+	icmpErrorReserveBurst = icmpErrorReserveGroups * icmpErrorReserveBuckets
+	// icmpErrorReserveInterval gives every protected slot an equal share of the
+	// aggregate reserve rate.
+	icmpErrorReserveInterval = time.Second * icmpErrorReserveBurst / icmpErrorReserveRate
+	// icmpErrorAggregateBurst leaves one burst token protected by each reserve
+	// bucket while preserving the class-wide controlResponseBurst envelope.
+	icmpErrorAggregateBurst = controlResponseBurst - icmpErrorReserveBurst
 	// recentDestinationMaximum bounds ICMP correlation state for one
 	// connectionless socket.
 	recentDestinationMaximum = 256
@@ -362,14 +379,14 @@ type Stack struct {
 	pathMTUMu sync.RWMutex
 	pathMTU   map[netip.Addr]pathMTUEntry
 
-	ipv4ID                atomic.Uint32
-	ipv6FragmentID        atomic.Uint32
-	nextOutputFlow        atomic.Uint64
-	closeCh               chan struct{}
-	timestampEpoch        time.Time
-	tcpISNSecret          [16]byte
-	flowLabelSecret       [16]byte
-	controlResponseSecret [16]byte
+	ipv4ID                 atomic.Uint32
+	ipv6FragmentID         atomic.Uint32
+	nextOutputFlow         atomic.Uint64
+	closeCh                chan struct{}
+	timestampEpoch         time.Time
+	tcpISNSecret           [16]byte
+	flowLabelSecret        [16]byte
+	icmpErrorLimiterSecret [16]byte
 
 	fragmentMu    sync.Mutex
 	fragments     map[fragmentKey]*ipPacketReassemblyEntry
@@ -378,10 +395,10 @@ type Stack struct {
 
 	controlMu       sync.Mutex
 	controlLimiters [controlResponseClassCount]tokenBucket
-	// controlTargets owns destination-scoped ICMP error limiters and is
+	// icmpErrorLimiters owns destination-scoped ICMP error limiters and is
 	// allocated lazily when that limiter is first used.
-	controlTargets *controlResponseTargetState
-	stats          stackCounters
+	icmpErrorLimiters *icmpErrorLimiterState
+	stats             stackCounters
 }
 
 // inboundDestinationClass keeps local ownership, non-unicast reception, and
@@ -556,18 +573,27 @@ const (
 	// controlResponseTCPChallengeACK limits RFC 5961 acknowledgements for
 	// suspicious segments on established tuples.
 	controlResponseTCPChallengeACK
-	// controlResponsePortUnreachable limits ICMP destination-unreachable
-	// responses for unbound ports and administratively rejected traffic.
-	controlResponsePortUnreachable
 	// controlResponseEchoReply limits ICMP echo replies.
 	controlResponseEchoReply
-	// controlResponseParameterProblem limits errors for unsupported IPv6
-	// options and upper-layer protocols.
-	controlResponseParameterProblem
-	// controlResponseFragmentTimeout limits ICMP reassembly timeout errors.
-	controlResponseFragmentTimeout
 	// controlResponseClassCount is the number of independent token buckets.
 	controlResponseClassCount
+)
+
+// icmpErrorResponseClass separates destination-aware ICMP error limiters.
+type icmpErrorResponseClass uint8
+
+const (
+	// icmpErrorResponsePortUnreachable limits destination-unreachable responses
+	// for unbound ports and administratively rejected traffic.
+	icmpErrorResponsePortUnreachable icmpErrorResponseClass = iota
+	// icmpErrorResponseParameterProblem limits errors for unsupported IPv6
+	// options and upper-layer protocols.
+	icmpErrorResponseParameterProblem
+	// icmpErrorResponseFragmentTimeout limits ICMP reassembly timeout errors.
+	icmpErrorResponseFragmentTimeout
+	// icmpErrorResponseClassCount is the number of destination-aware ICMP error
+	// limiters.
+	icmpErrorResponseClassCount
 )
 
 // tokenBucket is one lock-protected control-response limiter.
@@ -590,25 +616,39 @@ func (b *tokenBucket) refill(now time.Time, rate, burst float64) {
 	b.updated = now
 }
 
-// controlResponseTargetEntry associates one normalized IP destination with a
+// icmpErrorTargetEntry associates one normalized IP destination with a
 // bounded per-destination bucket. An invalid destination marks an unused slot.
-type controlResponseTargetEntry struct {
+type icmpErrorTargetEntry struct {
 	destination netip.Addr
 	bucket      tokenBucket
 }
 
-// controlResponseTargetTable stores exact destination buckets and a fixed
-// overflow partition. Lookup uses bounded linear probing from a keyed slot;
-// destinations without an exact slot use the overflow partition.
-type controlResponseTargetTable struct {
-	entries  [controlResponseTargetEntries]controlResponseTargetEntry
-	overflow [controlResponseTargetOverflowBuckets]tokenBucket
+// icmpErrorReserveSlot retains one protected response lease. A destination can
+// hold at most one of its two candidate leases until availableAt.
+type icmpErrorReserveSlot struct {
+	availableAt monotonicStamp
+	ownerHash   uint64
 }
 
-// controlResponseTargetState lazily owns one bounded table per response class.
+// icmpErrorLimiterTable stores one aggregate ledger, exact destination
+// buckets, and fixed overflow and reserve partitions. Lookup uses bounded
+// linear probing from a keyed slot. The fixed reserve provides probabilistic
+// isolation for bounded destination sets; enough distinct destinations can
+// occupy every reserve bucket.
+type icmpErrorLimiterTable struct {
+	aggregate tokenBucket
+	// reserveAggregate bounds the reserve partition's total capacity and refill
+	// rate and lets fully depleted traffic be rejected before hashing.
+	reserveAggregate tokenBucket
+	entries          [icmpErrorTargetEntries]icmpErrorTargetEntry
+	overflow         [icmpErrorTargetOverflowBuckets]tokenBucket
+	reserve          [icmpErrorReserveGroups][icmpErrorReserveBuckets]icmpErrorReserveSlot
+}
+
+// icmpErrorLimiterState lazily owns one bounded table per ICMP error class.
 // It is reachable only through Stack.controlMu.
-type controlResponseTargetState struct {
-	tables [controlResponseClassCount]*controlResponseTargetTable
+type icmpErrorLimiterState struct {
+	tables [icmpErrorResponseClassCount]*icmpErrorLimiterTable
 }
 
 // pathMTUEntry is one learned destination MTU and its last confirmation.
@@ -2258,7 +2298,7 @@ func New(config Config) (*Stack, error) {
 		return nil, err
 	}
 	// One OS-random read seeds independent port, fragment-ID, RFC 6528,
-	// flow-label, control-response, and output-flow spaces. Per-connection ISNs
+	// flow-label, ICMP-error-limiter, and output-flow spaces. Per-connection ISNs
 	// are derived from tcpISNSecret.
 	var seed [120]byte
 	if _, err = rand.Read(seed[:]); err != nil {
@@ -2281,8 +2321,8 @@ func New(config Config) (*Stack, error) {
 	copy(flowLabelSecret[:], seed[72:88])
 	var outputFlowSecret [16]byte
 	copy(outputFlowSecret[:], seed[88:104])
-	var controlResponseSecret [16]byte
-	copy(controlResponseSecret[:], seed[104:120])
+	var icmpErrorLimiterSecret [16]byte
+	copy(icmpErrorLimiterSecret[:], seed[104:120])
 	stack := &Stack{
 		tcp: make(map[tcpKey]*TCPConn), udp: make(map[udpKey]*UDPConn),
 		nextPort: [2]automaticPortCursor{ports4, ports6}, pathMTU: make(map[netip.Addr]pathMTUEntry),
@@ -2292,7 +2332,7 @@ func New(config Config) (*Stack, error) {
 	stack.loopback.initFIFO(loopbackPacketQueue, timestampEpoch)
 	copy(stack.tcpISNSecret[:], seed[24:40])
 	stack.flowLabelSecret = flowLabelSecret
-	stack.controlResponseSecret = controlResponseSecret
+	stack.icmpErrorLimiterSecret = icmpErrorLimiterSecret
 	stack.ipv4ID.Store(ipv4ID)
 	stack.ipv6FragmentID.Store(ipv6FragmentID)
 	stack.network.Store(state)
@@ -2780,59 +2820,101 @@ func (s *Stack) allowControlResponse(class controlResponseClass) bool {
 	return allowed
 }
 
-// allowControlResponseTo applies the class-wide and normalized destination
-// buckets as one decision. destination is the final ICMP destination (the
-// source of the packet that triggered the response). Tokens are consumed only
-// after both buckets admit the response.
-func (s *Stack) allowControlResponseTo(class controlResponseClass, destination netip.Addr) bool {
+// allowICMPErrorResponseTo admits an ICMP error for destination, which is the
+// source of the packet that triggered the response. Every admitted response is
+// charged to one aggregate ledger. Keyed reserve leases partition protected
+// service among destinations after ordinary aggregate credit is spent.
+func (s *Stack) allowICMPErrorResponseTo(class icmpErrorResponseClass, destination netip.Addr) bool {
 	if !destination.IsValid() {
-		return s.allowControlResponse(class)
+		s.stats.rateLimitedControlResponses.Add(1)
+		return false
 	}
-	// Use the canonical wire address form for the limiter key.
 	destination = destination.Unmap().WithZone("")
 
 	s.controlMu.Lock()
 	now := time.Now()
-	global := &s.controlLimiters[class]
-	global.refill(now, controlResponseRate, controlResponseBurst)
-	if global.tokens < 1 {
-		s.controlMu.Unlock()
-		s.stats.rateLimitedControlResponses.Add(1)
-		return false
+	table := s.icmpErrorLimiterTableLocked(class)
+	aggregate := &table.aggregate
+	aggregate.refill(now, controlResponseRate, icmpErrorAggregateBurst)
+	useReserve := aggregate.tokens < 1
+	if useReserve {
+		reserveAggregate := &table.reserveAggregate
+		reserveAggregate.refill(now, icmpErrorReserveRate, icmpErrorReserveBurst)
+		if reserveAggregate.tokens < 1 {
+			s.controlMu.Unlock()
+			s.stats.rateLimitedControlResponses.Add(1)
+			return false
+		}
 	}
 
-	target := s.controlResponseTargetBucketLocked(class, destination, now)
-	target.refill(now, controlResponseTargetRate, controlResponseTargetBurst)
+	address := destination.As16()
+	hash := sipHash24(s.icmpErrorLimiterSecret, address[:])
+	var reserve *icmpErrorReserveSlot
+	var reserveNow monotonicStamp
+	if useReserve {
+		reserveNow = monotonicStampAt(s.timestampEpoch, now)
+		// Reserve choices use disjoint upper hash nibbles because the lower bits
+		// select exact and overflow target buckets.
+		first := &table.reserve[0][uint32(hash>>32)%icmpErrorReserveBuckets]
+		second := &table.reserve[1][uint32(hash>>48)%icmpErrorReserveBuckets]
+		if (first.availableAt > reserveNow && first.ownerHash == hash) ||
+			(second.availableAt > reserveNow && second.ownerHash == hash) {
+			s.controlMu.Unlock()
+			s.stats.rateLimitedControlResponses.Add(1)
+			return false
+		}
+		if first.availableAt <= reserveNow {
+			reserve = first
+		} else if second.availableAt <= reserveNow {
+			reserve = second
+		} else {
+			s.controlMu.Unlock()
+			s.stats.rateLimitedControlResponses.Add(1)
+			return false
+		}
+	}
+	target := table.targetBucketLocked(destination, hash, now)
+	target.refill(now, icmpErrorTargetRate, icmpErrorTargetBurst)
 	if target.tokens < 1 {
 		s.controlMu.Unlock()
 		s.stats.rateLimitedControlResponses.Add(1)
 		return false
 	}
-	global.tokens--
+
+	aggregate.tokens--
 	target.tokens--
+	if reserve != nil {
+		// The aggregate debit may create debt; subsequent refill repays it
+		// before ordinary responses can exceed the total envelope.
+		table.reserveAggregate.tokens--
+		reserve.availableAt = reserveNow + monotonicStamp(icmpErrorReserveInterval)
+		reserve.ownerHash = hash
+	}
 	s.controlMu.Unlock()
 	return true
 }
 
-// controlResponseTargetBucketLocked returns an exact destination bucket or a
-// fixed overflow bucket. It is called only while Stack.controlMu is held.
-func (s *Stack) controlResponseTargetBucketLocked(class controlResponseClass, destination netip.Addr, now time.Time) *tokenBucket {
-	if s.controlTargets == nil {
-		s.controlTargets = &controlResponseTargetState{}
+// icmpErrorLimiterTableLocked returns the lazily allocated table for class. It
+// is called only while Stack.controlMu is held.
+func (s *Stack) icmpErrorLimiterTableLocked(class icmpErrorResponseClass) *icmpErrorLimiterTable {
+	if s.icmpErrorLimiters == nil {
+		s.icmpErrorLimiters = &icmpErrorLimiterState{}
 	}
-	table := s.controlTargets.tables[class]
+	table := s.icmpErrorLimiters.tables[class]
 	if table == nil {
-		table = &controlResponseTargetTable{}
-		s.controlTargets.tables[class] = table
+		table = &icmpErrorLimiterTable{}
+		s.icmpErrorLimiters.tables[class] = table
 	}
+	return table
+}
 
-	bytes := destination.As16()
-	// SipHash selects the initial slot for bounded linear probing.
-	hash := uint32(sipHash24(s.controlResponseSecret, bytes[:]))
-	start := int(hash % uint32(len(table.entries)))
-	var stale *controlResponseTargetEntry
-	for offset := range table.entries {
-		entry := &table.entries[(start+offset)%len(table.entries)]
+// targetBucketLocked returns an exact destination bucket or a fixed overflow
+// bucket. The caller holds the Stack control mutex associated with the table.
+func (t *icmpErrorLimiterTable) targetBucketLocked(destination netip.Addr, hash uint64, now time.Time) *tokenBucket {
+	start := int(uint32(hash) % uint32(len(t.entries)))
+	var stale *icmpErrorTargetEntry
+	for offset := range t.entries {
+		entry := &t.entries[(start+offset)%len(t.entries)]
 		if entry.destination == destination {
 			return &entry.bucket
 		}
@@ -2841,7 +2923,7 @@ func (s *Stack) controlResponseTargetBucketLocked(class controlResponseClass, de
 			entry.bucket = tokenBucket{}
 			return &entry.bucket
 		}
-		if stale == nil && now.Sub(entry.bucket.updated) >= controlResponseTargetIdle {
+		if stale == nil && now.Sub(entry.bucket.updated) >= icmpErrorTargetIdle {
 			stale = entry
 		}
 	}
@@ -2850,7 +2932,7 @@ func (s *Stack) controlResponseTargetBucketLocked(class controlResponseClass, de
 		stale.bucket = tokenBucket{}
 		return &stale.bucket
 	}
-	return &table.overflow[hash%uint32(len(table.overflow))]
+	return &t.overflow[uint32(hash)%uint32(len(t.overflow))]
 }
 
 // Start activates packet and socket I/O and starts background maintenance.
