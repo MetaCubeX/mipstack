@@ -1166,3 +1166,10 @@ would not benefit existing consumers.
 ## License
 
 MIPS is licensed under the Mozilla Public License 2.0. See `LICENSE`.
+
+### Low-memory builds
+
+The existing `with_low_memory` build tag selects smaller idle TCP cache and
+initial allocation bounds while retaining automatic buffer growth and normal
+buffer reuse. Ordinary builds keep the existing policy. See
+[Low-memory TCP storage](LOW_MEMORY.md) for behavior and validation details.
