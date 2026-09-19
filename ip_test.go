@@ -1180,11 +1180,15 @@ func TestIPHeaderIncludedLinuxKnownAnswers(t *testing.T) {
 	connection4 := IPConn{stack: stack4}
 	input4 := mustCodecVector(t, "462e0001000040002563aabb00000000c633649a01010000deadbeef")
 	original4 := append([]byte(nil), input4...)
-	packet4, packetTarget4, hopLimit4, err := connection4.prepareHeaderIncludedPacket(input4, source4, target4)
+	layout4, err := parseHeaderIncludedPacket(input4, source4, target4)
+	packet4 := make([]byte, len(input4))
+	if err == nil {
+		connection4.marshalHeaderIncludedPacket(packet4, input4, layout4)
+	}
 	want4 := mustCodecVector(t, "462e001c43214000256322c7c000029ac633649a01010000deadbeef")
-	if err != nil || packetTarget4 != target4 || hopLimit4 != 37 || !bytes.Equal(packet4, want4) {
+	if err != nil || layout4.packetTarget != target4 || layout4.hopLimit != 37 || !bytes.Equal(packet4, want4) {
 		t.Fatalf("Linux IPv4 IP_HDRINCL repair = target %s hop %d error %v\n got %x\nwant %x",
-			packetTarget4, hopLimit4, err, packet4, want4)
+			layout4.packetTarget, layout4.hopLimit, err, packet4, want4)
 	}
 	if !bytes.Equal(input4, original4) || referenceChecksum(packet4[:24]) != 0 || stack4.ipv4ID.Load() != 0x4321 {
 		t.Fatalf("Linux IPv4 IP_HDRINCL ownership/checksum/ID = input %x checksum %#x ID %#x",
@@ -1192,7 +1196,11 @@ func TestIPHeaderIncludedLinuxKnownAnswers(t *testing.T) {
 	}
 
 	explicit4 := mustCodecVector(t, "452e0001123440002563aabbcb007109c633649adeadbeef")
-	packet4, _, _, err = connection4.prepareHeaderIncludedPacket(explicit4, source4, target4)
+	layout4, err = parseHeaderIncludedPacket(explicit4, source4, target4)
+	packet4 = make([]byte, len(explicit4))
+	if err == nil {
+		connection4.marshalHeaderIncludedPacket(packet4, explicit4, layout4)
+	}
 	if err != nil || !bytes.Equal(packet4[4:6], explicit4[4:6]) || !bytes.Equal(packet4[12:16], explicit4[12:16]) ||
 		binary.BigEndian.Uint16(packet4[2:4]) != uint16(len(packet4)) || referenceChecksum(packet4[:20]) != 0 {
 		t.Fatalf("Linux IPv4 explicit ID/source repair = %x, %v", packet4, err)
@@ -1211,9 +1219,13 @@ func TestIPHeaderIncludedLinuxKnownAnswers(t *testing.T) {
 	connection6 := IPConn{stack: stack6}
 	input6 := mustCodecVector(t, "6a5543210004632520010db800000000000000000000009a20010db800010000000000000000009adeadbeef")
 	original6 := append([]byte(nil), input6...)
-	packet6, packetTarget6, hopLimit6, err := connection6.prepareHeaderIncludedPacket(input6, source6, target6)
-	if err != nil || packetTarget6 != target6 || hopLimit6 != 37 || !bytes.Equal(packet6, input6) {
-		t.Fatalf("IPv6 header-included packet = target %s hop %d error %v packet %x", packetTarget6, hopLimit6, err, packet6)
+	layout6, err := parseHeaderIncludedPacket(input6, source6, target6)
+	packet6 := make([]byte, len(input6))
+	if err == nil {
+		connection6.marshalHeaderIncludedPacket(packet6, input6, layout6)
+	}
+	if err != nil || layout6.packetTarget != target6 || layout6.hopLimit != 37 || !bytes.Equal(packet6, input6) {
+		t.Fatalf("IPv6 header-included packet = target %s hop %d error %v packet %x", layout6.packetTarget, layout6.hopLimit, err, packet6)
 	}
 	packet6[0] ^= 0xff
 	if !bytes.Equal(input6, original6) {
@@ -1240,8 +1252,8 @@ func TestIPHeaderIncludedLinuxKnownAnswers(t *testing.T) {
 	for _, test := range invalid {
 		t.Run(test.name, func(t *testing.T) {
 			before := append([]byte(nil), test.input...)
-			if packet, _, _, prepareErr := test.connection.prepareHeaderIncludedPacket(test.input, test.selectedSource, test.target); prepareErr == nil || packet != nil {
-				t.Fatalf("invalid header-included packet = %x, %v", packet, prepareErr)
+			if _, parseErr := parseHeaderIncludedPacket(test.input, test.selectedSource, test.target); parseErr == nil {
+				t.Fatal("invalid header-included packet was accepted")
 			}
 			if !bytes.Equal(test.input, before) {
 				t.Fatal("invalid header-included packet modified caller storage")
@@ -1284,13 +1296,15 @@ func FuzzIPHeaderIncludedPreparation(f *testing.F) {
 		}
 		defer stack.Close()
 		connection := IPConn{stack: stack}
-		packet, packetTarget, hopLimit, err := connection.prepareHeaderIncludedPacket(input, selectedSource, routeTarget)
+		layout, err := parseHeaderIncludedPacket(input, selectedSource, routeTarget)
 		if !bytes.Equal(input, original) {
 			t.Fatal("header-included preparation modified caller storage")
 		}
 		if err != nil {
 			return
 		}
+		packet := make([]byte, len(input))
+		connection.marshalHeaderIncludedPacket(packet, input, layout)
 		expectedVersion := byte(4)
 		if routeIPv6 {
 			expectedVersion = 6
@@ -1299,16 +1313,16 @@ func FuzzIPHeaderIncludedPreparation(f *testing.F) {
 			t.Fatalf("accepted header-included packet has version/length %d/%d", packet[0]>>4, len(packet))
 		}
 		if routeIPv6 {
-			if !bytes.Equal(packet, input) || packetTarget != netip.AddrFrom16([16]byte(packet[24:40])) || hopLimit != packet[7] {
-				t.Fatalf("IPv6 header-included result changed caller fields: target=%s hop=%d", packetTarget, hopLimit)
+			if !bytes.Equal(packet, input) || layout.packetTarget != netip.AddrFrom16([16]byte(packet[24:40])) || layout.hopLimit != packet[7] {
+				t.Fatalf("IPv6 header-included result changed caller fields: target=%s hop=%d", layout.packetTarget, layout.hopLimit)
 			}
 		} else {
 			headerSize := int(packet[0]&0x0f) * 4
 			if headerSize < 20 || headerSize > len(packet) || binary.BigEndian.Uint16(packet[2:4]) != uint16(len(packet)) || checksum(packet[:headerSize]) != 0 {
 				t.Fatalf("IPv4 header-included result has invalid header: %x", packet)
 			}
-			if packetTarget != netip.AddrFrom4([4]byte(packet[16:20])) || hopLimit != packet[8] {
-				t.Fatalf("IPv4 header-included metadata = target %s hop %d", packetTarget, hopLimit)
+			if layout.packetTarget != netip.AddrFrom4([4]byte(packet[16:20])) || layout.hopLimit != packet[8] {
+				t.Fatalf("IPv4 header-included metadata = target %s hop %d", layout.packetTarget, layout.hopLimit)
 			}
 			if binary.BigEndian.Uint32(input[12:16]) == 0 {
 				if !bytes.Equal(packet[12:16], selectedSource.AsSlice()) {
@@ -2019,7 +2033,7 @@ func TestIPHeaderIncludedWriteQueueExhaustionPolicy(t *testing.T) {
 		t.Run(policy.name, func(t *testing.T) {
 			local := netip.MustParseAddr("192.0.2.239")
 			remote := netip.MustParseAddr("198.51.100.239")
-			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 1500})
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 9000})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2041,7 +2055,7 @@ func TestIPHeaderIncludedWriteQueueExhaustionPolicy(t *testing.T) {
 			}
 			dummy := buildIPPacket(local, remote, 98, []byte{0}, 1, false)
 			fillTestPacketQueue(t, &stack.outbound, dummy)
-			packet := buildIPPacket(local, remote, 99, []byte("header-included"), 2, true)
+			packet := buildIPPacket(local, remote, 99, bytes.Repeat([]byte{0x5a}, 9000-20), 2, true)
 			messages := []SocketMessage{{Buffers: [][]byte{packet[:17], packet[17:]}}}
 			count, writeErr := connection.WriteBatch(messages, policy.flags)
 			if count != 1 || writeErr != nil || messages[0].N != len(packet) {
@@ -2066,10 +2080,19 @@ func TestIPHeaderIncludedWriteQueueExhaustionPolicy(t *testing.T) {
 					break
 				}
 				found = found || bytes.Equal(entry.packet, packet)
+				if entry.reusable && cap(entry.packet) > packetReusableBufferLimit {
+					if cache := stack.largeBuffers.Load(); cache != nil {
+						cache.release(entry.packet)
+					}
+					entry.reusable = false
+				}
 				stack.outbound.release(entry)
 			}
 			if !found {
 				t.Fatal("header-included packet was not admitted over published backlog")
+			}
+			if cache := stack.largeBuffers.Load(); cache == nil || len(cache.buffers) != 1 {
+				t.Fatal("header-included jumbo buffer was not retained after device consumption")
 			}
 		})
 	}
@@ -2499,59 +2522,73 @@ func BenchmarkIPPacketWrite(b *testing.B) {
 func BenchmarkIPHeaderIncludedWrite(b *testing.B) {
 	local := netip.MustParseAddr("2001:db8::247")
 	remote := netip.MustParseAddr("2001:db8:1::247")
-	datagram := mustTestWire((UDPDatagram{
-		Source: netip.AddrPortFrom(local, 14000), Destination: netip.AddrPortFrom(remote, 443), Payload: make([]byte, 1200),
-	}).MarshalBinary())
 	hop := IPv6ExtensionHeader{Type: IPv6ExtensionHeaderHopByHop}
 	if err := hop.SetOptions(nil); err != nil {
 		b.Fatal(err)
 	}
-	for _, test := range []struct {
-		name      string
-		headers   []IPv6ExtensionHeader
-		flowLabel uint32
-	}{
-		{name: "base-header"},
-		{name: "hop-by-hop", headers: []IPv6ExtensionHeader{hop}},
-		{name: "base-header/labeled", flowLabel: 0x12345},
-		{name: "hop-by-hop/labeled", headers: []IPv6ExtensionHeader{hop}, flowLabel: 0x12345},
-	} {
-		b.Run(test.name, func(b *testing.B) {
-			stack, err := New(Config{
-				LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)},
-				IP:             IPSocketDefaults{IPHeaderIncludedOnWrite: true},
-			})
-			if err != nil {
-				b.Fatal(err)
-			}
-			if err = stack.Start(); err != nil {
-				b.Fatal(err)
-			}
-			connection, err := stack.DialIP(context.Background(), "ip6:udp", netip.Addr{}, remote)
-			if err != nil {
-				b.Fatal(err)
-			}
-			b.Cleanup(func() {
-				_ = connection.Close()
-				_ = stack.Close()
-			})
-			packet := IPPacket{Source: local, Destination: remote, HopLimit: 64, FlowLabel: test.flowLabel}
-			if err = packet.SetIPv6ExtensionHeaders(test.headers, ProtocolUDP, datagram); err != nil {
-				b.Fatal(err)
-			}
-			wire := mustTestWire(packet.MarshalBinary())
-			b.SetBytes(int64(len(wire)))
-			b.ReportAllocs()
-			b.ResetTimer()
-			for iteration := 0; iteration < b.N; iteration++ {
-				if written, writeErr := connection.Write(wire); writeErr != nil || written != len(wire) {
-					b.Fatalf("Write = %d, %v", written, writeErr)
-				}
-				entry, ok := stack.outbound.tryDequeue()
-				if !ok {
-					b.Fatal("header-included write did not queue output")
-				}
-				stack.outbound.release(entry)
+	for _, mtu := range []int{1500, 9000, 16384, 32768, 65535} {
+		b.Run(fmt.Sprintf("mtu-%d", mtu), func(b *testing.B) {
+			for _, test := range []struct {
+				name      string
+				headers   []IPv6ExtensionHeader
+				flowLabel uint32
+			}{
+				{name: "base-header"},
+				{name: "hop-by-hop", headers: []IPv6ExtensionHeader{hop}},
+				{name: "base-header/labeled", flowLabel: 0x12345},
+				{name: "hop-by-hop/labeled", headers: []IPv6ExtensionHeader{hop}, flowLabel: 0x12345},
+			} {
+				b.Run(test.name, func(b *testing.B) {
+					extensionSize := len(test.headers) * 8
+					datagram := mustTestWire((UDPDatagram{
+						Source:      netip.AddrPortFrom(local, 14000),
+						Destination: netip.AddrPortFrom(remote, 443),
+						Payload:     make([]byte, mtu-40-extensionSize-udpHeaderSize),
+					}).MarshalBinary())
+					stack, err := New(Config{
+						LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)},
+						MTU:            uint32(mtu),
+						IP:             IPSocketDefaults{IPHeaderIncludedOnWrite: true},
+					})
+					if err != nil {
+						b.Fatal(err)
+					}
+					if err = stack.Start(); err != nil {
+						b.Fatal(err)
+					}
+					connection, err := stack.DialIP(context.Background(), "ip6:udp", netip.Addr{}, remote)
+					if err != nil {
+						b.Fatal(err)
+					}
+					b.Cleanup(func() {
+						_ = connection.Close()
+						_ = stack.Close()
+					})
+					packet := IPPacket{Source: local, Destination: remote, HopLimit: 64, FlowLabel: test.flowLabel}
+					if err = packet.SetIPv6ExtensionHeaders(test.headers, ProtocolUDP, datagram); err != nil {
+						b.Fatal(err)
+					}
+					wire := mustTestWire(packet.MarshalBinary())
+					b.SetBytes(int64(len(wire)))
+					b.ReportAllocs()
+					b.ResetTimer()
+					for iteration := 0; iteration < b.N; iteration++ {
+						if written, writeErr := connection.Write(wire); writeErr != nil || written != len(wire) {
+							b.Fatalf("Write = %d, %v", written, writeErr)
+						}
+						entry, ok := stack.outbound.tryDequeue()
+						if !ok {
+							b.Fatal("header-included write did not queue output")
+						}
+						if entry.reusable && cap(entry.packet) > packetReusableBufferLimit {
+							if cache := stack.largeBuffers.Load(); cache != nil {
+								cache.release(entry.packet)
+							}
+							entry.reusable = false
+						}
+						stack.outbound.release(entry)
+					}
+				})
 			}
 		})
 	}

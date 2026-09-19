@@ -1212,9 +1212,16 @@ func (s *Stack) writeBestEffortIPPayloadForMTU(source, target netip.Addr, protoc
 		}
 		return err
 	}
-	packet, reusable := queue.acquireBuffer(headerSize + len(payload))
+	packetSize := headerSize + len(payload)
+	var packet []byte
+	var reusable bool
+	if packetSize <= packetReusableBufferLimit {
+		packet, reusable = queue.acquireBuffer(packetSize)
+	} else {
+		packet, reusable = s.acquireLargeOutputBuffer(packetSize)
+	}
 	if !marshalIPHeader(packet, source, target, protocol, identification, fragmentation.dontFragment, options) {
-		queue.releaseBuffer(packet, reusable)
+		s.releaseOutputBuffer(queue, packet, reusable)
 		queue.releaseReserved(slot)
 		return syscall.EMSGSIZE
 	}
@@ -1252,9 +1259,16 @@ func (s *Stack) tryWriteIPSocketPayloadForMTU(source, target netip.Addr, protoco
 		if err != nil {
 			return err
 		}
-		packet, reusable := queue.acquireBuffer(headerSize + len(payload))
+		packetSize := headerSize + len(payload)
+		var packet []byte
+		var reusable bool
+		if packetSize <= packetReusableBufferLimit {
+			packet, reusable = queue.acquireBuffer(packetSize)
+		} else {
+			packet, reusable = s.acquireLargeOutputBuffer(packetSize)
+		}
 		if !marshalIPHeader(packet, source, target, protocol, identification, fragmentation.dontFragment, options) {
-			queue.releaseBuffer(packet, reusable)
+			s.releaseOutputBuffer(queue, packet, reusable)
 			queue.releaseReserved(slot)
 			return syscall.EMSGSIZE
 		}
@@ -1324,9 +1338,16 @@ func (s *Stack) tryWriteIPFragmentsLayout(source, target netip.Addr, protocol by
 		if err != nil {
 			return err
 		}
-		packet, reusable := queue.acquireBuffer(int(layout.headerSize) + size)
+		packetSize := int(layout.headerSize) + size
+		var packet []byte
+		var reusable bool
+		if packetSize <= packetReusableBufferLimit {
+			packet, reusable = queue.acquireBuffer(packetSize)
+		} else {
+			packet, reusable = s.acquireLargeOutputBuffer(packetSize)
+		}
 		if !marshalIPFragmentHeader(packet, source, target, protocol, layout.identification, offset, more, layout.options) {
-			queue.releaseBuffer(packet, reusable)
+			s.releaseOutputBuffer(queue, packet, reusable)
 			queue.releaseReserved(slot)
 			return syscall.EMSGSIZE
 		}

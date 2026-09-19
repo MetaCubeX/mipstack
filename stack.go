@@ -42,8 +42,12 @@ const (
 	// socket actor from recursively entering its own protocol handler.
 	loopbackPacketQueue = 256
 	// packetReusableBufferLimit retains common link-MTU packets while allowing
-	// uncommon jumbo packets to be collected immediately after transmission.
+	// larger packets to use the stack-wide size-aware cache.
 	packetReusableBufferLimit = 2048
+	// largePacketBufferSlack bounds retained buffers beyond one complete device
+	// batch by the byte capacity those remaining queue positions would consume
+	// at the ordinary reusable-buffer limit.
+	largePacketBufferSlack = (outboundPacketQueue - deviceBatchSize) * packetReusableBufferLimit
 	// pathMTUMaximumEntries bounds destinations learned from authenticated
 	// transport tuples so long-running proxy workloads cannot grow the cache
 	// without limit.
@@ -353,6 +357,9 @@ type Stack struct {
 	network  atomic.Pointer[networkState]
 	outbound packetQueue
 	loopback loopbackQueue
+	// largeBuffers is shared by external and loopback output so idle capacity
+	// follows aggregate demand instead of being reserved per destination path.
+	largeBuffers atomic.Pointer[largePacketBufferCache]
 
 	mu            sync.RWMutex
 	started       bool
@@ -1696,9 +1703,100 @@ func outputHashedFlowKey(hash uint64) outputFlowKey {
 // store it in a bounded channel and fair queues store it in the matching fixed
 // scheduler node, so neither path allocates per packet.
 type packetQueueEntry struct {
-	packet   []byte
-	slot     uint16
+	packet []byte
+	slot   uint16
+	// reusable marks packet storage as stack-owned. packetQueue.release returns
+	// storage within packetReusableBufferLimit itself; consumers return larger
+	// storage through Stack.releaseOutputBuffer before releasing the slot.
 	reusable bool
+}
+
+// largePacketBufferCache retains a bounded output working set for packets that
+// exceed the per-queue small-buffer limit. maximum and buffers are immutable;
+// replacement on MTU changes keeps the packet hot path lock-free.
+type largePacketBufferCache struct {
+	maximum int
+	buffers chan []byte
+	retired atomic.Bool
+}
+
+// largePacketBufferSlots preserves one complete device batch at every large
+// MTU and spends a fixed byte allowance on additional burst absorption. The
+// result never exceeds one output queue, and no large cache exists at ordinary
+// MTUs.
+func largePacketBufferSlots(mtu int) int {
+	if mtu <= packetReusableBufferLimit {
+		return 0
+	}
+	slots := deviceBatchSize + largePacketBufferSlack/mtu
+	if slots > outboundPacketQueue {
+		slots = outboundPacketQueue
+	}
+	return slots
+}
+
+// newLargePacketBufferCache returns nil when the configured MTU can use only
+// the existing per-queue small-buffer caches.
+func newLargePacketBufferCache(mtu int) *largePacketBufferCache {
+	slots := largePacketBufferSlots(mtu)
+	if slots == 0 {
+		return nil
+	}
+	return &largePacketBufferCache{maximum: mtu, buffers: make(chan []byte, slots)}
+}
+
+// acquire returns reusable storage only while this cache generation is active.
+// A too-small entry is discarded so repeated larger output converges on a
+// useful working set without a size-class table or an unbounded search.
+func (c *largePacketBufferCache) acquire(size int) ([]byte, bool) {
+	if c == nil || c.retired.Load() || size > c.maximum {
+		return nil, false
+	}
+	select {
+	case buffer := <-c.buffers:
+		if cap(buffer) >= size && cap(buffer) <= c.maximum {
+			return buffer[:size], true
+		}
+	default:
+	}
+	return nil, false
+}
+
+// release retains one eligible buffer unless this generation has been
+// replaced. The post-send retirement check closes the race with an MTU update
+// or Stack.Close without serializing packet output with configuration changes.
+func (c *largePacketBufferCache) release(buffer []byte) {
+	if c == nil || c.retired.Load() || cap(buffer) <= packetReusableBufferLimit || cap(buffer) > c.maximum {
+		return
+	}
+	select {
+	case c.buffers <- buffer[:0]:
+	default:
+		return
+	}
+	if c.retired.Load() {
+		select {
+		case <-c.buffers:
+		default:
+		}
+	}
+}
+
+// retire prevents further retention and releases all idle backing owned by
+// this cache generation. Buffers still owned by queues are checked against the
+// current generation when they are later released.
+func (c *largePacketBufferCache) retire() {
+	if c == nil {
+		return
+	}
+	c.retired.Store(true)
+	for {
+		select {
+		case <-c.buffers:
+		default:
+			return
+		}
+	}
 }
 
 // packetQueue uses one reusable slot per queue position. The free-slot channel
@@ -1972,20 +2070,21 @@ func (q *packetQueue) tryReserve() (uint16, bool) {
 // replaceBestEffort reclaims one already-published packet from the fattest
 // flow. FIFO queues and capacity held by unpublished reservations retain
 // strict bounded admission. The caller must retry ordinary reservation first
-// so a concurrently released slot wins over displacement.
-func (q *packetQueue) replaceBestEffort() (uint16, bool) {
+// so a concurrently released slot wins over displacement. The returned entry
+// retains both its packet storage and slot reservation for the caller to
+// release or replace.
+func (q *packetQueue) replaceBestEffort() (packetQueueEntry, bool) {
 	if q.scheduler == nil {
-		return 0, false
+		return packetQueueEntry{}, false
 	}
 	entry, ok := q.scheduler.dropFromFattestFlow()
 	if !ok {
-		return 0, false
+		return packetQueueEntry{}, false
 	}
 	if q.depart(entry.slot) {
 		q.completeDeparture(entry.slot)
 	}
-	q.releaseBuffer(entry.packet, entry.reusable)
-	return entry.slot, true
+	return entry, true
 }
 
 // releaseReserved returns a slot that was acquired but not published.
@@ -2129,9 +2228,10 @@ func (q *packetQueue) acquireBuffer(size int) ([]byte, bool) {
 	return make([]byte, size), true
 }
 
-// releaseBuffer returns reusable storage without publishing a queue slot.
+// releaseBuffer returns reusable small-packet storage without publishing a
+// queue slot. Large storage belongs to the stack-wide cache generation.
 func (q *packetQueue) releaseBuffer(packet []byte, reusable bool) {
-	if !reusable {
+	if !reusable || cap(packet) > packetReusableBufferLimit {
 		return
 	}
 	select {
@@ -2149,6 +2249,32 @@ func (q *packetQueue) releaseBuffer(packet []byte, reusable bool) {
 	}
 }
 
+// acquireLargeOutputBuffer uses the shared cache for packets above the
+// per-queue limit. Keeping this path separate leaves standard-MTU allocation
+// directly inlineable at packet construction sites.
+func (s *Stack) acquireLargeOutputBuffer(size int) ([]byte, bool) {
+	cache := s.largeBuffers.Load()
+	if buffer, ok := cache.acquire(size); ok {
+		return buffer, true
+	}
+	return make([]byte, size), cache != nil && size <= cache.maximum
+}
+
+// releaseOutputBuffer returns queue-owned storage to the cache selected by its
+// capacity. Caller-owned packets are marked non-reusable and remain untouched.
+func (s *Stack) releaseOutputBuffer(queue *packetQueue, packet []byte, reusable bool) {
+	if !reusable {
+		return
+	}
+	if cap(packet) <= packetReusableBufferLimit {
+		queue.releaseBuffer(packet, true)
+		return
+	}
+	if cache := s.largeBuffers.Load(); cache != nil {
+		cache.release(packet)
+	}
+}
+
 // depart marks a dequeued generation as no longer owned by the host queue and
 // reports whether its cold loss-timer waiter must be completed. Capacity
 // remains reserved until release because the consumer may still be reading the
@@ -2160,9 +2286,11 @@ func (q *packetQueue) depart(slot uint16) bool {
 	return state&packetQueueSlotDepartureWaiter != 0
 }
 
-// release recycles a departed entry's bounded packet storage and makes its
-// slot available to exactly one waiting producer. The caller must finish
-// reading packet before release because another writer may reuse it.
+// release recycles a departed entry's small packet storage and makes its slot
+// available to exactly one waiting producer. Large reusable storage must first
+// be returned through Stack.releaseOutputBuffer and marked non-reusable. The
+// caller must finish reading packet before release because another writer may
+// reuse it.
 func (q *packetQueue) release(entry packetQueueEntry) {
 	q.releaseBuffer(entry.packet, entry.reusable)
 	q.free <- entry.slot
@@ -2330,6 +2458,7 @@ func New(config Config) (*Stack, error) {
 	}
 	stack.outbound.initFair(outboundPacketQueue, timestampEpoch, state.mtu, outputFlowSecret)
 	stack.loopback.initFIFO(loopbackPacketQueue, timestampEpoch)
+	stack.largeBuffers.Store(newLargePacketBufferCache(state.mtu))
 	copy(stack.tcpISNSecret[:], seed[24:40])
 	stack.flowLabelSecret = flowLabelSecret
 	stack.icmpErrorLimiterSecret = icmpErrorLimiterSecret
@@ -2356,6 +2485,10 @@ func (s *Stack) UpdateConfig(config Config) error {
 	}
 	previous := s.network.Load()
 	multicastConfigurationChanged := !previous.sameMulticastConfiguration(state)
+	if previous.mtu != state.mtu {
+		retired := s.largeBuffers.Swap(newLargePacketBufferCache(state.mtu))
+		retired.retire()
+	}
 	if !previous.samePathConfiguration(state) {
 		s.pathMTUMu.Lock()
 		s.network.Store(state)
@@ -2963,11 +3096,23 @@ func (s *Stack) runLoopback() {
 		}
 		select {
 		case <-s.closeCh:
+			if entry.reusable && cap(entry.packet) > packetReusableBufferLimit {
+				if cache := s.largeBuffers.Load(); cache != nil {
+					cache.release(entry.packet)
+				}
+				entry.reusable = false
+			}
 			s.loopback.release(entry)
 			return
 		default:
 		}
 		_ = s.handleInboundPacket(entry.packet, time.Now(), true)
+		if entry.reusable && cap(entry.packet) > packetReusableBufferLimit {
+			if cache := s.largeBuffers.Load(); cache != nil {
+				cache.release(entry.packet)
+			}
+			entry.reusable = false
+		}
 		s.loopback.release(entry)
 	}
 }
@@ -3521,13 +3666,20 @@ func (s *Stack) Read(buffers [][]byte, sizes []int, offset int) (int, error) {
 		}
 	}
 	readPacket := func(index int, entry packetQueueEntry) error {
+		var err error
 		if len(entry.packet) > len(buffers[index])-offset {
-			s.outbound.release(entry)
-			return io.ErrShortBuffer
+			err = io.ErrShortBuffer
+		} else {
+			sizes[index] = copy(buffers[index][offset:], entry.packet)
 		}
-		sizes[index] = copy(buffers[index][offset:], entry.packet)
+		if entry.reusable && cap(entry.packet) > packetReusableBufferLimit {
+			if cache := s.largeBuffers.Load(); cache != nil {
+				cache.release(entry.packet)
+			}
+			entry.reusable = false
+		}
 		s.outbound.release(entry)
-		return nil
+		return err
 	}
 	first, ok := s.outbound.dequeue(s.closeCh)
 	if !ok {
@@ -3591,14 +3743,6 @@ func (s *Stack) tryWritePacket(packet []byte) error {
 	return s.tryWritePacketToFlow(packet, queue, loopback, outputFlowKey{})
 }
 
-// tryWriteCompletePacket queues a caller-owned complete packet using an
-// independently selected route destination. Header-included sockets may route
-// through a send address that differs from the destination in the IP header.
-func (s *Stack) tryWriteCompletePacket(packet []byte, routeTarget netip.Addr) error {
-	queue, loopback := s.outputQueueFor(routeTarget)
-	return s.tryWritePacketToFlow(packet, queue, loopback, outputFlowKey{})
-}
-
 // tryWritePacketToFlow publishes one packet to an already selected queue. A
 // zero flow asks the queue to classify the wire packet; a nonzero flow retains
 // a semantic identity shared by a source-fragmented sequence.
@@ -3645,9 +3789,10 @@ func (s *Stack) replaceBestEffortPacket(queue *packetQueue) (uint16, error) {
 	if slot, ok := queue.tryReserve(); ok {
 		return slot, nil
 	}
-	if slot, ok := queue.replaceBestEffort(); ok {
+	if entry, ok := queue.replaceBestEffort(); ok {
+		s.releaseOutputBuffer(queue, entry.packet, entry.reusable)
 		s.recordQueueDrops(queue, 1)
-		return slot, nil
+		return entry.slot, nil
 	}
 	select {
 	case <-s.closeCh:
@@ -4251,6 +4396,7 @@ func (s *Stack) Close() error {
 	s.stats.activeUDPSockets.Store(0)
 	s.stats.activeIPSockets.Store(0)
 	s.mu.Unlock()
+	s.largeBuffers.Swap(nil).retire()
 	s.outbound.close()
 	s.loopback.close()
 	s.pathMTUMu.Lock()

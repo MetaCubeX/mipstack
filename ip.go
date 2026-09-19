@@ -1375,26 +1375,46 @@ func (c *IPConn) writeHeaderIncluded(input []byte, target, packetInfoSource neti
 	if len(input) > c.stack.network.Load().mtu {
 		return 0, syscall.EMSGSIZE
 	}
-	packet, packetTarget, hopLimit, err := c.prepareHeaderIncludedPacket(input, parameters.source, parameters.target)
+	layout, err := parseHeaderIncludedPacket(input, parameters.source, parameters.target)
 	if err != nil {
 		return 0, err
 	}
 	if parameters.nonUnicast {
 		c.mu.Lock()
-		_, external, loopback, policyErr := nonUnicastOutputPolicy(parameters.target, c.multicastHopLimit, c.multicastLoopback, c.broadcast, ipPacketOptions{hopLimit: hopLimit, hopLimitSet: true})
+		_, external, loopback, policyErr := nonUnicastOutputPolicy(parameters.target, c.multicastHopLimit, c.multicastLoopback, c.broadcast, ipPacketOptions{hopLimit: layout.hopLimit, hopLimitSet: true})
 		c.mu.Unlock()
 		if policyErr != nil {
 			return 0, policyErr
 		}
-		err = c.stack.tryWriteNonUnicastPacket(len(packet), external, loopback, func(destination []byte) bool {
-			copy(destination, packet)
+		err = c.stack.tryWriteNonUnicastPacket(len(input), external, loopback, func(destination []byte) bool {
+			c.marshalHeaderIncludedPacket(destination, input, layout)
 			return true
 		})
 	} else {
-		err = c.stack.tryWriteCompletePacket(packet, parameters.target)
+		queue, loopback := c.stack.outputQueueFor(parameters.target)
+		var slot uint16
+		slot, err = c.stack.tryReservePacket(queue)
+		if err == ErrResourceLimit {
+			slot, err = c.stack.replaceBestEffortPacket(queue)
+		}
+		if err == nil {
+			var packet []byte
+			var reusable bool
+			if len(input) <= packetReusableBufferLimit {
+				packet, reusable = queue.acquireBuffer(len(input))
+			} else {
+				packet, reusable = c.stack.acquireLargeOutputBuffer(len(input))
+			}
+			c.marshalHeaderIncludedPacket(packet, input, layout)
+			if !queue.enqueueReservedPacket(slot, packet, reusable) {
+				err = ErrClosed
+			} else {
+				c.stack.recordOutput(loopback)
+			}
+		}
 	}
 	if !parameters.nonUnicast && datagramWriteNeedsCorrelation(err) {
-		c.rememberTarget(packetTarget)
+		c.rememberTarget(layout.packetTarget)
 	}
 	err = datagramLinkWriteError(err, parameters.receiveErrors)
 	if err != nil {
@@ -1405,41 +1425,74 @@ func (c *IPConn) writeHeaderIncluded(input []byte, target, packetInfoSource neti
 	return len(input), nil
 }
 
-// prepareHeaderIncludedPacket copies and applies the limited IPv4 mutations
-// made by Linux raw_send_hdrinc. IPv6 and transport headers remain unchanged.
-func (c *IPConn) prepareHeaderIncludedPacket(input []byte, selectedSource, routeTarget netip.Addr) ([]byte, netip.Addr, byte, error) {
+// headerIncludedPacketLayout retains validated wire offsets and the limited
+// IPv4 fields filled by Linux raw_send_hdrinc. IPv6 and transport headers are
+// copied unchanged.
+type headerIncludedPacketLayout struct {
+	packetTarget netip.Addr
+	source       [4]byte
+	headerSize   int
+	hopLimit     byte
+	ipv4         bool
+	fillSource   bool
+	fillID       bool
+}
+
+// parseHeaderIncludedPacket validates caller-owned storage without copying or
+// mutating it, allowing queue admission to precede allocation of the final
+// packet buffer.
+func parseHeaderIncludedPacket(input []byte, selectedSource, routeTarget netip.Addr) (headerIncludedPacketLayout, error) {
 	if len(input) == 0 || !routeTarget.IsValid() {
-		return nil, netip.Addr{}, 0, syscall.EINVAL
+		return headerIncludedPacketLayout{}, syscall.EINVAL
 	}
-	packet := append([]byte(nil), input...)
-	switch packet[0] >> 4 {
+	switch input[0] >> 4 {
 	case 4:
-		if !routeTarget.Is4() || len(packet) < 20 || len(packet) > 65535 {
-			return nil, netip.Addr{}, 0, syscall.EINVAL
+		if !routeTarget.Is4() || len(input) < 20 || len(input) > 65535 {
+			return headerIncludedPacketLayout{}, syscall.EINVAL
 		}
-		headerSize := int(packet[0]&0x0f) * 4
-		if headerSize < 20 || headerSize > len(packet) {
-			return nil, netip.Addr{}, 0, syscall.EINVAL
+		headerSize := int(input[0]&0x0f) * 4
+		if headerSize < 20 || headerSize > len(input) {
+			return headerIncludedPacketLayout{}, syscall.EINVAL
 		}
-		if binary.BigEndian.Uint32(packet[12:16]) == 0 {
-			value := selectedSource.As4()
-			copy(packet[12:16], value[:])
+		fillSource := binary.BigEndian.Uint32(input[12:16]) == 0
+		var source [4]byte
+		if fillSource {
+			if !selectedSource.Is4() {
+				return headerIncludedPacketLayout{}, syscall.EINVAL
+			}
+			source = selectedSource.As4()
 		}
-		binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
-		if binary.BigEndian.Uint16(packet[4:6]) == 0 {
-			binary.BigEndian.PutUint16(packet[4:6], uint16(c.stack.ipv4ID.Add(1)))
-		}
-		packet[10], packet[11] = 0, 0
-		binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:headerSize]))
-		return packet, netip.AddrFrom4([4]byte(packet[16:20])), packet[8], nil
+		return headerIncludedPacketLayout{
+			packetTarget: netip.AddrFrom4([4]byte(input[16:20])), source: source,
+			headerSize: headerSize, hopLimit: input[8], ipv4: true, fillSource: fillSource,
+			fillID: binary.BigEndian.Uint16(input[4:6]) == 0,
+		}, nil
 	case 6:
-		if !routeTarget.Is6() || len(packet) < 40 {
-			return nil, netip.Addr{}, 0, syscall.EINVAL
+		if !routeTarget.Is6() || len(input) < 40 {
+			return headerIncludedPacketLayout{}, syscall.EINVAL
 		}
-		return packet, netip.AddrFrom16([16]byte(packet[24:40])), packet[7], nil
+		return headerIncludedPacketLayout{packetTarget: netip.AddrFrom16([16]byte(input[24:40])), hopLimit: input[7]}, nil
 	default:
-		return nil, netip.Addr{}, 0, syscall.EINVAL
+		return headerIncludedPacketLayout{}, syscall.EINVAL
 	}
+}
+
+// marshalHeaderIncludedPacket copies one validated packet into queue-owned
+// storage and applies the Linux IPv4 header-included fields exactly once.
+func (c *IPConn) marshalHeaderIncludedPacket(destination, input []byte, layout headerIncludedPacketLayout) {
+	copy(destination, input)
+	if !layout.ipv4 {
+		return
+	}
+	if layout.fillSource {
+		copy(destination[12:16], layout.source[:])
+	}
+	binary.BigEndian.PutUint16(destination[2:4], uint16(len(destination)))
+	if layout.fillID {
+		binary.BigEndian.PutUint16(destination[4:6], uint16(c.stack.ipv4ID.Add(1)))
+	}
+	destination[10], destination[11] = 0, 0
+	binary.BigEndian.PutUint16(destination[10:12], checksum(destination[:layout.headerSize]))
 }
 
 // prepareWrite snapshots socket policy and selects the source for one output
@@ -1616,20 +1669,27 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 	if err != nil {
 		return err
 	}
-	packet, reusable := queue.acquireBuffer(headerSize + payloadSize)
+	packetSize := headerSize + payloadSize
+	var packet []byte
+	var reusable bool
+	if packetSize <= packetReusableBufferLimit {
+		packet, reusable = queue.acquireBuffer(packetSize)
+	} else {
+		packet, reusable = c.stack.acquireLargeOutputBuffer(packetSize)
+	}
 	if !marshalIPHeader(packet, source, target, c.protocol, identification, fragmentation.dontFragment, options) {
-		queue.releaseBuffer(packet, reusable)
+		c.stack.releaseOutputBuffer(queue, packet, reusable)
 		queue.releaseReserved(slot)
 		return syscall.EMSGSIZE
 	}
 	payload := packet[headerSize:]
 	if copied := copyMessageBuffers(payload, buffers); copied != payloadSize {
-		queue.releaseBuffer(packet, reusable)
+		c.stack.releaseOutputBuffer(queue, packet, reusable)
 		queue.releaseReserved(slot)
 		return syscall.EINVAL
 	}
 	if err = setIPv6PayloadChecksum(payload, source, target, c.protocol, checksumOffset); err != nil {
-		queue.releaseBuffer(packet, reusable)
+		c.stack.releaseOutputBuffer(queue, packet, reusable)
 		queue.releaseReserved(slot)
 		return err
 	}

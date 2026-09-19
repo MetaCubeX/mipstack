@@ -1949,11 +1949,11 @@ func TestFairPacketQueueBestEffortAdmissionDropsFattestFlow(t *testing.T) {
 		}
 		enqueueTestOutputPacket(t, &queue, packet)
 	}
-	slot, ok := queue.replaceBestEffort()
+	replaced, ok := queue.replaceBestEffort()
 	if !ok {
 		t.Fatal("late flow could not reclaim published backlog")
 	}
-	if !queue.enqueueReservedPacket(slot, late, false) {
+	if !queue.enqueueReservedPacket(replaced.slot, late, false) {
 		t.Fatal("late flow was not admitted from published backlog")
 	}
 	counts := map[uint16]int{}
@@ -2020,10 +2020,10 @@ func TestFairPacketQueueBestEffortAdmissionRemovesDueFlow(t *testing.T) {
 			t.Fatalf("filler packet %d was not published", index)
 		}
 	}
-	slot, ok = queue.replaceBestEffort()
+	replaced, ok := queue.replaceBestEffort()
 	replacementPacket := make([]byte, 64)
 	replacementPacket[0] = 3
-	if !ok || !queue.enqueueReservedPacketForFlow(slot, replacementPacket, false, outputHashedFlowKey(3)) {
+	if !ok || !queue.enqueueReservedPacketForFlow(replaced.slot, replacementPacket, false, outputHashedFlowKey(3)) {
 		t.Fatal("due old-flow packet was not replaced")
 	}
 	entry, ok = queue.tryDequeue()
@@ -2264,11 +2264,11 @@ func TestFairPacketQueueBestEffortAdmissionDepartsTCPBacklog(t *testing.T) {
 	if waiter == nil {
 		t.Fatal("oldest TCP ticket was not pending")
 	}
-	slot, ok := queue.replaceBestEffort()
+	replaced, ok := queue.replaceBestEffort()
 	if !ok {
 		t.Fatal("UDP packet could not reclaim published TCP backlog")
 	}
-	if !queue.enqueueReservedPacket(slot, udpPacket, false) {
+	if !queue.enqueueReservedPacket(replaced.slot, udpPacket, false) {
 		t.Fatal("UDP packet did not replace published TCP backlog")
 	}
 	select {
@@ -3070,8 +3070,8 @@ func TestFairPacketQueueReusesBoundedFlowStorage(t *testing.T) {
 	}
 	for round := 0; round < 128; round++ {
 		packet := testOutputUDPPacket(source, target, uint16(15000+round), 53, 64)
-		slot, ok := queue.replaceBestEffort()
-		if !ok || !queue.enqueueReservedPacket(slot, packet, false) {
+		replaced, ok := queue.replaceBestEffort()
+		if !ok || !queue.enqueueReservedPacket(replaced.slot, packet, false) {
 			t.Fatalf("overload flow %d was not admitted", round)
 		}
 	}
@@ -3235,9 +3235,9 @@ func BenchmarkPacketQueueOverloadAdmission(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
-				slot, ok := queue.replaceBestEffort()
+				replaced, ok := queue.replaceBestEffort()
 				flow := outputFlowKey{tcp: uint64(iteration%flows + 1)}
-				if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
+				if !ok || !queue.enqueueReservedPacketForFlow(replaced.slot, packet, false, flow) {
 					b.Fatal("failed to replace published backlog")
 				}
 			}

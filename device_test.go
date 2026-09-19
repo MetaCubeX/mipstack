@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -162,6 +163,64 @@ func TestPacketDeviceCloseDiscardsOutput(t *testing.T) {
 	}
 }
 
+// TestPacketDeviceCloseDiscardsLargeOutput verifies that queued, dequeued, and
+// late-published jumbo buffers cannot repopulate the cache after shutdown.
+func TestPacketDeviceCloseDiscardsLargeOutput(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.22")
+	remote := netip.MustParseAddrPort("192.0.2.23:9000")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 9000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 9000-20-udpHeaderSize)
+	if _, err = connection.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	inFlight, available := stack.outbound.tryDequeue()
+	if !available || !inFlight.reusable || len(inFlight.packet) != 9000 {
+		t.Fatal("failed to retain dequeued jumbo output across Close")
+	}
+	if _, err = connection.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	lateSlot, reserved := stack.outbound.tryReserve()
+	if !reserved {
+		t.Fatal("no output slot available for late jumbo publisher")
+	}
+	lateBuffer, lateReusable := stack.acquireLargeOutputBuffer(9000)
+	cache := stack.largeBuffers.Load()
+	if cache == nil || !lateReusable {
+		t.Fatal("jumbo output cache is unavailable")
+	}
+	if err = stack.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if stack.outbound.enqueueReservedPacket(lateSlot, lateBuffer, lateReusable) {
+		t.Fatal("jumbo packet publication succeeded after Close")
+	}
+	if cache := stack.largeBuffers.Load(); cache != nil {
+		cache.release(inFlight.packet)
+	}
+	inFlight.reusable = false
+	stack.outbound.release(inFlight)
+	if stack.largeBuffers.Load() != nil || !cache.retired.Load() || len(cache.buffers) != 0 {
+		t.Fatal("Close retained or repopulated the jumbo buffer cache")
+	}
+	if queued := stack.outbound.len(); queued != 0 {
+		t.Fatalf("Close retained %d outbound packets", queued)
+	}
+	if slots := len(stack.outbound.free); slots != cap(stack.outbound.free) {
+		t.Fatalf("output slots after Close = %d, want %d", slots, cap(stack.outbound.free))
+	}
+}
+
 // TestPacketDeviceConcurrentCloseAndPublish verifies that publishers which
 // crossed the initial close check still clean up without making Close wait.
 func TestPacketDeviceConcurrentCloseAndPublish(t *testing.T) {
@@ -224,6 +283,260 @@ func TestPacketDeviceConcurrentCloseAndPublish(t *testing.T) {
 		}
 		if buffers := len(stack.outbound.buffers); buffers != 0 {
 			t.Fatalf("round %d retained %d reusable buffers", round, buffers)
+		}
+	}
+}
+
+// TestPacketDeviceLargeBufferCacheBounds verifies the MTU-scaled retention
+// limit and the absence of large-cache state at ordinary MTUs.
+func TestPacketDeviceLargeBufferCacheBounds(t *testing.T) {
+	for _, test := range []struct {
+		mtu   int
+		slots int
+	}{
+		{mtu: 1500, slots: 0},
+		{mtu: 2048, slots: 0},
+		{mtu: 2049, slots: 255},
+		{mtu: 9000, slots: 107},
+		{mtu: 16384, slots: 88},
+		{mtu: 32768, slots: 76},
+		{mtu: 65535, slots: 70},
+	} {
+		t.Run(fmt.Sprintf("mtu-%d", test.mtu), func(t *testing.T) {
+			if slots := largePacketBufferSlots(test.mtu); slots != test.slots {
+				t.Fatalf("large buffer slots = %d, want %d", slots, test.slots)
+			}
+			cache := newLargePacketBufferCache(test.mtu)
+			if test.slots == 0 {
+				if cache != nil {
+					t.Fatal("standard MTU created a large buffer cache")
+				}
+				return
+			}
+			if cache == nil || cache.maximum != test.mtu || cap(cache.buffers) != test.slots {
+				t.Fatalf("large buffer cache = %+v, want maximum %d capacity %d", cache, test.mtu, test.slots)
+			}
+			for slot := 0; slot < test.slots+1; slot++ {
+				cache.release(make([]byte, test.mtu))
+			}
+			if retained := len(cache.buffers); retained != test.slots {
+				t.Fatalf("retained buffers = %d, want %d", retained, test.slots)
+			}
+			retainedBytes := 0
+			for len(cache.buffers) != 0 {
+				retainedBytes += cap(<-cache.buffers)
+			}
+			if maximum := deviceBatchSize*test.mtu + largePacketBufferSlack; retainedBytes > maximum {
+				t.Fatalf("retained bytes = %d, want <= %d", retainedBytes, maximum)
+			}
+		})
+	}
+}
+
+// TestPacketDeviceLargeBufferCacheSharing verifies that jumbo output shares
+// one bounded cache while ordinary packets retain the existing per-queue
+// working sets.
+func TestPacketDeviceLargeBufferCacheSharing(t *testing.T) {
+	local := netip.MustParsePrefix("192.0.2.1/32")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{local}, MTU: 9000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	cache := stack.largeBuffers.Load()
+	if cache == nil {
+		t.Fatal("jumbo MTU did not create a large buffer cache")
+	}
+	packet, reusable := stack.acquireLargeOutputBuffer(9000)
+	if !reusable {
+		t.Fatal("jumbo output buffer is not reusable")
+	}
+	packet[0] = 0xa5
+	stack.releaseOutputBuffer(&stack.outbound, packet, reusable)
+	if retained := len(cache.buffers); retained != 1 {
+		t.Fatalf("retained large buffers = %d, want 1", retained)
+	}
+	reused, reusable := stack.acquireLargeOutputBuffer(9000)
+	if !reusable || len(reused) != 9000 || reused[0] != 0xa5 {
+		t.Fatal("loopback output did not reuse the external-output buffer")
+	}
+	stack.releaseOutputBuffer(&stack.loopback.packetQueue, reused, reusable)
+
+	externalSmall, reusable := stack.outbound.acquireBuffer(1500)
+	stack.releaseOutputBuffer(&stack.outbound, externalSmall, reusable)
+	localSmall, reusable := stack.loopback.acquireBuffer(1500)
+	stack.releaseOutputBuffer(&stack.loopback.packetQueue, localSmall, reusable)
+	if len(stack.outbound.buffers) != 1 || len(stack.loopback.buffers) != 1 {
+		t.Fatalf("small buffer caches = external %d local %d, want 1 each", len(stack.outbound.buffers), len(stack.loopback.buffers))
+	}
+	if retained := len(cache.buffers); retained != 1 {
+		t.Fatalf("small output changed large buffer retention to %d", retained)
+	}
+}
+
+// TestPacketDeviceLargeBufferCacheBestEffortReplacement verifies that DRR
+// displacement returns stack-owned jumbo storage before reusing its queue slot.
+func TestPacketDeviceLargeBufferCacheBestEffortReplacement(t *testing.T) {
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")}, MTU: 9000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	cache := stack.largeBuffers.Load()
+	if cache == nil {
+		t.Fatal("jumbo MTU did not create a large buffer cache")
+	}
+	const marker = 0xa5
+	for index := 0; index < cap(stack.outbound.free); index++ {
+		slot, reserved := stack.outbound.tryReserve()
+		if !reserved {
+			t.Fatalf("output slot %d was not available", index)
+		}
+		packet, reusable := stack.acquireLargeOutputBuffer(9000)
+		if !reusable {
+			t.Fatalf("jumbo packet %d is not reusable", index)
+		}
+		packet[0] = marker
+		if !stack.outbound.enqueueReservedPacketForFlow(slot, packet, reusable, outputHashedFlowKey(1)) {
+			t.Fatalf("jumbo packet %d was not published", index)
+		}
+	}
+	if retained := len(cache.buffers); retained != 0 {
+		t.Fatalf("full output queue left %d idle large buffers", retained)
+	}
+	drops := stack.Stats().OutboundQueueDrops
+	slot, err := stack.replaceBestEffortPacket(&stack.outbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained := len(cache.buffers); retained != 1 {
+		t.Fatalf("best-effort replacement retained %d large buffers, want 1", retained)
+	}
+	if got := stack.Stats().OutboundQueueDrops; got != drops+1 {
+		t.Fatalf("best-effort replacement drops = %d, want %d", got, drops+1)
+	}
+	packet, reusable := stack.acquireLargeOutputBuffer(9000)
+	if !reusable || packet[0] != marker {
+		t.Fatal("best-effort replacement did not return the displaced jumbo buffer")
+	}
+	stack.releaseOutputBuffer(&stack.outbound, packet, reusable)
+	stack.outbound.releaseReserved(slot)
+}
+
+// TestPacketDeviceLargeBufferCacheLifecycle verifies that configuration
+// changes retire only obsolete generations and Close releases the active one.
+func TestPacketDeviceLargeBufferCacheLifecycle(t *testing.T) {
+	local := netip.MustParsePrefix("192.0.2.1/32")
+	configuration := Config{LocalAddresses: []netip.Prefix{local}, MTU: 9000}
+	stack, err := New(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := stack.largeBuffers.Load()
+	held, reusable := stack.acquireLargeOutputBuffer(9000)
+	if first == nil || !reusable {
+		t.Fatal("initial large buffer cache is unavailable")
+	}
+	first.release(make([]byte, 9000))
+	if err = stack.UpdateConfig(configuration); err != nil {
+		t.Fatal(err)
+	}
+	if current := stack.largeBuffers.Load(); current != first || first.retired.Load() {
+		t.Fatal("unchanged MTU replaced the large buffer cache")
+	}
+
+	configuration.MTU = 32768
+	if err = stack.UpdateConfig(configuration); err != nil {
+		t.Fatal(err)
+	}
+	second := stack.largeBuffers.Load()
+	if second == nil || second == first || !first.retired.Load() || len(first.buffers) != 0 {
+		t.Fatal("MTU increase did not retire and drain the old cache")
+	}
+	stack.releaseOutputBuffer(&stack.outbound, held, reusable)
+	if retained := len(second.buffers); retained != 1 {
+		t.Fatalf("current cache retained %d migrated buffers, want 1", retained)
+	}
+
+	configuration.MTU = 1500
+	if err = stack.UpdateConfig(configuration); err != nil {
+		t.Fatal(err)
+	}
+	if stack.largeBuffers.Load() != nil || !second.retired.Load() || len(second.buffers) != 0 {
+		t.Fatal("standard MTU retained a large buffer cache")
+	}
+	configuration.MTU = 9000
+	if err = stack.UpdateConfig(configuration); err != nil {
+		t.Fatal(err)
+	}
+	third := stack.largeBuffers.Load()
+	if third == nil || third == first || third == second {
+		t.Fatal("jumbo MTU did not install a new cache generation")
+	}
+	third.release(make([]byte, 9000))
+	if err = stack.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if stack.largeBuffers.Load() != nil || !third.retired.Load() || len(third.buffers) != 0 {
+		t.Fatal("Close retained the active large buffer cache")
+	}
+}
+
+// TestPacketDeviceLargeBufferCacheConcurrentRetirement verifies that output
+// can return buffers while MTU generations are replaced or the Stack closes.
+func TestPacketDeviceLargeBufferCacheConcurrentRetirement(t *testing.T) {
+	local := netip.MustParsePrefix("192.0.2.1/32")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{local}, MTU: 9000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	generations := []*largePacketBufferCache{stack.largeBuffers.Load()}
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		workers.Add(1)
+		go func(worker int) {
+			defer workers.Done()
+			<-start
+			for iteration := 0; iteration < 1000; iteration++ {
+				size := 9000
+				if (worker+iteration)&1 != 0 {
+					size = 32768
+				}
+				buffer, reusable := stack.acquireLargeOutputBuffer(size)
+				stack.releaseOutputBuffer(&stack.outbound, buffer, reusable)
+			}
+		}(worker)
+	}
+	close(start)
+	var updateErr error
+	for iteration := 0; iteration < 100; iteration++ {
+		mtu := uint32(9000)
+		if iteration&1 != 0 {
+			mtu = 32768
+		}
+		if updateErr = stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{local}, MTU: mtu}); updateErr != nil {
+			break
+		}
+		current := stack.largeBuffers.Load()
+		if current != generations[len(generations)-1] {
+			generations = append(generations, current)
+		}
+	}
+	closeErr := stack.Close()
+	workers.Wait()
+	if updateErr != nil {
+		t.Fatal(updateErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if stack.largeBuffers.Load() != nil {
+		t.Fatal("Close retained an active large buffer cache")
+	}
+	for _, generation := range generations {
+		if !generation.retired.Load() || len(generation.buffers) != 0 {
+			t.Fatal("concurrent retirement retained an obsolete cache generation")
 		}
 	}
 }
@@ -368,4 +681,91 @@ func TestPacketDeviceBatchReadReportsCompletedPrefix(t *testing.T) {
 	if !errors.Is(err, io.ErrShortBuffer) || count != 1 || sizes[0] == 0 || sizes[1] != 0 {
 		t.Fatalf("partial Read = %d, %v, sizes %v", count, err, sizes)
 	}
+}
+
+// TestPacketDeviceShortReadReturnsLargeBuffer verifies that the device read
+// error path releases queue-owned jumbo storage together with its queue slot.
+func TestPacketDeviceShortReadReturnsLargeBuffer(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.61")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 9000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	connection, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.MustParseAddrPort("192.0.2.62:5300"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = connection.Close() })
+	payload := make([]byte, 9000-20-udpHeaderSize)
+	if _, err = connection.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	count, err := stack.Read([][]byte{make([]byte, 8999)}, []int{0}, 0)
+	if count != 0 || !errors.Is(err, io.ErrShortBuffer) {
+		t.Fatalf("short jumbo Read = %d, %v, want 0, io.ErrShortBuffer", count, err)
+	}
+	if slots := len(stack.outbound.free); slots != cap(stack.outbound.free) {
+		t.Fatalf("free output slots = %d, want %d", slots, cap(stack.outbound.free))
+	}
+	cache := stack.largeBuffers.Load()
+	if cache == nil || len(cache.buffers) != 1 {
+		t.Fatal("short jumbo Read did not return its large buffer")
+	}
+	packet, reusable := stack.acquireLargeOutputBuffer(9000)
+	if !reusable || len(packet) != 9000 {
+		t.Fatal("short jumbo Read buffer could not be reused")
+	}
+	stack.releaseOutputBuffer(&stack.outbound, packet, reusable)
+}
+
+// TestPacketDeviceLoopbackReturnsLargeBuffer verifies jumbo storage ownership
+// across real local UDP construction, loopback delivery, and socket receipt.
+func TestPacketDeviceLoopbackReturnsLargeBuffer(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.63")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}, MTU: 9000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stack.Close() })
+	listener, err := stack.ListenUDP(context.Background(), "udp4", netip.AddrPortFrom(local, 5300))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	sender, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, netip.AddrPortFrom(local, 5300))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sender.Close() })
+	payload := bytes.Repeat([]byte{0x5a}, 9000-20-udpHeaderSize)
+	if _, err = sender.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err = listener.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	received := make([]byte, len(payload))
+	n, _, err := listener.ReadFrom(received)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received[:n], payload) {
+		t.Fatal("loopback jumbo payload mismatch")
+	}
+	cache := stack.largeBuffers.Load()
+	waitFor(t, time.Second, func() bool {
+		return cache != nil && len(cache.buffers) == 1 && len(stack.loopback.free) == cap(stack.loopback.free)
+	})
+	packet, reusable := stack.acquireLargeOutputBuffer(9000)
+	if !reusable || len(packet) != 9000 {
+		t.Fatal("loopback jumbo buffer could not be reused")
+	}
+	stack.releaseOutputBuffer(&stack.loopback.packetQueue, packet, reusable)
 }

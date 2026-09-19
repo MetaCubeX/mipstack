@@ -1182,25 +1182,34 @@ func TestIPHeaderIncludedInterop(t *testing.T) {
 				entry, notifications := registerReadable(&queue)
 				defer queue.EventUnregister(&entry)
 
-				request := buildHeaderIncludedInteropPacket(family, family.mipstackAddress, family.gvisorAddress, patternedPayload(19, 0xa1))
-				written, writeErr := mips.WriteTo(request, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
-				if writeErr != nil || written != len(request) {
-					t.Fatalf("write mipstack complete packet: n=%d, error=%v", written, writeErr)
+				headerSize := header.IPv6MinimumSize
+				if family.mipstackAddress.Is4() {
+					headerSize = header.IPv4MinimumSize + 4
 				}
-				received, remote, readErr := readGVisorEndpoint(ctx, peer, notifications, int(mtu))
-				if readErr != nil || remote.Addr != gvisorAddress(family.mipstackAddress) || !bytes.Equal(received, request) {
-					t.Fatalf("gVisor complete-packet read: bytes=%d, source=%v, error=%v", len(received), remote, readErr)
-				}
+				// gVisor's header-included write check reserves its network header
+				// within the MTU. Mipstack output fills the wire MTU while the peer
+				// response stays within that endpoint-specific input bound.
+				for index, sizes := range [][2]int{{19, 23}, {int(mtu) - headerSize, int(mtu) - 2*headerSize}} {
+					request := buildHeaderIncludedInteropPacket(family, family.mipstackAddress, family.gvisorAddress, patternedPayload(sizes[0], byte(0xa1+index)))
+					written, writeErr := mips.WriteTo(request, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())})
+					if writeErr != nil || written != len(request) {
+						t.Fatalf("write mipstack complete packet %d: n=%d, error=%v", index, written, writeErr)
+					}
+					received, remote, readErr := readGVisorEndpoint(ctx, peer, notifications, int(mtu))
+					if readErr != nil || remote.Addr != gvisorAddress(family.mipstackAddress) || !bytes.Equal(received, request) {
+						t.Fatalf("gVisor complete-packet read %d: bytes=%d, source=%v, error=%v", index, len(received), remote, readErr)
+					}
 
-				response := buildHeaderIncludedInteropPacket(family, family.gvisorAddress, family.mipstackAddress, patternedPayload(23, 0xb2))
-				written64, tcpipErr := peer.Write(bytes.NewReader(response), tcpip.WriteOptions{})
-				if tcpipErr != nil || written64 != int64(len(response)) {
-					t.Fatalf("write gVisor complete packet: n=%d, error=%s", written64, tcpipErrorString(tcpipErr))
-				}
-				storage := make([]byte, mtu)
-				read, source, readErr := mips.ReadFrom(storage)
-				if readErr != nil || source.String() != family.gvisorAddress.String() || !bytes.Equal(storage[:read], response) {
-					t.Fatalf("mipstack complete-packet read: bytes=%d, source=%v, error=%v", read, source, readErr)
+					response := buildHeaderIncludedInteropPacket(family, family.gvisorAddress, family.mipstackAddress, patternedPayload(sizes[1], byte(0xb2+index)))
+					written64, tcpipErr := peer.Write(bytes.NewReader(response), tcpip.WriteOptions{})
+					if tcpipErr != nil || written64 != int64(len(response)) {
+						t.Fatalf("write gVisor complete packet %d: n=%d, error=%s", index, written64, tcpipErrorString(tcpipErr))
+					}
+					storage := make([]byte, mtu)
+					read, source, readErr := mips.ReadFrom(storage)
+					if readErr != nil || source.String() != family.gvisorAddress.String() || !bytes.Equal(storage[:read], response) {
+						t.Fatalf("mipstack complete-packet read %d: bytes=%d, source=%v, error=%v", index, read, source, readErr)
+					}
 				}
 			})
 		}

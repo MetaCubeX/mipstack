@@ -5086,10 +5086,16 @@ func (s *Stack) tryWriteTCPControl(source, target netip.Addr, sourcePort, target
 	if err != nil {
 		return err
 	}
-	packet, reusable := queue.acquireBuffer(packetSize)
+	var packet []byte
+	var reusable bool
+	if packetSize <= packetReusableBufferLimit {
+		packet, reusable = queue.acquireBuffer(packetSize)
+	} else {
+		packet, reusable = s.acquireLargeOutputBuffer(packetSize)
+	}
 	built, err := buildTCPPacketInto(packet, source, target, sourcePort, targetPort, sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, flowLabel)
 	if err != nil {
-		queue.releaseBuffer(packet, reusable)
+		s.releaseOutputBuffer(queue, packet, reusable)
 		queue.releaseReserved(slot)
 		return err
 	}
@@ -9510,14 +9516,20 @@ func (c *TCPConn) publishReservedTCP(sequence, acknowledgement uint32, flags byt
 		reservation.release()
 		return packetQueueTicket{}, errTCPOutputRouteChanged
 	}
-	packet, reusable := queue.acquireBuffer(packetSize)
+	var packet []byte
+	var reusable bool
+	if packetSize <= packetReusableBufferLimit {
+		packet, reusable = queue.acquireBuffer(packetSize)
+	} else {
+		packet, reusable = c.stack.acquireLargeOutputBuffer(packetSize)
+	}
 	built, err := buildTCPPacketViewInto(
 		packet,
 		c.key.local.Addr(), c.key.remote.Addr(), c.key.local.Port(), c.key.remote.Port(),
 		sequence, acknowledgement, flags, window, options, payload, mtu, trafficClass, ecn, c.flowLabel,
 	)
 	if err != nil {
-		queue.releaseBuffer(packet, reusable)
+		c.stack.releaseOutputBuffer(queue, packet, reusable)
 		reservation.release()
 		return packetQueueTicket{}, err
 	}

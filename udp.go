@@ -1535,9 +1535,16 @@ func (s *Stack) writeBestEffortUDPDatagram(source, target netip.Addr, sourcePort
 			}
 			return err
 		}
-		packet, reusable := queue.acquireBuffer(ipSize + udpSize)
+		packetSize := ipSize + udpSize
+		var packet []byte
+		var reusable bool
+		if packetSize <= packetReusableBufferLimit {
+			packet, reusable = queue.acquireBuffer(packetSize)
+		} else {
+			packet, reusable = s.acquireLargeOutputBuffer(packetSize)
+		}
 		if !marshalIPHeader(packet, source, target, ProtocolUDP, identification, fragmentation.dontFragment, options) {
-			queue.releaseBuffer(packet, reusable)
+			s.releaseOutputBuffer(queue, packet, reusable)
 			queue.releaseReserved(slot)
 			return syscall.EMSGSIZE
 		}
@@ -1597,9 +1604,16 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 		if err != nil {
 			return err
 		}
-		packet, reusable := queue.acquireBuffer(ipSize + udpSize)
+		packetSize := ipSize + udpSize
+		var packet []byte
+		var reusable bool
+		if packetSize <= packetReusableBufferLimit {
+			packet, reusable = queue.acquireBuffer(packetSize)
+		} else {
+			packet, reusable = c.stack.acquireLargeOutputBuffer(packetSize)
+		}
 		if !marshalIPHeader(packet, source, target, ProtocolUDP, identification, fragmentation.dontFragment, options) {
-			queue.releaseBuffer(packet, reusable)
+			c.stack.releaseOutputBuffer(queue, packet, reusable)
 			queue.releaseReserved(slot)
 			return syscall.EMSGSIZE
 		}
@@ -1659,16 +1673,23 @@ func (c *UDPConn) writeDatagramBuffersForMTU(source, target netip.Addr, sourcePo
 	if err != nil {
 		return err
 	}
-	packet, reusable := queue.acquireBuffer(ipSize + udpSize)
+	packetSize := ipSize + udpSize
+	var packet []byte
+	var reusable bool
+	if packetSize <= packetReusableBufferLimit {
+		packet, reusable = queue.acquireBuffer(packetSize)
+	} else {
+		packet, reusable = c.stack.acquireLargeOutputBuffer(packetSize)
+	}
 	if !marshalIPHeader(packet, source, target, ProtocolUDP, identification, fragmentation.dontFragment, options) {
-		queue.releaseBuffer(packet, reusable)
+		c.stack.releaseOutputBuffer(queue, packet, reusable)
 		queue.releaseReserved(slot)
 		return syscall.EMSGSIZE
 	}
 	udp := packet[ipSize:]
 	marshalUDPHeaderFields(udp[:udpHeaderSize], sourcePort, targetPort, udpSize)
 	if copied := copyMessageBuffers(udp[udpHeaderSize:], buffers); copied != payloadSize {
-		queue.releaseBuffer(packet, reusable)
+		c.stack.releaseOutputBuffer(queue, packet, reusable)
 		queue.releaseReserved(slot)
 		return syscall.EINVAL
 	}

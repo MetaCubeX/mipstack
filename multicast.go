@@ -1603,9 +1603,15 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 		queue = &s.loopback.packetQueue
 		slot = localSlot
 	}
-	packet, reusable := queue.acquireBuffer(size)
+	var packet []byte
+	var reusable bool
+	if size <= packetReusableBufferLimit {
+		packet, reusable = queue.acquireBuffer(size)
+	} else {
+		packet, reusable = s.acquireLargeOutputBuffer(size)
+	}
 	if !marshal(packet) {
-		queue.releaseBuffer(packet, reusable)
+		s.releaseOutputBuffer(queue, packet, reusable)
 		queue.releaseReserved(slot)
 		if localReserved && queue != &s.loopback.packetQueue {
 			s.loopback.releaseReserved(localSlot)
@@ -1616,12 +1622,16 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 		var localPacket []byte
 		var localReusable bool
 		if localReserved {
-			localPacket, localReusable = s.loopback.acquireBuffer(size)
+			if size <= packetReusableBufferLimit {
+				localPacket, localReusable = s.loopback.acquireBuffer(size)
+			} else {
+				localPacket, localReusable = s.acquireLargeOutputBuffer(size)
+			}
 			copy(localPacket, packet)
 		}
 		if !s.outbound.enqueueReservedPacket(externalSlot, packet, reusable) {
 			if localReserved {
-				s.loopback.releaseBuffer(localPacket, localReusable)
+				s.releaseOutputBuffer(&s.loopback.packetQueue, localPacket, localReusable)
 				s.loopback.releaseReserved(localSlot)
 			}
 			return ErrClosed
