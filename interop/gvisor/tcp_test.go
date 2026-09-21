@@ -64,6 +64,62 @@ func TestTCPInterop(t *testing.T) {
 	}
 }
 
+// TestTCPReadWithBufferInterop verifies that lazy caller-owned receive buffers
+// consume native gVisor streams in both endpoint roles and address families.
+func TestTCPReadWithBufferInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mipstackListens := range []bool{false, true} {
+			mipstackListens := mipstackListens
+			role := "gvisor-listens"
+			if mipstackListens {
+				role = "mipstack-listens"
+			}
+			t.Run(family.name+"/"+role, func(t *testing.T) {
+				network := newFamilyInteropNetwork(t, family, 1500)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+
+				client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+				defer listener.Close()
+				defer client.Close()
+				defer server.Close()
+				var connection *mipstack.TCPConn
+				var peer net.Conn
+				if mipstackListens {
+					connection = server.(*mipstack.TCPConn)
+					peer = client
+				} else {
+					connection = client.(*mipstack.TCPConn)
+					peer = server
+				}
+				deadline := time.Now().Add(8 * time.Second)
+				if err := connection.SetReadDeadline(deadline); err != nil {
+					t.Fatalf("set mipstack read deadline: %v", err)
+				}
+				if err := peer.SetWriteDeadline(deadline); err != nil {
+					t.Fatalf("set gVisor write deadline: %v", err)
+				}
+
+				payload := patternedPayload(64*1024+137, 59)
+				written := make(chan error, 1)
+				go func() {
+					n, err := peer.Write(payload)
+					if err == nil && n != len(payload) {
+						err = io.ErrShortWrite
+					}
+					written <- err
+				}()
+				readTCPPayloadWithBuffer(t, connection, payload)
+				if err := <-written; err != nil {
+					t.Fatalf("write gVisor TCP payload: %v", err)
+				}
+				exchangeTCPPayload(t, connection, peer, patternedPayload(8*1024+73, 137))
+			})
+		}
+	}
+}
+
 // TestTCPTimeWaitReuseInterop verifies that a gVisor active opener can reuse
 // the same local port against a mipstack listener while the first server-side
 // incarnation remains in TIME-WAIT. Both handshakes exercise the RFC 6191
@@ -1553,6 +1609,46 @@ func exchangeTCPPayload(t *testing.T, sender, receiver net.Conn, payload []byte)
 	}
 	if !bytes.Equal(received, payload) {
 		t.Fatal("payload mismatch")
+	}
+}
+
+// readTCPPayloadWithBuffer consumes one expected stream through the public
+// lazy-buffer API while reusing the same caller-owned storage across reads.
+func readTCPPayloadWithBuffer(t *testing.T, connection *mipstack.TCPConn, expected []byte) {
+	t.Helper()
+	storage := make([]byte, 4*1024)
+	received := make([]byte, 0, len(expected))
+	for len(received) < len(expected) {
+		remaining := len(expected) - len(received)
+		var provided []byte
+		n, err := connection.ReadWithBuffer(func(sizeHint int) []byte {
+			if sizeHint <= 0 {
+				t.Fatalf("ReadWithBuffer reported non-positive size hint %d", sizeHint)
+			}
+			provided = storage
+			if sizeHint < len(provided) {
+				provided = provided[:sizeHint]
+			}
+			if remaining < len(provided) {
+				provided = provided[:remaining]
+			}
+			return provided
+		})
+		if n < 0 || n > len(provided) {
+			t.Fatalf("ReadWithBuffer returned %d bytes for a %d-byte buffer", n, len(provided))
+		}
+		if n != 0 {
+			received = append(received, provided[:n]...)
+		}
+		if err != nil {
+			t.Fatalf("ReadWithBuffer after %d bytes: %v", len(received), err)
+		}
+		if n == 0 {
+			t.Fatal("ReadWithBuffer returned no data and no error")
+		}
+	}
+	if !bytes.Equal(received, expected) {
+		t.Fatal("ReadWithBuffer payload mismatch")
 	}
 }
 

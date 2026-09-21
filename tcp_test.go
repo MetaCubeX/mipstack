@@ -902,7 +902,7 @@ func TestTCPReadBufferAdoptsOwnedPayload(t *testing.T) {
 		t.Fatal("empty receive buffer did not adopt actor-owned payload")
 	}
 	buffer := make([]byte, len(payload))
-	if n, err := connection.read(buffer); err != nil || n != len(payload) || string(buffer) != "data" {
+	if n, err := connection.Read(buffer); err != nil || n != len(payload) || string(buffer) != "data" {
 		t.Fatalf("Read = %d, %q, %v; want 4, data, nil", n, buffer, err)
 	}
 }
@@ -920,6 +920,339 @@ func TestTCPReadCrossesReceiveChunks(t *testing.T) {
 	}
 	if connection.readBuffer.size != 0 || connection.readBuffer.head != 0 || len(connection.readBuffer.chunks) != 0 {
 		t.Fatalf("drained receive deque = size %d head %d chunks %d", connection.readBuffer.size, connection.readBuffer.head, len(connection.readBuffer.chunks))
+	}
+}
+
+func TestTCPReadWithBufferAllocatesOnlyForAvailableData(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	started := make(chan struct{})
+	result := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	var provided []byte
+	var sizeHint int
+	callbackCalls := 0
+	callbackCalled := make(chan struct{}, 1)
+	go func() {
+		close(started)
+		n, err := connection.ReadWithBuffer(func(hint int) []byte {
+			callbackCalls++
+			sizeHint = hint
+			callbackCalled <- struct{}{}
+			provided = make([]byte, 5)
+			return provided
+		})
+		result <- struct {
+			n   int
+			err error
+		}{n: n, err: err}
+	}()
+	<-started
+	select {
+	case <-result:
+		t.Fatal("ReadWithBuffer returned before data was available")
+	case <-callbackCalled:
+		t.Fatal("buffer callback ran before data was available")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if accepted := connection.appendReadBuffer([]byte("hello world"), []byte("hello world"), 0); accepted != len("hello world") {
+		t.Fatalf("accepted = %d, want %d", accepted, len("hello world"))
+	}
+	var readResult struct {
+		n   int
+		err error
+	}
+	select {
+	case readResult = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("ReadWithBuffer did not return after data arrived")
+	}
+	if readResult.n != 5 || readResult.err != nil || callbackCalls != 1 || sizeHint != len("hello world") || string(provided) != "hello" {
+		t.Fatalf("ReadWithBuffer = %d, %v, buffer %q, callback calls %d, size hint %d; want 5, nil, hello, 1, %d", readResult.n, readResult.err, provided, callbackCalls, sizeHint, len("hello world"))
+	}
+	var remaining []byte
+	remainingHint := 0
+	n, err := connection.ReadWithBuffer(func(hint int) []byte {
+		remainingHint = hint
+		remaining = make([]byte, 6)
+		return remaining
+	})
+	if n != len(remaining) || err != nil || remainingHint != len(remaining) || string(remaining) != " world" {
+		t.Fatalf("remaining ReadWithBuffer = %d, %v, %q, size hint %d; want 6, nil, ' world', 6", n, err, remaining, remainingHint)
+	}
+}
+
+func TestTCPReadWithBufferEmptyBufferDoesNotConsume(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	payload := []byte("preserved")
+	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
+	}
+	callbackCalls := 0
+	sizeHint := 0
+	n, err := connection.ReadWithBuffer(func(hint int) []byte {
+		callbackCalls++
+		sizeHint = hint
+		return nil
+	})
+	if n != 0 || !errors.Is(err, io.ErrShortBuffer) || callbackCalls != 1 || sizeHint != len(payload) {
+		t.Fatalf("empty-buffer ReadWithBuffer = %d, %v, callback calls %d, size hint %d; want 0, ErrShortBuffer, 1, %d", n, err, callbackCalls, sizeHint, len(payload))
+	}
+	buffer := make([]byte, len(payload))
+	if n, err = connection.Read(buffer); n != len(buffer) || err != nil || string(buffer) != string(payload) {
+		t.Fatalf("data after empty-buffer ReadWithBuffer = %d, %v, %q; want %d, nil, %q", n, err, buffer, len(payload), payload)
+	}
+}
+
+func TestTCPReadWithBufferReportsFullQueuedSize(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	payload := bytes.Repeat([]byte{'x'}, 64*1024+1)
+	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
+	}
+	var sizeHint int
+	n, err := connection.ReadWithBuffer(func(hint int) []byte {
+		sizeHint = hint
+		return make([]byte, 1)
+	})
+	if n != 1 || err != nil || sizeHint != len(payload) {
+		t.Fatalf("ReadWithBuffer = %d, %v, size hint %d; want 1, nil, %d", n, err, sizeHint, len(payload))
+	}
+}
+
+func TestTCPReadWithBufferCrossesReceiveChunks(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	for _, payload := range [][]byte{[]byte("one"), []byte("two"), []byte("three")} {
+		if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+			t.Fatalf("accepted %d of %d bytes", accepted, len(payload))
+		}
+	}
+	var buffer []byte
+	sizeHint := 0
+	n, err := connection.ReadWithBuffer(func(hint int) []byte {
+		sizeHint = hint
+		buffer = make([]byte, len("onetwothree"))
+		return buffer
+	})
+	if n != len(buffer) || err != nil || sizeHint != len(buffer) || string(buffer) != "onetwothree" {
+		t.Fatalf("cross-chunk ReadWithBuffer = %d, %v, %q, size hint %d; want 11, nil, onetwothree, %d", n, err, buffer, sizeHint, len(buffer))
+	}
+}
+
+func TestTCPReadWithBufferTerminalStatesDoNotCallCallback(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*TCPConn)
+		want  error
+	}{
+		{name: "EOF", setup: func(c *TCPConn) { c.readErr = io.EOF }, want: io.EOF},
+		{name: "reset", setup: func(c *TCPConn) { c.readErr = syscall.ECONNRESET }, want: syscall.ECONNRESET},
+		{name: "read closed", setup: func(c *TCPConn) { c.readClosed = true; c.readErr = net.ErrClosed }, want: net.ErrClosed},
+		{name: "user closed", setup: func(c *TCPConn) { c.userClosed = true }, want: net.ErrClosed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+			connection.mu.Lock()
+			test.setup(connection)
+			connection.mu.Unlock()
+			callbackCalls := 0
+			n, err := connection.ReadWithBuffer(func(_ int) []byte {
+				callbackCalls++
+				return make([]byte, 1)
+			})
+			if n != 0 || !errors.Is(err, test.want) || callbackCalls != 0 {
+				t.Fatalf("ReadWithBuffer = %d, %v, callback calls %d; want 0, %v, 0", n, err, callbackCalls, test.want)
+			}
+		})
+	}
+}
+
+func TestTCPReadWithBufferExpiredDeadlineDoesNotCallCallback(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	payload := []byte("deadline data")
+	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	callbackCalls := 0
+	n, err := connection.ReadWithBuffer(func(_ int) []byte {
+		callbackCalls++
+		return make([]byte, 1)
+	})
+	if n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) || callbackCalls != 0 {
+		t.Fatalf("expired-deadline ReadWithBuffer = %d, %v, callback calls %d; want 0, deadline, 0", n, err, callbackCalls)
+	}
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, len(payload))
+	if n, err := connection.Read(buffer); n != len(payload) || err != nil || string(buffer) != string(payload) {
+		t.Fatalf("data after expired-deadline ReadWithBuffer = %d, %v, %q; want %d, nil, %q", n, err, buffer, len(payload), payload)
+	}
+}
+
+func TestTCPReadWithBufferDataPrecedesEOF(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	payload := []byte("data")
+	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
+	}
+	connection.mu.Lock()
+	connection.readErr = io.EOF
+	connection.mu.Unlock()
+	callbackCalls := 0
+	buffer := []byte(nil)
+	sizeHint := 0
+	n, err := connection.ReadWithBuffer(func(hint int) []byte {
+		callbackCalls++
+		sizeHint = hint
+		buffer = make([]byte, len(payload))
+		return buffer
+	})
+	if n != len(payload) || err != nil || callbackCalls != 1 || sizeHint != len(payload) || string(buffer) != string(payload) {
+		t.Fatalf("data ReadWithBuffer = %d, %v, %q, callback calls %d, size hint %d; want %d, nil, %q, 1, %d", n, err, buffer, callbackCalls, sizeHint, len(payload), payload, len(payload))
+	}
+	if n, err = connection.ReadWithBuffer(func(_ int) []byte {
+		callbackCalls++
+		return make([]byte, 1)
+	}); n != 0 || err != io.EOF || callbackCalls != 1 {
+		t.Fatalf("EOF ReadWithBuffer = %d, %v, callback calls %d; want 0, EOF, 1", n, err, callbackCalls)
+	}
+}
+
+func TestTCPReadWithBufferCallbackRunsOutsideConnectionLock(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	payload := []byte("callback")
+	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
+	}
+	buffer := []byte(nil)
+	n, err := connection.ReadWithBuffer(func(hint int) []byte {
+		if hint != len(payload) {
+			t.Fatalf("ReadWithBuffer size hint = %d; want %d", hint, len(payload))
+		}
+		if deadlineErr := connection.SetReadDeadline(time.Time{}); deadlineErr != nil {
+			t.Fatalf("SetReadDeadline in buffer callback = %v", deadlineErr)
+		}
+		buffer = make([]byte, len(payload))
+		return buffer
+	})
+	if n != len(payload) || err != nil || string(buffer) != string(payload) {
+		t.Fatalf("ReadWithBuffer = %d, %v, %q; want %d, nil, %q", n, err, buffer, len(payload), payload)
+	}
+}
+
+func TestTCPReadWithBufferCallbackCanRaceCloseRead(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	payload := []byte("callback close")
+	if accepted := connection.appendReadBuffer(payload, payload, 0); accepted != len(payload) {
+		t.Fatalf("accepted = %d, want %d", accepted, len(payload))
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	result := make(chan struct {
+		n        int
+		err      error
+		provided []byte
+		sizeHint int
+	}, 1)
+	go func() {
+		var provided []byte
+		sizeHint := 0
+		n, err := connection.ReadWithBuffer(func(hint int) []byte {
+			sizeHint = hint
+			close(entered)
+			<-release
+			provided = make([]byte, len(payload))
+			return provided
+		})
+		result <- struct {
+			n        int
+			err      error
+			provided []byte
+			sizeHint int
+		}{n: n, err: err, provided: provided, sizeHint: sizeHint}
+	}()
+	<-entered
+	closed := make(chan error, 1)
+	go func() { closed <- connection.CloseRead() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("CloseRead during buffer callback = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CloseRead blocked during buffer callback")
+	}
+	close(release)
+	select {
+	case readResult := <-result:
+		if readResult.n != 0 || !errors.Is(readResult.err, net.ErrClosed) || readResult.provided == nil || readResult.sizeHint != len(payload) {
+			t.Fatalf("ReadWithBuffer after CloseRead = %d, %v, buffer nil=%v, size hint %d; want 0, closed, non-nil buffer, %d", readResult.n, readResult.err, readResult.provided == nil, readResult.sizeHint, len(payload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadWithBuffer did not return after CloseRead")
+	}
+}
+
+func TestTCPReadWithBufferUsesEstablishedReceivePath(t *testing.T) {
+	clientAddress := netip.MustParseAddr("192.0.2.221")
+	serverAddress := netip.MustParseAddr("192.0.2.222")
+	client, server := newStackPair(t, clientAddress, serverAddress, 1400)
+	newStackBridge(t, client, server)
+	listener, err := server.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(serverAddress, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			accepted <- nil
+			return
+		}
+		accepted <- connection
+	}()
+	clientConnection, err := client.DialTCP(context.Background(), "tcp4", netip.AddrPort{}, listener.Addr().(*net.TCPAddr).AddrPort())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverConnection := <-accepted
+	if serverConnection == nil {
+		t.Fatal("server did not accept connection")
+	}
+	defer clientConnection.Close()
+	defer serverConnection.Close()
+	defer listener.Close()
+	payload := []byte("established receive path")
+	if _, err = clientConnection.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	var buffer []byte
+	sizeHint := 0
+	n, err := serverConnection.(*TCPConn).ReadWithBuffer(func(hint int) []byte {
+		sizeHint = hint
+		buffer = make([]byte, len(payload))
+		return buffer
+	})
+	if n != len(payload) || err != nil || sizeHint != len(payload) || string(buffer) != string(payload) {
+		t.Fatalf("ReadWithBuffer = %d, %v, %q, size hint %d; want %d, nil, %q, %d", n, err, buffer, sizeHint, len(payload), payload, len(payload))
+	}
+}
+
+func TestTCPReadWithBufferRejectsNilCallback(t *testing.T) {
+	connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+	n, err := connection.ReadWithBuffer(nil)
+	if n != 0 || !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("nil callback ReadWithBuffer = %d, %v; want 0, EINVAL", n, err)
+	}
+	var operationError *net.OpError
+	if !errors.As(err, &operationError) || operationError.Op != "read" || operationError.Net != "tcp4" {
+		t.Fatalf("nil callback error = %T %v; want read tcp4 OpError", err, err)
 	}
 }
 
@@ -10617,6 +10950,176 @@ func BenchmarkTCPStreamRoundTrip(b *testing.B) {
 		if _, err = io.ReadFull(connection, response); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkTCPApplicationRead compares Read with caller-owned lazy reads
+// after production receive chunks have entered a TCP connection queue.
+func BenchmarkTCPApplicationRead(b *testing.B) {
+	const receiveChunkSize = 1200
+	// Cover application-sized reads, a sub-MSS read, and multi-chunk
+	// bursts; the bounded 4 KiB case exercises caller-buffer reuse.
+	for _, payloadSize := range []int{64, 512, receiveChunkSize, 4 * 1024, 32 * 1024} {
+		payloadSize := payloadSize
+		b.Run(fmt.Sprintf("%dB", payloadSize), func(b *testing.B) {
+			bufferSizes := []struct {
+				name string
+				size int
+			}{{name: "exact", size: payloadSize}}
+			if payloadSize > 4*1024 {
+				bufferSizes = append(bufferSizes, struct {
+					name string
+					size int
+				}{name: "4K", size: 4 * 1024})
+			}
+			for _, bufferSize := range bufferSizes {
+				bufferSize := bufferSize
+				b.Run(bufferSize.name, func(b *testing.B) {
+					chunks := make([][]byte, 0, (payloadSize+receiveChunkSize-1)/receiveChunkSize)
+					for offset := 0; offset < payloadSize; {
+						length := payloadSize - offset
+						if length > receiveChunkSize {
+							length = receiveChunkSize
+						}
+						chunks = append(chunks, bytes.Repeat([]byte{0x5a}, length))
+						offset += length
+					}
+
+					for _, mode := range []string{"Read", "ReadWithBuffer"} {
+						mode := mode
+						b.Run(mode, func(b *testing.B) {
+							connection := newTCPConn(nil, "tcp4", tcpKey{}, 1500, tcpSocketOptionSet{})
+							buffer := make([]byte, bufferSize.size)
+							remaining := payloadSize
+							getBuffer := func(_ int) []byte {
+								length := len(buffer)
+								if remaining < length {
+									length = remaining
+								}
+								return buffer[:length]
+							}
+							b.SetBytes(int64(payloadSize))
+							b.ReportAllocs()
+							b.ResetTimer()
+							if mode == "Read" {
+								for iteration := 0; iteration < b.N; iteration++ {
+									for _, chunk := range chunks {
+										if accepted := connection.appendReadBuffer(chunk, chunk, 0); accepted != len(chunk) {
+											b.Fatalf("accepted %d of %d bytes", accepted, len(chunk))
+										}
+									}
+									remaining := payloadSize
+									for remaining > 0 {
+										length := len(buffer)
+										if remaining < length {
+											length = remaining
+										}
+										n, err := connection.Read(buffer[:length])
+										if err != nil || n <= 0 || n > length {
+											b.Fatalf("Read = %d, %v", n, err)
+										}
+										if buffer[0] != 0x5a {
+											b.Fatalf("Read returned unexpected payload byte %#x", buffer[0])
+										}
+										remaining -= n
+									}
+								}
+								return
+							}
+
+							for iteration := 0; iteration < b.N; iteration++ {
+								for _, chunk := range chunks {
+									if accepted := connection.appendReadBuffer(chunk, chunk, 0); accepted != len(chunk) {
+										b.Fatalf("accepted %d of %d bytes", accepted, len(chunk))
+									}
+								}
+								remaining = payloadSize
+								for remaining > 0 {
+									n, err := connection.ReadWithBuffer(getBuffer)
+									length := len(buffer)
+									if remaining < length {
+										length = remaining
+									}
+									if err != nil || n <= 0 || n > length {
+										b.Fatalf("ReadWithBuffer = %d, %v", n, err)
+									}
+									if buffer[0] != 0x5a {
+										b.Fatalf("ReadWithBuffer returned unexpected payload byte %#x", buffer[0])
+									}
+									remaining -= n
+								}
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
+// BenchmarkTCPStreamReadModes compares Read with caller-owned lazy reads
+// through the existing packet-level TCP echo path.
+func BenchmarkTCPStreamReadModes(b *testing.B) {
+	for _, mode := range []string{"Read", "ReadWithBuffer"} {
+		mode := mode
+		b.Run(mode, func(b *testing.B) {
+			link, stack := newTestStack(b, netip.MustParseAddr("192.0.2.241"), netip.MustParseAddr("198.51.100.241"))
+			link.mu.Lock()
+			link.echoTCP = true
+			link.mu.Unlock()
+			connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8443))
+			if err != nil {
+				b.Fatal(err)
+			}
+			tcpConnection := connection.(*TCPConn)
+			defer connection.Close()
+			if err = connection.SetDeadline(time.Now().Add(10 * time.Minute)); err != nil {
+				b.Fatal(err)
+			}
+			payload := bytes.Repeat([]byte{0x5a}, 32*1024)
+			response := make([]byte, len(payload))
+			offset := 0
+			getBuffer := func(_ int) []byte { return response[offset:] }
+			b.ReportAllocs()
+			b.SetBytes(int64(len(payload)))
+			b.ResetTimer()
+			if mode == "Read" {
+				for iteration := 0; iteration < b.N; iteration++ {
+					if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
+						b.Fatalf("Write = %d, %v", n, writeErr)
+					}
+					offset = 0
+					for offset < len(response) {
+						n, readErr := tcpConnection.Read(response[offset:])
+						if readErr != nil || n <= 0 || n > len(response)-offset {
+							b.Fatalf("Read = %d, %v", n, readErr)
+						}
+						offset += n
+					}
+					if !bytes.Equal(response, payload) {
+						b.Fatal("TCP echo payload mismatch")
+					}
+				}
+				return
+			}
+
+			for iteration := 0; iteration < b.N; iteration++ {
+				if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
+					b.Fatalf("Write = %d, %v", n, writeErr)
+				}
+				offset = 0
+				for offset < len(response) {
+					n, readErr := tcpConnection.ReadWithBuffer(getBuffer)
+					if readErr != nil || n <= 0 || n > len(response)-offset {
+						b.Fatalf("ReadWithBuffer = %d, %v", n, readErr)
+					}
+					offset += n
+				}
+				if !bytes.Equal(response, payload) {
+					b.Fatal("TCP echo payload mismatch")
+				}
+			}
+		})
 	}
 }
 

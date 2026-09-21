@@ -5254,23 +5254,48 @@ func (c *TCPConn) Read(buffer []byte) (int, error) {
 	}
 	c.readCallMu.Lock()
 	defer c.readCallMu.Unlock()
-	n, err := c.read(buffer)
+	_, n, _, err := c.readChunk(buffer, len(buffer), nil)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return n, c.operationError("read", err)
 	}
 	return n, err
 }
 
-// read returns stream data without adding the public operation wrapper. The
-// caller serializes it with other stream reads.
-func (c *TCPConn) read(buffer []byte) (int, error) {
-	_, n, _, err := c.readChunk(buffer, len(buffer))
+// ReadWithBuffer reads application bytes into a buffer obtained lazily from
+// getBuffer. The callback receives the currently queued application byte
+// count as an advisory hint. It runs at most once after this call observes
+// queued application data, and it runs without the connection state mutex
+// held. It must not call Read, ReadWithBuffer, or WriteTo on the same
+// connection. The hint may be stale by the time the callback returns.
+//
+// The caller owns the buffer returned by getBuffer. The callback should save
+// that slice where the caller can inspect or release it after this method
+// returns. The first n bytes contain the data read, and the connection does
+// not retain the buffer. If the callback is called, the caller must release
+// the buffer even when this method returns an error. The length of the
+// returned slice limits the number of bytes read. A nil callback is invalid,
+// and an empty buffer reports an error matching io.ErrShortBuffer without
+// consuming receive data.
+//
+// This is an experimental API and is not covered by the package's stability
+// guarantees.
+func (c *TCPConn) ReadWithBuffer(getBuffer func(sizeHint int) []byte) (int, error) {
+	if getBuffer == nil {
+		return 0, c.operationError("read", syscall.EINVAL)
+	}
+	c.readCallMu.Lock()
+	defer c.readCallMu.Unlock()
+	_, n, _, err := c.readChunk(nil, 0, getBuffer)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return n, c.operationError("read", err)
+	}
 	return n, err
 }
 
 // readChunk consumes one receive-buffer prefix. A nil destination transfers
-// one independently owned chunk to another synchronous TCP writer.
-func (c *TCPConn) readChunk(destination []byte, maximum int) ([]byte, int, bool, error) {
+// one independently owned chunk unless getBuffer supplies a caller-owned
+// destination after queued application data becomes available.
+func (c *TCPConn) readChunk(destination []byte, maximum int, getBuffer func(sizeHint int) []byte) ([]byte, int, bool, error) {
 	for {
 		c.mu.Lock()
 		if c.userClosed || c.readClosed {
@@ -5289,6 +5314,16 @@ func (c *TCPConn) readChunk(destination []byte, maximum int) ([]byte, int, bool,
 			recyclable := false
 			n := 0
 			if destination == nil {
+				if getBuffer != nil {
+					sizeHint := c.readBuffer.size
+					c.mu.Unlock()
+					destination = getBuffer(sizeHint)
+					if len(destination) == 0 {
+						return nil, 0, false, io.ErrShortBuffer
+					}
+					maximum = len(destination)
+					continue
+				}
 				payload, recyclable = c.readBuffer.take(maximum)
 				n = len(payload)
 			} else {
@@ -5332,7 +5367,7 @@ func (c *TCPConn) WriteTo(writer io.Writer) (int64, error) {
 	buffer := make([]byte, 32*1024)
 	var total int64
 	for {
-		_, n, _, readErr := c.readChunk(buffer, len(buffer))
+		_, n, _, readErr := c.readChunk(buffer, len(buffer), nil)
 		if n > 0 {
 			written, writeErr := writer.Write(buffer[:n])
 			if written < 0 || written > n {
@@ -5360,7 +5395,7 @@ func (c *TCPConn) WriteTo(writer io.Writer) (int64, error) {
 func (c *TCPConn) writeToTCP(target *TCPConn) (int64, error) {
 	var total int64
 	for {
-		payload, _, recyclable, readErr := c.readChunk(nil, 32*1024)
+		payload, _, recyclable, readErr := c.readChunk(nil, 32*1024, nil)
 		if len(payload) != 0 {
 			written, writeErr := target.Write(payload)
 			if recyclable {
