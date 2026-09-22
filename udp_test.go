@@ -1339,6 +1339,188 @@ func TestUDPConcurrentReaders(t *testing.T) {
 	}
 }
 
+func TestUDPReadWithBufferAddressVariants(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.97")
+	remote := netip.MustParseAddrPort("198.51.100.97:5301")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newUDPConn(stack, "udp4", 5300, false, local, remote, datagramSocketOptionSet{})
+	defer connection.closeFromStack()
+
+	first := []byte("first datagram")
+	connection.enqueue(first, remote, local, ipPacketOptions{})
+	var firstBuffer []byte
+	firstHint := 0
+	n, readErr := connection.ReadWithBuffer(func(sizeHint int) []byte {
+		firstHint = sizeHint
+		firstBuffer = make([]byte, 3)
+		return firstBuffer
+	})
+	if readErr != nil || n != len(firstBuffer) || firstHint != len(first) || string(firstBuffer) != "fir" {
+		t.Fatalf("ReadWithBuffer = %d, %v, hint %d, payload %q; want 3, nil, %d, fir", n, readErr, firstHint, firstBuffer, len(first))
+	}
+
+	second := []byte("second")
+	connection.enqueue(second, remote, local, ipPacketOptions{})
+	var secondBuffer []byte
+	n, address, readErr := connection.ReadFromWithBuffer(func(sizeHint int) []byte {
+		if sizeHint != len(second) {
+			t.Fatalf("ReadFromWithBuffer size hint = %d; want %d", sizeHint, len(second))
+		}
+		secondBuffer = make([]byte, sizeHint)
+		return secondBuffer
+	})
+	if readErr != nil || n != len(second) || string(secondBuffer) != string(second) {
+		t.Fatalf("ReadFromWithBuffer = %d, %v, payload %q; want %d, nil, %q", n, readErr, secondBuffer, len(second), second)
+	}
+	if got, ok := address.(*net.UDPAddr); !ok || got.AddrPort() != remote {
+		t.Fatalf("ReadFromWithBuffer address = %#v; want %v", address, remote)
+	}
+
+	third := []byte("third")
+	connection.enqueue(third, remote, local, ipPacketOptions{})
+	var thirdBuffer []byte
+	n, addressUDP, readErr := connection.ReadFromUDPWithBuffer(func(sizeHint int) []byte {
+		if sizeHint != len(third) {
+			t.Fatalf("ReadFromUDPWithBuffer size hint = %d; want %d", sizeHint, len(third))
+		}
+		thirdBuffer = make([]byte, sizeHint)
+		return thirdBuffer
+	})
+	if readErr != nil || n != len(third) || string(thirdBuffer) != string(third) || addressUDP == nil || addressUDP.AddrPort() != remote {
+		t.Fatalf("ReadFromUDPWithBuffer = %d, %v, address %v, payload %q; want %d, nil, %v, %q", n, readErr, addressUDP, thirdBuffer, len(third), remote, third)
+	}
+
+	fourth := []byte("fourth")
+	connection.enqueue(fourth, remote, local, ipPacketOptions{})
+	var fourthBuffer []byte
+	n, addressPort, readErr := connection.ReadFromUDPAddrPortWithBuffer(func(sizeHint int) []byte {
+		if sizeHint != len(fourth) {
+			t.Fatalf("ReadFromUDPAddrPortWithBuffer size hint = %d; want %d", sizeHint, len(fourth))
+		}
+		fourthBuffer = make([]byte, sizeHint)
+		return fourthBuffer
+	})
+	if readErr != nil || n != len(fourth) || string(fourthBuffer) != string(fourth) || addressPort != remote {
+		t.Fatalf("ReadFromUDPAddrPortWithBuffer = %d, %v, address %v, payload %q; want %d, nil, %v, %q", n, readErr, addressPort, fourthBuffer, len(fourth), remote, fourth)
+	}
+
+	connection.enqueue(nil, remote, local, ipPacketOptions{})
+	emptyHint := -1
+	n, addressPort, readErr = connection.ReadFromUDPAddrPortWithBuffer(func(sizeHint int) []byte {
+		emptyHint = sizeHint
+		return nil
+	})
+	if readErr != nil || n != 0 || emptyHint != 0 || addressPort != remote {
+		t.Fatalf("zero-length ReadWithBuffer = %d, %v, hint %d, address %v; want 0, nil, 0, %v", n, readErr, emptyHint, addressPort, remote)
+	}
+
+	if _, _, readErr = connection.ReadFromWithBuffer(nil); !errors.Is(readErr, syscall.EINVAL) {
+		t.Fatalf("nil UDP buffer callback error = %v; want EINVAL", readErr)
+	}
+}
+
+func TestUDPReadWithBufferWaitsOutsideConnectionLock(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.98")
+	remote := netip.MustParseAddrPort("198.51.100.98:5301")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newUDPConn(stack, "udp4", 5300, false, local, remote, datagramSocketOptionSet{})
+	defer connection.closeFromStack()
+	callbackCalled := make(chan int, 1)
+	result := make(chan struct {
+		n           int
+		err         error
+		hint        int
+		payload     []byte
+		deadlineErr error
+	}, 1)
+	go func() {
+		var payload []byte
+		deadlineErr := error(nil)
+		n, readErr := connection.ReadWithBuffer(func(sizeHint int) []byte {
+			callbackCalled <- sizeHint
+			deadlineErr = connection.SetReadDeadline(time.Time{})
+			payload = make([]byte, sizeHint)
+			return payload
+		})
+		result <- struct {
+			n           int
+			err         error
+			hint        int
+			payload     []byte
+			deadlineErr error
+		}{n: n, err: readErr, hint: len(payload), payload: payload, deadlineErr: deadlineErr}
+	}()
+	select {
+	case hint := <-callbackCalled:
+		t.Fatalf("UDP buffer callback ran before a datagram was queued with hint %d", hint)
+	case <-time.After(20 * time.Millisecond):
+	}
+	payload := []byte("outside lock")
+	connection.enqueue(payload, remote, local, ipPacketOptions{})
+	var readResult struct {
+		n           int
+		err         error
+		hint        int
+		payload     []byte
+		deadlineErr error
+	}
+	select {
+	case hint := <-callbackCalled:
+		if hint != len(payload) {
+			t.Fatalf("UDP ReadWithBuffer size hint = %d; want %d", hint, len(payload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("UDP ReadWithBuffer callback did not run")
+	}
+	select {
+	case readResult = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("UDP ReadWithBuffer did not return")
+	}
+	if readResult.n != len(payload) || readResult.err != nil || readResult.hint != len(payload) || string(readResult.payload) != string(payload) || readResult.deadlineErr != nil {
+		t.Fatalf("UDP ReadWithBuffer = %d, %v, hint %d, payload %q, deadline error %v; want %d, nil, %d, %q, nil", readResult.n, readResult.err, readResult.hint, readResult.payload, readResult.deadlineErr, len(payload), len(payload), payload)
+	}
+}
+
+func TestUDPReadWithBufferDeadlineDoesNotCallCallback(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.99")
+	remote := netip.MustParseAddrPort("198.51.100.99:5301")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newUDPConn(stack, "udp4", 5300, false, local, remote, datagramSocketOptionSet{})
+	defer connection.closeFromStack()
+	payload := []byte("deadline")
+	connection.enqueue(payload, remote, local, ipPacketOptions{})
+	if err := connection.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	callbackCalls := 0
+	if n, readErr := connection.ReadWithBuffer(func(int) []byte {
+		callbackCalls++
+		return make([]byte, len(payload))
+	}); n != 0 || !errors.Is(readErr, os.ErrDeadlineExceeded) || callbackCalls != 0 {
+		t.Fatalf("expired UDP ReadWithBuffer = %d, %v, callback calls %d; want 0, deadline, 0", n, readErr, callbackCalls)
+	}
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, len(payload))
+	if n, readErr := connection.Read(buffer); n != len(payload) || readErr != nil || string(buffer) != string(payload) {
+		t.Fatalf("UDP data after expired ReadWithBuffer = %d, %v, %q; want %d, nil, %q", n, readErr, buffer, len(payload), payload)
+	}
+}
+
 func TestUDPTypedMethods(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.96")
 	remote := netip.MustParseAddr("198.51.100.96")
@@ -1955,8 +2137,63 @@ func BenchmarkUDPReceiveQueue(b *testing.B) {
 	b.ResetTimer()
 	for iteration := 0; iteration < b.N; iteration++ {
 		connection.enqueue(payload, remote, local, ipPacketOptions{})
-		if n, _, _, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) {
+		if n, _, _, _, _, readErr := connection.readDatagram(buffer, nil); readErr != nil || n != len(payload) {
 			b.Fatalf("readDatagram = %d, %v", n, readErr)
+		}
+	}
+}
+
+func BenchmarkUDPReadBufferAPI(b *testing.B) {
+	for _, payloadSize := range []int{64, 512, 1200, 4096, 65507} {
+		payloadSize := payloadSize
+		for _, mode := range []string{
+			"Read", "ReadWithBuffer",
+			"ReadFrom", "ReadFromWithBuffer",
+			"ReadFromUDP", "ReadFromUDPWithBuffer",
+			"ReadFromUDPAddrPort", "ReadFromUDPAddrPortWithBuffer",
+		} {
+			mode := mode
+			b.Run(fmt.Sprintf("%s/%d", mode, payloadSize), func(b *testing.B) {
+				local := netip.MustParseAddr("192.0.2.245")
+				remote := netip.MustParseAddrPort("198.51.100.245:5353")
+				stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+				if err != nil {
+					b.Fatal(err)
+				}
+				connection := newUDPConn(stack, "udp4", 5300, false, local, remote, datagramSocketOptionSet{})
+				b.Cleanup(connection.closeFromStack)
+				payload := bytes.Repeat([]byte{0x5a}, payloadSize)
+				buffer := make([]byte, payloadSize)
+				getBuffer := func(int) []byte { return buffer }
+				b.SetBytes(int64(payloadSize))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for iteration := 0; iteration < b.N; iteration++ {
+					connection.enqueue(payload, remote, local, ipPacketOptions{})
+					var n int
+					switch mode {
+					case "Read":
+						n, err = connection.Read(buffer)
+					case "ReadWithBuffer":
+						n, err = connection.ReadWithBuffer(getBuffer)
+					case "ReadFrom":
+						n, _, err = connection.ReadFrom(buffer)
+					case "ReadFromWithBuffer":
+						n, _, err = connection.ReadFromWithBuffer(getBuffer)
+					case "ReadFromUDP":
+						n, _, err = connection.ReadFromUDP(buffer)
+					case "ReadFromUDPWithBuffer":
+						n, _, err = connection.ReadFromUDPWithBuffer(getBuffer)
+					case "ReadFromUDPAddrPort":
+						n, _, err = connection.ReadFromUDPAddrPort(buffer)
+					case "ReadFromUDPAddrPortWithBuffer":
+						n, _, err = connection.ReadFromUDPAddrPortWithBuffer(getBuffer)
+					}
+					if err != nil || n != payloadSize {
+						b.Fatalf("%s = %d, %v", mode, n, err)
+					}
+				}
+			})
 		}
 	}
 }
@@ -2023,7 +2260,7 @@ func TestUDPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
 	read := func(payload []byte) {
 		connection.enqueue(payload, remote, local, ipPacketOptions{})
 		buffer := make([]byte, len(payload))
-		if n, _, _, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) || !bytes.Equal(buffer, payload) {
+		if n, _, _, _, _, readErr := connection.readDatagram(buffer, nil); readErr != nil || n != len(payload) || !bytes.Equal(buffer, payload) {
 			t.Fatalf("readDatagram = %d bytes, %v", n, readErr)
 		}
 	}

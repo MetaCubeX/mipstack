@@ -38,6 +38,93 @@ func TestRawIPInterop(t *testing.T) {
 	}
 }
 
+// TestIPReadWithBufferInterop verifies lazy caller-owned buffers on connected
+// raw-IP reads and both source-address return forms against gVisor's native
+// raw endpoint.
+func TestIPReadWithBufferInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			network := newFamilyInteropNetwork(t, family, 1500)
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer cancel()
+			connection, err := network.mipstack.DialIP(ctx, family.rawNetwork, family.mipstackAddress, family.gvisorAddress)
+			if err != nil {
+				t.Fatalf("dial mipstack raw socket: %v", err)
+			}
+			defer connection.Close()
+			if err = connection.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			mipstackIP := connection.(*mipstack.IPConn)
+
+			var queue waiter.Queue
+			peer, tcpipErr := raw.NewEndpoint(network.gvisor, family.networkProtocol, interopRawIPProtocol, &queue)
+			if tcpipErr != nil {
+				t.Fatalf("create gVisor raw endpoint: %s", tcpipErr.String())
+			}
+			defer peer.Close()
+			if tcpipErr = peer.Bind(gvisorFullAddress(family.gvisorAddress, 0)); tcpipErr != nil {
+				t.Fatalf("bind gVisor raw endpoint: %s", tcpipErr.String())
+			}
+			if tcpipErr = peer.Connect(gvisorFullAddress(family.mipstackAddress, 0)); tcpipErr != nil {
+				t.Fatalf("connect gVisor raw endpoint: %s", tcpipErr.String())
+			}
+			entry, notifications := registerReadable(&queue)
+			defer queue.EventUnregister(&entry)
+
+			for index, mode := range []string{"ReadWithBuffer", "ReadFromWithBuffer", "ReadFromIPWithBuffer"} {
+				request := patternedPayload(29+index, byte(0x41+index))
+				if written, writeErr := peer.Write(bytes.NewReader(request), tcpip.WriteOptions{}); writeErr != nil || written != int64(len(request)) {
+					t.Fatalf("gVisor raw request %s = %d, error=%s", mode, written, tcpipErrorString(writeErr))
+				}
+				buffer := make([]byte, len(request))
+				var read int
+				var source net.Addr
+				var readErr error
+				getBuffer := func(sizeHint int) []byte {
+					if sizeHint != len(request) {
+						t.Fatalf("raw IP %s size hint = %d; want %d", mode, sizeHint, len(request))
+					}
+					return buffer
+				}
+				switch mode {
+				case "ReadWithBuffer":
+					read, readErr = mipstackIP.ReadWithBuffer(getBuffer)
+				case "ReadFromWithBuffer":
+					read, source, readErr = mipstackIP.ReadFromWithBuffer(getBuffer)
+				case "ReadFromIPWithBuffer":
+					var address *net.IPAddr
+					read, address, readErr = mipstackIP.ReadFromIPWithBuffer(getBuffer)
+					source = address
+				}
+				if readErr != nil || !bytes.Equal(buffer[:read], request) {
+					t.Fatalf("mipstack raw IP %s = n=%d source=%v error=%v", mode, read, source, readErr)
+				}
+				if mode != "ReadWithBuffer" {
+					address, ok := source.(*net.IPAddr)
+					if !ok || address == nil || !address.IP.Equal(net.IP(family.gvisorAddress.AsSlice())) {
+						t.Fatalf("mipstack raw IP %s source = %#v; want %v", mode, source, family.gvisorAddress)
+					}
+				}
+
+				response := patternedPayload(37+index, byte(0x81+index))
+				if written, writeErr := mipstackIP.Write(response); writeErr != nil || written != len(response) {
+					t.Fatalf("mipstack raw response %s = %d, %v", mode, written, writeErr)
+				}
+				packet, remote, endpointErr := readGVisorEndpoint(ctx, peer, notifications, 65535)
+				if endpointErr != nil {
+					t.Fatalf("gVisor raw response %s: %v", mode, endpointErr)
+				}
+				payload, stripErr := stripGVisorRawHeader(family, packet)
+				if stripErr != nil || remote.Addr != gvisorAddress(family.mipstackAddress) || !bytes.Equal(payload, response) {
+					t.Fatalf("gVisor raw response %s = source=%v payload=%x error=%v", mode, remote, payload, stripErr)
+				}
+			}
+		})
+	}
+}
+
 // TestIPConnectedWriteBatchInterop verifies connected raw-IP batches against
 // gVisor's native endpoint with single- and multi-buffer payloads across the
 // MTU matrix. Low-MTU IPv4 cases also exercise source fragmentation. gVisor's

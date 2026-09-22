@@ -759,7 +759,7 @@ func udpDatagramSize(payload []byte) int {
 
 // ReadFrom returns the next complete datagram or socket error.
 func (c *UDPConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
-	n, source, _, _, _, err := c.readDatagram(buffer)
+	n, source, _, _, _, err := c.readDatagram(buffer, nil)
 	var address net.Addr
 	if source.IsValid() {
 		address = net.UDPAddrFromAddrPort(source)
@@ -772,7 +772,7 @@ func (c *UDPConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
 
 // ReadFromUDP acts like ReadFrom but returns a UDPAddr.
 func (c *UDPConn) ReadFromUDP(buffer []byte) (int, *net.UDPAddr, error) {
-	n, source, _, _, _, err := c.readDatagram(buffer)
+	n, source, _, _, _, err := c.readDatagram(buffer, nil)
 	var address *net.UDPAddr
 	if source.IsValid() {
 		address = net.UDPAddrFromAddrPort(source)
@@ -785,7 +785,78 @@ func (c *UDPConn) ReadFromUDP(buffer []byte) (int, *net.UDPAddr, error) {
 
 // ReadFromUDPAddrPort acts like ReadFrom but returns a netip.AddrPort.
 func (c *UDPConn) ReadFromUDPAddrPort(buffer []byte) (int, netip.AddrPort, error) {
-	n, source, _, _, _, err := c.readDatagram(buffer)
+	n, source, _, _, _, err := c.readDatagram(buffer, nil)
+	if err != nil {
+		return n, source, c.operationError("read", c.remoteAddr(), err)
+	}
+	return n, source, nil
+}
+
+// ReadFromWithBuffer reads the next complete datagram like ReadFrom, obtaining
+// the destination buffer lazily from getBuffer and returning its source
+// address.
+//
+// If a datagram is available, getBuffer is called once after it is dequeued.
+// It is not called when the operation returns before a datagram is available
+// because of an error or deadline. The callback receives the complete UDP
+// payload length as an advisory size hint. It runs without c's connection state
+// lock and must return promptly; it must not call a read method on c. The caller
+// owns the returned slice, and c does not retain it. A nil callback returns
+// EINVAL. A short returned slice truncates and consumes the datagram, matching
+// ReadFrom.
+//
+// This is an experimental API and is not covered by the package's stability
+// guarantees.
+func (c *UDPConn) ReadFromWithBuffer(getBuffer func(sizeHint int) []byte) (int, net.Addr, error) {
+	if getBuffer == nil {
+		return 0, nil, c.operationError("read", c.remoteAddr(), syscall.EINVAL)
+	}
+	n, source, _, _, _, err := c.readDatagram(nil, getBuffer)
+	var address net.Addr
+	if source.IsValid() {
+		address = net.UDPAddrFromAddrPort(source)
+	}
+	if err != nil {
+		return n, address, c.operationError("read", c.remoteAddr(), err)
+	}
+	return n, address, nil
+}
+
+// ReadFromUDPWithBuffer is the *net.UDPAddr form of ReadFromWithBuffer.
+//
+// It has the same callback, buffer ownership, truncation, and nil-callback
+// semantics as ReadFromWithBuffer.
+//
+// This is an experimental API and is not covered by the package's stability
+// guarantees.
+func (c *UDPConn) ReadFromUDPWithBuffer(getBuffer func(sizeHint int) []byte) (int, *net.UDPAddr, error) {
+	if getBuffer == nil {
+		return 0, nil, c.operationError("read", c.remoteAddr(), syscall.EINVAL)
+	}
+	n, source, _, _, _, err := c.readDatagram(nil, getBuffer)
+	var address *net.UDPAddr
+	if source.IsValid() {
+		address = net.UDPAddrFromAddrPort(source)
+	}
+	if err != nil {
+		return n, address, c.operationError("read", c.remoteAddr(), err)
+	}
+	return n, address, nil
+}
+
+// ReadFromUDPAddrPortWithBuffer is the netip.AddrPort form of
+// ReadFromWithBuffer.
+//
+// It has the same callback, buffer ownership, truncation, and nil-callback
+// semantics as ReadFromWithBuffer.
+//
+// This is an experimental API and is not covered by the package's stability
+// guarantees.
+func (c *UDPConn) ReadFromUDPAddrPortWithBuffer(getBuffer func(sizeHint int) []byte) (int, netip.AddrPort, error) {
+	if getBuffer == nil {
+		return 0, netip.AddrPort{}, c.operationError("read", c.remoteAddr(), syscall.EINVAL)
+	}
+	n, source, _, _, _, err := c.readDatagram(nil, getBuffer)
 	if err != nil {
 		return n, source, c.operationError("read", c.remoteAddr(), err)
 	}
@@ -814,7 +885,7 @@ func (c *UDPConn) readMsgUDPAddrPort(buffer, oob []byte) (n, oobn, flags int, so
 	var target netip.Addr
 	var options ipPacketOptions
 	var truncated bool
-	n, source, target, options, truncated, err = c.readDatagram(buffer)
+	n, source, target, options, truncated, err = c.readDatagram(buffer, nil)
 	if truncated {
 		flags |= MessageFlagTruncated
 	}
@@ -894,7 +965,32 @@ func (c *UDPConn) readBatchMessage(message *SocketMessage, flags int, wait, cons
 
 // Read receives the next datagram from a connected remote endpoint.
 func (c *UDPConn) Read(buffer []byte) (int, error) {
-	n, _, _, _, _, err := c.readDatagram(buffer)
+	n, _, _, _, _, err := c.readDatagram(buffer, nil)
+	if err != nil {
+		return n, c.operationError("read", c.remoteAddr(), err)
+	}
+	return n, nil
+}
+
+// ReadWithBuffer reads the next datagram from a connected remote endpoint like
+// Read, obtaining the destination buffer lazily from getBuffer.
+//
+// If a datagram is available, getBuffer is called once after it is dequeued.
+// It is not called when the operation returns before a datagram is available
+// because of an error or deadline. The callback receives the complete UDP
+// payload length as an advisory size hint. It runs without c's connection state
+// lock and must return promptly; it must not call a read method on c. The caller
+// owns the returned slice, and c does not retain it. A nil callback returns
+// EINVAL. A short returned slice truncates and consumes the datagram, matching
+// Read.
+//
+// This is an experimental API and is not covered by the package's stability
+// guarantees.
+func (c *UDPConn) ReadWithBuffer(getBuffer func(sizeHint int) []byte) (int, error) {
+	if getBuffer == nil {
+		return 0, c.operationError("read", c.remoteAddr(), syscall.EINVAL)
+	}
+	n, _, _, _, _, err := c.readDatagram(nil, getBuffer)
 	if err != nil {
 		return n, c.operationError("read", c.remoteAddr(), err)
 	}
@@ -902,8 +998,9 @@ func (c *UDPConn) Read(buffer []byte) (int, error) {
 }
 
 // readDatagram returns one datagram without adding the public net.OpError
-// wrapper. truncated reports that the payload did not fit in buffer.
-func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, target netip.Addr, options ipPacketOptions, truncated bool, err error) {
+// wrapper. truncated reports that the payload did not fit in buffer. A
+// non-nil getBuffer obtains the destination after a datagram is dequeued.
+func (c *UDPConn) readDatagram(buffer []byte, getBuffer func(sizeHint int) []byte) (n int, source netip.AddrPort, target netip.Addr, options ipPacketOptions, truncated bool, err error) {
 	for {
 		c.mu.Lock()
 		select {
@@ -924,6 +1021,9 @@ func (c *UDPConn) readDatagram(buffer []byte) (n int, source netip.AddrPort, tar
 			c.queuedBytes -= udpDatagramSize(datagram.payload)
 			c.notifyReceiveLocked()
 			c.mu.Unlock()
+			if getBuffer != nil {
+				buffer = getBuffer(len(datagram.payload))
+			}
 			n = copy(buffer, datagram.payload)
 			if cap(datagram.payload) != 0 && cap(datagram.payload) <= datagramReusablePayloadLimit {
 				c.mu.Lock()

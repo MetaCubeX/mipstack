@@ -5261,21 +5261,20 @@ func (c *TCPConn) Read(buffer []byte) (int, error) {
 	return n, err
 }
 
-// ReadWithBuffer reads application bytes into a buffer obtained lazily from
-// getBuffer. The callback receives the currently queued application byte
-// count as an advisory hint. It runs at most once after this call observes
-// queued application data, and it runs without the connection state mutex
-// held. It must not call Read, ReadWithBuffer, or WriteTo on the same
-// connection. The hint may be stale by the time the callback returns.
+// ReadWithBuffer reads contiguous application bytes like Read, obtaining the
+// destination buffer lazily from getBuffer.
 //
-// The caller owns the buffer returned by getBuffer. The callback should save
-// that slice where the caller can inspect or release it after this method
-// returns. The first n bytes contain the data read, and the connection does
-// not retain the buffer. If the callback is called, the caller must release
-// the buffer even when this method returns an error. The length of the
-// returned slice limits the number of bytes read. A nil callback is invalid,
-// and an empty buffer reports an error matching io.ErrShortBuffer without
-// consuming receive data.
+// If application data is available, getBuffer is called once after this method
+// observes it. It is not called when the operation returns before data is
+// available because of an error or deadline. The callback receives the
+// currently queued application byte count as an advisory size hint, which may
+// be stale when it returns. It runs without c's connection state lock and must
+// return promptly; it must not call Read, ReadWithBuffer, or WriteTo on c. The
+// caller owns the returned slice, and c does not retain it. The slice length
+// limits the number of bytes read. A nil callback returns EINVAL. An empty
+// returned slice reports io.ErrShortBuffer without consuming receive data. If
+// the callback is called, the caller must release the returned buffer even when
+// this method returns an error.
 //
 // This is an experimental API and is not covered by the package's stability
 // guarantees.

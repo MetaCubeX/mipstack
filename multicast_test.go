@@ -3144,7 +3144,7 @@ func BenchmarkUDPInboundDispatch(b *testing.B) {
 					b.Fatal(err)
 				}
 				for _, connection := range connections {
-					if _, _, _, _, _, err := connection.readDatagram(buffer); err != nil {
+					if _, _, _, _, _, err := connection.readDatagram(buffer, nil); err != nil {
 						b.Fatal(err)
 					}
 				}

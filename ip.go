@@ -760,7 +760,7 @@ func (c *IPConn) receiveNotificationLocked() <-chan struct{} {
 
 // ReadFrom implements net.PacketConn.
 func (c *IPConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
-	n, datagram, _, err := c.readDatagram(buffer)
+	n, datagram, _, err := c.readDatagram(buffer, nil)
 	address := ipNetAddr(datagram.source)
 	if err != nil {
 		return n, address, c.operationError("read", err)
@@ -770,7 +770,54 @@ func (c *IPConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
 
 // ReadFromIP acts like ReadFrom but returns an IPAddr.
 func (c *IPConn) ReadFromIP(buffer []byte) (int, *net.IPAddr, error) {
-	n, datagram, _, err := c.readDatagram(buffer)
+	n, datagram, _, err := c.readDatagram(buffer, nil)
+	address := ipNetAddr(datagram.source)
+	if err != nil {
+		return n, address, c.operationError("read", err)
+	}
+	return n, address, nil
+}
+
+// ReadFromWithBuffer reads the next protocol payload like ReadFrom, obtaining
+// the destination buffer lazily from getBuffer and returning its source
+// address.
+//
+// If a datagram is available, getBuffer is called once after it is dequeued.
+// It is not called when the operation returns before a datagram is available
+// because of an error or deadline. The callback receives the exposed datagram
+// length as an advisory size hint: this is the protocol payload length, or the
+// complete reassembled IP packet length when IPHeaderIncludedOnRead is enabled.
+// It runs without c's connection state lock and must return promptly; it must
+// not call a read method on c. The caller owns the returned slice, and c does
+// not retain it. A nil callback returns EINVAL. A short returned slice
+// truncates and consumes the datagram, matching ReadFrom.
+//
+// This is an experimental API and is not covered by the package's stability
+// guarantees.
+func (c *IPConn) ReadFromWithBuffer(getBuffer func(sizeHint int) []byte) (int, net.Addr, error) {
+	if getBuffer == nil {
+		return 0, nil, c.operationError("read", syscall.EINVAL)
+	}
+	n, datagram, _, err := c.readDatagram(nil, getBuffer)
+	address := ipNetAddr(datagram.source)
+	if err != nil {
+		return n, address, c.operationError("read", err)
+	}
+	return n, address, nil
+}
+
+// ReadFromIPWithBuffer is the *net.IPAddr form of ReadFromWithBuffer.
+//
+// It has the same callback, buffer ownership, truncation, and nil-callback
+// semantics as ReadFromWithBuffer.
+//
+// This is an experimental API and is not covered by the package's stability
+// guarantees.
+func (c *IPConn) ReadFromIPWithBuffer(getBuffer func(sizeHint int) []byte) (int, *net.IPAddr, error) {
+	if getBuffer == nil {
+		return 0, nil, c.operationError("read", syscall.EINVAL)
+	}
+	n, datagram, _, err := c.readDatagram(nil, getBuffer)
 	address := ipNetAddr(datagram.source)
 	if err != nil {
 		return n, address, c.operationError("read", err)
@@ -785,7 +832,7 @@ func (c *IPConn) ReadFromIP(buffer []byte) (int, *net.IPAddr, error) {
 func (c *IPConn) ReadMsgIP(buffer, oob []byte) (n, oobn, flags int, address *net.IPAddr, err error) {
 	var datagram ipDatagram
 	var truncated bool
-	n, datagram, truncated, err = c.readDatagram(buffer)
+	n, datagram, truncated, err = c.readDatagram(buffer, nil)
 	address = ipNetAddr(datagram.source)
 	if truncated {
 		flags |= MessageFlagTruncated
@@ -862,7 +909,33 @@ func (c *IPConn) readBatchMessage(message *SocketMessage, flags int, wait, consu
 
 // Read receives from a connected remote endpoint.
 func (c *IPConn) Read(buffer []byte) (int, error) {
-	n, _, _, err := c.readDatagram(buffer)
+	n, _, _, err := c.readDatagram(buffer, nil)
+	if err != nil {
+		return n, c.operationError("read", err)
+	}
+	return n, nil
+}
+
+// ReadWithBuffer reads the next protocol payload from a connected remote
+// endpoint like Read, obtaining the destination buffer lazily from getBuffer.
+//
+// If a datagram is available, getBuffer is called once after it is dequeued.
+// It is not called when the operation returns before a datagram is available
+// because of an error or deadline. The callback receives the exposed datagram
+// length as an advisory size hint: this is the protocol payload length, or the
+// complete reassembled IP packet length when IPHeaderIncludedOnRead is enabled.
+// It runs without c's connection state lock and must return promptly; it must
+// not call a read method on c. The caller owns the returned slice, and c does
+// not retain it. A nil callback returns EINVAL. A short returned slice
+// truncates and consumes the datagram, matching Read.
+//
+// This is an experimental API and is not covered by the package's stability
+// guarantees.
+func (c *IPConn) ReadWithBuffer(getBuffer func(sizeHint int) []byte) (int, error) {
+	if getBuffer == nil {
+		return 0, c.operationError("read", syscall.EINVAL)
+	}
+	n, _, _, err := c.readDatagram(nil, getBuffer)
 	if err != nil {
 		return n, c.operationError("read", err)
 	}
@@ -870,7 +943,8 @@ func (c *IPConn) Read(buffer []byte) (int, error) {
 }
 
 // readDatagram returns one payload without adding the public operation wrapper.
-func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, truncated bool, err error) {
+// A non-nil getBuffer obtains the destination after a datagram is dequeued.
+func (c *IPConn) readDatagram(buffer []byte, getBuffer func(sizeHint int) []byte) (n int, datagram ipDatagram, truncated bool, err error) {
 	for {
 		c.mu.Lock()
 		select {
@@ -892,6 +966,9 @@ func (c *IPConn) readDatagram(buffer []byte) (n int, datagram ipDatagram, trunca
 			c.queuedBytes -= ipDatagramMetadataSize + len(datagram.payload)
 			c.notifyReceiveLocked()
 			c.mu.Unlock()
+			if getBuffer != nil {
+				buffer = getBuffer(len(datagram.payload))
+			}
 			n = copy(buffer, datagram.payload)
 			if cap(datagram.payload) != 0 && cap(datagram.payload) <= datagramReusablePayloadLimit {
 				c.mu.Lock()

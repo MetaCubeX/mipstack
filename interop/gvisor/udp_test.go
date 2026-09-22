@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -50,6 +51,109 @@ func TestUDPInterop(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// TestUDPReadWithBufferInterop verifies lazy caller-owned buffers on the
+// connected and address-returning UDP paths against gVisor's native endpoint.
+func TestUDPReadWithBufferInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			network := newFamilyInteropNetwork(t, family, 1500)
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer cancel()
+
+			gvisorConnection, mipstackPacket := openUDPPair(t, ctx, network, family, false)
+			defer gvisorConnection.Close()
+			defer mipstackPacket.Close()
+			deadline := time.Now().Add(10 * time.Second)
+			if err := gvisorConnection.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			if err := mipstackPacket.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			mipstackUDP := mipstackPacket.(*mipstack.UDPConn)
+			expectedSource := gvisorConnection.LocalAddr().(*net.UDPAddr).AddrPort()
+			for index, mode := range []string{"ReadFrom", "ReadFromUDP", "ReadFromUDPAddrPort"} {
+				request := patternedPayload(31+index, byte(0x31+index))
+				if written, err := gvisorConnection.Write(request); err != nil || written != len(request) {
+					t.Fatalf("gVisor UDP request %s = %d, %v", mode, written, err)
+				}
+				var buffer []byte
+				var source netip.AddrPort
+				var read int
+				var readErr error
+				var address net.Addr
+				getBuffer := func(sizeHint int) []byte {
+					if sizeHint != len(request) {
+						t.Fatalf("UDP %s size hint = %d; want %d", mode, sizeHint, len(request))
+					}
+					buffer = make([]byte, sizeHint)
+					return buffer
+				}
+				switch mode {
+				case "ReadFrom":
+					read, address, readErr = mipstackUDP.ReadFromWithBuffer(getBuffer)
+				case "ReadFromUDP":
+					var typedAddress *net.UDPAddr
+					read, typedAddress, readErr = mipstackUDP.ReadFromUDPWithBuffer(getBuffer)
+					address = typedAddress
+				case "ReadFromUDPAddrPort":
+					read, source, readErr = mipstackUDP.ReadFromUDPAddrPortWithBuffer(getBuffer)
+				}
+				if address != nil {
+					typedAddress, ok := address.(*net.UDPAddr)
+					if !ok {
+						t.Fatalf("mipstack UDP %s address type = %T", mode, address)
+					}
+					source = typedAddress.AddrPort()
+				}
+				if readErr != nil || !bytes.Equal(buffer[:read], request) || source != expectedSource {
+					t.Fatalf("mipstack UDP %s = n=%d source=%v error=%v", mode, read, source, readErr)
+				}
+				response := patternedPayload(47+index, byte(0x71+index))
+				if written, err := mipstackUDP.WriteToUDPAddrPort(response, source); err != nil || written != len(response) {
+					t.Fatalf("mipstack UDP response %s = %d, %v", mode, written, err)
+				}
+				responseBuffer := make([]byte, len(response))
+				if read, err := io.ReadFull(gvisorConnection, responseBuffer); err != nil || !bytes.Equal(responseBuffer[:read], response) {
+					t.Fatalf("gVisor UDP response %s = n=%d error=%v", mode, read, err)
+				}
+			}
+
+			mipstackConnection, gvisorPacket := openUDPPairAt(t, ctx, network, family, true, 42101, 42102)
+			defer mipstackConnection.Close()
+			defer gvisorPacket.Close()
+			if err := mipstackConnection.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			if err := gvisorPacket.SetDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			request := patternedPayload(53, 0x91)
+			if written, err := gvisorPacket.WriteTo(request, mipstackConnection.LocalAddr()); err != nil || written != len(request) {
+				t.Fatalf("gVisor connected-peer UDP request = %d, %v", written, err)
+			}
+			mipstackBuffer := make([]byte, len(request))
+			if read, err := mipstackConnection.(*mipstack.UDPConn).ReadWithBuffer(func(sizeHint int) []byte {
+				if sizeHint != len(request) {
+					t.Fatalf("connected UDP size hint = %d; want %d", sizeHint, len(request))
+				}
+				return mipstackBuffer
+			}); err != nil || read != len(request) || !bytes.Equal(mipstackBuffer, request) {
+				t.Fatalf("mipstack connected UDP ReadWithBuffer = n=%d error=%v", read, err)
+			}
+			response := patternedPayload(61, 0xa1)
+			if written, err := mipstackConnection.Write(response); err != nil || written != len(response) {
+				t.Fatalf("mipstack connected UDP response = %d, %v", written, err)
+			}
+			responseBuffer := make([]byte, len(response))
+			if read, _, err := gvisorPacket.ReadFrom(responseBuffer); err != nil || !bytes.Equal(responseBuffer[:read], response) {
+				t.Fatalf("gVisor connected-peer UDP response = n=%d error=%v", read, err)
+			}
+		})
 	}
 }
 

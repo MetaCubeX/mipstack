@@ -2183,6 +2183,208 @@ func TestIPConcurrentReadersShareDeadline(t *testing.T) {
 	}
 }
 
+func TestIPReadWithBufferAddressVariants(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.125")
+	remote := netip.MustParseAddr("198.51.100.125")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+
+	connected := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
+	defer connected.closeFromStack()
+	connectedPayload := []byte("connected raw payload")
+	connected.enqueuePacket(ipPacket{payload: connectedPayload, source: remote, target: local}, ipPacketOptions{})
+	var connectedBuffer []byte
+	connectedHint := 0
+	n, readErr := connected.ReadWithBuffer(func(sizeHint int) []byte {
+		connectedHint = sizeHint
+		connectedBuffer = make([]byte, sizeHint)
+		return connectedBuffer
+	})
+	if readErr != nil || n != len(connectedPayload) || connectedHint != len(connectedPayload) || !bytes.Equal(connectedBuffer, connectedPayload) {
+		t.Fatalf("ReadWithBuffer = %d, %v, hint %d, payload %q; want %d, nil, %d, %q", n, readErr, connectedHint, connectedBuffer, len(connectedPayload), len(connectedPayload), connectedPayload)
+	}
+
+	unconnected := newIPConn(stack, "ip4:99", 99, local, netip.Addr{}, socketOptionSet{})
+	defer unconnected.closeFromStack()
+	first := []byte("first raw payload")
+	unconnected.enqueuePacket(ipPacket{payload: first, source: remote, target: local}, ipPacketOptions{})
+	var firstBuffer []byte
+	n, address, readErr := unconnected.ReadFromWithBuffer(func(sizeHint int) []byte {
+		if sizeHint != len(first) {
+			t.Fatalf("ReadFromWithBuffer size hint = %d; want %d", sizeHint, len(first))
+		}
+		firstBuffer = make([]byte, sizeHint)
+		return firstBuffer
+	})
+	if readErr != nil || n != len(first) || !bytes.Equal(firstBuffer, first) {
+		t.Fatalf("ReadFromWithBuffer = %d, %v, payload %q; want %d, nil, %q", n, readErr, firstBuffer, len(first), first)
+	}
+	if got, ok := address.(*net.IPAddr); !ok || !got.IP.Equal(net.IP(remote.AsSlice())) {
+		t.Fatalf("ReadFromWithBuffer address = %#v; want %v", address, remote)
+	}
+
+	second := []byte("second raw payload")
+	unconnected.enqueuePacket(ipPacket{payload: second, source: remote, target: local}, ipPacketOptions{})
+	var secondBuffer []byte
+	n, addressIP, readErr := unconnected.ReadFromIPWithBuffer(func(sizeHint int) []byte {
+		if sizeHint != len(second) {
+			t.Fatalf("ReadFromIPWithBuffer size hint = %d; want %d", sizeHint, len(second))
+		}
+		secondBuffer = make([]byte, sizeHint)
+		return secondBuffer
+	})
+	if readErr != nil || n != len(second) || !bytes.Equal(secondBuffer, second) {
+		t.Fatalf("ReadFromIPWithBuffer = %d, %v, payload %q; want %d, nil, %q", n, readErr, secondBuffer, len(second), second)
+	}
+	if addressIP == nil || !addressIP.IP.Equal(net.IP(remote.AsSlice())) {
+		t.Fatalf("ReadFromIPWithBuffer address = %#v; want %v", addressIP, remote)
+	}
+
+	short := []byte("short raw payload")
+	unconnected.enqueuePacket(ipPacket{payload: short, source: remote, target: local}, ipPacketOptions{})
+	var shortBuffer []byte
+	n, addressIP, readErr = unconnected.ReadFromIPWithBuffer(func(sizeHint int) []byte {
+		if sizeHint != len(short) {
+			t.Fatalf("short ReadFromIPWithBuffer size hint = %d; want %d", sizeHint, len(short))
+		}
+		shortBuffer = make([]byte, 3)
+		return shortBuffer
+	})
+	if readErr != nil || n != len(shortBuffer) || !bytes.Equal(shortBuffer, short[:len(shortBuffer)]) {
+		t.Fatalf("short ReadFromIPWithBuffer = %d, %v, payload %q; want %d, nil, %q", n, readErr, shortBuffer, len(shortBuffer), short[:len(shortBuffer)])
+	}
+	if addressIP == nil || !addressIP.IP.Equal(net.IP(remote.AsSlice())) {
+		t.Fatalf("short ReadFromIPWithBuffer address = %#v; want %v", addressIP, remote)
+	}
+
+	complete := buildIPPacket(remote, local, 99, []byte("complete raw packet"), 125, true)
+	headerIncluded := newIPConn(stack, "ip4:99", 99, local, netip.Addr{}, socketOptionSet{
+		ip: ipSocketOptionSet{headerIncludedOnRead: socketOptionBoolOverrideEnabled},
+	})
+	defer headerIncluded.closeFromStack()
+	headerIncluded.enqueuePacket(ipPacket{
+		payload: []byte("complete raw packet"), original: complete, source: remote, target: local,
+	}, ipPacketOptions{})
+	var completeBuffer []byte
+	completeHint := 0
+	n, addressIP, readErr = headerIncluded.ReadFromIPWithBuffer(func(sizeHint int) []byte {
+		completeHint = sizeHint
+		completeBuffer = make([]byte, sizeHint)
+		return completeBuffer
+	})
+	if readErr != nil || n != len(complete) || completeHint != len(complete) || !bytes.Equal(completeBuffer, complete) {
+		t.Fatalf("header-included ReadFromIPWithBuffer = %d, %v, hint %d, payload length %d; want %d, nil, hint %d, payload length %d", n, readErr, completeHint, len(completeBuffer), len(complete), len(complete), len(complete))
+	}
+	if addressIP == nil || !addressIP.IP.Equal(net.IP(remote.AsSlice())) {
+		t.Fatalf("header-included source = %#v; want %v", addressIP, remote)
+	}
+
+	if _, _, readErr = unconnected.ReadFromWithBuffer(nil); !errors.Is(readErr, syscall.EINVAL) {
+		t.Fatalf("nil IP buffer callback error = %v; want EINVAL", readErr)
+	}
+}
+
+func TestIPReadWithBufferWaitsOutsideConnectionLock(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.126")
+	remote := netip.MustParseAddr("198.51.100.126")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
+	defer connection.closeFromStack()
+	callbackCalled := make(chan int, 1)
+	result := make(chan struct {
+		n           int
+		err         error
+		hint        int
+		payload     []byte
+		deadlineErr error
+	}, 1)
+	go func() {
+		var payload []byte
+		deadlineErr := error(nil)
+		n, readErr := connection.ReadWithBuffer(func(sizeHint int) []byte {
+			callbackCalled <- sizeHint
+			deadlineErr = connection.SetReadDeadline(time.Time{})
+			payload = make([]byte, sizeHint)
+			return payload
+		})
+		result <- struct {
+			n           int
+			err         error
+			hint        int
+			payload     []byte
+			deadlineErr error
+		}{n: n, err: readErr, hint: len(payload), payload: payload, deadlineErr: deadlineErr}
+	}()
+	select {
+	case hint := <-callbackCalled:
+		t.Fatalf("IP buffer callback ran before a datagram was queued with hint %d", hint)
+	case <-time.After(20 * time.Millisecond):
+	}
+	payload := []byte("outside lock")
+	connection.enqueuePacket(ipPacket{payload: payload, source: remote, target: local}, ipPacketOptions{})
+	select {
+	case hint := <-callbackCalled:
+		if hint != len(payload) {
+			t.Fatalf("IP ReadWithBuffer size hint = %d; want %d", hint, len(payload))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("IP ReadWithBuffer callback did not run")
+	}
+	var readResult struct {
+		n           int
+		err         error
+		hint        int
+		payload     []byte
+		deadlineErr error
+	}
+	select {
+	case readResult = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("IP ReadWithBuffer did not return")
+	}
+	if readResult.n != len(payload) || readResult.err != nil || readResult.hint != len(payload) || string(readResult.payload) != string(payload) || readResult.deadlineErr != nil {
+		t.Fatalf("IP ReadWithBuffer = %d, %v, hint %d, payload %q, deadline error %v; want %d, nil, %d, %q, nil", readResult.n, readResult.err, readResult.hint, readResult.payload, readResult.deadlineErr, len(payload), len(payload), payload)
+	}
+}
+
+func TestIPReadWithBufferDeadlineDoesNotCallCallback(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.127")
+	remote := netip.MustParseAddr("198.51.100.127")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	connection := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
+	defer connection.closeFromStack()
+	payload := []byte("deadline")
+	connection.enqueuePacket(ipPacket{payload: payload, source: remote, target: local}, ipPacketOptions{})
+	if err = connection.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	callbackCalls := 0
+	if n, readErr := connection.ReadWithBuffer(func(int) []byte {
+		callbackCalls++
+		return make([]byte, len(payload))
+	}); n != 0 || !errors.Is(readErr, os.ErrDeadlineExceeded) || callbackCalls != 0 {
+		t.Fatalf("expired IP ReadWithBuffer = %d, %v, callback calls %d; want 0, deadline, 0", n, readErr, callbackCalls)
+	}
+	if err = connection.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, len(payload))
+	if n, readErr := connection.Read(buffer); n != len(payload) || readErr != nil || string(buffer) != string(payload) {
+		t.Fatalf("IP data after expired ReadWithBuffer = %d, %v, %q; want %d, nil, %q", n, readErr, buffer, len(payload), payload)
+	}
+}
+
 func TestIPReceiveNotificationIsLazy(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.239")
 	remote := netip.MustParseAddr("198.51.100.239")
@@ -2373,8 +2575,54 @@ func BenchmarkIPReceiveQueue(b *testing.B) {
 	b.ResetTimer()
 	for iteration := 0; iteration < b.N; iteration++ {
 		connection.enqueuePacket(ipPacket{payload: payload, source: remote, target: local}, ipPacketOptions{})
-		if n, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) {
+		if n, _, _, readErr := connection.readDatagram(buffer, nil); readErr != nil || n != len(payload) {
 			b.Fatalf("readDatagram = %d, %v", n, readErr)
+		}
+	}
+}
+
+func BenchmarkIPReadBufferAPI(b *testing.B) {
+	for _, payloadSize := range []int{64, 512, 1200, 4096, 65515} {
+		payloadSize := payloadSize
+		for _, mode := range []string{"Read", "ReadWithBuffer", "ReadFrom", "ReadFromWithBuffer", "ReadFromIP", "ReadFromIPWithBuffer"} {
+			mode := mode
+			b.Run(fmt.Sprintf("%s/%d", mode, payloadSize), func(b *testing.B) {
+				local := netip.MustParseAddr("192.0.2.246")
+				remote := netip.MustParseAddr("198.51.100.246")
+				stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+				if err != nil {
+					b.Fatal(err)
+				}
+				connection := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
+				b.Cleanup(connection.closeFromStack)
+				payload := bytes.Repeat([]byte{0x6b}, payloadSize)
+				buffer := make([]byte, payloadSize)
+				getBuffer := func(int) []byte { return buffer }
+				b.SetBytes(int64(payloadSize))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for iteration := 0; iteration < b.N; iteration++ {
+					connection.enqueuePacket(ipPacket{payload: payload, source: remote, target: local}, ipPacketOptions{})
+					var n int
+					switch mode {
+					case "Read":
+						n, err = connection.Read(buffer)
+					case "ReadWithBuffer":
+						n, err = connection.ReadWithBuffer(getBuffer)
+					case "ReadFrom":
+						n, _, err = connection.ReadFrom(buffer)
+					case "ReadFromWithBuffer":
+						n, _, err = connection.ReadFromWithBuffer(getBuffer)
+					case "ReadFromIP":
+						n, _, err = connection.ReadFromIP(buffer)
+					case "ReadFromIPWithBuffer":
+						n, _, err = connection.ReadFromIPWithBuffer(getBuffer)
+					}
+					if err != nil || n != payloadSize {
+						b.Fatalf("%s = %d, %v", mode, n, err)
+					}
+				}
+			})
 		}
 	}
 }
@@ -2405,7 +2653,7 @@ func BenchmarkIPInboundDispatch(b *testing.B) {
 		if !state.deliver(stack, packet) {
 			b.Fatal("raw IP packet was not delivered")
 		}
-		if n, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) {
+		if n, _, _, readErr := connection.readDatagram(buffer, nil); readErr != nil || n != len(payload) {
 			b.Fatalf("readDatagram = %d, %v", n, readErr)
 		}
 	}
@@ -2422,7 +2670,7 @@ func TestIPReceivePayloadSpareIsBoundedAndReleased(t *testing.T) {
 	read := func(payload []byte) {
 		connection.enqueuePacket(ipPacket{payload: payload, source: remote, target: local}, ipPacketOptions{})
 		buffer := make([]byte, len(payload))
-		if n, _, _, readErr := connection.readDatagram(buffer); readErr != nil || n != len(payload) || !bytes.Equal(buffer, payload) {
+		if n, _, _, readErr := connection.readDatagram(buffer, nil); readErr != nil || n != len(payload) || !bytes.Equal(buffer, payload) {
 			t.Fatalf("readDatagram = %d bytes, %v", n, readErr)
 		}
 	}
