@@ -169,6 +169,7 @@ type testPacketLink struct {
 	clientECTPackets       int
 	clientRetransmittedECT int
 	maximumTCPData         int
+	maximumTCPDataWithSACK int
 	clientECEs             int
 	clientCWRs             int
 	legacySYNSends         int
@@ -765,6 +766,9 @@ func (l *testPacketLink) handleTCP(packet ipPacket) error {
 		l.clientSACKs++
 		if len(payload) != 0 {
 			l.clientDataSACKs++
+			if len(payload) > l.maximumTCPDataWithSACK {
+				l.maximumTCPDataWithSACK = len(payload)
+			}
 		}
 	}
 	if value, _, present := parseTCPTimestamp(tcp[tcpHeaderSize:headerSize]); present {

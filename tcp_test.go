@@ -6044,6 +6044,63 @@ func TestTCPSACKRecoversMultipleSegments(t *testing.T) {
 	}
 }
 
+// TestTCPDataSACKPayloadUsesOptionBudget verifies the wire payload limit when
+// an established sender carries both negotiated timestamps and a SACK block.
+func TestTCPDataSACKPayloadUsesOptionBudget(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		local, remote netip.Addr
+	}{
+		{name: "ipv4", local: netip.MustParseAddr("192.0.2.1"), remote: netip.MustParseAddr("192.0.2.2")},
+		{name: "ipv6", local: netip.MustParseAddr("2001:db8::1"), remote: netip.MustParseAddr("2001:db8::2")},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			link, stack := newTestStack(t, test.local, test.remote)
+			link.echoTCP = true
+			link.timestampTCP = true
+			connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8082))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			tcpConnection := connection.(*TCPConn)
+			if tcpConnection.peerMSS != 1280 {
+				t.Fatalf("test peer MSS = %d, want 1280", tcpConnection.peerMSS)
+			}
+			localPort := tcpConnection.key.local.Port()
+			link.mu.Lock()
+			peer := link.tcp[localPort]
+			serverSequence, clientAcknowledgement := peer.serverNext+100, peer.clientNext
+			link.mu.Unlock()
+			// Leave a receive hole so the established sender has an outstanding SACK
+			// block while the application writes its own data.
+			if err = link.deliverTCP(tcpConnection.key.remote.Port(), localPort, serverSequence, clientAcknowledgement, TCPFlagACK, 65535, nil, bytes.Repeat([]byte{0x7f}, 100)); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, time.Second, func() bool {
+				link.mu.Lock()
+				defer link.mu.Unlock()
+				return link.clientSACKs != 0
+			})
+			if _, err = connection.Write(bytes.Repeat([]byte{0x52}, 1300)); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, time.Second, func() bool {
+				link.mu.Lock()
+				defer link.mu.Unlock()
+				return link.maximumTCPDataWithSACK != 0
+			})
+			link.mu.Lock()
+			maximum := link.maximumTCPDataWithSACK
+			link.mu.Unlock()
+			if maximum != 1256 {
+				t.Fatalf("timestamped SACK data payload = %d, want 1256", maximum)
+			}
+		})
+	}
+}
+
 func TestTCPSACKRenegingWaitsBeforeClearingScoreboard(t *testing.T) {
 	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
 	defer stack.Close()
@@ -6358,6 +6415,7 @@ func TestTCPPathMTUReduction(t *testing.T) {
 	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
 	defer stack.Close()
 	link.echoTCP = true
+	link.timestampTCP = true
 	link.tcpPathMTU = 1000
 	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 8083))
 	if err != nil {
@@ -6381,6 +6439,9 @@ func TestTCPPathMTUReduction(t *testing.T) {
 	link.mu.Unlock()
 	if !injected || maximum > int(link.tcpPathMTU) {
 		t.Fatalf("Packet Too Big injected = %v, later maximum packet = %d, PMTU = %d", injected, maximum, link.tcpPathMTU)
+	}
+	if info := connection.(*TCPConn).Info(); info.MaximumSegmentSize != 948 {
+		t.Fatalf("timestamped PMTU send MSS = %d, want 948", info.MaximumSegmentSize)
 	}
 }
 
@@ -6438,6 +6499,7 @@ func TestTCPMTUIncreaseRaisesMSS(t *testing.T) {
 	defer stack.Close()
 	link.mu.Lock()
 	link.echoTCP = true
+	link.timestampTCP = true
 	link.mu.Unlock()
 	localPrefix := netip.PrefixFrom(link.local, 32)
 	if err := stack.UpdateConfig(Config{LocalAddresses: []netip.Prefix{localPrefix}, MTU: 1280}); err != nil {
@@ -6456,15 +6518,15 @@ func TestTCPMTUIncreaseRaisesMSS(t *testing.T) {
 	}
 	waitFor(t, time.Second, func() bool {
 		info := connection.(*TCPConn).Info()
-		return info.PathMTU == 2000 && info.MaximumSegmentSize == 1280
+		return info.PathMTU == 2000 && info.MaximumSegmentSize == 1268
 	})
 	payload := bytes.Repeat([]byte{0x4d}, 1280)
 	writeAndReadTCPEcho(t, connection, payload)
 	link.mu.Lock()
 	maximum := link.maximumTCPData
 	link.mu.Unlock()
-	if maximum != len(payload) {
-		t.Fatalf("TCP payload after MTU increase = %d, want %d", maximum, len(payload))
+	if maximum != 1268 {
+		t.Fatalf("TCP payload after MTU increase = %d, want 1268", maximum)
 	}
 }
 
@@ -7479,12 +7541,27 @@ func TestTCPPeerMSSHasLinuxSafetyFloor(t *testing.T) {
 	for _, test := range []struct {
 		peer, path, options, want int
 	}{
-		{536, 1348, 28, 536},
-		{48, 1348, 28, 48},
-		{1348, 1348, 28, 1320},
+		{536, 1348, 0, 536},
+		{536, 1348, 28, 508},
+		{1268, 1348, 0, 1268},
+		{1268, 1348, 12, 1256},
+		{524, 1348, 12, 512},
 	} {
 		if got := tcpSegmentPayloadLimit(test.peer, test.path, test.options); got != test.want {
 			t.Errorf("payload limit peer=%d path=%d options=%d = %d, want %d", test.peer, test.path, test.options, got, test.want)
+		}
+	}
+	for _, test := range []struct {
+		peer, path, want int
+		timestamp        bool
+	}{
+		{peer: 1280, path: 1460, want: 1280},
+		{peer: 1280, path: 1460, want: 1268, timestamp: true},
+		{peer: 536, path: 1460, want: 524, timestamp: true},
+	} {
+		got := tcpEffectiveSendMSS(test.peer, test.path, test.timestamp)
+		if got != test.want {
+			t.Errorf("effective send MSS peer=%d path=%d timestamp=%t = %d, want %d", test.peer, test.path, test.timestamp, got, test.want)
 		}
 	}
 }
@@ -9287,6 +9364,12 @@ func TestTCPTimestampsPAWSAndMSS(t *testing.T) {
 	}
 	if _, err = io.ReadFull(connection, make([]byte, len(payload))); err != nil {
 		t.Fatal(err)
+	}
+	link.mu.Lock()
+	maximumPayload := link.maximumTCPData
+	link.mu.Unlock()
+	if maximumPayload != 1268 {
+		t.Fatalf("timestamped TCP payload = %d, want 1268", maximumPayload)
 	}
 
 	link.mu.Lock()

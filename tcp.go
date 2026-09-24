@@ -52,6 +52,9 @@ const (
 
 	// tcpHeaderSize is the TCP header length without options.
 	tcpHeaderSize = 20
+	// tcpTimestampOptionSize is the wire-aligned size of the negotiated
+	// RFC 7323 timestamp option (two NOP bytes plus the ten-byte option).
+	tcpTimestampOptionSize = 12
 	// tcpActorWakeSend reports application send-buffer progress. Wake bits
 	// coalesce state-only notifications without per-class connection channels.
 	tcpActorWakeSend = uint32(1 << 0)
@@ -1891,13 +1894,14 @@ type tcpSendTimerState struct {
 type tcpEstablishedState struct {
 	// connection owns application-visible synchronization and socket policy;
 	// every other field in this object is accessed only by its actor goroutine.
-	connection                                    *TCPConn
-	sendNext, sendUnacknowledged                  uint32
+	connection *TCPConn
+	// peerMSS and pathMSS are effective data limits after fixed negotiated
+	// options; TCPConn.peerMSS remains the raw MSS learned from the peer.
 	peerMSS, pathMSS, receiveMSS                  int
 	peerWindow, peerWindowSequence, peerWindowACK uint32
 	maximumPeerWindow                             uint32
 	bytesAcknowledged, bytesSent, bytesReceived   uint64
-	receiveNext                                   uint32
+	sendUnacknowledged, sendNext, receiveNext     uint32
 	congestionWindow, slowStartThreshold          uint32
 	ecnRecoveryPoint                              uint32
 	// outstanding is the live suffix of outstandingBase. outstandingHead is
@@ -2053,11 +2057,16 @@ func (s *tcpEstablishedState) ensurePathMTUState() *tcpEstablishedPathMTUState {
 // newTCPEstablishedState transfers handshake results into one actor-owned
 // state object and initializes the data-phase timers and congestion state.
 func newTCPEstablishedState(c *TCPConn, sendNext uint32) *tcpEstablishedState {
-	localMaximum := tcpMSSForMTU(c.mtu, c.key.local.Addr())
+	rawPathMSS := tcpMSSForMTU(c.mtu, c.key.local.Addr())
+	// RFC 9293 section 3.7.1 defines Eff.snd.MSS from the smaller of the
+	// peer's advertised MSS and the fixed-header path MSS. RFC 6691 requires
+	// the negotiated timestamp option to be charged to that result, while the
+	// MSS carried in a SYN itself describes only the fixed headers.
+	peerMSS := tcpEffectiveSendMSS(c.peerMSS, rawPathMSS, c.peerTimestamp)
+	localMaximum := rawPathMSS
 	if c.peerTimestamp {
-		localMaximum -= 12
+		localMaximum -= tcpTimestampOptionSize
 	}
-	peerMSS := clampMSS(c.peerMSS, localMaximum)
 	receiveMSS := localMaximum
 	if receiveMSS > tcpDefaultReceiveMSS {
 		receiveMSS = tcpDefaultReceiveMSS
@@ -2593,7 +2602,7 @@ func (s *tcpEstablishedState) measureReceiveMSS(segment *tcpSegment) {
 	segmentSize := len(segment.payload)
 	fixedOptions := 0
 	if s.connection.peerTimestamp {
-		fixedOptions = 12
+		fixedOptions = tcpTimestampOptionSize
 	}
 	if optionSize := int(segment.optionLength); optionSize > fixedOptions {
 		segmentSize += optionSize - fixedOptions
@@ -7608,10 +7617,11 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 			candidateMTU, ok := state.pathMTUState.discovery.candidate(now)
 			if ok {
 				candidateMSS := tcpMSSForMTU(candidateMTU, c.key.local.Addr())
-				if c.peerTimestamp {
-					candidateMSS -= 12
-				}
-				candidateMSS = tcpSegmentPayloadLimit(c.peerMSS, candidateMSS, optionSize)
+				candidateMSS = tcpEffectiveSendMSS(c.peerMSS, candidateMSS, c.peerTimestamp)
+				// The fixed-header peer/path minimum and negotiated timestamp
+				// are already accounted for; only this segment's SACK options
+				// remain to be charged to the probe payload.
+				candidateMSS -= optionSize
 				total, _, _ := c.sendState()
 				if candidateMSS > segmentMSS && total-offset >= candidateMSS+(tcpDuplicateACKThreshold+1)*segmentMSS {
 					size = candidateMSS
@@ -9285,16 +9295,20 @@ func (state *tcpEstablishedState) applyPathMTU(mtu int, retransmit bool) {
 		}
 		state.ensurePathMTUState().discovery.reduce(mtu, priorMTU, c.stack.network.Load().mtu, time.Now())
 	}
-	state.pathMSS = tcpMSSForMTU(mtu, c.key.local.Addr())
+	rawPathMSS := tcpMSSForMTU(mtu, c.key.local.Addr())
+	state.pathMSS = rawPathMSS
 	if c.peerTimestamp {
-		state.pathMSS -= 12
+		state.pathMSS -= tcpTimestampOptionSize
 	}
 	if state.receiveMSS > state.pathMSS {
 		state.receiveMSS = state.pathMSS
 	}
 	state.lastReceiveSegmentSize = 0
 	state.armPathMTUProbe()
-	newMSS := clampMSS(c.peerMSS, state.pathMSS)
+	// Clamp the raw peer and path MSS before charging the fixed timestamp
+	// option, as required by RFC 9293 section 3.7.1 and RFC 6691. The SYN MSS
+	// remains a fixed-header value and is never reduced by TCP options.
+	newMSS := tcpEffectiveSendMSS(c.peerMSS, rawPathMSS, c.peerTimestamp)
 	if newMSS == state.peerMSS {
 		return
 	}
@@ -9339,7 +9353,7 @@ func (c *TCPConn) trySendSegment(sequence, acknowledgement uint32, flags byte, w
 func (c *TCPConn) trySendSegmentWithOptions(sequence, acknowledgement uint32, flags byte, window uint16, options []byte) error {
 	var timestampOptions [40]byte
 	if c.peerTimestamp {
-		if len(options) > len(timestampOptions)-12 {
+		if len(options) > len(timestampOptions)-tcpTimestampOptionSize {
 			return errors.New("mipstack: invalid TCP options")
 		}
 		encoded := appendTCPTimestampOptions(timestampOptions[:0], c.stack.tcpTimestamp(), c.recentTimestamp)
@@ -9371,7 +9385,7 @@ func (c *TCPConn) publishReservedPayloadForMTU(sequence, acknowledgement uint32,
 	timestamp := uint32(0)
 	var timestampOptions [40]byte
 	if c.peerTimestamp {
-		if len(options) > len(timestampOptions)-12 {
+		if len(options) > len(timestampOptions)-tcpTimestampOptionSize {
 			reservation.release()
 			return tcpPublishedTransmission{}, errors.New("mipstack: invalid TCP options")
 		}
@@ -9773,7 +9787,10 @@ func backedOffRTO(base time.Duration, backoffs uint8) time.Duration {
 	return result
 }
 
-// tcpMSSForMTU returns the largest transport payload fitting one IP packet.
+// tcpMSSForMTU returns the largest fixed-header transport payload fitting one
+// IP packet. RFC 6691 keeps TCP options out of the MSS advertised in a SYN;
+// negotiated and per-segment options are charged by the effective-send-MSS
+// calculation instead.
 func tcpMSSForMTU(mtu int, address netip.Addr) int {
 	header := tcpHeaderSize + 40
 	if address.Is4() {
@@ -9820,7 +9837,7 @@ func nextBlackHoleProbeMTU(current int, ipv6 bool, payloadSize int, timestamp bo
 		}
 		maximumPayload := tcpMSSForMTU(next, address)
 		if timestamp {
-			maximumPayload -= 12
+			maximumPayload -= tcpTimestampOptionSize
 		}
 		if payloadSize > maximumPayload {
 			return next
@@ -10019,7 +10036,7 @@ func tcpSACKBlockLimit(mtu int, address netip.Addr, timestamp bool, reservePaylo
 	timestampSize := 0
 	maximum := 4
 	if timestamp {
-		timestampSize = 12
+		timestampSize = tcpTimestampOptionSize
 		maximum = 3
 	}
 	for blocks := maximum; blocks > 0; blocks-- {
@@ -10879,7 +10896,7 @@ func trimAcknowledgedTCPSegment(segment *sentTCPSegment, acknowledgement uint32)
 	segment.state.set(sentTCPSegmentCWR, false)
 }
 
-// clampMSS applies local packet-size bounds to a peer MSS.
+// clampMSS applies local fixed-header packet-size bounds to a peer MSS.
 func clampMSS(value, maximum int) int {
 	if value < tcpMinimumPeerMSS {
 		value = tcpMinimumPeerMSS
@@ -10890,14 +10907,27 @@ func clampMSS(value, maximum int) int {
 	return value
 }
 
-// tcpSegmentPayloadLimit applies peer MSS to data only, while charging extra
-// TCP options exclusively to the current path's header budget.
-func tcpSegmentPayloadLimit(peerMSS, pathMSS, optionSize int) int {
-	pathLimit := pathMSS - optionSize
-	if pathLimit < peerMSS {
-		return pathLimit
+// tcpEffectiveSendMSS applies the RFC 9293/RFC 6691 fixed-option rule to the
+// raw MSS values learned from the handshake and the current path. The SYN MSS
+// is a fixed-header limit; negotiated timestamps are charged only when data is
+// sent, before any per-segment SACK options are charged by the caller. Linux's
+// tcp_mtu_to_mss follows the same ordering.
+func tcpEffectiveSendMSS(peerMSS, pathMSS int, timestamp bool) int {
+	maximum := clampMSS(peerMSS, pathMSS)
+	if timestamp {
+		maximum -= tcpTimestampOptionSize
 	}
-	return peerMSS
+	return maximum
+}
+
+// tcpSegmentPayloadLimit takes the smaller of the already normalized peer and
+// path send limits, then charges options present on this segment. This matches
+// RFC 9293's Eff.snd.MSS formula.
+func tcpSegmentPayloadLimit(peerMSS, pathMSS, optionSize int) int {
+	if pathMSS < peerMSS {
+		peerMSS = pathMSS
+	}
+	return peerMSS - optionSize
 }
 
 // defaultTCPPeerMSS returns the RFC default for a SYN without an MSS option.

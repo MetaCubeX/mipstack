@@ -64,6 +64,122 @@ func TestTCPInterop(t *testing.T) {
 	}
 }
 
+// TestTCPPeerMSSWithTimestampInterop configures a native gVisor TCP socket
+// with TCP_MAXSEG, then verifies that mipstack uses the peer's advertised MSS
+// after charging the negotiated timestamp option on the wire.
+func TestTCPPeerMSSWithTimestampInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			var maximumPayload atomic.Int32
+			var timestampedPayloads atomic.Int32
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family},
+				mtu:      1500,
+				mipstackToGVisor: func(packet []byte) bool {
+					tcpHeader, payloadLength, ok := tcpSegment(packet)
+					if !ok || payloadLength == 0 {
+						return true
+					}
+					for {
+						current := maximumPayload.Load()
+						if payloadLength <= int(current) || maximumPayload.CompareAndSwap(current, int32(payloadLength)) {
+							break
+						}
+					}
+					if tcpHeader.ParsedOptions().TS {
+						timestampedPayloads.Add(1)
+					}
+					return true
+				},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			const (
+				port        = 41003
+				peerMSS     = 1200
+				wantSendMSS = peerMSS - 12
+			)
+			var queue waiter.Queue
+			endpoint, tcpipErr := network.gvisor.NewEndpoint(tcp.ProtocolNumber, family.networkProtocol, &queue)
+			if tcpipErr != nil {
+				t.Fatalf("create native gVisor TCP listener: %s", tcpipErr.String())
+			}
+			if tcpipErr = endpoint.SetSockOptInt(tcpip.MaxSegOption, peerMSS); tcpipErr != nil {
+				t.Fatalf("set gVisor TCP_MAXSEG: %s", tcpipErr.String())
+			}
+			if tcpipErr = endpoint.Bind(gvisorFullAddress(family.gvisorAddress, port)); tcpipErr != nil {
+				t.Fatalf("bind native gVisor TCP listener: %s", tcpipErr.String())
+			}
+			if tcpipErr = endpoint.Listen(1); tcpipErr != nil {
+				t.Fatalf("listen with native gVisor TCP endpoint: %s", tcpipErr.String())
+			}
+			listener := gonet.NewTCPListener(network.gvisor, &queue, endpoint)
+			defer listener.Close()
+			accepted := make(chan net.Conn, 1)
+			acceptErr := make(chan error, 1)
+			go func() {
+				connection, err := listener.Accept()
+				if err != nil {
+					acceptErr <- err
+					return
+				}
+				accepted <- connection
+			}()
+
+			client, err := network.mipstack.DialTCP(ctx, family.tcpNetwork, netip.AddrPort{}, netipAddrPort(family.gvisorAddress, port))
+			if err != nil {
+				t.Fatalf("mipstack dial with gVisor TCP_MAXSEG peer: %v", err)
+			}
+			defer client.Close()
+			var server net.Conn
+			select {
+			case server = <-accepted:
+			case err = <-acceptErr:
+				t.Fatalf("accept native gVisor TCP connection: %v", err)
+			case <-ctx.Done():
+				t.Fatalf("accept native gVisor TCP connection: %v", ctx.Err())
+			}
+			defer server.Close()
+
+			info := client.(*mipstack.TCPConn).Info()
+			if info.MaximumSegmentSize != wantSendMSS || !info.Timestamps {
+				t.Fatalf("mipstack TCP info = MSS:%d timestamps:%v, want MSS:%d timestamps:true", info.MaximumSegmentSize, info.Timestamps, wantSendMSS)
+			}
+			deadline := time.Now().Add(8 * time.Second)
+			if err = client.SetDeadline(deadline); err != nil {
+				t.Fatalf("set mipstack TCP deadline: %v", err)
+			}
+			if err = server.SetDeadline(deadline); err != nil {
+				t.Fatalf("set gVisor TCP deadline: %v", err)
+			}
+			payload := patternedPayload(64*1024+137, 211)
+			writeResult := make(chan error, 1)
+			go func() {
+				n, writeErr := client.Write(payload)
+				if writeErr == nil && n != len(payload) {
+					writeErr = io.ErrShortWrite
+				}
+				writeResult <- writeErr
+			}()
+			received := make([]byte, len(payload))
+			if _, err = io.ReadFull(server, received); err != nil {
+				t.Fatalf("read low-MSS gVisor payload: %v", err)
+			}
+			if !bytes.Equal(received, payload) {
+				t.Fatal("low-MSS gVisor payload mismatch")
+			}
+			if err = <-writeResult; err != nil {
+				t.Fatalf("write low-MSS mipstack payload: %v", err)
+			}
+			if got := maximumPayload.Load(); got != wantSendMSS || timestampedPayloads.Load() == 0 {
+				t.Fatalf("mipstack wire payload = %d, timestamped segments = %d; want max %d and timestamp coverage", got, timestampedPayloads.Load(), wantSendMSS)
+			}
+		})
+	}
+}
+
 // TestTCPReadWithBufferInterop verifies that lazy caller-owned receive buffers
 // consume native gVisor streams in both endpoint roles and address families.
 func TestTCPReadWithBufferInterop(t *testing.T) {
