@@ -1746,6 +1746,28 @@ func TestTCPTimeWaitDoesNotLearnTimestampFromOutOfWindow(t *testing.T) {
 	}
 }
 
+// TestTCPTimeWaitAcceptsMissingTimestampFIN verifies that TIME-WAIT handles a
+// retransmitted FIN even when a negotiated Timestamp option was stripped.
+// RFC 7323 section 5.3 applies the PAWS rejection rule only when a Timestamp
+// option is present; Linux therefore continues with ordinary FIN processing,
+// while dropping the FIN would defer close until the peer's retransmission RTO.
+func TestTCPTimeWaitAcceptsMissingTimestampFIN(t *testing.T) {
+	connection := &TCPConn{stack: &Stack{}, peerTimestamp: true, recentTimestamp: 100}
+	state := &tcpEstablishedState{
+		connection:          connection,
+		receiveNext:         501,
+		lastACKSent:         501,
+		lastTimestampUpdate: time.Now(),
+	}
+	segment := tcpSegment{sequence: 500, flags: TCPFlagACK | TCPFlagFIN}
+	if state.handleTimeWaitSegment(segment, time.Now()) {
+		t.Fatal("missing-timestamp FIN unexpectedly replaced TIME-WAIT")
+	}
+	if !state.retransmit || state.retransmissionKind != tcpRetransmissionClose {
+		t.Fatalf("missing-timestamp FIN close timer = retransmit:%v kind:%v", state.retransmit, state.retransmissionKind)
+	}
+}
+
 // TestTCPTimeWaitKeepsQueuedAcceptOwner verifies that replacement cannot make
 // Accept return an obsolete connection. A completed connection still waiting
 // in the listener queue therefore blocks tuple reuse until the application
@@ -1935,6 +1957,56 @@ func TestTCPPassiveHandshakeProcessesSYNText(t *testing.T) {
 	}
 	if n, readErr := connection.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
 		t.Fatalf("SYN FIN read = %d, %v", n, readErr)
+	}
+}
+
+// TestTCPPassiveHandshakeAcceptsMissingTimestamp verifies Linux-compatible
+// completion when a middlebox removes Timestamp from the final ACK after it
+// was negotiated in the SYN.
+func TestTCPPassiveHandshakeAcceptsMissingTimestamp(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.72")
+	remote := netip.MustParseAddr("198.51.100.72")
+	link, stack := newTestStack(t, local, remote)
+	listener, err := stack.ListenTCP(context.Background(), "tcp4", netip.AddrPortFrom(local, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	localPort := listener.Addr().(*net.TCPAddr).AddrPort().Port()
+	const (
+		remotePort      = 45002
+		remoteSequence  = 100
+		remoteTimestamp = 700
+	)
+	syn := buildTestTCP(remote, local, remotePort, localPort, remoteSequence, 0, TCPFlagSYN, 65535, tcpTimestampOptions(remoteTimestamp, 0), nil)
+	if err = writeTestPacket(stack, syn); err != nil {
+		t.Fatal(err)
+	}
+	var synACK []byte
+	select {
+	case synACK = <-link.outbound:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for passive timestamp SYN-ACK")
+	}
+	parsed, ok := parseIPPacket(synACK)
+	if !ok || len(parsed.payload) < tcpHeaderSize {
+		t.Fatalf("passive timestamp SYN-ACK = %x", synACK)
+	}
+	serverSequence := binary.BigEndian.Uint32(parsed.payload[4:8])
+	finalACK := buildTestTCP(remote, local, remotePort, localPort, remoteSequence+1, serverSequence+1, TCPFlagACK, 65535, nil, nil)
+	if err = writeTestPacket(stack, finalACK); err != nil {
+		t.Fatal(err)
+	}
+	if err = listener.(*TCPListener).SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Accept without final-ACK timestamp: %v", err)
+	}
+	defer connection.Close()
+	if info := connection.(*TCPConn).Info(); info.State != TCPStateEstablished {
+		t.Fatalf("accepted connection state = %v, want established", info.State)
 	}
 }
 
@@ -8272,6 +8344,42 @@ func BenchmarkTCPHandlePureACK(b *testing.B) {
 	}
 }
 
+// BenchmarkTCPTimeWaitACKAdmission measures the production TIME-WAIT
+// admission path with and without a negotiated Timestamp option. The segment
+// is an in-window pure ACK, so no output packet or queue allocation obscures
+// the PAWS comparison itself.
+func BenchmarkTCPTimeWaitACKAdmission(b *testing.B) {
+	now := time.Now()
+	for _, timestamped := range []bool{false, true} {
+		name := "without-timestamp"
+		if timestamped {
+			name = "with-timestamp"
+		}
+		b.Run(name, func(b *testing.B) {
+			stack := &Stack{}
+			connection := &TCPConn{stack: stack, peerTimestamp: true, recentTimestamp: 123}
+			state := &tcpEstablishedState{
+				connection:          connection,
+				receiveNext:         100,
+				lastACKSent:         100,
+				lastTimestampUpdate: now,
+				receiveWindowState:  newTCPReceiveWindow(100, 65535, false, false, 0),
+			}
+			segment := tcpSegment{sequence: 100, flags: TCPFlagACK}
+			if timestamped {
+				segment.setOptions(tcpTimestampOptions(123, 456))
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for index := 0; index < b.N; index++ {
+				if state.handleTimeWaitSegment(segment, now) {
+					b.Fatal("TIME-WAIT ACK unexpectedly replaced the connection")
+				}
+			}
+		})
+	}
+}
+
 func TestBuildTCPPacketIntoOverwritesReusedBuffer(t *testing.T) {
 	source := netip.MustParseAddr("192.0.2.242")
 	target := netip.MustParseAddr("198.51.100.242")
@@ -9434,6 +9542,155 @@ func TestTCPPureACKAdvancesPAWS(t *testing.T) {
 	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
 	if _, err = io.ReadFull(connection, payload); err != nil || string(payload) != "data" {
 		t.Fatalf("fresh data after newer pure ACK = %q, %v", payload, err)
+	}
+}
+
+// TestTCPMissingTimestampRemainsCompatible verifies that a middlebox removing
+// a negotiated Timestamp option does not strand an established stream. RFC
+// 7323 section 5.3 only applies PAWS rejection to a present Timestamp option;
+// Linux consequently continues ordinary sequence processing for this segment.
+func TestTCPMissingTimestampRemainsCompatible(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"))
+	defer stack.Close()
+	link.echoTCP = true
+	link.timestampTCP = true
+	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 9109))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	tcpConnection := connection.(*TCPConn)
+	link.mu.Lock()
+	peer := link.tcp[tcpConnection.key.local.Port()]
+	sequence, acknowledgement := peer.serverNext, peer.clientNext
+	serverPort := tcpConnection.key.remote.Port()
+	clientPort := tcpConnection.key.local.Port()
+	link.mu.Unlock()
+	link.mu.Lock()
+	link.echoTCP = false
+	link.mu.Unlock()
+	if _, err = connection.Write([]byte("seed")); err != nil {
+		t.Fatal(err)
+	}
+	var seedPacket []byte
+	select {
+	case seedPacket = <-link.outbound:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for seed TCP packet")
+	}
+	seedParsed, ok := parseIPPacket(seedPacket)
+	if !ok || len(seedParsed.payload) < tcpHeaderSize {
+		t.Fatalf("seed TCP packet = %x", seedPacket)
+	}
+	seedHeaderSize := int(seedParsed.payload[12]>>4) * 4
+	_, baseTimestamp, timestampPresent := parseTCPTimestamp(seedParsed.payload[tcpHeaderSize:seedHeaderSize])
+	if !timestampPresent || baseTimestamp == 0 {
+		t.Fatal("timestamp negotiation did not establish a TCP timestamp echo")
+	}
+	missingTimestamp := buildTestTCP(link.remote, link.local, serverPort, clientPort, sequence, acknowledgement, TCPFlagACK|TCPFlagPSH, 65535, nil, []byte("without-ts"))
+	if err = writeTestPacket(stack, missingTimestamp); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	received := make([]byte, len("without-ts"))
+	if _, err = io.ReadFull(connection, received); err != nil || string(received) != "without-ts" {
+		t.Fatalf("missing-timestamp payload = %q, %v", received, err)
+	}
+	var ackPacket []byte
+	select {
+	case ackPacket = <-link.outbound:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for missing-timestamp ACK")
+	}
+	ackParsed, ok := parseIPPacket(ackPacket)
+	if !ok || len(ackParsed.payload) < tcpHeaderSize {
+		t.Fatalf("missing-timestamp ACK = %x", ackPacket)
+	}
+	ackHeaderSize := int(ackParsed.payload[12]>>4) * 4
+	_, acknowledgementEcho, timestampPresent := parseTCPTimestamp(ackParsed.payload[tcpHeaderSize:ackHeaderSize])
+	if !timestampPresent || acknowledgementEcho != baseTimestamp {
+		t.Fatalf("missing-timestamp ACK TSecr = %d, want unchanged %d", acknowledgementEcho, baseTimestamp)
+	}
+	missingFIN := buildTestTCP(link.remote, link.local, serverPort, clientPort, sequence+uint32(len(received)), acknowledgement, TCPFlagACK|TCPFlagFIN, 65535, nil, nil)
+	if err = writeTestPacket(stack, missingFIN); err != nil {
+		t.Fatal(err)
+	}
+	if n, readErr := connection.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+		t.Fatalf("missing-timestamp FIN read = %d, %v", n, readErr)
+	}
+}
+
+// TestTCPPAWSPrecedesWindowAdmission verifies that a stale Timestamp is
+// rejected before the RFC 9293 receive-window test. The resulting challenge
+// ACK uses the ordinary current send sequence instead of the peer-probe
+// sequence selected for an otherwise unacceptable segment.
+func TestTCPPAWSPrecedesWindowAdmission(t *testing.T) {
+	link, stack := newTestStack(t, netip.MustParseAddr("192.0.2.3"), netip.MustParseAddr("192.0.2.4"))
+	defer stack.Close()
+	link.echoTCP = true
+	link.timestampTCP = true
+	connection, err := stack.DialTCP(context.Background(), "tcp", netip.AddrPort{}, netip.AddrPortFrom(link.remote, 9110))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	tcpConnection := connection.(*TCPConn)
+	link.mu.Lock()
+	link.echoTCP = false
+	peer := link.tcp[tcpConnection.key.local.Port()]
+	serverNext := peer.serverNext
+	serverPort := tcpConnection.key.remote.Port()
+	clientPort := tcpConnection.key.local.Port()
+	link.mu.Unlock()
+	const pending = "pending"
+	if _, err = connection.Write([]byte(pending)); err != nil {
+		t.Fatal(err)
+	}
+	var dataPacket []byte
+	select {
+	case dataPacket = <-link.outbound:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for pending TCP packet")
+	}
+	dataParsed, ok := parseIPPacket(dataPacket)
+	if !ok || dataParsed.protocol != ProtocolTCP || len(dataParsed.payload) < tcpHeaderSize {
+		t.Fatalf("pending TCP packet = %x", dataPacket)
+	}
+	dataSequence := binary.BigEndian.Uint32(dataParsed.payload[4:8])
+	// Info is actor-serialized and confirms that sendNext includes the queued
+	// payload before the deliberately out-of-window segment is injected.
+	_ = tcpConnection.Info()
+	// The sequence is deliberately beyond RCV.NXT and the ACK/window pair is
+	// chosen so the old window-first path would select dataSequence+1.
+	stale := buildTestTCP(link.remote, link.local, serverPort, clientPort, serverNext+tcpReceiveCapacity+1,
+		dataSequence+1, TCPFlagACK, 0, tcpTimestampOptions(1, 0), nil)
+	if err = writeTestPacket(stack, stale); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	var parsed ipPacket
+	for {
+		select {
+		case challenge := <-link.outbound:
+			candidate, candidateOK := parseIPPacket(challenge)
+			if !candidateOK || candidate.protocol != ProtocolTCP || len(candidate.payload) < tcpHeaderSize {
+				continue
+			}
+			headerSize := int(candidate.payload[12]>>4) * 4
+			if headerSize < tcpHeaderSize || headerSize > len(candidate.payload) || len(candidate.payload) != headerSize {
+				continue
+			}
+			parsed = candidate
+		case <-deadline.C:
+			t.Fatal("timed out waiting for PAWS challenge")
+		}
+		if parsed.payload != nil {
+			break
+		}
+	}
+	if got := binary.BigEndian.Uint32(parsed.payload[4:8]); got != dataSequence+uint32(len(pending)) {
+		t.Fatalf("PAWS challenge sequence = %d, want current send next %d", got, dataSequence+uint32(len(pending)))
 	}
 }
 

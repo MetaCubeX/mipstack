@@ -81,6 +81,40 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// A second cookie handshake models a middlebox that removes Timestamp from
+	// the final ACK. The production dispatch path must accept it and restore the
+	// connection conservatively without timestamp or ECN state.
+	const missingTimestampClientSequence = uint32(0x22345678)
+	missingTimestampSYN := buildTestTCP(remote, local, 43002, 47002, missingTimestampClientSequence, 0, TCPFlagSYN|TCPFlagECE|TCPFlagCWR, 4096, options, nil)
+	if err = writeTestPacket(stack, missingTimestampSYN); err != nil {
+		t.Fatal(err)
+	}
+	missingTimestampResponse := readOutboundPacket(t, stack)
+	missingParsed, ok := parseIPPacket(missingTimestampResponse)
+	if !ok || missingParsed.protocol != ProtocolTCP || len(missingParsed.payload) < tcpHeaderSize {
+		t.Fatalf("invalid missing-timestamp SYN-cookie response: %x", missingTimestampResponse)
+	}
+	missingServerSequence := binary.BigEndian.Uint32(missingParsed.payload[4:8])
+	missingTimestampACK := buildTestTCP(remote, local, 43002, 47002, missingTimestampClientSequence+1, missingServerSequence+1, TCPFlagACK, 1234, nil, nil)
+	if err = writeTestPacket(stack, missingTimestampACK); err != nil {
+		t.Fatal(err)
+	}
+	if err = listener.(*TCPListener).SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	missingConnection, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Accept without cookie timestamp: %v", err)
+	}
+	missingConnectionTCP := missingConnection.(*TCPConn)
+	if missingConnectionTCP.peerTimestamp || missingConnectionTCP.peerECN || missingConnectionTCP.recentTimestamp != 0 {
+		t.Fatalf("missing-timestamp cookie options = TS:%v/%d ECN:%v", missingConnectionTCP.peerTimestamp, missingConnectionTCP.recentTimestamp, missingConnectionTCP.peerECN)
+	}
+	_ = missingConnection.Close()
+	// Consume the close handshake before injecting the first connection's
+	// forged ACK so the two control paths cannot be confused in the device queue.
+	_ = readOutboundPacket(t, stack)
+
 	ackOptions := tcpTimestampOptions(clientTimestamp+1, serverTimestamp)
 	forgedACK := buildTestTCP(remote, local, 43001, 47002, clientSequence+1, serverSequence+2, TCPFlagACK, 1234, ackOptions, nil)
 	if err = writeTestPacket(stack, forgedACK); err != nil {
@@ -119,13 +153,13 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 		t.Fatalf("cookie connection remote = %v", connection.RemoteAddr())
 	}
 	info := listener.(*TCPListener).Info()
-	if info.SYNsReceived != 1 || info.SYNCookiesSent != 1 || info.SYNCookiesRejected != 1 || info.SYNCookiesAccepted != 1 ||
-		info.HandshakeCompletions != 1 || info.AcceptedConnections != 1 || info.AcceptQueuePeak > 1 ||
+	if info.SYNsReceived != 2 || info.SYNCookiesSent != 2 || info.SYNCookiesRejected != 1 || info.SYNCookiesAccepted != 2 ||
+		info.HandshakeCompletions != 2 || info.AcceptedConnections != 2 || info.AcceptQueuePeak > 1 ||
 		info.SYNBacklogConnections != tcpSYNBacklog || info.SYNBacklogPeak != tcpSYNBacklog {
 		t.Fatalf("SYN cookie listener diagnostics = %+v", info)
 	}
 	stats := stack.Stats()
-	if stats.TCPSYNCookiesSent != 1 || stats.TCPSYNCookiesRejected != 1 || stats.TCPSYNCookiesAccepted != 1 {
+	if stats.TCPSYNCookiesSent != 2 || stats.TCPSYNCookiesRejected != 1 || stats.TCPSYNCookiesAccepted != 2 {
 		t.Fatalf("SYN cookie stack diagnostics = %+v", stats)
 	}
 }
@@ -364,6 +398,38 @@ func TestSYNCookieValidationIPv4AndIPv6(t *testing.T) {
 				t.Fatal("cookie ACK was accepted without recent cookie issuance")
 			}
 		})
+	}
+}
+
+// TestSYNCookieAcceptsMissingTimestamp verifies the Linux-compatible cookie
+// fallback for a final ACK whose negotiated Timestamp option was stripped.
+// The keyed tag still authenticates the original option state; the restored
+// connection simply disables Timestamp and ECN because the ACK proved neither.
+func TestSYNCookieAcceptsMissingTimestamp(t *testing.T) {
+	now := time.Unix(2000002000, 0)
+	state := &tcpPassiveState{
+		cookieSet: true, cookieActive: true, cookieEpoch: now, cookiePeriod: 0,
+		cookieScaleSet: true, cookieScalePeriod: 0, cookieWindowScale: 4,
+	}
+	for index := range state.cookieKey {
+		state.cookieKey[index] = byte(index + 1)
+	}
+	key := tcpKey{
+		local:  netip.MustParseAddrPort("192.0.2.72:443"),
+		remote: netip.MustParseAddrPort("198.51.100.72:50000"),
+	}
+	syn := tcpSegment{sequence: 100, flags: TCPFlagSYN | TCPFlagECE | TCPFlagCWR, window: 65535}
+	syn.setOptions(tcpTimestampOptions(700, 0))
+	_, data := encodeSYNCookieOptions(syn, key.remote.Addr())
+	period := synCookiePeriodNumber(now, state.cookieEpoch)
+	cookie := synCookieSequence(state.cookieKey, key, syn.sequence, period, data, synCookieAuthenticatedData(data, true, true))
+	ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: cookie + 1, flags: TCPFlagACK, window: 4096}
+	_, options, valid, attempted := state.validateSYNCookie(key, ack, now)
+	if !attempted || !valid {
+		t.Fatalf("missing-timestamp cookie validation = valid:%v attempted:%v", valid, attempted)
+	}
+	if options.timestamp || options.ecn || options.timestampNow != 0 {
+		t.Fatalf("missing-timestamp cookie options = timestamp:%v ecn:%v tsval:%d", options.timestamp, options.ecn, options.timestampNow)
 	}
 }
 

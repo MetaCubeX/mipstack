@@ -16,6 +16,7 @@ import (
 
 	"github.com/metacubex/gvisor/pkg/tcpip"
 	"github.com/metacubex/gvisor/pkg/tcpip/adapters/gonet"
+	"github.com/metacubex/gvisor/pkg/tcpip/checksum"
 	"github.com/metacubex/gvisor/pkg/tcpip/header"
 	"github.com/metacubex/gvisor/pkg/tcpip/transport/tcp"
 	"github.com/metacubex/gvisor/pkg/waiter"
@@ -236,6 +237,49 @@ func TestTCPReadWithBufferInterop(t *testing.T) {
 	}
 }
 
+// TestTCPMissingTimestampInterop verifies that a real gVisor-to-mipstack
+// packet path still completes streams when an in-path device removes the
+// negotiated Timestamp option from non-SYN segments. The hook delivers the
+// rewritten packet to mipstack with valid lengths and transport checksums.
+func TestTCPMissingTimestampInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		for _, mipstackListens := range []bool{false, true} {
+			mipstackListens := mipstackListens
+			role := "gvisor-listens"
+			if mipstackListens {
+				role = "mipstack-listens"
+			}
+			t.Run(family.name+"/"+role, func(t *testing.T) {
+				var stripped atomic.Uint32
+				network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 1500,
+					gvisorToMipstack: func(packet []byte) bool {
+						tcpHeader, _, ok := tcpSegment(packet)
+						if !ok || tcpHeader.Flags().Contains(header.TCPFlagSyn) || !tcpHeader.ParsedOptions().TS {
+							return true
+						}
+						if stripTCPTimestamp(packet) {
+							stripped.Add(1)
+						}
+						return true
+					},
+				})
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+				defer listener.Close()
+				defer client.Close()
+				defer server.Close()
+				exerciseFullDuplexTCP(t, client, server, 32*1024)
+				if stripped.Load() == 0 {
+					t.Fatal("gVisor-to-mipstack hook did not strip a negotiated Timestamp")
+				}
+			})
+		}
+	}
+}
+
 // TestTCPTimeWaitReuseInterop verifies that a gVisor active opener can reuse
 // the same local port against a mipstack listener while the first server-side
 // incarnation remains in TIME-WAIT. Both handshakes exercise the RFC 6191
@@ -307,6 +351,145 @@ func TestTCPTimeWaitReuseInterop(t *testing.T) {
 			defer secondServer.Close()
 			if got := second.LocalAddr().(*net.TCPAddr).Port; got != clientPort {
 				t.Fatalf("replacement gVisor local port = %d, want %d", got, clientPort)
+			}
+		})
+	}
+}
+
+// TestTCPTimeWaitMissingTimestampInterop verifies that a retransmitted FIN
+// reaching a mipstack TIME-WAIT tuple is still acknowledged when a middlebox
+// removes the negotiated Timestamp option. The first ACK is dropped to force
+// gVisor to retransmit the FIN, so the rewritten packet exercises the actual
+// TIME-WAIT path rather than only established-state FIN handling.
+func TestTCPTimeWaitMissingTimestampInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			var (
+				firstFINSequence atomic.Uint32
+				firstFINSeen     atomic.Bool
+				ackDropped       atomic.Bool
+				ackAfterDrop     atomic.Uint32
+				strippedFIN      atomic.Uint32
+				timeWaitReady    atomic.Bool
+				earlyDuplicate   atomic.Bool
+			)
+			firstFIN := make(chan struct{})
+			ackWasDropped := make(chan struct{})
+			stripped := make(chan struct{})
+			ackAfterWasSent := make(chan struct{})
+			var firstFINOnce, ackDropOnce, strippedOnce, ackAfterOnce sync.Once
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					tcpHeader, payloadLength, ok := tcpSegment(packet)
+					if !ok || payloadLength != 0 || !tcpHeader.Flags().Contains(header.TCPFlagFin) || tcpHeader.Flags().Contains(header.TCPFlagSyn) {
+						return true
+					}
+					sequence := tcpHeader.SequenceNumber()
+					if firstFINSeen.CompareAndSwap(false, true) {
+						firstFINSequence.Store(sequence)
+						firstFINOnce.Do(func() { close(firstFIN) })
+						return true
+					}
+					if sequence != firstFINSequence.Load() || !tcpHeader.ParsedOptions().TS {
+						return true
+					}
+					if !timeWaitReady.Load() {
+						earlyDuplicate.Store(true)
+					}
+					if stripTCPTimestamp(packet) {
+						strippedFIN.Add(1)
+						strippedOnce.Do(func() { close(stripped) })
+					}
+					return true
+				},
+				mipstackToGVisor: func(packet []byte) bool {
+					tcpHeader, payloadLength, ok := tcpSegment(packet)
+					if !ok || payloadLength != 0 || tcpHeader.Flags() != header.TCPFlagAck || !firstFINSeen.Load() {
+						return true
+					}
+					if tcpHeader.AckNumber() != firstFINSequence.Load()+1 {
+						return true
+					}
+					if ackDropped.CompareAndSwap(false, true) {
+						ackDropOnce.Do(func() { close(ackWasDropped) })
+						return false
+					}
+					if strippedFIN.Load() == 0 {
+						return true
+					}
+					ackAfterDrop.Add(1)
+					ackAfterOnce.Do(func() { close(ackAfterWasSent) })
+					return true
+				},
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			const (
+				serverPort = 41013
+				clientPort = 41014
+			)
+			listener, err := network.mipstack.ListenTCP(ctx, family.tcpNetwork, netipAddrPort(family.mipstackAddress, serverPort))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			local := gvisorFullAddress(family.gvisorAddress, clientPort)
+			remote := gvisorFullAddress(family.mipstackAddress, serverPort)
+			first, err := gonet.DialTCPWithBind(ctx, network.gvisor, local, remote, family.networkProtocol)
+			if err != nil {
+				t.Fatalf("gVisor DialTCPWithBind: %v", err)
+			}
+			defer first.Close()
+			firstServer, err := listener.Accept()
+			if err != nil {
+				t.Fatalf("Accept: %v", err)
+			}
+			defer firstServer.Close()
+			if err = firstServer.(*mipstack.TCPConn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			if err = first.SetReadDeadline(deadline); err != nil {
+				t.Fatal(err)
+			}
+			if n, readErr := first.Read(make([]byte, 1)); n != 0 || readErr != io.EOF {
+				t.Fatalf("gVisor FIN read = %d, %v", n, readErr)
+			}
+			if err = first.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-firstFIN:
+			case <-time.After(2 * time.Second):
+				t.Fatal("gVisor FIN was not observed")
+			}
+			select {
+			case <-ackWasDropped:
+			case <-time.After(2 * time.Second):
+				t.Fatal("mipstack FIN acknowledgement was not dropped")
+			}
+			stateDeadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(stateDeadline) && firstServer.(*mipstack.TCPConn).Info().State != mipstack.TCPStateTimeWait {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if state := firstServer.(*mipstack.TCPConn).Info().State; state != mipstack.TCPStateTimeWait {
+				t.Fatalf("mipstack state after dropped FIN ACK = %v, want TIME-WAIT", state)
+			}
+			timeWaitReady.Store(true)
+			select {
+			case <-stripped:
+			case <-time.After(5 * time.Second):
+				t.Fatal("gVisor did not retransmit a Timestamp-stripped FIN")
+			}
+			select {
+			case <-ackAfterWasSent:
+			case <-time.After(2 * time.Second):
+				t.Fatal("mipstack did not acknowledge the Timestamp-stripped FIN")
+			}
+			if earlyDuplicate.Load() || strippedFIN.Load() != 1 || ackAfterDrop.Load() == 0 {
+				t.Fatalf("TIME-WAIT missing-Timestamp FIN = early:%v stripped:%d ACKs-after-drop:%d", earlyDuplicate.Load(), strippedFIN.Load(), ackAfterDrop.Load())
 			}
 		})
 	}
@@ -1596,6 +1779,121 @@ func tcpSegment(packet []byte) (header.TCP, int, bool) {
 		return nil, 0, false
 	}
 	return tcpHeader, len(packet) - transportOffset - headerSize, true
+}
+
+// stripTCPTimestamp removes one well-formed Timestamp option from a complete
+// IPv4/IPv6 TCP packet. It models an option-stripping middlebox using gVisor's
+// header and checksum implementations, then updates the network length and
+// transport checksum before the packet reaches mipstack.
+func stripTCPTimestamp(packet []byte) bool {
+	const timestampOptionLength = 10
+	if len(packet) == 0 {
+		return false
+	}
+	transportOffset := 0
+	wireEnd := len(packet)
+	var source, target tcpip.Address
+	var ipv4Header header.IPv4
+	var ipv6Header header.IPv6
+	switch packet[0] >> 4 {
+	case header.IPv4Version:
+		if len(packet) < header.IPv4MinimumSize {
+			return false
+		}
+		ipv4Header = header.IPv4(packet)
+		if ipv4Header.TransportProtocol() != header.TCPProtocolNumber || int(ipv4Header.TotalLength()) > len(packet) {
+			return false
+		}
+		transportOffset = int(ipv4Header.HeaderLength())
+		wireEnd = int(ipv4Header.TotalLength())
+		source, target = ipv4Header.SourceAddress(), ipv4Header.DestinationAddress()
+	case header.IPv6Version:
+		if len(packet) < header.IPv6MinimumSize || header.IPv6(packet).TransportProtocol() != header.TCPProtocolNumber {
+			return false
+		}
+		ipv6Header = header.IPv6(packet)
+		wireEnd = header.IPv6MinimumSize + int(ipv6Header.PayloadLength())
+		if wireEnd > len(packet) {
+			return false
+		}
+		transportOffset = header.IPv6MinimumSize
+		source, target = ipv6Header.SourceAddress(), ipv6Header.DestinationAddress()
+	default:
+		return false
+	}
+	if wireEnd < transportOffset+header.TCPMinimumSize {
+		return false
+	}
+	tcpHeader := header.TCP(packet[transportOffset:wireEnd])
+	oldHeaderSize := int(tcpHeader.DataOffset())
+	if oldHeaderSize < header.TCPMinimumSize || oldHeaderSize > len(tcpHeader) || tcpHeader.Flags().Contains(header.TCPFlagSyn) {
+		return false
+	}
+	var compact [40]byte
+	writeOffset := 0
+	removed := false
+	for options := tcpHeader.Options(); len(options) != 0; {
+		kind := options[0]
+		if kind == mipstack.TCPHeaderOptionEnd {
+			break
+		}
+		if kind == mipstack.TCPHeaderOptionNOP {
+			if writeOffset >= len(compact) {
+				return false
+			}
+			compact[writeOffset] = kind
+			writeOffset++
+			options = options[1:]
+			continue
+		}
+		if len(options) < 2 || options[1] < 2 || int(options[1]) > len(options) {
+			return false
+		}
+		length := int(options[1])
+		if kind == mipstack.TCPHeaderOptionTimestamp && length == timestampOptionLength {
+			removed = true
+			options = options[length:]
+			continue
+		}
+		if writeOffset+length > len(compact) {
+			return false
+		}
+		copy(compact[writeOffset:], options[:length])
+		writeOffset += length
+		options = options[length:]
+	}
+	if !removed {
+		return false
+	}
+	newOptionsSize := (writeOffset + 3) &^ 3
+	if newOptionsSize > len(compact) {
+		return false
+	}
+	for writeOffset < newOptionsSize {
+		compact[writeOffset] = mipstack.TCPHeaderOptionNOP
+		writeOffset++
+	}
+	newHeaderSize := header.TCPMinimumSize + newOptionsSize
+	if newHeaderSize >= oldHeaderSize {
+		return false
+	}
+	removedBytes := oldHeaderSize - newHeaderSize
+	newWireEnd := wireEnd - removedBytes
+	copy(packet[transportOffset+newHeaderSize:newWireEnd], packet[transportOffset+oldHeaderSize:wireEnd])
+	copy(packet[transportOffset+header.TCPMinimumSize:transportOffset+newHeaderSize], compact[:newOptionsSize])
+	tcpHeader = header.TCP(packet[transportOffset:newWireEnd])
+	tcpHeader.SetDataOffset(uint8(newHeaderSize))
+	tcpHeader.SetChecksum(0)
+	partial := header.PseudoHeaderChecksum(header.TCPProtocolNumber, source, target, uint16(newWireEnd-transportOffset))
+	tcpHeader.SetChecksum(^checksum.Checksum(tcpHeader, partial))
+	if ipv4Header != nil {
+		ipv4Header.SetTotalLength(uint16(newWireEnd))
+		ipv4Header.SetChecksum(0)
+		ipv4Header.SetChecksum(^ipv4Header.CalculateChecksum())
+	} else {
+		ipv6Header.SetPayloadLength(uint16(newWireEnd - header.IPv6MinimumSize))
+	}
+	return true
 }
 
 // acceptGVisorTCP waits for one native endpoint without wrapping away access

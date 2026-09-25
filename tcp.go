@@ -2327,21 +2327,21 @@ func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, received
 		s.trySendChallengeACK()
 		return false
 	}
-	// RFC 7323 requires a negotiated timestamp on every non-RST segment and
-	// applies PAWS before ordinary sequence admission. A stale timestamp is
-	// acknowledged without changing the retained tuple; a missing timestamp is
-	// discarded, matching mipstack's strict established-state timestamp policy
-	// rather than Linux's more permissive missing-option handling. SYNs use the
-	// RFC 6191 test above instead of this PAWS path.
+	// RFC 7323 applies PAWS before ordinary sequence admission. Linux keeps the
+	// TIME-WAIT tuple usable when a middlebox strips a negotiated option: a
+	// missing timestamp therefore falls through to the normal sequence/window
+	// tests, while a stale timestamp is rejected with a rate-limited challenge
+	// ACK without changing TS.Recent.
+	// SYNs use the RFC 6191 test above instead of this PAWS path.
 	var timestamp uint32
 	present := false
 	if s.connection.peerTimestamp {
 		timestamp, _, present = parseTCPTimestamp(segment.optionBytes())
-		if !present {
-			return false
-		}
-		if receivedAt.Sub(s.lastTimestampUpdate) < tcpPAWSMaxAge && tcpSequenceLess(timestamp, s.connection.recentTimestamp) {
-			s.trySendACK()
+		if present && receivedAt.Sub(s.lastTimestampUpdate) < tcpPAWSMaxAge && tcpSequenceLess(timestamp, s.connection.recentTimestamp) {
+			// A PAWS-rejected TIME-WAIT segment is an out-of-window control
+			// event; use the existing RFC 5961 challenge-ACK limiter rather
+			// than reflecting one ACK for every stale duplicate.
+			s.trySendChallengeACK()
 			return false
 		}
 	}
@@ -6642,16 +6642,26 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 				}
 				continue
 			}
+			timestampValue, timestampPresent := uint32(0), false
+			// RFC 7323 section 5.3 places PAWS ahead of ordinary sequence
+			// validation. Linux accepts a missing Timestamp option after
+			// negotiation and continues with the normal handshake checks;
+			// only a present stale TSval is rejected here.
+			if c.peerTimestamp {
+				timestampValue, _, timestampPresent = parseTCPTimestamp(segment.optionBytes())
+				if timestampPresent && tcpSequenceLess(timestampValue, c.recentTimestamp) {
+					if c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
+						_ = c.trySendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false))
+					}
+					continue
+				}
+			}
 			if transmissions != 0 && !c.passive && segment.flags&(TCPFlagSYN|TCPFlagACK) == TCPFlagSYN|TCPFlagACK && segment.acknowledgement == initialSequence+1 && segment.sequence+1 == c.receiveNext {
 				// During simultaneous open both endpoints send SYN-ACK. Its
 				// SYN repeats the already accepted IRS while its ACK completes
 				// our active half of the handshake.
-				if c.peerTimestamp {
-					value, _, present := parseTCPTimestamp(segment.optionBytes())
-					if !present || tcpSequenceLess(value, c.recentTimestamp) {
-						continue
-					}
-					c.recentTimestamp = value
+				if timestampPresent {
+					c.recentTimestamp = timestampValue
 				}
 				c.peerWindow = uint32(segment.window)
 				c.peerWindowSeq = segment.sequence
@@ -6672,11 +6682,8 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 				if segment.flags&(TCPFlagECE|TCPFlagCWR) != TCPFlagECE|TCPFlagCWR {
 					c.peerECN = false
 				}
-				if c.peerTimestamp {
-					value, _, present := parseTCPTimestamp(segment.optionBytes())
-					if present && !tcpSequenceLess(value, c.recentTimestamp) {
-						c.recentTimestamp = value
-					}
+				if timestampPresent {
+					c.recentTimestamp = timestampValue
 				}
 				if hostQueueWait != nil {
 					sendRearm = true
@@ -6703,12 +6710,8 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 			if transmissions == 0 || segment.flags&TCPFlagACK == 0 || segment.acknowledgement != initialSequence+1 {
 				continue
 			}
-			if c.peerTimestamp {
-				value, _, present := parseTCPTimestamp(segment.optionBytes())
-				if !present || tcpSequenceLess(value, c.recentTimestamp) {
-					continue
-				}
-				c.recentTimestamp = value
+			if timestampPresent {
+				c.recentTimestamp = timestampValue
 			}
 			c.peerWindow = uint32(segment.window)
 			if c.peerWindowScaling {
@@ -8681,6 +8684,21 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 					continue
 				}
+				timestampEcho := uint32(0)
+				timestampValue := uint32(0)
+				timestampPresent := false
+				// RFC 7323 section 5.3 requires PAWS before the ordinary
+				// sequence/window test. Linux treats a missing option as a
+				// compatibility case, so only a present, stale TSval rejects
+				// this segment; RST continues to bypass PAWS as required by
+				// RFC 7323 section 5.2.
+				if c.peerTimestamp && segment.flags&TCPFlagRST == 0 {
+					timestampValue, timestampEcho, timestampPresent = parseTCPTimestamp(segment.optionBytes())
+					if timestampPresent && receivedAt.Sub(state.lastTimestampUpdate) < tcpPAWSMaxAge && tcpSequenceLess(timestampValue, c.recentTimestamp) {
+						state.trySendChallengeACK()
+						continue
+					}
+				}
 				if !tcpSegmentAcceptable(segment.sequence, payloadLength, state.receiveNext, receiveWindow) {
 					if segment.flags&TCPFlagRST == 0 {
 						if tcpKeepAliveOrWindowProbe(segment, payloadLength, state.receiveNext, receiveWindow) {
@@ -8692,21 +8710,9 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 					}
 					continue
 				}
-				timestampEcho := uint32(0)
-				if c.peerTimestamp && segment.flags&TCPFlagRST == 0 {
-					timestampValue, echo, present := parseTCPTimestamp(segment.optionBytes())
-					if !present {
-						continue
-					}
-					timestampEcho = echo
-					if receivedAt.Sub(state.lastTimestampUpdate) < tcpPAWSMaxAge && tcpSequenceLess(timestampValue, c.recentTimestamp) {
-						state.trySendChallengeACK()
-						continue
-					}
-					if tcpSequenceLessEqual(segment.sequence, state.lastACKSent) {
-						c.recentTimestamp = timestampValue
-						state.lastTimestampUpdate = receivedAt
-					}
+				if timestampPresent && tcpSequenceLessEqual(segment.sequence, state.lastACKSent) {
+					c.recentTimestamp = timestampValue
+					state.lastTimestampUpdate = receivedAt
 				}
 				state.lastActivity = receivedAt
 				keepAliveOutputWaiting = false
