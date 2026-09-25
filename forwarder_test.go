@@ -681,6 +681,92 @@ func TestPromiscuousAdmissionDoesNotImplySourceSpoofing(t *testing.T) {
 	}
 }
 
+func TestPromiscuousUDPForwarderPacketInfo(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.35")
+	remote := netip.MustParseAddr("198.51.100.35")
+	target := netip.MustParseAddr("203.0.113.35")
+	tests := []struct {
+		name       string
+		local      netip.Addr
+		wantSource netip.Addr
+	}{
+		{name: "configured source", local: local, wantSource: local},
+		{name: "addressless", wantSource: netip.Addr{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stack *Stack
+			var err error
+			if test.local.IsValid() {
+				stack = newForwarderTestStack(t, test.local, true)
+			} else {
+				stack, err = New(Config{Promiscuous: true, MTU: 1400})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = stack.Start(); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = stack.Close() })
+			}
+			connections := make(chan *UDPConn, 1)
+			handlerErrors := make(chan error, 1)
+			forwarder, err := NewUDPForwarder(stack, UDPForwarderOptions{}, func(request *UDPForwarderRequest) {
+				connection, listenErr := request.Listen()
+				if listenErr != nil {
+					handlerErrors <- listenErr
+					return
+				}
+				connections <- connection
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			if err = writeTestPacket(stack, buildTestUDP(remote, target, 42501, 53001, []byte("promiscuous"))); err != nil {
+				t.Fatal(err)
+			}
+			var connection *UDPConn
+			select {
+			case err = <-handlerErrors:
+				t.Fatal(err)
+			case connection = <-connections:
+			}
+			defer connection.Close()
+			if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			payload, control := make([]byte, 64), make([]byte, 128)
+			n, oobn, flags, source, err := connection.ReadMsgUDPAddrPort(payload, control)
+			if err != nil || flags != 0 || string(payload[:n]) != "promiscuous" || source != netip.AddrPortFrom(remote, 42501) {
+				t.Fatalf("promiscuous ReadMsgUDPAddrPort = %q/%d flags %#x source %s, %v", payload[:n], oobn, flags, source, err)
+			}
+			var message IPv4ControlMessage
+			if err = message.Parse(control[:oobn]); err != nil || message.Dst != target {
+				t.Fatalf("promiscuous packet-info = %+v, %v, want destination %s", message, err, target)
+			}
+			var wantSource [4]byte
+			if test.wantSource.IsValid() {
+				wantSource = test.wantSource.As4()
+			}
+			if oobn < 28 || !bytes.Equal(control[20:24], wantSource[:]) || !bytes.Equal(control[24:28], target.AsSlice()) {
+				t.Fatalf("promiscuous packet-info fields = %x/%x, want %s/%s", control[20:24], control[24:28], test.wantSource, target)
+			}
+			if _, err = stack.Write([][]byte{buildTestUDP(remote, target, 42502, 53001, []byte("promiscuous-batch"))}, 0); err != nil {
+				t.Fatal(err)
+			}
+			batch := []SocketMessage{{Buffers: [][]byte{make([]byte, 64)}, OOB: make([]byte, 128)}}
+			if count, batchErr := connection.ReadBatch(batch, 0); batchErr != nil || count != 1 || string(batch[0].Buffers[0][:batch[0].N]) != "promiscuous-batch" {
+				t.Fatalf("promiscuous ReadBatch = %d/%d, %v", count, batch[0].N, batchErr)
+			}
+			var batchMessage IPv4ControlMessage
+			if err = batchMessage.Parse(batch[0].OOB[:batch[0].NN]); err != nil || batchMessage.Dst != target || !bytes.Equal(batch[0].OOB[20:24], wantSource[:]) || !bytes.Equal(batch[0].OOB[24:28], target.AsSlice()) {
+				t.Fatalf("promiscuous batch packet-info = %+v, %v, fields %x/%x", batchMessage, err, batch[0].OOB[20:24], batch[0].OOB[24:28])
+			}
+		})
+	}
+}
+
 func TestForwardersHandleLocalTrafficWithoutPromiscuous(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.37")
 	remote := netip.MustParseAddr("192.0.2.38")

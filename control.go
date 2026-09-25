@@ -196,8 +196,8 @@ func parseSocketErrorControl(v6 bool, data []byte) (SocketErrorControlMessage, e
 
 // IPv4ControlMessage represents per-packet IPv4 metadata carried by
 // UDPConn.ReadMsgUDP, UDPConn.WriteMsgUDP, IPConn.ReadMsgIP, and
-// IPConn.WriteMsgIP. Src is used when sending and Dst is populated when
-// parsing received control data. MIPS has one embedding link, so IfIndex is
+// IPConn.WriteMsgIP. Src is used when sending and Dst is populated from the
+// received IP header destination. MIPS has one embedding link, so IfIndex is
 // always zero and a nonzero value cannot be marshaled.
 type IPv4ControlMessage struct {
 	// TTL is the received or requested time to live. A received value may be
@@ -208,7 +208,7 @@ type IPv4ControlMessage struct {
 	TOS int
 	// Src selects a managed source address when marshaling.
 	Src netip.Addr
-	// Dst is the local destination populated by Parse and is not marshaled.
+	// Dst is the IP header destination populated by Parse and is not marshaled.
 	Dst netip.Addr
 	// IfIndex is the embedding-link index. MIPS supports only zero.
 	IfIndex int
@@ -221,31 +221,37 @@ func (message *IPv4ControlMessage) Marshal() ([]byte, error) {
 	if message == nil {
 		return nil, nil
 	}
-	return message.marshal(message.Src, false)
+	return message.marshal(message.Src, netip.Addr{}, false)
 }
 
-// marshalForRead encodes the receive-only Dst field and required header
-// values. Keeping this operation on the public type makes it share Marshal's
-// validation and wire encoding while leaving Marshal's send semantics intact.
-func (message *IPv4ControlMessage) marshalForRead() ([]byte, error) {
-	return message.marshal(message.Dst, true)
+// marshalForRead encodes receive metadata with specDst as ipi_spec_dst and
+// Dst as the IP header destination in ipi_addr.
+func (message *IPv4ControlMessage) marshalForRead(specDst netip.Addr) ([]byte, error) {
+	return message.marshal(specDst, message.Dst, true)
 }
 
-// marshal encodes the selected packet-info address and header values.
-func (message *IPv4ControlMessage) marshal(address netip.Addr, receiving bool) ([]byte, error) {
+// marshal encodes the IPv4 packet-info fields and header values. For a send,
+// specDst is the source-selection field and destination is ignored. For a
+// receive, the two packet-info addresses remain independent: specDst is the
+// local address selected for the embedding link and destination is the IP
+// header destination.
+func (message *IPv4ControlMessage) marshal(specDst, destination netip.Addr, receiving bool) ([]byte, error) {
 	if message.IfIndex != 0 {
 		return nil, errors.New("mipstack: nonzero IPv4 control-message interface index is not supported")
 	}
-	address = address.Unmap()
-	capacity := 0
-	if address.IsValid() {
-		if !address.Is4() || address.Zone() != "" || !receiving && address.IsMulticast() {
-			field := "source"
-			if receiving {
-				field = "destination"
-			}
-			return nil, errors.New("mipstack: invalid IPv4 control-message " + field)
+	specDst, destination = specDst.Unmap(), destination.Unmap()
+	if receiving {
+		if specDst.IsValid() && (!specDst.Is4() || specDst.Zone() != "" || specDst.IsMulticast()) {
+			return nil, errors.New("mipstack: invalid IPv4 control-message source")
 		}
+		if destination.IsValid() && (!destination.Is4() || destination.Zone() != "") {
+			return nil, errors.New("mipstack: invalid IPv4 control-message destination")
+		}
+	} else if specDst.IsValid() && (!specDst.Is4() || specDst.Zone() != "" || specDst.IsMulticast()) {
+		return nil, errors.New("mipstack: invalid IPv4 control-message source")
+	}
+	capacity := 0
+	if specDst.IsValid() || receiving && destination.IsValid() {
 		capacity += 32
 	}
 	if message.TTL < 0 || message.TTL > 255 {
@@ -261,8 +267,12 @@ func (message *IPv4ControlMessage) marshal(address netip.Addr, receiving bool) (
 		capacity += 24
 	}
 	control := make([]byte, 0, capacity)
-	if address.IsValid() {
-		control = appendLinuxPacketInfoControl(control, address)
+	if specDst.IsValid() || receiving && destination.IsValid() {
+		if receiving {
+			control = appendLinuxIPv4PacketInfoControl(control, specDst, destination)
+		} else {
+			control = appendLinuxIPv4PacketInfoControl(control, specDst, netip.Addr{})
+		}
 	}
 	if receiving || message.TTL != 0 {
 		control = appendLinuxControlInt32(control, linuxLevelIP, linuxIPTimeToLive, int32(message.TTL))
@@ -321,7 +331,7 @@ type IPv6ControlMessage struct {
 	FlowLabel uint32
 	// Src selects a managed source address when marshaling.
 	Src netip.Addr
-	// Dst is the local destination populated by Parse and is not marshaled.
+	// Dst is the IP header destination populated by Parse and is not marshaled.
 	Dst netip.Addr
 	// IfIndex is the embedding-link index. MIPS supports only zero.
 	IfIndex int
@@ -381,7 +391,7 @@ func (message *IPv6ControlMessage) marshal(address netip.Addr, receiving bool) (
 	}
 	control := make([]byte, 0, capacity)
 	if address.IsValid() {
-		control = appendLinuxPacketInfoControl(control, address)
+		control = appendLinuxIPv6PacketInfoControl(control, address)
 	}
 	if receiving || message.HopLimit != 0 {
 		control = appendLinuxControlInt32(control, linuxLevelIPv6, linuxIPv6HopLimit, int32(message.HopLimit))
@@ -430,32 +440,42 @@ func (message *IPv6ControlMessage) parseForWrite(control []byte) (ipPacketOption
 	return options, nil
 }
 
-// appendLinuxPacketInfoControl encodes source-selection metadata. Interface
-// index zero selects MIPS's single embedding link.
-func appendLinuxPacketInfoControl(control []byte, address netip.Addr) []byte {
+// appendLinuxIPv6PacketInfoControl encodes one Linux IPv6 packet-info address.
+func appendLinuxIPv6PacketInfoControl(control []byte, address netip.Addr) []byte {
 	address = address.Unmap()
-	if address.Is4() {
-		var data [12]byte
-		addressBytes := address.As4()
-		copy(data[4:8], addressBytes[:])
-		copy(data[8:12], addressBytes[:])
-		return appendLinuxControl(control, linuxLevelIP, linuxIPPacketInfo, data[:])
-	}
 	var data [20]byte
 	addressBytes := address.As16()
 	copy(data[0:16], addressBytes[:])
 	return appendLinuxControl(control, linuxLevelIPv6, linuxIPv6PacketInfo, data[:])
 }
 
-// controlMessageForRead encodes receive metadata through the public control
-// message types so their field semantics remain authoritative.
-func controlMessageForRead(address netip.Addr, options ipPacketOptions) ([]byte, error) {
-	address = address.Unmap()
-	if address.Is4() {
-		message := IPv4ControlMessage{TTL: int(options.hopLimit), TOS: int(options.trafficClass), Dst: address}
-		return message.marshalForRead()
+// appendLinuxIPv4PacketInfoControl encodes the independent Linux IPv4
+// ipi_spec_dst and ipi_addr fields. Interface index zero selects MIPS's single
+// embedding link.
+func appendLinuxIPv4PacketInfoControl(control []byte, specDst, destination netip.Addr) []byte {
+	var data [12]byte
+	if specDst = specDst.Unmap(); specDst.Is4() {
+		address := specDst.As4()
+		copy(data[4:8], address[:])
 	}
-	message := IPv6ControlMessage{TrafficClass: int(options.trafficClass), HopLimit: int(options.hopLimit), FlowLabel: options.flowLabel, Dst: address}
+	if destination = destination.Unmap(); destination.Is4() {
+		address := destination.As4()
+		copy(data[8:12], address[:])
+	}
+	return appendLinuxControl(control, linuxLevelIP, linuxIPPacketInfo, data[:])
+}
+
+// controlMessageForRead encodes receive metadata through the public control
+// message types so their field semantics remain authoritative. specDst is the
+// IPv4 receive-side ipi_spec_dst; destination is the IP header destination.
+func controlMessageForRead(specDst, destination netip.Addr, options ipPacketOptions) ([]byte, error) {
+	destination = destination.Unmap()
+	if destination.Is4() {
+		specDst = specDst.Unmap()
+		message := IPv4ControlMessage{TTL: int(options.hopLimit), TOS: int(options.trafficClass), Dst: destination}
+		return message.marshalForRead(specDst)
+	}
+	message := IPv6ControlMessage{TrafficClass: int(options.trafficClass), HopLimit: int(options.hopLimit), FlowLabel: options.flowLabel, Dst: destination}
 	return message.marshalForRead()
 }
 
@@ -582,7 +602,7 @@ func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPa
 				return netip.Addr{}, ipPacketOptions{}, errors.New("mipstack: nonzero packet-info interface index is not supported")
 			}
 			candidate := netip.AddrFrom4([4]byte(data[4:8]))
-			if candidate.IsUnspecified() {
+			if receiving {
 				candidate = netip.AddrFrom4([4]byte(data[8:12]))
 			}
 			if err := mergePacketInfoAddress(&address, candidate); err != nil {
@@ -653,7 +673,8 @@ func parseLinuxIPControlValues(oob []byte, v6, receiving bool) (netip.Addr, ipPa
 	return address, options, nil
 }
 
-// mergePacketInfoAddress accepts one consistent, nonzero local address.
+// mergePacketInfoAddress accepts one consistent, non-unspecified packet-info
+// address.
 func mergePacketInfoAddress(current *netip.Addr, candidate netip.Addr) error {
 	if !candidate.IsValid() || candidate.IsUnspecified() {
 		return nil

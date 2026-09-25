@@ -633,6 +633,46 @@ func (state *networkState) sourceForNonUnicast(destination, requested netip.Addr
 	return selected, nil
 }
 
+// inboundIPv4PacketInfoSource selects ipi_spec_dst for one received IPv4
+// packet. A local unicast destination selects itself. Other destinations use
+// the packet-source route's preferred source, then an address on the source's
+// configured prefix, and finally the first usable address, matching Linux's
+// fib_compute_spec_dst behavior on this single embedding link. The result is
+// computed when receive ancillary data is produced; queued datagrams retain
+// only their wire addresses. Linux computes and stores fib_compute_spec_dst
+// during ingress, so a configuration change before a read can produce a
+// different ipi_spec_dst here. Deriving the value on demand keeps queued
+// datagrams compact and avoids packet-info source selection on ordinary reads.
+func (state *networkState) inboundIPv4PacketInfoSource(source, destination netip.Addr) netip.Addr {
+	source, destination = source.Unmap(), destination.Unmap()
+	if !destination.Is4() {
+		return netip.Addr{}
+	}
+	if _, local := state.local[destination]; local {
+		return destination
+	}
+	if source.Is4() && !source.IsUnspecified() {
+		if selected, err := state.sourceForUnicast(source, netip.Addr{}); err == nil {
+			return selected
+		}
+		for index, candidate := range state.sources {
+			if !candidate.Is4() || candidate.IsLoopback() || index >= len(state.sourcePrefixBits) {
+				continue
+			}
+			prefix := netip.PrefixFrom(candidate, state.sourcePrefixBits[index])
+			if prefix.Contains(source) {
+				return candidate
+			}
+		}
+	}
+	for _, candidate := range state.sources {
+		if candidate.Is4() && !candidate.IsLoopback() {
+			return candidate
+		}
+	}
+	return netip.Addr{}
+}
+
 // hasOutputPath reports whether an established connectionless socket can
 // still select this stack's only output interface after a configuration
 // change. Non-unicast interface selection is independent of unicast routes.

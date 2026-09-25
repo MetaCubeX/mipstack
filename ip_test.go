@@ -555,6 +555,24 @@ func TestIPConnWriteMsgSourceAndHeaderOptions(t *testing.T) {
 	if !ok || packet.source != second || packet.target != remote || packet.protocol != 99 || packet.hopLimit != options.hopLimit || packet.trafficClass != options.trafficClass || string(packet.payload) != "raw-output" {
 		t.Fatalf("raw output = %+v, parsed = %v", packet, ok)
 	}
+	mixedControl := mustCodecVector(t, "1c00000000000000000000000800000000000000c0000271c0000270")
+	n, oobn, err = connection.(*IPConn).WriteMsgIP([]byte("spec-dst"), mixedControl, ipNetAddr(remote))
+	if err != nil || n != len("spec-dst") || oobn != len(mixedControl) {
+		t.Fatalf("mixed WriteMsgIP = %d/%d, %v", n, oobn, err)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.source != second || string(packet.payload) != "spec-dst" {
+		t.Fatalf("mixed IPv4 packet-info source = %s payload %q, want %s/spec-dst", packet.source, packet.payload, second)
+	}
+	addrOnlyControl := mustCodecVector(t, "1c0000000000000000000000080000000000000000000000c0000271")
+	n, oobn, err = connection.(*IPConn).WriteMsgIP([]byte("addr-only"), addrOnlyControl, ipNetAddr(remote))
+	if err != nil || n != len("addr-only") || oobn != len(addrOnlyControl) {
+		t.Fatalf("addr-only WriteMsgIP = %d/%d, %v", n, oobn, err)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.source != first || string(packet.payload) != "addr-only" {
+		t.Fatalf("addr-only IPv4 packet-info source = %s payload %q, want %s/addr-only", packet.source, packet.payload, first)
+	}
 	if err = connection.(*IPConn).SetWriteBuffer(64 * 1024); err != nil {
 		t.Fatalf("SetWriteBuffer no-op = %v", err)
 	}
@@ -1759,6 +1777,9 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 	if err = control.Parse(messages[0].OOB[:messages[0].NN]); err != nil || control.Dst != secondLocal {
 		t.Fatalf("first IP batch control = %+v, %v", control, err)
 	}
+	if !bytes.Equal(messages[0].OOB[20:24], secondLocal.AsSlice()) || !bytes.Equal(messages[0].OOB[24:28], secondLocal.AsSlice()) {
+		t.Fatalf("first IP batch IPv4 packet-info fields = %x/%x, want %s", messages[0].OOB[20:24], messages[0].OOB[24:28], secondLocal)
+	}
 	if string(second) != "se" || messages[1].Flags != MessageFlagTruncated|MessageFlagControlTruncated {
 		t.Fatalf("second IP batch message = %+v payload %q", messages[1], second)
 	}
@@ -1769,7 +1790,10 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 		t.Fatalf("nonblocking empty IP ReadBatch = %d, %v", n, err)
 	}
 
-	controlBytes := appendLinuxPacketInfoControl(nil, secondLocal)
+	controlBytes, err := (&IPv4ControlMessage{Src: secondLocal}).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
 	writes := []SocketMessage{
 		{Buffers: [][]byte{[]byte("ab"), []byte("cd")}, Addr: ipNetAddr(remote)},
 		{Buffers: [][]byte{[]byte("ef"), []byte("gh")}, OOB: controlBytes, Addr: ipNetAddr(remote)},
@@ -2624,6 +2648,43 @@ func BenchmarkIPReadBufferAPI(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+func BenchmarkIPReadMessageAPI(b *testing.B) {
+	for _, mode := range []string{"ReadMsg", "ReadBatch"} {
+		b.Run(mode, func(b *testing.B) {
+			local := netip.MustParseAddr("192.0.2.247")
+			remote := netip.MustParseAddr("198.51.100.247")
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			connection := newIPConn(stack, "ip4:99", 99, local, remote, socketOptionSet{})
+			b.Cleanup(connection.closeFromStack)
+			payload := bytes.Repeat([]byte{0x6b}, 1200)
+			buffer := make([]byte, len(payload))
+			control := make([]byte, 128)
+			messages := []SocketMessage{{Buffers: [][]byte{buffer}, OOB: control}}
+			b.SetBytes(int64(len(payload)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				connection.enqueuePacket(ipPacket{payload: payload, source: remote, target: local}, ipPacketOptions{})
+				if mode == "ReadMsg" {
+					n, _, _, _, readErr := connection.ReadMsgIP(buffer, control)
+					if readErr != nil || n != len(payload) {
+						b.Fatalf("ReadMsgIP = %d, %v", n, readErr)
+					}
+				} else {
+					messages[0].N, messages[0].NN, messages[0].Flags = 0, 0, 0
+					count, readErr := connection.ReadBatch(messages, 0)
+					if readErr != nil || count != 1 || messages[0].N != len(payload) {
+						b.Fatalf("ReadBatch = %d/%d, %v", count, messages[0].N, readErr)
+					}
+				}
+			}
+		})
 	}
 }
 

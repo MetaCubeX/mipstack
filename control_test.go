@@ -276,7 +276,16 @@ func TestSocketErrorControlMessageForRead(t *testing.T) {
 			if err = message.Parse(control); err != nil || message != test.want {
 				t.Fatalf("parsed socket error = %+v, %v, want %+v", message, err, test.want)
 			}
-			packetInfo := appendLinuxPacketInfoControl(nil, test.input.Reporter)
+			var packetInfo []byte
+			var packetInfoErr error
+			if test.input.Reporter.Unmap().Is4() {
+				packetInfo, packetInfoErr = (&IPv4ControlMessage{Src: test.input.Reporter}).Marshal()
+			} else {
+				packetInfo, packetInfoErr = (&IPv6ControlMessage{Src: test.input.Reporter}).Marshal()
+			}
+			if packetInfoErr != nil {
+				t.Fatal(packetInfoErr)
+			}
 			packetInfo = append(packetInfo, control...)
 			if err = message.Parse(packetInfo); err != nil || message != test.want {
 				t.Fatalf("socket error with packet info = %+v, %v", message, err)
@@ -300,9 +309,9 @@ func TestSocketErrorControlMessageForRead(t *testing.T) {
 
 func TestIPControlMessageLinuxFixtures(t *testing.T) {
 	address4 := netip.MustParseAddr("192.0.2.123")
-	packetInfo4 := mustCodecVector(t, "00000000c000027bc000027b")
+	packetInfo4 := mustCodecVector(t, "00000000c000027b00000000")
 	send4 := mustCodecVector(t,
-		"1c00000000000000000000000800000000000000c000027bc000027b00000000"+
+		"1c00000000000000000000000800000000000000c000027b0000000000000000"+
 			"140000000000000000000000020000001f00000000000000"+
 			"14000000000000000000000001000000b800000000000000")
 	assertLinuxControlRecords(t, send4,
@@ -321,17 +330,19 @@ func TestIPControlMessageLinuxFixtures(t *testing.T) {
 		t.Fatalf("IPv4 send fixture = %+v options %+v, %v", parsed4, options4, err)
 	}
 
+	packetDestination4 := netip.MustParseAddr("198.51.100.7")
+	receivePacketInfo4 := mustCodecVector(t, "00000000c000027bc6336407")
 	receive4 := mustCodecVector(t,
-		"1c00000000000000000000000800000000000000c000027bc000027b00000000"+
+		"1c00000000000000000000000800000000000000c000027bc633640700000000"+
 			"140000000000000000000000020000001f00000000000000"+
 			"11000000000000000000000001000000b800000000000000")
 	assertLinuxControlRecords(t, receive4,
-		testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPPacketInfo, data: packetInfo4},
+		testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPPacketInfo, data: receivePacketInfo4},
 		testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPTimeToLive, data: mustCodecVector(t, "1f000000")},
 		testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPTypeOfService, data: mustCodecVector(t, "b8")},
 	)
-	incoming4 := IPv4ControlMessage{TTL: 31, TOS: 0xb8, Dst: address4}
-	encoded4, err = incoming4.marshalForRead()
+	incoming4 := IPv4ControlMessage{TTL: 31, TOS: 0xb8, Dst: packetDestination4}
+	encoded4, err = controlMessageForRead(address4, packetDestination4, ipPacketOptions{hopLimit: 31, trafficClass: 0xb8})
 	if err != nil || !bytes.Equal(encoded4, receive4) {
 		t.Fatalf("IPv4 receive control = %x, %v, want Linux fixture %x", encoded4, err, receive4)
 	}
@@ -374,9 +385,32 @@ func TestIPControlMessageLinuxFixtures(t *testing.T) {
 	}
 }
 
+func TestIPv4PacketInfoDirectionSelection(t *testing.T) {
+	control := mustCodecVector(t, "1c0000000000000000000000080000000000000000000000c633640700000000")
+	source, _, err := parseLinuxIPControlValues(control, false, false)
+	if err != nil || source.IsValid() {
+		t.Fatalf("IPv4 send packet-info source = %v, %v, want automatic selection", source, err)
+	}
+	destination, _, err := parseLinuxIPControlValues(control, false, true)
+	if err != nil || destination != netip.MustParseAddr("198.51.100.7") {
+		t.Fatalf("IPv4 receive packet-info destination = %v, %v", destination, err)
+	}
+	var message IPv4ControlMessage
+	if err = message.Parse(control); err != nil || message.Dst != netip.MustParseAddr("198.51.100.7") {
+		t.Fatalf("IPv4 receive packet-info message = %+v, %v", message, err)
+	}
+	readControl, err := controlMessageForRead(netip.Addr{}, netip.MustParseAddr("198.51.100.7"), ipPacketOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(readControl) < 32 || !bytes.Equal(readControl[20:24], []byte{0, 0, 0, 0}) {
+		t.Fatalf("IPv4 receive encoding supplied a send source: %x", readControl)
+	}
+}
+
 func TestIPControlMessageKnownAnswerMutations(t *testing.T) {
 	receive4 := mustCodecVector(t,
-		"1c00000000000000000000000800000000000000c000027bc000027b00000000"+
+		"1c00000000000000000000000800000000000000c000027bc633640700000000"+
 			"140000000000000000000000020000001f00000000000000"+
 			"11000000000000000000000001000000b800000000000000")
 	tests := []struct {
@@ -435,7 +469,7 @@ func TestIPv4ControlMessageMarshalAndParse(t *testing.T) {
 		t.Fatalf("marshaled IPv4 control = source %v options %+v, %v", parsedSource, options, err)
 	}
 	var incoming IPv4ControlMessage
-	receivedControl, err := controlMessageForRead(source, options)
+	receivedControl, err := controlMessageForRead(source, source, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +496,7 @@ func TestIPv6ControlMessageMarshalAndParse(t *testing.T) {
 		t.Fatalf("marshaled IPv6 control = source %v options %+v, %v", parsedSource, options, err)
 	}
 	var incoming IPv6ControlMessage
-	receivedControl, err := controlMessageForRead(source, options)
+	receivedControl, err := controlMessageForRead(source, source, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +561,7 @@ func TestControlMessageValidation(t *testing.T) {
 		netip.MustParseAddr("192.0.2.1"),
 		netip.MustParseAddr("2001:db8::1"),
 	} {
-		control, err := controlMessageForRead(address, ipPacketOptions{})
+		control, err := controlMessageForRead(address, address, ipPacketOptions{})
 		if err != nil {
 			t.Fatalf("controlMessageForRead(%v): %v", address, err)
 		}
@@ -583,7 +617,7 @@ func FuzzControlMessageParsing(f *testing.F) {
 				t.Fatal("failed IPv4 control parse modified its receiver")
 			}
 		} else {
-			encoded, marshalErr := ipv4.marshalForRead()
+			encoded, marshalErr := ipv4.marshalForRead(netip.Addr{})
 			var repeated IPv4ControlMessage
 			if marshalErr != nil || repeated.Parse(encoded) != nil || repeated != ipv4 {
 				t.Fatalf("IPv4 control round trip = %+v, %v, want %+v", repeated, marshalErr, ipv4)
@@ -726,7 +760,6 @@ func FuzzIPControlMessageMarshal(f *testing.F) {
 		address = netip.AddrFrom4(value)
 		packetInfo = make([]byte, 12)
 		copy(packetInfo[4:8], value[:])
-		copy(packetInfo[8:12], value[:])
 		records = append(records, testLinuxControlRecord{level: linuxLevelIP, kind: linuxIPPacketInfo, data: packetInfo})
 		if hopLimit != 0 {
 			data := make([]byte, 4)
@@ -767,11 +800,11 @@ func BenchmarkControlMessageMarshal(b *testing.B) {
 	}{
 		{name: "IPv4Send", marshal: (&IPv4ControlMessage{TTL: 31, TOS: 0xb8, Src: address4}).Marshal},
 		{name: "IPv4Receive", marshal: func() ([]byte, error) {
-			return controlMessageForRead(address4, ipPacketOptions{hopLimit: 31, trafficClass: 0xb8})
+			return controlMessageForRead(address4, address4, ipPacketOptions{hopLimit: 31, trafficClass: 0xb8})
 		}},
 		{name: "IPv6Send", marshal: (&IPv6ControlMessage{HopLimit: 29, TrafficClass: 0x2e, FlowLabel: 0x12345, Src: address6}).Marshal},
 		{name: "IPv6Receive", marshal: func() ([]byte, error) {
-			return controlMessageForRead(address6, ipPacketOptions{hopLimit: 29, trafficClass: 0x2e, flowLabel: 0x12345})
+			return controlMessageForRead(address6, address6, ipPacketOptions{hopLimit: 29, trafficClass: 0x2e, flowLabel: 0x12345})
 		}},
 		{name: "SocketErrorIPv4", marshal: socketError4.MarshalBinary},
 		{name: "SocketErrorIPv6", marshal: socketError6.MarshalBinary},

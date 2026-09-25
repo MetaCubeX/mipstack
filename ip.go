@@ -841,7 +841,11 @@ func (c *IPConn) ReadMsgIP(buffer, oob []byte) (n, oobn, flags int, address *net
 		err = c.operationError("read", err)
 		return
 	}
-	control, controlErr := controlMessageForRead(datagram.target, datagram.options)
+	var specDst netip.Addr
+	if datagram.target.Is4() {
+		specDst = c.stack.network.Load().inboundIPv4PacketInfoSource(datagram.source, datagram.target)
+	}
+	control, controlErr := controlMessageForRead(specDst, datagram.target, datagram.options)
 	if controlErr != nil {
 		err = c.operationError("read", controlErr)
 		return
@@ -865,9 +869,10 @@ func (c *IPConn) ReadBatch(messages []SocketMessage, flags int) (int, error) {
 	if flags&MessageFlagErrorQueue != 0 {
 		return c.readErrorBatch(messages, flags)
 	}
+	var network *networkState
 	for index := range messages {
 		wait := index == 0 && flags&MessageFlagDontWait == 0
-		err := c.readBatchMessage(&messages[index], flags, wait, index == 0)
+		err := c.readBatchMessage(&messages[index], flags, wait, index == 0, &network)
 		if err != nil {
 			// recvmmsg reports a completed prefix without the error that stopped
 			// the next message. A retry starting at index exposes that error.
@@ -882,8 +887,9 @@ func (c *IPConn) ReadBatch(messages []SocketMessage, flags int) (int, error) {
 
 // readBatchMessage receives one scatter/gather message without waiting when
 // wait is false. consumeErrors is false after a successful prefix so an
-// asynchronous error remains available to the next socket operation.
-func (c *IPConn) readBatchMessage(message *SocketMessage, flags int, wait, consumeErrors bool) error {
+// asynchronous error remains available to the next socket operation. network
+// caches one immutable configuration snapshot for IPv4 packet-info fields.
+func (c *IPConn) readBatchMessage(message *SocketMessage, flags int, wait, consumeErrors bool, network **networkState) error {
 	if _, err := messageBufferLength(message.Buffers); err != nil {
 		return c.operationError("read", err)
 	}
@@ -891,7 +897,14 @@ func (c *IPConn) readBatchMessage(message *SocketMessage, flags int, wait, consu
 	if err != nil {
 		return c.operationError("read", err)
 	}
-	control, err := controlMessageForRead(datagram.target, datagram.options)
+	var specDst netip.Addr
+	if datagram.target.Is4() {
+		if *network == nil {
+			*network = c.stack.network.Load()
+		}
+		specDst = (*network).inboundIPv4PacketInfoSource(datagram.source, datagram.target)
+	}
+	control, err := controlMessageForRead(specDst, datagram.target, datagram.options)
 	if err != nil {
 		return c.operationError("read", err)
 	}

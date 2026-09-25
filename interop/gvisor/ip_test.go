@@ -1173,6 +1173,9 @@ func TestIPControlMessageInterop(t *testing.T) {
 				if message.Dst != family.mipstackAddress || message.TTL != 37 || message.TOS != 0x2e {
 					t.Fatalf("mipstack raw IPv4 control message = %+v", message)
 				}
+				if controlRead < 28 || !bytes.Equal(control[20:24], family.mipstackAddress.AsSlice()) || !bytes.Equal(control[24:28], family.mipstackAddress.AsSlice()) {
+					t.Fatalf("mipstack raw IPv4 packet-info fields = %x/%x, want %s/%s", control[20:24], control[24:28], family.mipstackAddress, family.mipstackAddress)
+				}
 				control, err = (&mipstack.IPv4ControlMessage{TTL: 41, TOS: 0xb8}).Marshal()
 			} else {
 				var message mipstack.IPv6ControlMessage
@@ -1213,7 +1216,7 @@ func TestIPControlMessageInterop(t *testing.T) {
 			messages := result.ControlMessages
 			if family.mipstackAddress.Is4() {
 				if !messages.HasTTL || messages.TTL != 41 || !messages.HasTOS || messages.TOS != 0xb8 || !messages.HasIPPacketInfo ||
-					messages.PacketInfo.DestinationAddr != gvisorAddress(family.gvisorAddress) {
+					messages.PacketInfo.LocalAddr != gvisorAddress(family.gvisorAddress) || messages.PacketInfo.DestinationAddr != gvisorAddress(family.gvisorAddress) {
 					t.Fatalf("gVisor raw IPv4 control messages = %+v", messages)
 				}
 			} else if !messages.HasHopLimit || messages.HopLimit != 41 || !messages.HasTClass || messages.TClass != 0xb8 || !messages.HasIPv6PacketInfo ||

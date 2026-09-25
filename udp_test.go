@@ -380,6 +380,9 @@ func TestUDPBatchRead(t *testing.T) {
 	if err = control.Parse(messages[0].OOB[:messages[0].NN]); err != nil || control.Dst != local {
 		t.Fatalf("first batch control = %+v, %v", control, err)
 	}
+	if !bytes.Equal(messages[0].OOB[20:24], local.AsSlice()) || !bytes.Equal(messages[0].OOB[24:28], local.AsSlice()) {
+		t.Fatalf("first batch IPv4 packet-info fields = %x/%x, want %s", messages[0].OOB[20:24], messages[0].OOB[24:28], local)
+	}
 	if string(second) != "sec" || messages[1].N != 3 || messages[1].NN != len(messages[1].OOB) ||
 		messages[1].Flags != MessageFlagTruncated|MessageFlagControlTruncated {
 		t.Fatalf("second batch message = %+v payload %q", messages[1], second)
@@ -442,7 +445,10 @@ func TestUDPBatchWrite(t *testing.T) {
 	}
 	connection := packetConnection.(*UDPConn)
 	defer connection.Close()
-	control := appendLinuxPacketInfoControl(nil, secondLocal)
+	control, err := (&IPv4ControlMessage{Src: secondLocal}).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
 	messages := []SocketMessage{
 		{Buffers: [][]byte{[]byte("ab"), []byte("cd")}, Addr: net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5350))},
 		{Buffers: [][]byte{[]byte("ef"), []byte("gh")}, OOB: control, Addr: net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 5351))},
@@ -463,6 +469,22 @@ func TestUDPBatchWrite(t *testing.T) {
 		if messages[index].N != 4 || messages[index].NN != len(messages[index].OOB) {
 			t.Fatalf("batch result %d = %+v", index, messages[index])
 		}
+	}
+	mixedControl := mustCodecVector(t, "1c00000000000000000000000800000000000000c00002ecc00002eb")
+	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("spec-dst"), mixedControl, netip.AddrPortFrom(remote, 5352)); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.source != secondLocal || string(packet.payload[udpHeaderSize:]) != "spec-dst" {
+		t.Fatalf("mixed IPv4 packet-info source = %s payload %q, want %s/spec-dst", packet.source, packet.payload[udpHeaderSize:], secondLocal)
+	}
+	addrOnlyControl := mustCodecVector(t, "1c0000000000000000000000080000000000000000000000c00002ec")
+	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("addr-only"), addrOnlyControl, netip.AddrPortFrom(remote, 5353)); err != nil {
+		t.Fatal(err)
+	}
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	if !ok || packet.source != firstLocal || string(packet.payload[udpHeaderSize:]) != "addr-only" {
+		t.Fatalf("addr-only IPv4 packet-info source = %s payload %q, want %s/addr-only", packet.source, packet.payload[udpHeaderSize:], firstLocal)
 	}
 	if n, err = connection.WriteBatch(messages[:1], MessageFlagDontWait); n != 1 || err != nil {
 		t.Fatalf("nonblocking WriteBatch = %d, %v", n, err)
@@ -1658,7 +1680,10 @@ func TestUDPMessageControlValidationAndWriteBuffer(t *testing.T) {
 	if err = connection.SetWriteBuffer(0); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("SetWriteBuffer(0) = %v, want EINVAL", err)
 	}
-	control := appendLinuxPacketInfoControl(nil, local)
+	control, err := (&IPv4ControlMessage{Src: local}).Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
 	binary.LittleEndian.PutUint32(control[16:20], 1)
 	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("bad"), control, netip.AddrPortFrom(remote, 50016)); err == nil {
 		t.Fatal("WriteMsgUDPAddrPort accepted a nonzero interface index")
@@ -2195,6 +2220,43 @@ func BenchmarkUDPReadBufferAPI(b *testing.B) {
 				}
 			})
 		}
+	}
+}
+
+func BenchmarkUDPReadMessageAPI(b *testing.B) {
+	for _, mode := range []string{"ReadMsg", "ReadBatch"} {
+		b.Run(mode, func(b *testing.B) {
+			local := netip.MustParseAddr("192.0.2.248")
+			remote := netip.MustParseAddrPort("198.51.100.248:5353")
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			connection := newUDPConn(stack, "udp4", 5300, false, local, remote, datagramSocketOptionSet{})
+			b.Cleanup(connection.closeFromStack)
+			payload := bytes.Repeat([]byte{0x5a}, 1200)
+			buffer := make([]byte, len(payload))
+			control := make([]byte, 128)
+			messages := []SocketMessage{{Buffers: [][]byte{buffer}, OOB: control}}
+			b.SetBytes(int64(len(payload)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				connection.enqueue(payload, remote, local, ipPacketOptions{})
+				if mode == "ReadMsg" {
+					n, _, _, _, readErr := connection.ReadMsgUDPAddrPort(buffer, control)
+					if readErr != nil || n != len(payload) {
+						b.Fatalf("ReadMsgUDPAddrPort = %d, %v", n, readErr)
+					}
+				} else {
+					messages[0].N, messages[0].NN, messages[0].Flags = 0, 0, 0
+					count, readErr := connection.ReadBatch(messages, 0)
+					if readErr != nil || count != 1 || messages[0].N != len(payload) {
+						b.Fatalf("ReadBatch = %d/%d, %v", count, messages[0].N, readErr)
+					}
+				}
+			}
+		})
 	}
 }
 

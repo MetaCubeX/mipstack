@@ -864,7 +864,7 @@ func (c *UDPConn) ReadFromUDPAddrPortWithBuffer(getBuffer func(sizeHint int) []b
 }
 
 // ReadMsgUDP reads one datagram and Linux-compatible packet-info ancillary
-// data. The control message identifies the local destination address.
+// data. The control message identifies the packet's IP destination address.
 func (c *UDPConn) ReadMsgUDP(buffer, oob []byte) (n, oobn, flags int, address *net.UDPAddr, err error) {
 	var source netip.AddrPort
 	n, oobn, flags, source, err = c.readMsgUDPAddrPort(buffer, oob)
@@ -879,7 +879,7 @@ func (c *UDPConn) ReadMsgUDPAddrPort(buffer, oob []byte) (n, oobn, flags int, so
 	return c.readMsgUDPAddrPort(buffer, oob)
 }
 
-// readMsgUDPAddrPort reads one datagram and encodes its local destination as
+// readMsgUDPAddrPort reads one datagram and encodes its IP destination as
 // Linux IP_PKTINFO or IPV6_PKTINFO.
 func (c *UDPConn) readMsgUDPAddrPort(buffer, oob []byte) (n, oobn, flags int, source netip.AddrPort, err error) {
 	var target netip.Addr
@@ -893,7 +893,11 @@ func (c *UDPConn) readMsgUDPAddrPort(buffer, oob []byte) (n, oobn, flags int, so
 		err = c.operationError("read", c.remoteAddr(), err)
 		return
 	}
-	control, controlErr := controlMessageForRead(target, options)
+	var specDst netip.Addr
+	if target.Is4() {
+		specDst = c.stack.network.Load().inboundIPv4PacketInfoSource(source.Addr(), target)
+	}
+	control, controlErr := controlMessageForRead(specDst, target, options)
 	if controlErr != nil {
 		err = c.operationError("read", c.remoteAddr(), controlErr)
 		return
@@ -916,9 +920,10 @@ func (c *UDPConn) ReadBatch(messages []SocketMessage, flags int) (int, error) {
 	if flags&MessageFlagErrorQueue != 0 {
 		return c.readErrorBatch(messages, flags)
 	}
+	var network *networkState
 	for index := range messages {
 		wait := index == 0 && flags&MessageFlagDontWait == 0
-		err := c.readBatchMessage(&messages[index], flags, wait, index == 0)
+		err := c.readBatchMessage(&messages[index], flags, wait, index == 0, &network)
 		if err != nil {
 			// recvmmsg reports a completed prefix without the error that stopped
 			// the next message. A retry starting at index exposes that error.
@@ -933,8 +938,9 @@ func (c *UDPConn) ReadBatch(messages []SocketMessage, flags int) (int, error) {
 
 // readBatchMessage receives one scatter/gather message without waiting when
 // wait is false. consumeErrors is false after a successful prefix so an
-// asynchronous error remains available to the next socket operation.
-func (c *UDPConn) readBatchMessage(message *SocketMessage, flags int, wait, consumeErrors bool) error {
+// asynchronous error remains available to the next socket operation. network
+// caches one immutable configuration snapshot for IPv4 packet-info fields.
+func (c *UDPConn) readBatchMessage(message *SocketMessage, flags int, wait, consumeErrors bool, network **networkState) error {
 	if _, err := messageBufferLength(message.Buffers); err != nil {
 		return c.operationError("read", c.remoteAddr(), err)
 	}
@@ -942,7 +948,14 @@ func (c *UDPConn) readBatchMessage(message *SocketMessage, flags int, wait, cons
 	if err != nil {
 		return c.operationError("read", c.remoteAddr(), err)
 	}
-	control, err := controlMessageForRead(target, options)
+	var specDst netip.Addr
+	if target.Is4() {
+		if *network == nil {
+			*network = c.stack.network.Load()
+		}
+		specDst = (*network).inboundIPv4PacketInfoSource(source.Addr(), target)
+	}
+	control, err := controlMessageForRead(specDst, target, options)
 	if err != nil {
 		return c.operationError("read", c.remoteAddr(), err)
 	}

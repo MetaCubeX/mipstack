@@ -240,6 +240,42 @@ func TestDirectedBroadcastSelectsAddressOnMatchingSubnet(t *testing.T) {
 	}
 }
 
+func TestInboundIPv4PacketInfoSource(t *testing.T) {
+	primary := netip.MustParseAddr("198.51.100.1")
+	matching := netip.MustParseAddr("192.0.2.1")
+	state, err := buildNetworkState(Config{LocalAddresses: []netip.Prefix{
+		netip.PrefixFrom(primary, 24), netip.PrefixFrom(matching, 24),
+	}, Promiscuous: true, Routes: []Route{
+		{Destination: netip.MustParsePrefix("198.51.100.0/24"), Source: primary},
+		{Destination: netip.MustParsePrefix("203.0.113.0/24"), Source: matching},
+		{Destination: netip.MustParsePrefix("0.0.0.0/0")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := netip.MustParseAddr("198.51.100.9")
+	if got := state.inboundIPv4PacketInfoSource(remote, matching); got != matching {
+		t.Fatalf("local-unicast packet-info source = %s, want %s", got, matching)
+	}
+	if got := state.inboundIPv4PacketInfoSource(netip.IPv4Unspecified(), netip.MustParseAddr("192.0.2.255")); got != primary {
+		t.Fatalf("directed-broadcast packet-info source = %s, want %s", got, primary)
+	}
+	if got := state.inboundIPv4PacketInfoSource(netip.MustParseAddr("203.0.113.9"), netip.MustParseAddr("239.1.1.1")); got != matching {
+		t.Fatalf("multicast packet-info source = %s, want %s", got, matching)
+	}
+	if got := state.inboundIPv4PacketInfoSource(remote, netip.MustParseAddr("203.0.113.9")); got != primary {
+		t.Fatalf("promiscuous packet-info source = %s, want %s", got, primary)
+	}
+
+	addressless, err := buildNetworkState(Config{Promiscuous: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := addressless.inboundIPv4PacketInfoSource(remote, netip.MustParseAddr("203.0.113.9")); got.IsValid() {
+		t.Fatalf("addressless promiscuous packet-info source = %s, want unspecified", got)
+	}
+}
+
 func TestPathMTUMinimumPolicy(t *testing.T) {
 	local6 := netip.MustParseAddr("2001:db8::1")
 	remote6 := netip.MustParseAddr("2001:db8::2")

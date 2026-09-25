@@ -610,6 +610,22 @@ func TestIPv4BroadcastFanoutAndOutput(t *testing.T) {
 		t.Fatalf("first source = %s", source)
 	}
 	readMulticastTestUDP(t, second, "broadcast-in")
+	if _, err = stack.Write([][]byte{buildTestUDP(remote, broadcast, 53001, 42000, []byte("broadcast-control"))}, 0); err != nil {
+		t.Fatal(err)
+	}
+	controlPayload, controlOOB := make([]byte, 64), make([]byte, 128)
+	n, oobn, flags, source, err := first.ReadMsgUDPAddrPort(controlPayload, controlOOB)
+	if err != nil || flags != 0 || string(controlPayload[:n]) != "broadcast-control" || source != netip.AddrPortFrom(remote, 53001) {
+		t.Fatalf("broadcast ReadMsgUDPAddrPort = %q/%d flags %#x source %s, %v", controlPayload[:n], oobn, flags, source, err)
+	}
+	var controlMessage IPv4ControlMessage
+	if err = controlMessage.Parse(controlOOB[:oobn]); err != nil || controlMessage.Dst != broadcast {
+		t.Fatalf("broadcast packet-info = %+v, %v, want destination %s", controlMessage, err, broadcast)
+	}
+	if !bytes.Equal(controlOOB[20:24], local.AsSlice()) || !bytes.Equal(controlOOB[24:28], broadcast.AsSlice()) {
+		t.Fatalf("broadcast packet-info fields = %x/%x, want %s/%s", controlOOB[20:24], controlOOB[24:28], local, broadcast)
+	}
+	readMulticastTestUDP(t, second, "broadcast-control")
 
 	// RFC 1122 permits an unspecified IPv4 source during address
 	// initialization. DHCP and BOOTP rely on this limited-broadcast path.
@@ -666,6 +682,48 @@ func TestIPv4BroadcastFanoutAndOutput(t *testing.T) {
 	}
 	if stats := ipv6Only.Stats(); stats.UnacceptedIPPackets != 1 {
 		t.Fatalf("IPv6-only limited-broadcast admission = %+v", stats)
+	}
+}
+
+func TestIPv4BroadcastIPPacketInfo(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.10")
+	remote := netip.MustParseAddr("192.0.2.20")
+	broadcast := netip.MustParseAddr("192.0.2.255")
+	stack := newMulticastTestStack(t, []netip.Prefix{netip.MustParsePrefix("192.0.2.10/24")}, 1400)
+	connectionNet, err := stack.ListenIP(context.Background(), "ip4:99", netip.IPv4Unspecified())
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := connectionNet.(*IPConn)
+	defer connection.Close()
+	if _, err = stack.Write([][]byte{buildIPPacket(remote, broadcast, 99, []byte("broadcast-raw"), 1, true)}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	payload, control := make([]byte, 64), make([]byte, 128)
+	n, oobn, flags, source, err := connection.ReadMsgIP(payload, control)
+	if err != nil || flags != 0 || string(payload[:n]) != "broadcast-raw" || source.String() != remote.String() {
+		t.Fatalf("broadcast raw ReadMsgIP = %q/%d flags %#x source %v, %v", payload[:n], oobn, flags, source, err)
+	}
+	var message IPv4ControlMessage
+	if err = message.Parse(control[:oobn]); err != nil || message.Dst != broadcast {
+		t.Fatalf("broadcast raw packet-info = %+v, %v, want destination %s", message, err, broadcast)
+	}
+	if oobn < 28 || !bytes.Equal(control[20:24], local.AsSlice()) || !bytes.Equal(control[24:28], broadcast.AsSlice()) {
+		t.Fatalf("broadcast raw packet-info fields = %x/%x, want %s/%s", control[20:24], control[24:28], local, broadcast)
+	}
+	if _, err = stack.Write([][]byte{buildIPPacket(remote, broadcast, 99, []byte("broadcast-batch"), 2, true)}, 0); err != nil {
+		t.Fatal(err)
+	}
+	batch := []SocketMessage{{Buffers: [][]byte{make([]byte, 64)}, OOB: make([]byte, 128)}}
+	if count, batchErr := connection.ReadBatch(batch, 0); batchErr != nil || count != 1 || string(batch[0].Buffers[0][:batch[0].N]) != "broadcast-batch" {
+		t.Fatalf("broadcast raw ReadBatch = %d/%d, %v", count, batch[0].N, batchErr)
+	}
+	var batchMessage IPv4ControlMessage
+	if err = batchMessage.Parse(batch[0].OOB[:batch[0].NN]); err != nil || batchMessage.Dst != broadcast || !bytes.Equal(batch[0].OOB[20:24], local.AsSlice()) || !bytes.Equal(batch[0].OOB[24:28], broadcast.AsSlice()) {
+		t.Fatalf("broadcast raw batch packet-info = %+v, %v, fields %x/%x", batchMessage, err, batch[0].OOB[20:24], batch[0].OOB[24:28])
 	}
 }
 
@@ -768,6 +826,74 @@ func TestASMMulticastIPv4AndIPv6(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestIPv4MulticastReadPacketInfo(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.33")
+	remote := netip.MustParseAddr("192.0.2.34")
+	group := netip.MustParseAddr("239.1.2.33")
+	stack := newMulticastTestStack(t, []netip.Prefix{netip.MustParsePrefix("192.0.2.33/24")}, 1400)
+	connection, err := stack.ListenMulticastUDP(context.Background(), "udp4", netip.AddrPortFrom(group, 43003))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err = stack.Write([][]byte{buildTestUDP(remote, group, 53003, 43003, []byte("multicast-control"))}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	payload, oob := make([]byte, 64), make([]byte, 128)
+	n, oobn, flags, source, err := connection.ReadMsgUDPAddrPort(payload, oob)
+	if err != nil || flags != 0 || string(payload[:n]) != "multicast-control" || source != netip.AddrPortFrom(remote, 53003) {
+		t.Fatalf("multicast ReadMsgUDPAddrPort = %q/%d flags %#x source %s, %v", payload[:n], oobn, flags, source, err)
+	}
+	var message IPv4ControlMessage
+	if err = message.Parse(oob[:oobn]); err != nil || message.Dst != group {
+		t.Fatalf("multicast packet-info = %+v, %v, want destination %s", message, err, group)
+	}
+	if oobn < 28 || !bytes.Equal(oob[20:24], local.AsSlice()) || !bytes.Equal(oob[24:28], group.AsSlice()) {
+		t.Fatalf("multicast packet-info fields = %x/%x, want %s/%s", oob[20:24], oob[24:28], local, group)
+	}
+	if _, err = stack.Write([][]byte{buildTestUDP(remote, group, 53004, 43003, []byte("multicast-batch"))}, 0); err != nil {
+		t.Fatal(err)
+	}
+	batch := []SocketMessage{{Buffers: [][]byte{make([]byte, 64)}, OOB: make([]byte, 128)}}
+	if count, batchErr := connection.ReadBatch(batch, 0); batchErr != nil || count != 1 || string(batch[0].Buffers[0][:batch[0].N]) != "multicast-batch" {
+		t.Fatalf("multicast ReadBatch = %d/%d, %v", count, batch[0].N, batchErr)
+	}
+	var batchMessage IPv4ControlMessage
+	if err = batchMessage.Parse(batch[0].OOB[:batch[0].NN]); err != nil || batchMessage.Dst != group || !bytes.Equal(batch[0].OOB[20:24], local.AsSlice()) || !bytes.Equal(batch[0].OOB[24:28], group.AsSlice()) {
+		t.Fatalf("multicast batch packet-info = %+v, %v, fields %x/%x", batchMessage, err, batch[0].OOB[20:24], batch[0].OOB[24:28])
+	}
+	rawNet, err := stack.ListenIP(context.Background(), "ip4:99", netip.IPv4Unspecified())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := rawNet.(*IPConn)
+	defer raw.Close()
+	if err = raw.JoinGroup(group); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = stack.Write([][]byte{buildIPPacket(remote, group, 99, []byte("multicast-raw"), 2, true)}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err = raw.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	rawPayload, rawOOB := make([]byte, 64), make([]byte, 128)
+	rawN, rawOOBN, rawFlags, rawSource, err := raw.ReadMsgIP(rawPayload, rawOOB)
+	if err != nil || rawFlags != 0 || string(rawPayload[:rawN]) != "multicast-raw" || rawSource.String() != remote.String() {
+		t.Fatalf("multicast raw ReadMsgIP = %q/%d flags %#x source %v, %v", rawPayload[:rawN], rawOOBN, rawFlags, rawSource, err)
+	}
+	var rawMessage IPv4ControlMessage
+	if err = rawMessage.Parse(rawOOB[:rawOOBN]); err != nil || rawMessage.Dst != group {
+		t.Fatalf("multicast raw packet-info = %+v, %v, want destination %s", rawMessage, err, group)
+	}
+	if rawOOBN < 28 || !bytes.Equal(rawOOB[20:24], local.AsSlice()) || !bytes.Equal(rawOOB[24:28], group.AsSlice()) {
+		t.Fatalf("multicast raw packet-info fields = %x/%x, want %s/%s", rawOOB[20:24], rawOOB[24:28], local, group)
 	}
 }
 
