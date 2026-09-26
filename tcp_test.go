@@ -1707,7 +1707,8 @@ func TestTCPTimeWaitSYNAdmission(t *testing.T) {
 			state := &tcpEstablishedState{connection: connection, receiveNext: 500, lastTimestampUpdate: test.lastTimestampUpdate}
 			segment := tcpSegment{sequence: test.sequence, flags: TCPFlagSYN, optionLength: uint8(len(test.options))}
 			copy(segment.options[:], test.options)
-			got := state.handleTimeWaitSegment(segment, time.Now())
+			now := time.Now()
+			got := state.handleTimeWaitSegment(segment, now, now)
 			if got != test.replace {
 				t.Fatalf("TIME-WAIT SYN replacement = %v, want %v", got, test.replace)
 			}
@@ -1734,13 +1735,13 @@ func TestTCPTimeWaitDoesNotLearnTimestampFromOutOfWindow(t *testing.T) {
 	}
 	outOfWindow := tcpSegment{sequence: 100, flags: TCPFlagACK, optionLength: 12}
 	copy(outOfWindow.options[:], tcpTimestampOptions(200, 0))
-	state.handleTimeWaitSegment(outOfWindow, now)
+	state.handleTimeWaitSegment(outOfWindow, now, now)
 	if connection.recentTimestamp != 100 {
 		t.Fatalf("out-of-window TS.Recent = %d, want 100", connection.recentTimestamp)
 	}
 	inWindow := tcpSegment{sequence: 500, flags: TCPFlagACK, optionLength: 12}
 	copy(inWindow.options[:], tcpTimestampOptions(200, 0))
-	state.handleTimeWaitSegment(inWindow, now)
+	state.handleTimeWaitSegment(inWindow, now, now)
 	if connection.recentTimestamp != 200 {
 		t.Fatalf("in-window TS.Recent = %d, want 200", connection.recentTimestamp)
 	}
@@ -1752,19 +1753,141 @@ func TestTCPTimeWaitDoesNotLearnTimestampFromOutOfWindow(t *testing.T) {
 // option is present; Linux therefore continues with ordinary FIN processing,
 // while dropping the FIN would defer close until the peer's retransmission RTO.
 func TestTCPTimeWaitAcceptsMissingTimestampFIN(t *testing.T) {
+	now := time.Now()
 	connection := &TCPConn{stack: &Stack{}, peerTimestamp: true, recentTimestamp: 100}
 	state := &tcpEstablishedState{
 		connection:          connection,
 		receiveNext:         501,
 		lastACKSent:         501,
-		lastTimestampUpdate: time.Now(),
+		lastTimestampUpdate: now,
 	}
 	segment := tcpSegment{sequence: 500, flags: TCPFlagACK | TCPFlagFIN}
-	if state.handleTimeWaitSegment(segment, time.Now()) {
+	if state.handleTimeWaitSegment(segment, now, now) {
 		t.Fatal("missing-timestamp FIN unexpectedly replaced TIME-WAIT")
 	}
 	if !state.retransmit || state.retransmissionKind != tcpRetransmissionClose {
 		t.Fatalf("missing-timestamp FIN close timer = retransmit:%v kind:%v", state.retransmit, state.retransmissionKind)
+	}
+}
+
+// TestTCPTimeWaitTimerRefreshPolicy verifies the RFC/Linux split for the
+// retained tuple's expiry timer. RFC 9293 requires a retransmitted FIN to
+// restart 2MSL; Linux additionally refreshes ACK-bearing and PAWS-rejected
+// traffic, while RST, an old ACK-less SYN, and a successful replacement leave
+// the previous TIME-WAIT owner untouched.
+func TestTCPTimeWaitTimerRefreshPolicy(t *testing.T) {
+	now := time.Now()
+	for _, test := range []struct {
+		name                string
+		segment             tcpSegment
+		receivedAt          time.Time
+		peerTimestamp       bool
+		recentTimestamp     uint32
+		lastTimestampUpdate time.Time
+		receiveNext         uint32
+		replace             bool
+		wantReplacement     bool
+		wantRefresh         bool
+	}{
+		{
+			name:        "in-window ACK",
+			segment:     tcpSegment{sequence: 100, flags: TCPFlagACK},
+			receivedAt:  now.Add(-2 * tcpTimeWaitDuration),
+			receiveNext: 100,
+			wantRefresh: true,
+		},
+		{
+			name:        "out-of-window ACK",
+			segment:     tcpSegment{sequence: 99, flags: TCPFlagACK},
+			receiveNext: 100,
+			wantRefresh: true,
+		},
+		{
+			name:                "PAWS-rejected segment",
+			segment:             tcpSegment{sequence: 100, optionLength: 12},
+			peerTimestamp:       true,
+			recentTimestamp:     100,
+			lastTimestampUpdate: now,
+			receiveNext:         100,
+			wantRefresh:         true,
+		},
+		{
+			name:        "old ACK-less SYN",
+			segment:     tcpSegment{sequence: 99, flags: TCPFlagSYN},
+			receiveNext: 100,
+		},
+		{
+			name:        "invalid SYN-ACK",
+			segment:     tcpSegment{sequence: 99, flags: TCPFlagSYN | TCPFlagACK},
+			receiveNext: 100,
+			wantRefresh: true,
+		},
+		{
+			name:        "RST",
+			segment:     tcpSegment{sequence: 100, flags: TCPFlagRST},
+			receiveNext: 100,
+		},
+		{
+			name:        "retransmitted FIN",
+			segment:     tcpSegment{sequence: 99, flags: TCPFlagACK | TCPFlagFIN},
+			receiveNext: 100,
+			wantRefresh: true,
+		},
+		{
+			name:            "successful SYN replacement",
+			segment:         tcpSegment{sequence: 101, flags: TCPFlagSYN},
+			receiveNext:     100,
+			replace:         true,
+			wantReplacement: true,
+		},
+		{
+			name:                "PAWS-rejected SYN",
+			segment:             tcpSegment{sequence: 99, flags: TCPFlagSYN, optionLength: 12},
+			peerTimestamp:       true,
+			recentTimestamp:     100,
+			lastTimestampUpdate: now,
+			receiveNext:         100,
+			wantRefresh:         true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack := &Stack{}
+			if test.replace {
+				stack.tcpTimeWaitReplacer = func(*Stack, *TCPConn, tcpSegment) bool { return true }
+			}
+			connection := &TCPConn{
+				stack:           stack,
+				peerTimestamp:   test.peerTimestamp,
+				recentTimestamp: test.recentTimestamp,
+			}
+			state := &tcpEstablishedState{
+				connection:          connection,
+				receiveNext:         test.receiveNext,
+				receiveWindowState:  newTCPReceiveWindow(test.receiveNext, 65535, false, false, 0),
+				lastTimestampUpdate: test.lastTimestampUpdate,
+			}
+			if test.peerTimestamp && test.segment.optionLength != 0 {
+				copy(test.segment.options[:], tcpTimestampOptions(99, 0))
+			}
+			deadline := time.Now().Add(-time.Second)
+			state.retransmit = true
+			state.retransmissionKind = tcpRetransmissionClose
+			state.retransmissionDeadline = deadline
+			receivedAt := test.receivedAt
+			if receivedAt.IsZero() {
+				receivedAt = now
+			}
+			if replaced := state.handleTimeWaitSegment(test.segment, receivedAt, now); replaced != test.wantReplacement {
+				t.Fatalf("TIME-WAIT replacement = %v, want %v", replaced, test.wantReplacement)
+			}
+			if test.wantRefresh {
+				if !state.retransmissionDeadline.After(time.Now()) {
+					t.Fatalf("TIME-WAIT deadline = %v, want a fresh 2MSL deadline", state.retransmissionDeadline)
+				}
+			} else if !state.retransmissionDeadline.Equal(deadline) {
+				t.Fatalf("TIME-WAIT deadline = %v, want unchanged %v", state.retransmissionDeadline, deadline)
+			}
+		})
 	}
 }
 
@@ -8372,7 +8495,7 @@ func BenchmarkTCPTimeWaitACKAdmission(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for index := 0; index < b.N; index++ {
-				if state.handleTimeWaitSegment(segment, now) {
+				if state.handleTimeWaitSegment(segment, now, now) {
 					b.Fatal("TIME-WAIT ACK unexpectedly replaced the connection")
 				}
 			}

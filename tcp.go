@@ -2278,8 +2278,10 @@ type tcpTimeWaitReplacer func(*Stack, *TCPConn, tcpSegment) bool
 // queue, so its retainedBytes field is zero and the value can be handed to the
 // optional replacement hook without a second wire-only copy. It runs in the
 // established actor, so TS.Recent and close flags remain single-owner state and
-// no second TCP state machine is needed.
-func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, receivedAt time.Time) bool {
+// no second TCP state machine is needed. handledAt is sampled by the actor for
+// the current inbound batch; it must not be replaced with receivedAt because a
+// packet can wait in that queue before this state processes it.
+func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, receivedAt, handledAt time.Time) bool {
 	if segment.flags&TCPFlagRST != 0 {
 		// RFC 1337 prevents a stale reset from assassinating TIME-WAIT. mipstack
 		// keeps this protected behavior unconditionally; unlike Linux with its
@@ -2288,6 +2290,12 @@ func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, received
 	}
 	if segment.flags&TCPFlagSYN != 0 {
 		if segment.flags&(TCPFlagACK|TCPFlagFIN) != 0 {
+			// Linux refreshes TIME-WAIT for an ACK-bearing control segment even
+			// when the SYN cannot replace the retained tuple. RST is excluded
+			// above to retain the RFC 1337 protection.
+			if segment.flags&TCPFlagACK != 0 {
+				s.refreshTimeWaitTimer(handledAt)
+			}
 			s.trySendChallengeACK()
 			return false
 		}
@@ -2313,6 +2321,12 @@ func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, received
 			}
 		}
 		if pawsReject || !sequenceNew && !timestampNew {
+			if pawsReject {
+				// Linux restarts TIME-WAIT for a PAWS-rejected packet. This is
+				// a compatibility rule beyond RFC 9293; it keeps delayed or
+				// reordered traffic from making a live tuple reusable too soon.
+				s.refreshTimeWaitTimer(handledAt)
+			}
 			// RFC 6191 describes silently dropping this SYN. mipstack follows the
 			// RFC 5961 SYN-injection mitigation instead and emits a rate-limited
 			// challenge ACK, while retaining the old TIME-WAIT owner.
@@ -2323,6 +2337,12 @@ func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, received
 		// transfer tuple ownership out of this actor turn.
 		if s.connection.stack.tryReplaceTCPTimeWait(s.connection, segment) {
 			return true
+		}
+		if segment.flags&TCPFlagACK != 0 {
+			// A failed ACK-bearing replacement still represents Linux's
+			// ACK-refresh case; a successful replacement above transfers the
+			// tuple and deliberately leaves the old timer untouched.
+			s.refreshTimeWaitTimer(handledAt)
 		}
 		s.trySendChallengeACK()
 		return false
@@ -2338,6 +2358,10 @@ func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, received
 	if s.connection.peerTimestamp {
 		timestamp, _, present = parseTCPTimestamp(segment.optionBytes())
 		if present && receivedAt.Sub(s.lastTimestampUpdate) < tcpPAWSMaxAge && tcpSequenceLess(timestamp, s.connection.recentTimestamp) {
+			// Linux refreshes the retained tuple for a PAWS-rejected
+			// non-RST segment. RFC 7323 defines the rejection, while this
+			// timer refresh is the Linux interoperability behavior.
+			s.refreshTimeWaitTimer(handledAt)
 			// A PAWS-rejected TIME-WAIT segment is an out-of-window control
 			// event; use the existing RFC 5961 challenge-ACK limiter rather
 			// than reflecting one ACK for every stale duplicate.
@@ -2351,6 +2375,11 @@ func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, received
 	// window is zero: FIN consumes sequence space but carries no data, and
 	// dropping it would defer EOF until the peer's retransmission timeout.
 	if !retransmittedFIN && !tcpSegmentAcceptable(segment.sequence, uint32(len(segment.payload)), s.receiveNext, s.receiveWindowState.size(s.receiveNext)) {
+		if segment.flags&TCPFlagACK != 0 {
+			// Linux restarts TIME-WAIT for ACKs outside the receive window,
+			// even though they are not accepted into the TCP state machine.
+			s.refreshTimeWaitTimer(handledAt)
+		}
 		s.trySendACK()
 		return false
 	}
@@ -2360,14 +2389,20 @@ func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, received
 	}
 	if retransmittedFIN {
 		s.trySendACK()
-		s.armClose(time.Now(), tcpTimeWaitDuration)
+		// RFC 9293 requires the 2MSL wait to restart when the peer
+		// retransmits its FIN and this endpoint acknowledges it.
+		s.armClose(handledAt, tcpTimeWaitDuration)
 		return false
+	}
+	if segment.flags&TCPFlagACK != 0 {
+		// RFC 9293 requires the FIN case above. Linux additionally refreshes
+		// TIME-WAIT for every non-RST ACK that reaches this path, including
+		// duplicate and payload-bearing ACKs.
+		s.refreshTimeWaitTimer(handledAt)
 	}
 	// TIME-WAIT does not re-enter the established receive or acknowledgment
 	// state machine. RFC 9293 requires an unacceptable segment in this state to
 	// elicit only an empty ACK, while a pure ACK at RCV.NXT needs no response.
-	// Only a retransmitted FIN above restarts this implementation's expiry;
-	// Linux also refreshes its TIME-WAIT timer for some ACK and PAWS cases.
 	if segment.flags&TCPFlagACK == 0 || segment.sequence != s.receiveNext || len(segment.payload) != 0 {
 		s.trySendACK()
 	}
@@ -2522,13 +2557,27 @@ func (s *tcpEstablishedState) rackDeadline(now time.Time, haveSACKed bool) (time
 
 // armClose reuses the retransmission timer for a bounded close-state wait.
 func (s *tcpEstablishedState) armClose(startedAt time.Time, duration time.Duration) {
-	s.retransmissionDeadline = time.Now().Add(duration)
-	if !startedAt.IsZero() {
-		s.retransmissionDeadline = startedAt.Add(duration)
+	if startedAt.IsZero() {
+		startedAt = time.Now()
 	}
+	s.retransmissionDeadline = startedAt.Add(duration)
 	s.retransmit = true
 	s.retransmissionKind = tcpRetransmissionClose
 	s.sendTimer.baseDeadline = time.Time{}
+}
+
+// refreshTimeWaitTimer restarts the retained tuple's 2MSL timer from the
+// current handling time. RFC 9293 requires this after a retransmitted FIN;
+// Linux also applies it to ACK-bearing and PAWS-rejected non-RST traffic.
+// The current time is intentional because a queued packet's receivedAt may
+// predate the actor's processing by an arbitrary amount.
+func (s *tcpEstablishedState) refreshTimeWaitTimer(handledAt time.Time) {
+	if handledAt.IsZero() {
+		handledAt = time.Now()
+	}
+	// TIME-WAIT already owns the close timer, so only its deadline changes;
+	// retransmit and retransmissionKind remain the same logical state.
+	s.retransmissionDeadline = handledAt.Add(tcpTimeWaitDuration)
 }
 
 // clearDelayedACK cancels delayed acknowledgement state after an ACK is sent.
@@ -8658,6 +8707,7 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				queuedSegments = c.inbound.len()
 			}
 			batchLength := timerBacklog.receiveBatchLength(queuedSegments, forceTimer)
+			var handledAt time.Time
 			for batchIndex := 0; batchIndex < batchLength; batchIndex++ {
 				segment, ok := c.inbound.dequeue()
 				if !ok {
@@ -8679,7 +8729,10 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				payloadLength := uint32(len(segment.payload))
 				receiveWindow := state.receiveWindowState.size(state.receiveNext)
 				if state.timeWaitArmed {
-					if state.handleTimeWaitSegment(segment, receivedAt) {
+					if handledAt.IsZero() {
+						handledAt = time.Now()
+					}
+					if state.handleTimeWaitSegment(segment, receivedAt, handledAt) {
 						return nil
 					}
 					continue
