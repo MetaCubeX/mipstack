@@ -281,118 +281,134 @@ func TestTCPMissingTimestampInterop(t *testing.T) {
 	}
 }
 
-// TestTCPSYNCookieMissingTimestampInterop verifies that a native gVisor
-// connection can complete through a mipstack SYN-cookie when a middlebox
-// removes Timestamp from the final ACK. The first half-open handshake fills
-// the SYN backlog; the second handshake is validated from the wire and must
-// retain MSS while conservatively disabling extensions not proved by that ACK.
-func TestTCPSYNCookieMissingTimestampInterop(t *testing.T) {
-	for _, family := range interopFamilies {
-		family := family
-		t.Run(family.name, func(t *testing.T) {
-			const (
-				serverPort       = 41015
-				firstClientPort  = 41016
-				secondClientPort = 41017
-			)
-			var (
-				firstACKDropped atomic.Bool
-				strippedACK     atomic.Bool
-			)
-			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
-				families: []interopFamily{family},
-				mtu:      1500,
-				gvisorToMipstack: func(packet []byte) bool {
-					tcpHeader, _, ok := tcpSegment(packet)
-					if !ok || tcpHeader.DestinationPort() != serverPort || tcpHeader.Flags().Contains(header.TCPFlagSyn) || !tcpHeader.Flags().Contains(header.TCPFlagAck) {
-						return true
-					}
-					switch tcpHeader.SourcePort() {
-					case firstClientPort:
-						firstACKDropped.Store(true)
-						return false
-					case secondClientPort:
-						if strippedACK.CompareAndSwap(false, true) {
-							if !stripTCPTimestamp(packet) {
-								strippedACK.Store(false)
+// TestTCPSYNCookieOptionRecoveryInterop verifies that native gVisor
+// connections can complete through a mipstack SYN-cookie when a middlebox
+// removes Timestamp or clears TSecr in the final ACK. The first half-open
+// handshake fills the SYN backlog; the second handshake is validated from the
+// wire and restores only the extensions proved by the received options.
+func TestTCPSYNCookieOptionRecoveryInterop(t *testing.T) {
+	scenarios := []struct {
+		name             string
+		rewrite          func([]byte) bool
+		wantTimestamp    bool
+		wantWindowScale  bool
+		wantPeerScale    uint8
+		wantReceiveScale bool
+	}{
+		{name: "missing-timestamp", rewrite: stripTCPTimestamp},
+		{name: "zero-tsecr", rewrite: func(packet []byte) bool { return rewriteTCPTimestampEcho(packet, 0) }, wantTimestamp: true, wantWindowScale: true, wantReceiveScale: true},
+	}
+	for scenarioIndex, scenario := range scenarios {
+		scenarioIndex, scenario := scenarioIndex, scenario
+		t.Run(scenario.name, func(t *testing.T) {
+			for _, family := range interopFamilies {
+				family := family
+				t.Run(family.name, func(t *testing.T) {
+					serverPort := uint16(41015 + scenarioIndex*10)
+					firstClientPort := serverPort + 1
+					secondClientPort := serverPort + 2
+					var (
+						firstACKDropped atomic.Bool
+						rewrittenACK    atomic.Bool
+					)
+					network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+						families: []interopFamily{family},
+						mtu:      1500,
+						gvisorToMipstack: func(packet []byte) bool {
+							tcpHeader, _, ok := tcpSegment(packet)
+							if !ok || tcpHeader.DestinationPort() != serverPort || tcpHeader.Flags().Contains(header.TCPFlagSyn) || !tcpHeader.Flags().Contains(header.TCPFlagAck) {
+								return true
 							}
-						}
+							switch tcpHeader.SourcePort() {
+							case firstClientPort:
+								firstACKDropped.Store(true)
+								return false
+							case secondClientPort:
+								if rewrittenACK.CompareAndSwap(false, true) {
+									if !scenario.rewrite(packet) {
+										rewrittenACK.Store(false)
+									}
+								}
+							}
+							return true
+						},
+					})
+					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					defer cancel()
+					listener, err := (&mipstack.ListenConfig{Options: []mipstack.SocketOption{
+						mipstack.SocketOptions.AcceptQueue(1), mipstack.SocketOptions.SYNBacklog(1),
+					}}).ListenTCP(ctx, network.mipstack, family.tcpNetwork, netipAddrPort(family.mipstackAddress, serverPort))
+					if err != nil {
+						t.Fatalf("listen for SYN-cookie interop: %v", err)
 					}
-					return true
-				},
-			})
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			listener, err := (&mipstack.ListenConfig{Options: []mipstack.SocketOption{
-				mipstack.SocketOptions.AcceptQueue(1), mipstack.SocketOptions.SYNBacklog(1),
-			}}).ListenTCP(ctx, network.mipstack, family.tcpNetwork, netipAddrPort(family.mipstackAddress, serverPort))
-			if err != nil {
-				t.Fatalf("listen for SYN-cookie interop: %v", err)
-			}
-			defer listener.Close()
+					defer listener.Close()
 
-			firstResult := make(chan net.Conn, 1)
-			firstErr := make(chan error, 1)
-			go func() {
-				connection, dialErr := gonet.DialTCPWithBind(ctx, network.gvisor,
-					gvisorFullAddress(family.gvisorAddress, firstClientPort),
-					gvisorFullAddress(family.mipstackAddress, serverPort), family.networkProtocol)
-				if dialErr != nil {
-					firstErr <- dialErr
-					return
-				}
-				firstResult <- connection
-			}()
+					firstResult := make(chan net.Conn, 1)
+					firstErr := make(chan error, 1)
+					go func() {
+						connection, dialErr := gonet.DialTCPWithBind(ctx, network.gvisor,
+							gvisorFullAddress(family.gvisorAddress, firstClientPort),
+							gvisorFullAddress(family.mipstackAddress, serverPort), family.networkProtocol)
+						if dialErr != nil {
+							firstErr <- dialErr
+							return
+						}
+						firstResult <- connection
+					}()
 
-			backlogDeadline := time.Now().Add(5 * time.Second)
-			for time.Now().Before(backlogDeadline) {
-				info := listener.(*mipstack.TCPListener).Info()
-				if info.SYNBacklogConnections == 1 && firstACKDropped.Load() {
-					break
-				}
-				time.Sleep(time.Millisecond)
-			}
-			if info := listener.(*mipstack.TCPListener).Info(); info.SYNBacklogConnections != 1 || !firstACKDropped.Load() {
-				t.Fatalf("first handshake did not occupy SYN backlog: %+v, final-ACK dropped:%v", info, firstACKDropped.Load())
-			}
+					backlogDeadline := time.Now().Add(5 * time.Second)
+					for time.Now().Before(backlogDeadline) {
+						info := listener.(*mipstack.TCPListener).Info()
+						if info.SYNBacklogConnections == 1 && firstACKDropped.Load() {
+							break
+						}
+						time.Sleep(time.Millisecond)
+					}
+					if info := listener.(*mipstack.TCPListener).Info(); info.SYNBacklogConnections != 1 || !firstACKDropped.Load() {
+						t.Fatalf("first handshake did not occupy SYN backlog: %+v, final-ACK dropped:%v", info, firstACKDropped.Load())
+					}
 
-			second, err := gonet.DialTCPWithBind(ctx, network.gvisor,
-				gvisorFullAddress(family.gvisorAddress, secondClientPort),
-				gvisorFullAddress(family.mipstackAddress, serverPort), family.networkProtocol)
-			if err != nil {
-				t.Fatalf("second gVisor cookie dial: %v", err)
-			}
-			defer second.Close()
-			stripDeadline := time.Now().Add(2 * time.Second)
-			for !strippedACK.Load() && time.Now().Before(stripDeadline) {
-				time.Sleep(time.Millisecond)
-			}
-			if !strippedACK.Load() {
-				t.Fatal("SYN-cookie final ACK did not have Timestamp stripped")
-			}
-			accepted, err := listener.Accept()
-			if err != nil {
-				t.Fatalf("accept SYN-cookie connection: %v", err)
-			}
-			defer accepted.Close()
-			connection := accepted.(*mipstack.TCPConn)
-			info := connection.Info()
-			if info.State != mipstack.TCPStateEstablished || info.Timestamps || info.SACK || info.WindowScaling ||
-				info.PeerWindowScale != 0 || info.ReceiveWindowScale != 0 {
-				t.Fatalf("SYN-cookie missing-Timestamp options = %+v", info)
-			}
-			listenerInfo := listener.(*mipstack.TCPListener).Info()
-			if listenerInfo.SYNCookiesSent == 0 || listenerInfo.SYNCookiesAccepted == 0 {
-				t.Fatalf("SYN-cookie counters = sent:%d accepted:%d", listenerInfo.SYNCookiesSent, listenerInfo.SYNCookiesAccepted)
-			}
-			exchangeTCPPayload(t, second, accepted, patternedPayload(4096, 43))
-			exchangeTCPPayload(t, accepted, second, patternedPayload(4096, 47))
+					second, err := gonet.DialTCPWithBind(ctx, network.gvisor,
+						gvisorFullAddress(family.gvisorAddress, secondClientPort),
+						gvisorFullAddress(family.mipstackAddress, serverPort), family.networkProtocol)
+					if err != nil {
+						t.Fatalf("second gVisor cookie dial: %v", err)
+					}
+					defer second.Close()
+					rewriteDeadline := time.Now().Add(2 * time.Second)
+					for !rewrittenACK.Load() && time.Now().Before(rewriteDeadline) {
+						time.Sleep(time.Millisecond)
+					}
+					if !rewrittenACK.Load() {
+						t.Fatalf("SYN-cookie final ACK was not rewritten for %s", scenario.name)
+					}
+					accepted, err := listener.Accept()
+					if err != nil {
+						t.Fatalf("accept SYN-cookie connection: %v", err)
+					}
+					defer accepted.Close()
+					connection := accepted.(*mipstack.TCPConn)
+					info := connection.Info()
+					if info.State != mipstack.TCPStateEstablished || info.Timestamps != scenario.wantTimestamp || info.SACK ||
+						info.WindowScaling != scenario.wantWindowScale || info.PeerWindowScale != scenario.wantPeerScale ||
+						(!scenario.wantReceiveScale && info.ReceiveWindowScale != 0) ||
+						(scenario.wantReceiveScale && info.ReceiveWindowScale == 0) {
+						t.Fatalf("SYN-cookie %s options = %+v", scenario.name, info)
+					}
+					listenerInfo := listener.(*mipstack.TCPListener).Info()
+					if listenerInfo.SYNCookiesSent == 0 || listenerInfo.SYNCookiesAccepted == 0 {
+						t.Fatalf("SYN-cookie counters = sent:%d accepted:%d", listenerInfo.SYNCookiesSent, listenerInfo.SYNCookiesAccepted)
+					}
+					exchangeTCPPayload(t, second, accepted, patternedPayload(4096, 43))
+					exchangeTCPPayload(t, accepted, second, patternedPayload(4096, 47))
 
-			select {
-			case connection := <-firstResult:
-				_ = connection.Close()
-			case <-firstErr:
-			case <-time.After(time.Second):
+					select {
+					case connection := <-firstResult:
+						_ = connection.Close()
+					case <-firstErr:
+					case <-time.After(time.Second):
+					}
+				})
 			}
 		})
 	}
@@ -2127,12 +2143,10 @@ func stripTCPTimestamp(packet []byte) bool {
 	return true
 }
 
-// rewriteTCPTimestampEcho offsets one valid TCP Timestamp echo in a complete
+// rewriteTCPTimestampEcho replaces one valid TCP Timestamp echo in a complete
 // IP packet through gVisor's wire headers. It models a middlebox changing
-// TSecr without making the impairment depend on mipstack's codecs. The offset
-// stays below the serial-number half range while remaining outside any
-// handshake retry interval.
-func rewriteTCPTimestampEcho(packet []byte, offset uint32) bool {
+// TSecr without making the impairment depend on mipstack's codecs.
+func rewriteTCPTimestampEcho(packet []byte, echo uint32) bool {
 	if len(packet) == 0 {
 		return false
 	}
@@ -2192,7 +2206,7 @@ func rewriteTCPTimestampEcho(packet []byte, offset uint32) bool {
 		if kind == header.TCPOptionTS && length == header.TCPOptionTSLength {
 			oldEcho := binary.BigEndian.Uint32(options[6:10])
 			oldChecksum := tcpHeader.Checksum()
-			binary.BigEndian.PutUint32(options[6:10], oldEcho+offset)
+			binary.BigEndian.PutUint32(options[6:10], echo)
 			tcpHeader.SetChecksum(0)
 			partial := header.PseudoHeaderChecksum(header.TCPProtocolNumber, source, target, uint16(wireEnd-transportOffset))
 			tcpHeader.SetChecksum(^checksum.Checksum(tcpHeader, partial))

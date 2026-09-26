@@ -1901,13 +1901,13 @@ type tcpEstablishedState struct {
 	connection *TCPConn
 	// peerMSS and pathMSS are effective data limits after fixed negotiated
 	// options; TCPConn.peerMSS remains the raw MSS learned from the peer.
-	peerMSS, pathMSS, receiveMSS                  int
-	peerWindow, peerWindowSequence, peerWindowACK uint32
-	maximumPeerWindow                             uint32
-	bytesAcknowledged, bytesSent, bytesReceived   uint64
-	sendUnacknowledged, sendNext, receiveNext     uint32
-	congestionWindow, slowStartThreshold          uint32
-	ecnRecoveryPoint                              uint32
+	peerMSS, pathMSS, receiveMSS                int
+	peerWindow, peerWindowSequence              uint32
+	maximumPeerWindow                           uint32
+	bytesAcknowledged, bytesSent, bytesReceived uint64
+	sendUnacknowledged, sendNext, receiveNext   uint32
+	congestionWindow, slowStartThreshold        uint32
+	ecnRecoveryPoint                            uint32
 	// outstanding is the live suffix of outstandingBase. outstandingHead is
 	// its offset in that backing and permits cheap cumulative-ACK removal until
 	// compactOutstanding or rebaseOutstanding restores a zero-based slice.
@@ -2083,8 +2083,8 @@ func newTCPEstablishedState(c *TCPConn, sendNext uint32) *tcpEstablishedState {
 		peerMSS: peerMSS, pathMSS: localMaximum, receiveMSS: receiveMSS,
 		peerScale: c.peerWindowScale, peerSACK: c.peerSACK,
 		peerWindow: c.peerWindow, peerWindowSequence: c.peerWindowSeq,
-		peerWindowACK: c.peerWindowACK, maximumPeerWindow: c.peerWindow,
-		receiveNext: c.receiveNext, lastACKSent: c.receiveNext,
+		maximumPeerWindow: c.peerWindow,
+		receiveNext:       c.receiveNext, lastACKSent: c.receiveNext,
 		congestionWindow: initialTCPWindow(peerMSS), slowStartThreshold: ^uint32(0) >> 1,
 		lastTimestampUpdate: now, rackReorderingScale: 1,
 		cwndUsageStamp: monotonicStampAt(c.stack.timestampEpoch, now),
@@ -3839,7 +3839,6 @@ type TCPConn struct {
 	receiveNext     uint32
 	peerWindow      uint32
 	peerWindowSeq   uint32
-	peerWindowACK   uint32
 	handshakeRTT    time.Duration
 
 	// Group single-byte state to avoid alignment holes without adding bitset
@@ -5105,7 +5104,6 @@ func (state *tcpPassiveState) handleSYNCookieACK(stack *Stack, segment tcpSegmen
 		connection.peerWindow <<= options.windowScale
 	}
 	connection.peerWindowSeq = segment.sequence
-	connection.peerWindowACK = segment.acknowledgement
 	connection.receiveWindowScale = options.localWindowScale
 	if !listener.trackCompleted(connection) {
 		stack.mu.Unlock()
@@ -6573,7 +6571,6 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 	c.receiveNext = syn.sequence + 1
 	c.peerWindow = uint32(syn.window)
 	c.peerWindowSeq = syn.sequence
-	c.peerWindowACK = 0
 
 	rto := tcpInitialRTO
 	transmissions := 0
@@ -6786,7 +6783,6 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 				}
 				c.peerWindow = uint32(segment.window)
 				c.peerWindowSeq = segment.sequence
-				c.peerWindowACK = segment.acknowledgement
 				if transmissions == 1 {
 					c.handshakeRTT = elapsedRTTSampleAt(synSentAt, receivedAt)
 				}
@@ -6851,7 +6847,6 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 				c.peerWindow <<= c.peerWindowScale
 			}
 			c.peerWindowSeq = segment.sequence
-			c.peerWindowACK = segment.acknowledgement
 			if transmissions == 1 {
 				c.handshakeRTT = elapsedRTTSampleAt(synSentAt, receivedAt)
 			}
@@ -7117,7 +7112,6 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 			// shift applies only to later segments.
 			c.peerWindow = uint32(segment.window)
 			c.peerWindowSeq = segment.sequence
-			c.peerWindowACK = segment.acknowledgement
 			if transmissions == 1 {
 				c.handshakeRTT = elapsedRTTSampleAt(synSentAt, receivedAt)
 			}
@@ -7160,15 +7154,14 @@ func (state *tcpEstablishedState) processAcknowledgment(segment *tcpSegment, rec
 	previousSendUnacknowledged := state.sendUnacknowledged
 	sackScoreboardEmpty := state.sackedRanges == 0
 	previousWindow := state.peerWindow
-	if tcpWindowUpdateAllowed(segment.sequence, ack, state.peerWindowSequence, state.peerWindowACK) {
-		state.peerWindow = uint32(segment.window) << state.peerScale
+	ackAdvanced := tcpSequenceGreater(ack, state.sendUnacknowledged)
+	if peerWindow, update := tcpWindowUpdate(ackAdvanced, segment.sequence, state.peerWindowSequence, segment.window, state.peerScale, state.peerWindow); update {
+		state.peerWindow = peerWindow
 		if state.peerWindow > state.maximumPeerWindow {
 			state.maximumPeerWindow = state.peerWindow
 		}
 		state.peerWindowSequence = segment.sequence
-		state.peerWindowACK = ack
 	}
-	ackAdvanced := tcpSequenceGreater(ack, state.sendUnacknowledged)
 	recoveryAtACK := state.fastRecovery
 	hadSACKedAtACK := state.sackedRanges != 0
 	newlyDelivered := uint32(0)
@@ -11559,11 +11552,20 @@ func tcpKeepAliveOrWindowProbe(segment tcpSegment, length, receiveNext, receiveW
 	return length <= 1
 }
 
-// tcpWindowUpdateAllowed implements the RFC 9293 SND.WL1/SND.WL2 ordering
-// rule so reordered ACKs cannot restore a stale advertised send window.
-func tcpWindowUpdateAllowed(sequence, acknowledgement, lastSequence, lastAcknowledgement uint32) bool {
-	return tcpSequenceGreater(sequence, lastSequence) ||
-		sequence == lastSequence && tcpSequenceGreaterEqual(acknowledgement, lastAcknowledgement)
+// tcpWindowUpdate applies RFC 9293 ACK bounds and Linux's send-window update
+// rule. An advancing ACK or newer sequence is authoritative; a duplicate ACK
+// at the same sequence may only enlarge or close the window, preventing stale
+// nonzero window shrinkage. Callers validate SND.UNA <= SEG.ACK <= SND.NXT
+// before invoking this function.
+func tcpWindowUpdate(ackAdvanced bool, sequence, lastSequence uint32, advertisedWindow uint16, peerScale uint8, currentWindow uint32) (uint32, bool) {
+	if ackAdvanced || tcpSequenceGreater(sequence, lastSequence) {
+		return uint32(advertisedWindow) << peerScale, true
+	}
+	if sequence != lastSequence {
+		return 0, false
+	}
+	window := uint32(advertisedWindow) << peerScale
+	return window, window > currentWindow || window == 0
 }
 
 // tcpPAWSDisorderedACK applies Linux's exception for old duplicate pure ACKs

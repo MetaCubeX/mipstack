@@ -2716,19 +2716,32 @@ func TestTCPCloseReadKeepsReceiveWindow(t *testing.T) {
 	}
 }
 
-// TestTCPWindowUpdateOrdering verifies stale and wrapped ACK ordering.
+// TestTCPWindowUpdateOrdering verifies Linux's ACK, sequence, and advertised
+// window ordering for established send-window updates.
 func TestTCPWindowUpdateOrdering(t *testing.T) {
-	if tcpWindowUpdateAllowed(99, 200, 100, 100) {
-		t.Fatal("older segment sequence updated the send window")
+	const scale = uint8(2)
+	tests := []struct {
+		name                                        string
+		ackAdvanced                                 bool
+		sequence, lastSequence                      uint32
+		advertisedWindow, currentWindow, wantWindow uint32
+		want                                        bool
+	}{
+		{name: "advanced ACK beats old sequence", ackAdvanced: true, sequence: 99, lastSequence: 100, advertisedWindow: 1, currentWindow: 4096, wantWindow: 4, want: true},
+		{name: "old sequence", sequence: 99, lastSequence: 100, advertisedWindow: 65535, currentWindow: 4096, want: false},
+		{name: "same sequence shrinks nonzero window", sequence: 100, lastSequence: 100, advertisedWindow: 512, currentWindow: 4096, wantWindow: 2048},
+		{name: "same sequence grows window", sequence: 100, lastSequence: 100, advertisedWindow: 2048, currentWindow: 4096, wantWindow: 8192, want: true},
+		{name: "same sequence closes window", sequence: 100, lastSequence: 100, advertisedWindow: 0, currentWindow: 4096, want: true},
+		{name: "new sequence", sequence: 101, lastSequence: 100, advertisedWindow: 1, currentWindow: 4096, wantWindow: 4, want: true},
+		{name: "sequence wrap", sequence: 1, lastSequence: ^uint32(0), advertisedWindow: 1, currentWindow: 4096, wantWindow: 4, want: true},
 	}
-	if tcpWindowUpdateAllowed(100, 99, 100, 100) {
-		t.Fatal("older acknowledgement updated the send window")
-	}
-	if !tcpWindowUpdateAllowed(101, 1, 100, 100) || !tcpWindowUpdateAllowed(100, 100, 100, 100) {
-		t.Fatal("fresh send-window update was rejected")
-	}
-	if !tcpWindowUpdateAllowed(1, 1, 0xffffffff, 0xffffffff) {
-		t.Fatal("wrapped send-window update was rejected")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			window, got := tcpWindowUpdate(test.ackAdvanced, test.sequence, test.lastSequence, uint16(test.advertisedWindow), scale, test.currentWindow)
+			if got != test.want || got && window != test.wantWindow {
+				t.Fatalf("tcpWindowUpdate = (%d, %v), want (%d, %v)", window, got, test.wantWindow, test.want)
+			}
+		})
 	}
 }
 
@@ -7332,7 +7345,7 @@ func TestTCPConnectionMemoryLayout(t *testing.T) {
 		got  uintptr
 		want uintptr
 	}{
-		{"TCPConn", unsafe.Sizeof(TCPConn{}), 696},
+		{"TCPConn", unsafe.Sizeof(TCPConn{}), 688},
 		{"socketDeadline", unsafe.Sizeof(socketDeadline{}), 16},
 		{"tcpEstablishedState", unsafe.Sizeof(tcpEstablishedState{}), 1520},
 		{"tcpRACKSample", unsafe.Sizeof(tcpRACKSample{}), 48},
@@ -10126,7 +10139,6 @@ func TestTCPPAWSDisorderedACK(t *testing.T) {
 		sendUnacknowledged: 2000,
 		peerWindow:         4096,
 		peerWindowSequence: 1000,
-		peerWindowACK:      2000,
 		rtt:                rttEstimator{rto: 10 * time.Millisecond},
 	}
 	if drop, accept := tcpPAWSDisorderedACK(tcpSegment{sequence: 999, acknowledgement: 2000, flags: TCPFlagACK}, state, 90); !drop || accept {

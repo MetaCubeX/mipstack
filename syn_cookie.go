@@ -151,12 +151,19 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	// Linux accepts a final ACK whose negotiated Timestamp option was removed
 	// in flight. Such an ACK cannot reveal whether the SYN-cookie was created
 	// with timestamps or ECN, so authenticate the three possible states (TS with
-	// ECN, TS without ECN, and no TS); the connection is then restored
-	// conservatively without timestamp, ECN, SACK, or window scaling.
+	// ECN, TS without ECN, and no TS). A present zero TSecr is a separate Linux
+	// compatibility case: it proves that Timestamp was present but carries no
+	// recoverable ECN bit, so authenticate both ECN states and restore the
+	// connection with the conservative option values below.
 	var candidates [3]struct{ timestamp, ecn bool }
 	candidateCount := 1
 	if timestampPresent {
 		candidates[0] = struct{ timestamp, ecn bool }{timestamp: true, ecn: timestampEcho&1 != 0}
+		if timestampEcho == 0 {
+			candidates[0] = struct{ timestamp, ecn bool }{timestamp: true, ecn: true}
+			candidates[1] = struct{ timestamp, ecn bool }{timestamp: true}
+			candidateCount = 2
+		}
 	} else {
 		candidates[0] = struct{ timestamp, ecn bool }{timestamp: true, ecn: true}
 		candidates[1] = struct{ timestamp, ecn bool }{timestamp: true}
@@ -204,7 +211,7 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	if options.timestamp {
 		options.timestampNow = timestampValue
 	}
-	options.ecn = timestampPresent && matchedECN
+	options.ecn = timestampPresent && timestampEcho != 0 && matchedECN
 	options.localWindowScale = localWindowScale
 	if !timestampPresent {
 		// Linux does not restore SACK or window scaling when
@@ -215,6 +222,15 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 		options.windowScaling = false
 		options.windowScale = 0
 		options.localWindowScale = 0
+	} else if timestampEcho == 0 {
+		// RFC 7323 requires an ACK to echo a recently received TSval once
+		// timestamps are negotiated. Linux accepts a zero TSecr as a
+		// compatibility case: Timestamp remains enabled, while SACK and ECN
+		// are disabled and the peer window scale becomes zero. The local
+		// receive scale is independent of this echoed cookie field.
+		options.sack = false
+		options.windowScaling = true
+		options.windowScale = 0
 	}
 	return serverSequence, options, true, true
 }

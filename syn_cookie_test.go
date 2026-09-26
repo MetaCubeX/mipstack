@@ -154,17 +154,55 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 	if connectionTCP.receiveWindowScale != serverWindowScale {
 		t.Fatalf("restored local window scale = %d, want advertised %d", connectionTCP.receiveWindowScale, serverWindowScale)
 	}
+	// A third cookie handshake models a middlebox that keeps the Timestamp
+	// option but clears TSecr. Linux retains Timestamp in this case, while the
+	// echoed cookie options fall back to no SACK/ECN and peer scale zero.
+	const zeroEchoClientSequence = uint32(0x32345678)
+	zeroEchoSYN := buildTestTCP(remote, local, 43003, 47002, zeroEchoClientSequence, 0, TCPFlagSYN|TCPFlagECE|TCPFlagCWR, 4096, options, nil)
+	if err = writeTestPacket(stack, zeroEchoSYN); err != nil {
+		t.Fatal(err)
+	}
+	zeroEchoResponse := readOutboundPacket(t, stack)
+	zeroEchoParsed, ok := parseIPPacket(zeroEchoResponse)
+	if !ok || zeroEchoParsed.protocol != ProtocolTCP || len(zeroEchoParsed.payload) < tcpHeaderSize {
+		t.Fatalf("invalid zero-TSecr SYN-cookie response: %x", zeroEchoResponse)
+	}
+	zeroEchoTCP := zeroEchoParsed.payload
+	zeroEchoServerSequence := binary.BigEndian.Uint32(zeroEchoTCP[4:8])
+	zeroEchoACK := buildTestTCP(remote, local, 43003, 47002, zeroEchoClientSequence+1, zeroEchoServerSequence+1, TCPFlagACK, 1234, tcpTimestampOptions(clientTimestamp+2, 0), nil)
+	if err = writeTestPacket(stack, zeroEchoACK); err != nil {
+		t.Fatal(err)
+	}
+	if err = listener.(*TCPListener).SetDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	zeroEchoConnection, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Accept with zero cookie TSecr: %v", err)
+	}
+	zeroEchoConnectionTCP := zeroEchoConnection.(*TCPConn)
+	defer zeroEchoConnection.Close()
+	if !zeroEchoConnectionTCP.peerTimestamp || zeroEchoConnectionTCP.recentTimestamp != clientTimestamp+2 ||
+		zeroEchoConnectionTCP.peerECN || zeroEchoConnectionTCP.peerSACK || !zeroEchoConnectionTCP.peerWindowScaling ||
+		zeroEchoConnectionTCP.peerWindowScale != 0 || zeroEchoConnectionTCP.receiveWindowScale != serverWindowScale {
+		t.Fatalf("zero-TSecr cookie options = TS:%v/%d ECN:%v SACK:%v scale:%d/%d/%v", zeroEchoConnectionTCP.peerTimestamp,
+			zeroEchoConnectionTCP.recentTimestamp, zeroEchoConnectionTCP.peerECN, zeroEchoConnectionTCP.peerSACK,
+			zeroEchoConnectionTCP.peerWindowScale, zeroEchoConnectionTCP.receiveWindowScale, zeroEchoConnectionTCP.peerWindowScaling)
+	}
+	if zeroEchoConnectionTCP.peerWindow != 1234 {
+		t.Fatalf("zero-TSecr peer window = %d, want 1234", zeroEchoConnectionTCP.peerWindow)
+	}
 	if connection.RemoteAddr().(*net.TCPAddr).AddrPort() != netip.AddrPortFrom(remote, 43001) {
 		t.Fatalf("cookie connection remote = %v", connection.RemoteAddr())
 	}
 	info := listener.(*TCPListener).Info()
-	if info.SYNsReceived != 2 || info.SYNCookiesSent != 2 || info.SYNCookiesRejected != 1 || info.SYNCookiesAccepted != 2 ||
-		info.HandshakeCompletions != 2 || info.AcceptedConnections != 2 || info.AcceptQueuePeak > 1 ||
+	if info.SYNsReceived != 3 || info.SYNCookiesSent != 3 || info.SYNCookiesRejected != 1 || info.SYNCookiesAccepted != 3 ||
+		info.HandshakeCompletions != 3 || info.AcceptedConnections != 3 || info.AcceptQueuePeak > 1 ||
 		info.SYNBacklogConnections != tcpSYNBacklog || info.SYNBacklogPeak != tcpSYNBacklog {
 		t.Fatalf("SYN cookie listener diagnostics = %+v", info)
 	}
 	stats := stack.Stats()
-	if stats.TCPSYNCookiesSent != 2 || stats.TCPSYNCookiesRejected != 1 || stats.TCPSYNCookiesAccepted != 2 {
+	if stats.TCPSYNCookiesSent != 3 || stats.TCPSYNCookiesRejected != 1 || stats.TCPSYNCookiesAccepted != 3 {
 		t.Fatalf("SYN cookie stack diagnostics = %+v", stats)
 	}
 }
@@ -439,6 +477,53 @@ func TestSYNCookieAcceptsMissingTimestamp(t *testing.T) {
 		t.Fatalf("missing-timestamp cookie options = timestamp:%v ecn:%v tsval:%d sack:%v scale:%d/%d/%v",
 			options.timestamp, options.ecn, options.timestampNow, options.sack, options.windowScale,
 			options.localWindowScale, options.windowScaling)
+	}
+}
+
+// TestSYNCookieZeroTimestampEcho uses Linux's compatibility handling for a
+// present Timestamp option whose TSecr was cleared in flight. The cookie must
+// still authenticate both possible ECN states, while the restored connection
+// keeps Timestamp, disables SACK/ECN, and uses peer window scale zero.
+func TestSYNCookieZeroTimestampEcho(t *testing.T) {
+	now := time.Unix(2000003000, 0)
+	for _, withECN := range []bool{false, true} {
+		t.Run(map[bool]string{false: "without-ECN", true: "with-ECN"}[withECN], func(t *testing.T) {
+			state := &tcpPassiveState{
+				cookieSet: true, cookieActive: true, cookieEpoch: now, cookiePeriod: 0,
+				cookieScaleSet: true, cookieScalePeriod: 0, cookieWindowScale: 4,
+			}
+			for index := range state.cookieKey {
+				state.cookieKey[index] = byte(index + 1)
+			}
+			key := tcpKey{
+				local:  netip.MustParseAddrPort("192.0.2.74:443"),
+				remote: netip.MustParseAddrPort("198.51.100.74:50000"),
+			}
+			flags := byte(TCPFlagSYN)
+			if withECN {
+				flags |= TCPFlagECE | TCPFlagCWR
+			}
+			syn := tcpSegment{sequence: 100, flags: flags, window: 65535}
+			syn.setOptions(append([]byte{TCPHeaderOptionMSS, 4, 0x05, 0xb4, TCPHeaderOptionSACKPermitted, 2,
+				TCPHeaderOptionNOP, TCPHeaderOptionWindowScale, 3, 7}, tcpTimestampOptions(700, 0)...))
+			cookieOptions, data := encodeSYNCookieOptions(syn, key.remote.Addr())
+			period := synCookiePeriodNumber(now, state.cookieEpoch)
+			cookie := synCookieSequence(state.cookieKey, key, syn.sequence, period, data,
+				synCookieAuthenticatedData(data, cookieOptions.timestamp, cookieOptions.ecn))
+			ack := tcpSegment{sequence: syn.sequence + 1, acknowledgement: cookie + 1, flags: TCPFlagACK, window: 4096}
+			ack.setOptions(tcpTimestampOptions(701, 0))
+
+			_, options, valid, attempted := state.validateSYNCookie(key, ack, now)
+			if !attempted || !valid {
+				t.Fatalf("zero-TSecr cookie validation = valid:%v attempted:%v", valid, attempted)
+			}
+			if !options.timestamp || options.timestampNow != 701 || options.ecn || options.sack ||
+				!options.windowScaling || options.windowScale != 0 || options.localWindowScale != 4 {
+				t.Fatalf("zero-TSecr cookie options = timestamp:%v/%d ecn:%v sack:%v scale:%d/%d/%v",
+					options.timestamp, options.timestampNow, options.ecn, options.sack,
+					options.windowScale, options.localWindowScale, options.windowScaling)
+			}
+		})
 	}
 }
 
