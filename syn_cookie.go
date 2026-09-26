@@ -152,7 +152,7 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	// in flight. Such an ACK cannot reveal whether the SYN-cookie was created
 	// with timestamps or ECN, so authenticate the three possible states (TS with
 	// ECN, TS without ECN, and no TS); the connection is then restored
-	// conservatively without timestamp/ECN negotiation.
+	// conservatively without timestamp, ECN, SACK, or window scaling.
 	var candidates [3]struct{ timestamp, ecn bool }
 	candidateCount := 1
 	if timestampPresent {
@@ -206,6 +206,16 @@ func (state *tcpPassiveState) validateSYNCookie(key tcpKey, ack tcpSegment, now 
 	}
 	options.ecn = timestampPresent && matchedECN
 	options.localWindowScale = localWindowScale
+	if !timestampPresent {
+		// Linux does not restore SACK or window scaling when
+		// cookie_timestamp_decode sees no Timestamp in the final ACK. MSS remains
+		// reconstructible from the authenticated cookie; Timestamp and ECN remain
+		// disabled because the ACK did not prove that either option was negotiated.
+		options.sack = false
+		options.windowScaling = false
+		options.windowScale = 0
+		options.localWindowScale = 0
+	}
 	return serverSequence, options, true, true
 }
 

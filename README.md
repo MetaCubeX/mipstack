@@ -1058,8 +1058,10 @@ When the SYN backlog or configured connection capacity is exhausted, passive
 open uses stateless SYN cookies instead of retaining another half-open
 connection. A per-stack random key authenticates the complete tuple, client
 sequence, recent time period, and negotiated options. A valid final ACK
-reconstructs conservative MSS, window scaling, SACK, timestamp, and ECN state;
-forged or expired cookies do not allocate a connection.
+reconstructs the conservative MSS and authenticated negotiated options. If
+that ACK lacks Timestamp, the restored connection disables Timestamp, SACK,
+window scaling, and ECN. Forged or expired cookies do not allocate a
+connection.
 
 Validated ICMP Packet Too Big errors maintain a bounded, expiring destination
 PMTU cache. Error type/code combinations and quoted TCP sequence spans are

@@ -186,10 +186,14 @@ const (
 	// tcpTimeWaitDuration retains a completed tuple for twice the conventional
 	// 30-second maximum segment lifetime.
 	tcpTimeWaitDuration = 60 * time.Second
-	// tcpPAWSMaxAge is the RFC 7323 timestamp lifetime. After a timestamp has
-	// been absent for 24 days, an older TSval no longer proves that a segment is
-	// stale because the peer's timestamp clock may have wrapped.
+	// tcpPAWSMaxAge is the RFC 7323 lifetime for this stack's fixed millisecond
+	// TSval clock. After 24 days without a newer timestamp, a lower TSval no
+	// longer proves that a segment is stale because the clock may have wrapped.
 	tcpPAWSMaxAge = 24 * 24 * time.Hour
+	// tcpPAWSReplayWindow is Linux's TCP_PAWS_WINDOW allowance for established
+	// segments. The stack timestamp clock advances in milliseconds, so one replay
+	// tick is one millisecond.
+	tcpPAWSReplayWindow uint32 = 1
 	// tcpFINWaitDuration bounds orphaned FIN_WAIT_2 resource retention. A
 	// connection retained by an application after CloseWrite has no such
 	// timeout and may continue receiving until the peer closes.
@@ -2310,8 +2314,7 @@ func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, received
 		timestamp, _, present := parseTCPTimestamp(segment.optionBytes())
 		if present {
 			if s.connection.peerTimestamp {
-				pawsReject = receivedAt.Sub(s.lastTimestampUpdate) < tcpPAWSMaxAge &&
-					tcpSequenceLess(timestamp, s.connection.recentTimestamp)
+				pawsReject = tcpPAWSReject(timestamp, s.connection.recentTimestamp, s.lastTimestampUpdate, receivedAt, 0)
 				timestampNew = !pawsReject && tcpSequenceGreater(timestamp, s.connection.recentTimestamp)
 			} else {
 				// RFC 6191 permits a timestamp-enabled new incarnation to
@@ -2351,13 +2354,14 @@ func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, received
 	// TIME-WAIT tuple usable when a middlebox strips a negotiated option: a
 	// missing timestamp therefore falls through to the normal sequence/window
 	// tests, while a stale timestamp is rejected with a rate-limited challenge
-	// ACK without changing TS.Recent.
+	// ACK without changing TS.Recent. TIME-WAIT uses no replay allowance here;
+	// Linux calls its PAWS check with a zero window for this retained state.
 	// SYNs use the RFC 6191 test above instead of this PAWS path.
 	var timestamp uint32
 	present := false
 	if s.connection.peerTimestamp {
 		timestamp, _, present = parseTCPTimestamp(segment.optionBytes())
-		if present && receivedAt.Sub(s.lastTimestampUpdate) < tcpPAWSMaxAge && tcpSequenceLess(timestamp, s.connection.recentTimestamp) {
+		if present && tcpPAWSReject(timestamp, s.connection.recentTimestamp, s.lastTimestampUpdate, receivedAt, 0) {
 			// Linux refreshes the retained tuple for a PAWS-rejected
 			// non-RST segment. RFC 7323 defines the rejection, while this
 			// timer refresh is the Linux interoperability behavior.
@@ -2383,7 +2387,13 @@ func (s *tcpEstablishedState) handleTimeWaitSegment(segment tcpSegment, received
 		s.trySendACK()
 		return false
 	}
-	if present && tcpSequenceLessEqual(segment.sequence, s.lastACKSent) {
+	// For the RFC 1337-protected TIME-WAIT tuple, only an exact RCV.NXT empty
+	// ACK can replace TS.Recent. Linux also updates it for a retained RST when
+	// tcp_rfc1337 is enabled; keeping RST inert here preserves the protection
+	// above. Payload and FIN may refresh the timer without changing TS.Recent.
+	if present && segment.flags&TCPFlagACK != 0 &&
+		segment.flags&(TCPFlagSYN|TCPFlagFIN|TCPFlagRST) == 0 && len(segment.payload) == 0 &&
+		segment.sequence == s.receiveNext {
 		s.connection.recentTimestamp = timestamp
 		s.lastTimestampUpdate = receivedAt
 	}
@@ -4672,6 +4682,47 @@ func (s *Stack) tcpTimestampAt(now time.Time) uint32 {
 	return uint32(now.Sub(s.timestampEpoch)/time.Millisecond) + 1
 }
 
+// tcpPAWSReject applies RFC 7323's serial-number check and this stack's
+// 24-day lifetime, with Linux's zero-TS.Recent and caller-selected
+// replay-window allowances. The stack uses a fixed millisecond TSval clock;
+// Linux uses the more conservative TCP_PAWS_WRAP bound to cover faster clocks.
+func tcpPAWSReject(tsval, recent uint32, recentAt, receivedAt time.Time, replayWindow uint32) bool {
+	if recent == 0 || int32(recent-tsval) <= int32(replayWindow) {
+		return false
+	}
+	return receivedAt.Sub(recentAt) < tcpPAWSMaxAge
+}
+
+// tcpPAWSReplayTicks converts the current RTO to the millisecond timestamp
+// replay allowance Linux uses for reordered duplicate ACKs. Linux budgets for
+// peers whose timestamp clock runs at up to 1200 Hz; the stack's millisecond
+// clock therefore uses 6/5 of the RTO. It is evaluated only after the ordinary
+// PAWS check rejects a packet.
+func tcpPAWSReplayTicks(rto time.Duration) uint32 {
+	ticks := uint64(rto / time.Millisecond)
+	ticks += ticks / 5
+	if ticks < uint64(tcpPAWSReplayWindow) {
+		ticks = uint64(tcpPAWSReplayWindow)
+	}
+	return uint32(ticks)
+}
+
+// tcpTimestampEchoInRange accepts an echoed timestamp from the interval
+// covered by the first and most recent SYN or SYN-ACK transmission. Linux
+// validates non-zero TSecr values against this interval while allowing zero
+// or missing echoes for middlebox compatibility.
+func tcpTimestampEchoInRange(echo, first, last uint32) bool {
+	return tcpSequenceGreaterEqual(echo, first) && tcpSequenceLessEqual(echo, last)
+}
+
+// tcpHandshakeTimestampRange is retained only by one handshake actor. A
+// crossed SYN needs the original active SYN range, while the passive half
+// validates later ACKs against its own SYN-ACK range.
+type tcpHandshakeTimestampRange struct {
+	first, last uint32
+	valid       bool
+}
+
 // tcpInitialSequence implements RFC 6528's M+F(connection-id, secret)
 // construction. M advances every four microseconds and wraps in sequence
 // space; SipHash supplies the keyed pseudorandom per-four-tuple offset.
@@ -6473,7 +6524,7 @@ func (c *TCPConn) runPassive(listener *TCPListener, syn tcpSegment, initialSeque
 	defer close(c.done)
 	protocolTimer := newOwnedTimer()
 	defer protocolTimer.close()
-	if err := c.passiveHandshake(syn, initialSequence, protocolTimer); err != nil {
+	if err := c.passiveHandshake(syn, initialSequence, protocolTimer, tcpHandshakeTimestampRange{}); err != nil {
 		listener.noteHandshakeFailure(err)
 		if errors.Is(err, net.ErrClosed) {
 			_ = c.sendAbortReset(initialSequence+1, c.receiveNext, c.receiveWindow(0, false))
@@ -6498,7 +6549,7 @@ func (c *TCPConn) runForwardedPassive(syn tcpSegment, initialSequence uint32, re
 	defer close(c.done)
 	protocolTimer := newOwnedTimer()
 	defer protocolTimer.close()
-	if err := c.passiveHandshake(syn, initialSequence, protocolTimer); err != nil {
+	if err := c.passiveHandshake(syn, initialSequence, protocolTimer, tcpHandshakeTimestampRange{}); err != nil {
 		result <- err
 		c.finish(err)
 		return
@@ -6510,7 +6561,7 @@ func (c *TCPConn) runForwardedPassive(syn tcpSegment, initialSequence uint32, re
 
 // passiveHandshake replies to one valid SYN and waits for the final ACK with
 // bounded retransmission.
-func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer *ownedTimer) error {
+func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer *ownedTimer, activeTimestampRange tcpHandshakeTimestampRange) error {
 	localMSS := tcpMSSForMTU(c.mtu, c.key.local.Addr())
 	if localMSS < 1 {
 		return errors.New("mipstack: MTU is too small for TCP")
@@ -6533,6 +6584,8 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 	var synHostQueue packetQueueTicket
 	var hostQueueWait *packetQueueDepartureWaiter
 	var optionStorage [40]byte
+	var synTimestampFirst, synTimestampLast uint32
+	synTimestampSent := false
 	send := func(reservation tcpOutputReservation, rearm bool) error {
 		c.mtu = c.stack.mtuFor(c.key.remote.Addr())
 		localMSS = tcpMSSForMTU(c.mtu, c.key.local.Addr())
@@ -6540,7 +6593,11 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 			reservation.release()
 			return errors.New("mipstack: MTU is too small for TCP")
 		}
-		options := tcpPassiveSYNOptions(optionStorage[:0], localMSS, sack, windowScaling, timestamp, c.receiveWindowScale, c.stack.tcpTimestamp(), c.recentTimestamp)
+		timestampNow := uint32(0)
+		if timestamp {
+			timestampNow = c.stack.tcpTimestamp()
+		}
+		options := tcpPassiveSYNOptions(optionStorage[:0], localMSS, sack, windowScaling, timestamp, c.receiveWindowScale, timestampNow, c.recentTimestamp)
 		flags := byte(TCPFlagSYN | TCPFlagACK)
 		if c.peerECN {
 			flags |= TCPFlagECE
@@ -6549,6 +6606,13 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 		hostQueue, err := c.publishReservedTCP(initialSequence, c.receiveNext, flags, c.receiveWindow(0, false), options, &payload, c.mtu, uint8(c.trafficClass.Load()), 0, reservation, tcpOutputSequenceRange{})
 		if err != nil {
 			return err
+		}
+		if timestamp {
+			if !synTimestampSent {
+				synTimestampFirst = timestampNow
+				synTimestampSent = true
+			}
+			synTimestampLast = timestampNow
 		}
 		if hostQueueWait != nil {
 			// This copy supersedes a local-queue wait for the prior SYN-ACK.
@@ -6586,6 +6650,7 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 	}
 	sendPending, sendRearm := true, true
 	eventTime := tcpSegmentEventTime(syn, time.Now(), time.Time{}, c.stack.timestampEpoch)
+	recentTimestampAt := eventTime
 	var timerBacklog tcpTimerBacklog
 	for {
 		// Cancellation owns the connection before a newly available device slot
@@ -6691,14 +6756,14 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 				}
 				continue
 			}
-			timestampValue, timestampPresent := uint32(0), false
+			timestampValue, timestampEcho, timestampPresent := uint32(0), uint32(0), false
 			// RFC 7323 section 5.3 places PAWS ahead of ordinary sequence
 			// validation. Linux accepts a missing Timestamp option after
 			// negotiation and continues with the normal handshake checks;
 			// only a present stale TSval is rejected here.
 			if c.peerTimestamp {
-				timestampValue, _, timestampPresent = parseTCPTimestamp(segment.optionBytes())
-				if timestampPresent && tcpSequenceLess(timestampValue, c.recentTimestamp) {
+				timestampValue, timestampEcho, timestampPresent = parseTCPTimestamp(segment.optionBytes())
+				if timestampPresent && tcpPAWSReject(timestampValue, c.recentTimestamp, recentTimestampAt, receivedAt, 0) {
 					if c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
 						_ = c.trySendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false))
 					}
@@ -6709,8 +6774,15 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 				// During simultaneous open both endpoints send SYN-ACK. Its
 				// SYN repeats the already accepted IRS while its ACK completes
 				// our active half of the handshake.
+				if timestampPresent && timestampEcho != 0 && (!activeTimestampRange.valid || !tcpTimestampEchoInRange(timestampEcho, activeTimestampRange.first, activeTimestampRange.last)) {
+					if c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
+						_ = c.trySendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false))
+					}
+					continue
+				}
 				if timestampPresent {
 					c.recentTimestamp = timestampValue
+					recentTimestampAt = receivedAt
 				}
 				c.peerWindow = uint32(segment.window)
 				c.peerWindowSeq = segment.sequence
@@ -6733,6 +6805,7 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 				}
 				if timestampPresent {
 					c.recentTimestamp = timestampValue
+					recentTimestampAt = receivedAt
 				}
 				if hostQueueWait != nil {
 					sendRearm = true
@@ -6750,6 +6823,16 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 				_ = c.tryWriteTCPControl(segment.acknowledgement, 0, TCPFlagRST, 0, nil)
 				continue
 			}
+			// RFC 7323 requires a receiver to echo the peer's SYN-ACK
+			// timestamp. Linux rejects an incorrect non-zero TSecr, while
+			// accepting zero or a missing option for middlebox compatibility.
+			if segment.flags&TCPFlagACK != 0 && timestampPresent && timestampEcho != 0 &&
+				(!synTimestampSent || !tcpTimestampEchoInRange(timestampEcho, synTimestampFirst, synTimestampLast)) {
+				if c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
+					_ = c.trySendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false))
+				}
+				continue
+			}
 			if segment.flags&TCPFlagSYN != 0 {
 				if c.stack.allowControlResponse(controlResponseTCPChallengeACK) {
 					_ = c.trySendSegment(initialSequence+1, c.receiveNext, TCPFlagACK, c.receiveWindow(0, false))
@@ -6761,6 +6844,7 @@ func (c *TCPConn) passiveHandshake(syn tcpSegment, initialSequence uint32, timer
 			}
 			if timestampPresent {
 				c.recentTimestamp = timestampValue
+				recentTimestampAt = receivedAt
 			}
 			c.peerWindow = uint32(segment.window)
 			if c.peerWindowScaling {
@@ -6823,6 +6907,8 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 	var synHostQueue packetQueueTicket
 	var hostQueueWait *packetQueueDepartureWaiter
 	var optionStorage [40]byte
+	var synTimestampFirst, synTimestampLast uint32
+	synTimestampSent := false
 	send := func(reservation tcpOutputReservation, rearm bool) error {
 		c.mtu = c.stack.mtuFor(c.key.remote.Addr())
 		localMSS = tcpMSSForMTU(c.mtu, c.key.local.Addr())
@@ -6830,7 +6916,8 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 			reservation.release()
 			return errors.New("mipstack: MTU is too small for TCP")
 		}
-		options := tcpSYNOptions(optionStorage[:0], localMSS, c.receiveWindowScale, c.stack.tcpTimestamp())
+		timestampNow := c.stack.tcpTimestamp()
+		options := tcpSYNOptions(optionStorage[:0], localMSS, c.receiveWindowScale, timestampNow)
 		flags := byte(TCPFlagSYN)
 		if !ecnFallback {
 			flags |= TCPFlagECE | TCPFlagCWR
@@ -6840,6 +6927,11 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 		if err != nil {
 			return err
 		}
+		if !synTimestampSent {
+			synTimestampFirst = timestampNow
+			synTimestampSent = true
+		}
+		synTimestampLast = timestampNow
 		if hostQueueWait != nil {
 			// This copy supersedes a local-queue wait for the prior SYN.
 			hostQueueWait = nil
@@ -6994,12 +7086,21 @@ func (c *TCPConn) handshake(initialSequence uint32, timer *ownedTimer, initialRe
 				if initialReceive != nil {
 					*initialReceive = tcpInitialReceive{payload: segment.payload, fin: segment.flags&TCPFlagFIN != 0}
 				}
-				return c.passiveHandshake(segment, initialSequence, timer)
+				return c.passiveHandshake(segment, initialSequence, timer, tcpHandshakeTimestampRange{first: synTimestampFirst, last: synTimestampLast, valid: synTimestampSent})
 			}
 			if transmissions == 0 || segment.flags&(TCPFlagSYN|TCPFlagACK) != TCPFlagSYN|TCPFlagACK || segment.acknowledgement != initialSequence+1 {
 				continue
 			}
 			mss, scale, windowScaling, sack, timestamp, timestampValue := parseTCPOptions(segment.optionBytes(), defaultTCPPeerMSS(c.key.remote.Addr()), 65535)
+			_, timestampEcho, timestampPresent := parseTCPTimestamp(segment.optionBytes())
+			// RFC 7323 requires the SYN-ACK to echo the active SYN's
+			// timestamp. Linux rejects an incorrect non-zero TSecr, while
+			// accepting zero or a missing option for middlebox compatibility.
+			if timestampPresent && timestampEcho != 0 &&
+				(!synTimestampSent || !tcpTimestampEchoInRange(timestampEcho, synTimestampFirst, synTimestampLast)) {
+				_ = c.tryWriteTCPControl(segment.acknowledgement, 0, TCPFlagRST, 0, nil)
+				continue
+			}
 			c.peerMSS, c.peerWindowScale, c.peerSACK = mss, scale, sack
 			c.peerWindowScaling = windowScaling
 			c.peerTimestamp, c.recentTimestamp = timestamp, timestampValue
@@ -8747,9 +8848,15 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 				// RFC 7323 section 5.2.
 				if c.peerTimestamp && segment.flags&TCPFlagRST == 0 {
 					timestampValue, timestampEcho, timestampPresent = parseTCPTimestamp(segment.optionBytes())
-					if timestampPresent && receivedAt.Sub(state.lastTimestampUpdate) < tcpPAWSMaxAge && tcpSequenceLess(timestampValue, c.recentTimestamp) {
-						state.trySendChallengeACK()
-						continue
+					if timestampPresent && tcpPAWSReject(timestampValue, c.recentTimestamp, state.lastTimestampUpdate, receivedAt, tcpPAWSReplayWindow) {
+						drop, acceptReplay := tcpPAWSDisorderedACK(segment, state, timestampValue)
+						if drop {
+							continue
+						}
+						if !acceptReplay {
+							state.trySendChallengeACK()
+							continue
+						}
 					}
 				}
 				if !tcpSegmentAcceptable(segment.sequence, payloadLength, state.receiveNext, receiveWindow) {
@@ -8762,10 +8869,6 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 						}
 					}
 					continue
-				}
-				if timestampPresent && tcpSequenceLessEqual(segment.sequence, state.lastACKSent) {
-					c.recentTimestamp = timestampValue
-					state.lastTimestampUpdate = receivedAt
 				}
 				state.lastActivity = receivedAt
 				keepAliveOutputWaiting = false
@@ -8811,7 +8914,18 @@ func (c *TCPConn) established(sendNext uint32, actorTimer *ownedTimer, initialRe
 						state.trySendChallengeACK()
 						continue
 					}
-				} else {
+				}
+				// RFC 7323 section 5.3 and Linux update TS.Recent only after
+				// sequence and ACK admission. Linux excludes older cumulative ACKs;
+				// the zero-window PAWS check keeps a tolerated one-tick replay from
+				// moving TS.Recent backwards.
+				if timestampPresent && segment.flags&(TCPFlagSYN|TCPFlagRST) == 0 && !tcpSequenceLess(ack, state.sendUnacknowledged) &&
+					tcpSequenceLessEqual(segment.sequence, state.lastACKSent) &&
+					!tcpPAWSReject(timestampValue, c.recentTimestamp, state.lastTimestampUpdate, receivedAt, 0) {
+					c.recentTimestamp = timestampValue
+					state.lastTimestampUpdate = receivedAt
+				}
+				if !tcpSequenceLess(ack, state.sendUnacknowledged) {
 					if tcpSequenceGreater(ack, state.sendUnacknowledged) {
 						retransmissionUpdate = tcpRetransmissionRestart
 					} else {
@@ -11450,6 +11564,31 @@ func tcpKeepAliveOrWindowProbe(segment tcpSegment, length, receiveNext, receiveW
 func tcpWindowUpdateAllowed(sequence, acknowledgement, lastSequence, lastAcknowledgement uint32) bool {
 	return tcpSequenceGreater(sequence, lastSequence) ||
 		sequence == lastSequence && tcpSequenceGreaterEqual(acknowledgement, lastAcknowledgement)
+}
+
+// tcpPAWSDisorderedACK applies Linux's exception for old duplicate pure ACKs
+// after PAWS rejects their Timestamp. An old ACK behind RCV.NXT is discarded
+// silently; an unchanged duplicate ACK at RCV.NXT may pass when its TSval is
+// still inside the RTO-sized replay window. Window updates and data remain
+// ordinary PAWS rejects.
+func tcpPAWSDisorderedACK(segment tcpSegment, state *tcpEstablishedState, timestamp uint32) (drop, accept bool) {
+	if segment.flags&TCPFlagACK == 0 || len(segment.payload) != 0 || segment.flags&(TCPFlagSYN|TCPFlagFIN|TCPFlagRST) != 0 {
+		return false, false
+	}
+	if segment.sequence != state.receiveNext {
+		return tcpSequenceLess(segment.sequence, state.receiveNext), false
+	}
+	if segment.acknowledgement != state.sendUnacknowledged {
+		return false, false
+	}
+	window := uint32(segment.window) << state.peerScale
+	windowUpdate := tcpSequenceGreater(segment.sequence, state.peerWindowSequence) ||
+		segment.sequence == state.peerWindowSequence &&
+			(window > state.peerWindow || window == 0)
+	if windowUpdate {
+		return false, false
+	}
+	return false, int32(state.connection.recentTimestamp-timestamp) <= int32(tcpPAWSReplayTicks(state.rtt.rto))
 }
 
 // tcpDuplicateACKEvidence applies the deliberately different RFC 5681 and RFC
