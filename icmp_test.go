@@ -1759,25 +1759,49 @@ func TestUDPPathMTUAndICMPCorrelation(t *testing.T) {
 			if err = writeTestPacket(stack, errorPacket); err != nil {
 				t.Fatal(err)
 			}
+			if info := connection.(*UDPConn).Info(); info.ErrorQueueEntries != 0 || info.LastError != nil || info.ICMPErrors != 0 {
+				t.Fatalf("unconnected UDP retained an implicit ICMP error: %+v", info)
+			}
+			if count, readErr := connection.(*UDPConn).ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+				t.Fatalf("unconnected UDP read after ICMP = %d, %v", count, readErr)
+			}
+			if learned := stack.mtuFor(test.remote); learned != int(test.mtu) {
+				t.Fatalf("PMTU after ignored ICMP = %d, want %d", learned, test.mtu)
+			}
+			if err = connection.(*UDPConn).SetReceiveErrors(true); err != nil {
+				t.Fatal(err)
+			}
+			if err = writeTestPacket(stack, buildTestPacketTooBig(test.unknown, test.local, unknownQuote, test.mtu)); err != nil {
+				t.Fatal(err)
+			}
+			if err = writeTestPacket(stack, errorPacket); err != nil {
+				t.Fatal(err)
+			}
 			for index := range errorPacket {
 				errorPacket[index] = 0
 			}
-			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
-			_, _, err = connection.ReadFrom(make([]byte, 1))
+			var reported *net.OpError
+			reported, err = connection.(*UDPConn).ReadError()
+			if err != nil {
+				t.Fatal(err)
+			}
 			var operationError *net.OpError
-			if !errors.As(err, &operationError) {
-				t.Fatalf("ReadFrom error = %#v, want UDP error for %s", err, destination)
+			if !errors.As(reported, &operationError) {
+				t.Fatalf("ReadError result = %#v, want UDP error for %s", reported, destination)
 			}
 			errorAddress, ok := operationError.Addr.(*net.UDPAddr)
 			if !ok || errorAddress.AddrPort() != destination {
-				t.Fatalf("ReadFrom error address = %#v, want %s", operationError.Addr, destination)
+				t.Fatalf("ReadError address = %#v, want %s", operationError.Addr, destination)
 			}
 			var icmpError ICMPError
-			if !errors.As(err, &icmpError) || icmpError.MTU != test.mtu {
-				t.Fatalf("ReadFrom error does not expose ICMP Packet Too Big: %#v", err)
+			if !errors.As(reported, &icmpError) || icmpError.MTU != test.mtu {
+				t.Fatalf("ReadError result does not expose ICMP Packet Too Big: %#v", reported)
 			}
 			if icmpError.QuotedSourcePort != localPort || icmpError.QuotedTargetPort != destination.Port() || len(icmpError.QuotedPayload) < udpHeaderSize {
 				t.Fatalf("retained ICMP quote = %+v payload %x", icmpError, icmpError.QuotedPayload)
+			}
+			if queued, readErr := connection.(*UDPConn).ReadError(); queued != nil || !errors.Is(readErr, syscall.EAGAIN) {
+				t.Fatalf("unmatched UDP ICMP error was queued: %#v, %v", queued, readErr)
 			}
 			if learned := stack.mtuFor(test.remote); learned != int(test.mtu) {
 				t.Fatalf("learned PMTU = %d, want %d", learned, test.mtu)
@@ -1832,6 +1856,9 @@ func TestUDPExtendedICMPErrorCorrelation(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer connection.Close()
+			if err = connection.(*UDPConn).SetReceiveErrors(true); err != nil {
+				t.Fatal(err)
+			}
 			target := netip.AddrPortFrom(test.remote, 5353)
 			payload := []byte("extended-error-correlation")
 			if _, err = connection.WriteTo(payload, net.UDPAddrFromAddrPort(target)); err != nil {
@@ -1875,20 +1902,20 @@ func TestUDPExtendedICMPErrorCorrelation(t *testing.T) {
 			for index := range networkError.Extensions {
 				networkError.Extensions[index] = 0
 			}
-			if err = connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-				t.Fatal(err)
+			reported, readErr := connection.(*UDPConn).ReadError()
+			if readErr != nil {
+				t.Fatal(readErr)
 			}
-			_, _, readErr := connection.ReadFrom(make([]byte, 1))
 			var operationError *net.OpError
-			if !errors.As(readErr, &operationError) {
-				t.Fatalf("ReadFrom error = %#v, want extended network error", readErr)
+			if !errors.As(reported, &operationError) {
+				t.Fatalf("ReadError result = %#v, want extended network error", reported)
 			}
 			address, ok := operationError.Addr.(*net.UDPAddr)
 			if !ok || address.AddrPort() != target {
 				t.Fatalf("extended error address = %#v, want %s", operationError.Addr, target)
 			}
 			var received ICMPError
-			if !errors.As(readErr, &received) || received.Type != test.messageType || received.Code != test.code ||
+			if !errors.As(reported, &received) || received.Type != test.messageType || received.Code != test.code ||
 				!bytes.Equal(received.QuotedPacket, original) || len(received.QuotedPayload) != udpHeaderSize+len(payload) {
 				t.Fatalf("retained extended ICMP error = %+v, payload %x", received, received.QuotedPayload)
 			}
@@ -1943,22 +1970,46 @@ func TestIPConnPathMTUAndICMPCorrelation(t *testing.T) {
 			if err = writeTestPacket(stack, buildTestPacketTooBig(test.unknown, test.local, unknownQuote, test.mtu)); err != nil {
 				t.Fatal(err)
 			}
-			if err = writeTestPacket(stack, buildTestPacketTooBig(test.remote, test.local, original, test.mtu)); err != nil {
+			errorPacket := buildTestPacketTooBig(test.remote, test.local, original, test.mtu)
+			if err = writeTestPacket(stack, errorPacket); err != nil {
 				t.Fatal(err)
 			}
-			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
-			_, _, err = connection.ReadFrom(make([]byte, 1))
+			if info := connection.(*IPConn).Info(); info.ErrorQueueEntries != 0 || info.LastError != nil || info.ICMPErrors != 0 {
+				t.Fatalf("unconnected IP retained an implicit ICMP error: %+v", info)
+			}
+			if count, readErr := connection.(*IPConn).ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+				t.Fatalf("unconnected IP read after ICMP = %d, %v", count, readErr)
+			}
+			if learned := stack.mtuFor(test.remote); learned != int(test.mtu) {
+				t.Fatalf("PMTU after ignored ICMP = %d, want %d", learned, test.mtu)
+			}
+			if err = connection.(*IPConn).SetReceiveErrors(true); err != nil {
+				t.Fatal(err)
+			}
+			if err = writeTestPacket(stack, buildTestPacketTooBig(test.unknown, test.local, unknownQuote, test.mtu)); err != nil {
+				t.Fatal(err)
+			}
+			if err = writeTestPacket(stack, errorPacket); err != nil {
+				t.Fatal(err)
+			}
+			reported, readErr := connection.(*IPConn).ReadError()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
 			var operationError *net.OpError
-			if !errors.As(err, &operationError) {
-				t.Fatalf("ReadFrom error = %#v, want IP socket network error", err)
+			if !errors.As(reported, &operationError) {
+				t.Fatalf("ReadError result = %#v, want IP socket network error", reported)
 			}
 			errorAddress, ok := operationError.Addr.(*net.IPAddr)
 			if !ok || errorAddress.String() != test.remote.String() {
-				t.Fatalf("ReadFrom error address = %#v, want %s", operationError.Addr, test.remote)
+				t.Fatalf("ReadError address = %#v, want %s", operationError.Addr, test.remote)
 			}
 			var icmpError ICMPError
-			if !errors.As(err, &icmpError) || icmpError.MTU != test.mtu || icmpError.QuotedProtocol != 99 {
-				t.Fatalf("ReadFrom error does not expose matching ICMP error: %#v", err)
+			if !errors.As(reported, &icmpError) || icmpError.MTU != test.mtu || icmpError.QuotedProtocol != 99 {
+				t.Fatalf("ReadError result does not expose matching ICMP error: %#v", reported)
+			}
+			if queued, readErr := connection.(*IPConn).ReadError(); queued != nil || !errors.Is(readErr, syscall.EAGAIN) {
+				t.Fatalf("unmatched IP ICMP error was queued: %#v, %v", queued, readErr)
 			}
 			if learned := stack.mtuFor(test.remote); learned != int(test.mtu) {
 				t.Fatalf("learned PMTU = %d, want %d", learned, test.mtu)
@@ -2098,6 +2149,9 @@ func TestIPConnICMPErrorDoesNotRequireTransportHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close()
+	if err = connection.(*IPConn).SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = connection.WriteTo([]byte{1, 2, 3, 4}, ipNetAddr(remote)); err != nil {
 		t.Fatal(err)
 	}
@@ -2105,14 +2159,13 @@ func TestIPConnICMPErrorDoesNotRequireTransportHeader(t *testing.T) {
 	if err = writeTestPacket(stack, buildTestPacketTooBig(remote, local, original, 1200)); err != nil {
 		t.Fatal(err)
 	}
-	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
-	if _, _, err = connection.ReadFrom(make([]byte, 1)); err == nil {
-		t.Fatal("raw UDP-protocol socket did not receive the correlated ICMP error")
-	} else {
-		var icmpError ICMPError
-		if !errors.As(err, &icmpError) || icmpError.QuotedProtocol != ProtocolUDP || len(icmpError.QuotedPayload) != 4 {
-			t.Fatalf("short quoted transport error = %#v", err)
-		}
+	reported, readErr := connection.(*IPConn).ReadError()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var icmpError ICMPError
+	if !errors.As(reported, &icmpError) || icmpError.QuotedProtocol != ProtocolUDP || len(icmpError.QuotedPayload) != 4 {
+		t.Fatalf("short quoted transport error = %#v", reported)
 	}
 }
 

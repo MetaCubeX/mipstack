@@ -175,14 +175,35 @@ func TestSocketMessagePeekTruncationAndErrorQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	connection.deliverError(remote, networkError)
-	if count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagPeek); count != 0 || readErr == nil {
-		t.Fatalf("ordinary MSG_PEEK pending error = %d, %v", count, readErr)
+	if count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagPeek|MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("unconnected MSG_PEEK after ignored ICMP = %d, %v", count, readErr)
 	}
 	if info := connection.Info(); info.ErrorQueueEntries != 0 || info.ErrorQueueBytes != 0 {
-		t.Fatalf("ordinary MSG_PEEK retained pending error: %+v", info)
+		t.Fatalf("ignored ICMP retained an error: %+v", info)
 	}
 	if count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
-		t.Fatalf("read after pending error consumption = %d, %v", count, readErr)
+		t.Fatalf("read after ignored ICMP = %d, %v", count, readErr)
+	}
+	connectedNet, err := stack.DialUDP(context.Background(), "udp4", netip.AddrPort{}, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connected := connectedNet.(*UDPConn)
+	defer connected.Close()
+	connected.deliverError(remote, ICMPError{Code: 3})
+	if info := connected.Info(); info.ErrorQueueEntries != 1 {
+		t.Fatalf("connected UDP pending error = %+v", info)
+	}
+	count, readErr := connected.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagPeek|MessageFlagDontWait)
+	var peekError ICMPError
+	if count != 0 || !errors.As(readErr, &peekError) || peekError.Code != 3 {
+		t.Fatalf("connected UDP MSG_PEEK pending error = %d, %v", count, readErr)
+	}
+	if info := connected.Info(); info.ErrorQueueEntries != 0 {
+		t.Fatalf("connected UDP MSG_PEEK retained pending error: %+v", info)
+	}
+	if count, readErr := connected.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("connected UDP read after MSG_PEEK error consumption = %d, %v", count, readErr)
 	}
 
 	ipConnection := newIPConn(stack, "ip4:99", 99, local, remote.Addr(), socketOptionSet{})

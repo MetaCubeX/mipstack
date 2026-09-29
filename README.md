@@ -762,8 +762,10 @@ bounded wait for acknowledgement. `UDPConn.SetReadBuffer` changes the receive
 queue's approximate retained-memory capacity; payload, per-datagram metadata,
 and asynchronous errors share the bound. `IPConn` applies the same policy.
 `SetReceiveErrors(true)` reserves asynchronous ICMP errors for nonblocking
-`ReadError`; an empty error queue returns `EAGAIN`. With the default false
-setting, ordinary reads return queued errors after already queued payloads.
+`ReadError`; an empty error queue returns `EAGAIN`. By default, unconnected
+sockets do not report asynchronous ICMP errors (correlated PMTU updates still
+apply), while connected sockets return queued errors after already queued
+payloads. Disabling an enabled option clears errors retained for `ReadError`.
 `ReceiveErrors` reports the current mode. UDP and IP writes make one immediate
 bounded queue-admission attempt. Published backlog is subject to flow-aware
 replacement. Failure to admit unicast output or an external-link non-unicast
@@ -839,8 +841,9 @@ The write counters include default-policy writes silently rejected by local
 admission and remain cumulative for packets later dropped by link scheduling.
 Both also report the PMTU-discovery mode, explicit-error mode,
 queued error count and bytes, and errors dropped by the shared receive-buffer
-bound. They retain the latest correlated ICMP error while open. Closing the
-socket releases that diagnostic state while preserving cumulative counters.
+bound. When ICMP error reporting applies, they retain the latest correlated
+error while open. Closing the socket releases that diagnostic state while
+preserving cumulative counters.
 An automatic `IPConn` Flow Label is reported as zero because raw payload fields
 may select a different flow on each write; fixed socket labels are reported
 directly.
@@ -1089,10 +1092,9 @@ tuples; unconnected sockets can use arbitrary destinations in one IP family.
 Both correlate asynchronous ICMP errors with recently used remote endpoints.
 
 `IPConn` applies the same recent-destination correlation to protocol payload
-writes. Validated errors are returned by a subsequent read and retained in
-`IPConnInfo`; Packet Too Big also updates the shared destination PMTU. Its
-explicit probe and confirmation methods follow the same
-application-acknowledgement contract as UDP.
+writes. Correlated Packet Too Big updates the shared destination PMTU when
+the socket's discovery policy permits it. Its explicit probe and confirmation
+methods follow the same application-acknowledgement contract as UDP.
 
 ICMP echo, unreachable, packet-too-big, IPv4 fragmentation, IPv6 source
 fragmentation, and bounded IPv4 and IPv6 reassembly are handled internally.

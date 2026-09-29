@@ -135,13 +135,15 @@ type IPConnInfo struct {
 	// ReceiveQueueCapacity is the configured accounting-byte limit of the
 	// combined payload and error queues, not an exact heap-allocation limit.
 	ReceiveQueueCapacity int
-	// ReceiveErrors reports whether asynchronous network errors are reserved
-	// for ReadError instead of being returned by ordinary reads and whether
+	// ReceiveErrors reports whether asynchronous network errors are retained
+	// for ReadError. Otherwise, unconnected sockets do not report those errors;
+	// connected sockets return them from ordinary reads. It also reports whether
 	// immediate failure to admit unicast or external-link non-unicast output is
 	// reported as ENOBUFS.
 	ReceiveErrors bool
 	// ErrorQueueEntries is the number of asynchronous network errors awaiting
-	// ReadError or, when ReceiveErrors is false, an ordinary read.
+	// ReadError or, on a connected socket with ReceiveErrors disabled, an
+	// ordinary read.
 	ErrorQueueEntries int
 	// ErrorQueueBytes is the accounted metadata and quoted packet data retained
 	// by the asynchronous error queue.
@@ -2113,9 +2115,12 @@ func (c *IPConn) SetReadBuffer(bytes int) error {
 // for ReadError. It also makes a write fail with ENOBUFS when immediate
 // admission of unicast output or the external-link copy of multicast or
 // broadcast output fails. It does not report packets displaced after admission.
-// Receive-side non-unicast loopback copies remain best effort. When disabled,
-// the default, ordinary reads return queued errors after any already queued
-// payloads and an immediate output admission failure is silent.
+// Receive-side non-unicast loopback copies remain best effort. By default,
+// unconnected sockets do not report asynchronous ICMP errors,
+// although correlated PMTU updates still apply. Connected sockets return
+// those errors after any already queued payloads. Disabling a previously
+// enabled option clears errors retained for ReadError. Immediate output
+// admission failures remain silent.
 func (c *IPConn) SetReceiveErrors(enabled bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2123,16 +2128,20 @@ func (c *IPConn) SetReceiveErrors(enabled bool) error {
 	case <-c.closed:
 		return c.setOperationError(net.ErrClosed)
 	default:
+		if c.receiveErrors && !enabled {
+			c.errorState.purgeQueue()
+		}
 		c.receiveErrors = enabled
 		c.notifyReceiveLocked()
 		return nil
 	}
 }
 
-// ReceiveErrors reports whether asynchronous errors are reserved for
-// ReadError instead of being returned by ordinary reads and whether immediate
-// failure to admit unicast or external-link non-unicast output is reported as
-// ENOBUFS.
+// ReceiveErrors reports whether asynchronous errors are retained for
+// ReadError. When disabled, unconnected sockets do not report those errors;
+// connected sockets return them from ordinary reads. It also reports whether
+// immediate failure to admit unicast or external-link non-unicast output is
+// reported as ENOBUFS.
 func (c *IPConn) ReceiveErrors() (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2322,6 +2331,13 @@ func (c *IPConn) deliverError(target netip.Addr, err error) {
 		c.mu.Unlock()
 		return
 	default:
+	}
+	// Linux does not report asynchronous ICMP to an unconnected raw IP
+	// socket unless IP_RECVERR or IPV6_RECVERR is enabled. Correlated PMTU
+	// updates are independent of whether the socket retains an error.
+	if !c.remote.IsValid() && !c.receiveErrors {
+		c.mu.Unlock()
+		return
 	}
 	if c.errorState == nil {
 		c.errorState = &datagramSocketErrorState{}

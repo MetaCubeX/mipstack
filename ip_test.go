@@ -1669,12 +1669,43 @@ func TestIPExplicitErrorQueue(t *testing.T) {
 	if _, err = connection.ReadError(); err != nil {
 		t.Fatal(err)
 	}
+	connection.deliverError(first, ICMPError{Code: 5})
 	if err = connection.SetReceiveErrors(false); err != nil {
 		t.Fatal(err)
 	}
-	connection.deliverError(first, ICMPError{Code: 5})
-	if _, readErr := connection.Read(make([]byte, 1)); readErr == nil {
-		t.Fatal("ordinary IP read did not consume an asynchronous error")
+	if info := connection.Info(); info.ErrorQueueEntries != 0 || info.ErrorQueueBytes != 0 {
+		t.Fatalf("disabled IP error queue = %+v", info)
+	}
+	connection.deliverError(first, ICMPError{Code: 6})
+	if count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+		t.Fatalf("unconnected IP read after ignored ICMP = %d, %v", count, readErr)
+	}
+	connected := newIPConn(stack, "ip4:99", 99, local, first, socketOptionSet{})
+	defer connected.closeFromStack()
+	if err = connected.SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
+	connected.deliverError(first, ICMPError{Code: 7})
+	if err = connected.SetReceiveErrors(false); err != nil {
+		t.Fatal(err)
+	}
+	if info := connected.Info(); info.ErrorQueueEntries != 0 {
+		t.Fatalf("disabled connected IP error queue = %+v", info)
+	}
+	connected.deliverError(first, ICMPError{Code: 8})
+	if err = connected.SetReceiveErrors(false); err != nil {
+		t.Fatal(err)
+	}
+	if info := connected.Info(); info.ErrorQueueEntries != 1 {
+		t.Fatalf("repeatedly disabling connected IP error reception discarded a pending error: %+v", info)
+	}
+	if err = connected.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	count, readErr := connected.Read(make([]byte, 1))
+	var networkError ICMPError
+	if count != 0 || !errors.As(readErr, &networkError) || networkError.Code != 8 {
+		t.Fatalf("connected IP read after disabling error queue = %d, %v", count, readErr)
 	}
 	connection.closeFromStack()
 	if _, err = connection.ReceiveErrors(); !errors.Is(err, net.ErrClosed) {
@@ -2775,6 +2806,9 @@ func TestIPConnCloseReleasesRetainedState(t *testing.T) {
 	}
 	connection.enqueuePacket(ipPacket{payload: make([]byte, 1200), source: remote, target: local}, ipPacketOptions{})
 	connection.rememberTarget(remote)
+	if err = connection.SetReceiveErrors(true); err != nil {
+		t.Fatal(err)
+	}
 	connection.deliverError(remote, ICMPError{QuotedPayload: make([]byte, 1200)})
 	connection.mu.Lock()
 	connection.receiveSpare = make([]byte, 0, 1200)

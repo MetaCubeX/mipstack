@@ -38,6 +38,161 @@ func TestRawIPInterop(t *testing.T) {
 	}
 }
 
+// TestIPUnconnectedClosedPortErrorInterop verifies that a gVisor-generated
+// Port Unreachable is ignored by default and queued when error reception is
+// enabled on an unconnected raw-IP socket.
+func TestIPUnconnectedClosedPortErrorInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			observed := make(chan []byte, 1)
+			network := newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					parsed, err := mipstack.ParseIPPacket(packet)
+					if err != nil || parsed.Protocol != mipstack.ProtocolICMPv4 && parsed.Protocol != mipstack.ProtocolICMPv6 {
+						return true
+					}
+					select {
+					case observed <- append([]byte(nil), packet...):
+					default:
+					}
+					return true
+				},
+			})
+			rawNetwork := "ip4:udp"
+			if family.mipstackAddress.Is6() {
+				rawNetwork = "ip6:udp"
+			}
+			packetConnection, err := network.mipstack.ListenIP(context.Background(), rawNetwork, family.mipstackAddress)
+			if err != nil {
+				t.Fatal(err)
+			}
+			connection := packetConnection.(*mipstack.IPConn)
+			defer connection.Close()
+			if err = connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			closed := netipAddrPort(family.gvisorAddress, 44996)
+			outgoing := mipstack.UDPDatagram{
+				Source: netipAddrPort(family.mipstackAddress, 44995), Destination: closed, Payload: []byte{1},
+			}
+			wire, err := outgoing.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, writeErr := connection.WriteTo(wire, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || n != len(wire) {
+				t.Fatalf("raw UDP write to closed gVisor port = %d, %v", n, writeErr)
+			}
+			var response []byte
+			select {
+			case response = <-observed:
+			case <-time.After(3 * time.Second):
+				t.Fatal("gVisor did not emit Port Unreachable for raw UDP")
+			}
+			packet, err := mipstack.ParseIPPacket(response)
+			if err != nil || packet.Source != family.gvisorAddress || packet.Destination != family.mipstackAddress {
+				t.Fatalf("gVisor ICMP packet = %+v, %v", packet, err)
+			}
+			message, err := packet.ICMPMessage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			networkError, err := message.ICMPError()
+			if err != nil || networkError.QuotedSource != family.mipstackAddress || networkError.QuotedTarget != family.gvisorAddress ||
+				networkError.QuotedProtocol != mipstack.ProtocolUDP ||
+				networkError.QuotedSourcePort != outgoing.Source.Port() || networkError.QuotedTargetPort != closed.Port() {
+				t.Fatalf("gVisor Port Unreachable quote = %+v, %v", networkError, err)
+			}
+			if family.mipstackAddress.Is4() {
+				if networkError.Type != mipstack.ICMPv4TypeDestinationUnreachable || networkError.Code != mipstack.ICMPv4DestinationUnreachableCodePort {
+					t.Fatalf("gVisor IPv4 error type/code = %d/%d", networkError.Type, networkError.Code)
+				}
+			} else if networkError.Type != mipstack.ICMPv6TypeDestinationUnreachable || networkError.Code != mipstack.ICMPv6DestinationUnreachableCodePort {
+				t.Fatalf("gVisor IPv6 error type/code = %d/%d", networkError.Type, networkError.Code)
+			}
+
+			sink, err := network.mipstack.ListenUDP(context.Background(), family.udpNetwork, netipAddrPort(family.mipstackAddress, 44998))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sink.Close()
+			peer := newGVisorUDPSocket(t, network, family.networkProtocol, gvisorFullAddress(family.gvisorAddress, 44997), func(tcpip.Endpoint) {})
+			defer peer.Close()
+			if _, err = peer.WriteTo([]byte{2}, net.UDPAddrFromAddrPort(netipAddrPort(family.mipstackAddress, 44998))); err != nil {
+				t.Fatal(err)
+			}
+			buffer := make([]byte, 64)
+			n, source, readErr := connection.ReadFrom(buffer)
+			if readErr != nil || source == nil || source.String() != family.gvisorAddress.String() {
+				t.Fatalf("raw IP read after gVisor ICMP = %d, %v, %v", n, source, readErr)
+			}
+			received, err := (mipstack.IPPacket{
+				Source: family.gvisorAddress, Destination: family.mipstackAddress,
+				Protocol: mipstack.ProtocolUDP, Payload: buffer[:n],
+			}).UDPDatagram()
+			if err != nil || received.Source != netipAddrPort(family.gvisorAddress, 44997) ||
+				received.Destination != netipAddrPort(family.mipstackAddress, 44998) || !bytes.Equal(received.Payload, []byte{2}) {
+				t.Fatalf("raw IP UDP datagram after ICMP = %+v, %v", received, err)
+			}
+			if count, readErr := connection.ReadBatch([]mipstack.SocketMessage{{Buffers: [][]byte{buffer}}}, mipstack.MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
+				t.Fatalf("raw IP read after payload = %d, %v", count, readErr)
+			}
+			if queued, readErr := connection.ReadError(); queued != nil || !errors.Is(readErr, syscall.EAGAIN) {
+				t.Fatalf("default IP error queue = %+v, %v", queued, readErr)
+			}
+			if info := connection.Info(); info.ErrorQueueEntries != 0 || info.ICMPErrors != 0 || info.LastError != nil {
+				t.Fatalf("default unconnected IP retained ICMP error: %+v", info)
+			}
+
+			if err = connection.SetReceiveErrors(true); err != nil {
+				t.Fatal(err)
+			}
+			enabledClosed := netipAddrPort(family.gvisorAddress, 44999)
+			outgoing.Destination = enabledClosed
+			wire, err = outgoing.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, writeErr := connection.WriteTo(wire, &net.IPAddr{IP: net.IP(family.gvisorAddress.AsSlice())}); writeErr != nil || n != len(wire) {
+				t.Fatalf("raw UDP write with error reception enabled = %d, %v", n, writeErr)
+			}
+			select {
+			case <-observed:
+			case <-time.After(3 * time.Second):
+				t.Fatal("gVisor did not emit Port Unreachable with IP error reception enabled")
+			}
+			if err = connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = peer.WriteTo([]byte{4}, net.UDPAddrFromAddrPort(netipAddrPort(family.mipstackAddress, 44998))); err != nil {
+				t.Fatal(err)
+			}
+			n, source, readErr = connection.ReadFrom(buffer)
+			if readErr != nil || source == nil || source.String() != family.gvisorAddress.String() {
+				t.Fatalf("raw IP read with error reception enabled = %d, %v, %v", n, source, readErr)
+			}
+			received, err = (mipstack.IPPacket{
+				Source: family.gvisorAddress, Destination: family.mipstackAddress,
+				Protocol: mipstack.ProtocolUDP, Payload: buffer[:n],
+			}).UDPDatagram()
+			if err != nil || received.Source != netipAddrPort(family.gvisorAddress, 44997) ||
+				received.Destination != netipAddrPort(family.mipstackAddress, 44998) || !bytes.Equal(received.Payload, []byte{4}) {
+				t.Fatalf("raw IP UDP datagram with error reception enabled = %+v, %v", received, err)
+			}
+			reported, readErr := connection.ReadError()
+			var reportedError mipstack.ICMPError
+			if readErr != nil || !errors.As(reported, &reportedError) ||
+				reportedError.QuotedSource != family.mipstackAddress || reportedError.QuotedTarget != family.gvisorAddress ||
+				reportedError.QuotedProtocol != mipstack.ProtocolUDP ||
+				reportedError.QuotedSourcePort != outgoing.Source.Port() || reportedError.QuotedTargetPort != enabledClosed.Port() ||
+				reportedError.Type != networkError.Type || reportedError.Code != networkError.Code {
+				t.Fatalf("enabled unconnected IP error = %+v, %v", reported, readErr)
+			}
+		})
+	}
+}
+
 // TestIPReadWithBufferInterop verifies lazy caller-owned buffers on connected
 // raw-IP reads and both source-address return forms against gVisor's native
 // raw endpoint.

@@ -259,8 +259,9 @@ const (
 type DatagramSocketDefaults struct {
 	// ReceiveBuffer is the approximate retained-memory receive capacity.
 	ReceiveBuffer int
-	// ReceiveErrors reserves asynchronous network errors for ReadError instead
-	// of returning them from ordinary reads after queued payloads. It also makes
+	// ReceiveErrors retains asynchronous network errors for ReadError. When
+	// disabled, unconnected sockets do not report those errors; connected sockets
+	// return them from ordinary reads after queued payloads. When enabled, it makes
 	// an immediate failure to admit unicast output, or the external-link copy of
 	// multicast or broadcast output, fail a UDP or IP write with ENOBUFS. It does
 	// not report packets displaced after admission. Receive-side non-unicast
@@ -834,14 +835,22 @@ func (s *datagramSocketErrorState) readMessage(message *SocketMessage, flags int
 	return ok, err
 }
 
+// purgeQueue releases queued asynchronous errors and their buffer charge.
+func (s *datagramSocketErrorState) purgeQueue() {
+	if s == nil {
+		return
+	}
+	s.queue.clear()
+	s.queuedBytes = 0
+}
+
 // releaseRetained clears payload-bearing error state while preserving the
 // cumulative counters reported after socket closure.
 func (s *datagramSocketErrorState) releaseRetained() {
 	if s == nil {
 		return
 	}
-	s.queue.clear()
-	s.queuedBytes = 0
+	s.purgeQueue()
 	s.lastError = nil
 }
 
