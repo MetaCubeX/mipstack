@@ -164,22 +164,20 @@ type UDPConnInfo struct {
 	// receive queue.
 	ReceiveQueueBytes int
 	// ReceiveQueueCapacity is the configured accounting-byte limit of the
-	// combined datagram and error queues, not an exact heap-allocation limit.
+	// combined datagram and extended-error queues, not an exact heap limit.
 	ReceiveQueueCapacity int
 	// ReceiveErrors reports whether asynchronous network errors are retained
 	// for ReadError. Otherwise, unconnected sockets do not report those errors;
-	// connected sockets return them from ordinary reads. It also reports whether
-	// immediate failure to admit unicast or external-link non-unicast output is
-	// reported as ENOBUFS.
+	// connected sockets report hard errors on ordinary reads or writes. It also
+	// reports whether immediate failure to admit unicast or external-link
+	// non-unicast output is reported as ENOBUFS.
 	ReceiveErrors bool
-	// ErrorQueueEntries is the number of asynchronous network errors awaiting
-	// ReadError or, on a connected socket with ReceiveErrors disabled, an
-	// ordinary read.
+	// ErrorQueueEntries is the number of extended errors awaiting ReadError.
 	ErrorQueueEntries int
 	// ErrorQueueBytes is the accounted metadata and quoted packet data retained
 	// by the asynchronous error queue.
 	ErrorQueueBytes int
-	// ErrorsDropped counts asynchronous network errors discarded because the
+	// ErrorsDropped counts extended-error entries discarded because the
 	// configured receive-buffer budget was exhausted.
 	ErrorsDropped uint64
 	// PacketsSent counts successful UDP socket write results. It includes writes
@@ -726,13 +724,13 @@ func (c *UDPConn) enqueue(payload []byte, source netip.AddrPort, target netip.Ad
 	c.mu.Unlock()
 }
 
-// notifyReceiveLocked keeps one edge notification armed while queued data
-// remains and removes a stale token when the queue becomes empty.
+// notifyReceiveLocked keeps one edge notification armed while data or an
+// ordinary socket error remains and removes a stale token otherwise.
 func (c *UDPConn) notifyReceiveLocked() {
 	if c.receiveNotify == nil {
 		return
 	}
-	if c.receive.len() != 0 || !c.receiveErrors && c.errorState.len() != 0 {
+	if c.receive.len() != 0 || c.errorState != nil && c.errorState.pending != nil {
 		select {
 		case c.receiveNotify <- struct{}{}:
 		default:
@@ -1031,6 +1029,11 @@ func (c *UDPConn) readDatagram(buffer []byte, getBuffer func(sizeHint int) []byt
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
 		default:
 		}
+		if pending := c.errorState.takePending(); pending != nil {
+			c.notifyReceiveLocked()
+			c.mu.Unlock()
+			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, pending
+		}
 		datagram, ok := c.receive.pop()
 		if ok {
 			c.queuedBytes -= udpDatagramSize(datagram.payload)
@@ -1052,14 +1055,6 @@ func (c *UDPConn) readDatagram(buffer []byte, getBuffer func(sizeHint int) []byt
 				c.mu.Unlock()
 			}
 			return n, datagram.source, datagram.target, datagram.options, n < len(datagram.payload), nil
-		}
-		if !c.receiveErrors {
-			queued, queuedOK := c.errorState.pop()
-			if queuedOK {
-				c.notifyReceiveLocked()
-				c.mu.Unlock()
-				return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, queued.err
-			}
 		}
 		notified := c.receiveNotificationLocked()
 		if timeout == nil {
@@ -1095,6 +1090,15 @@ func (c *UDPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, pee
 			return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, os.ErrDeadlineExceeded
 		default:
 		}
+		if consumeErrors {
+			if pending := c.errorState.takePending(); pending != nil {
+				// Linux MSG_PEEK preserves data, but a pending socket error
+				// returned by the ordinary receive path is consumed.
+				c.notifyReceiveLocked()
+				c.mu.Unlock()
+				return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, pending
+			}
+		}
 		var datagram udpDatagram
 		var ok bool
 		if peek {
@@ -1125,17 +1129,6 @@ func (c *UDPConn) readDatagramBuffers(buffers [][]byte, wait, consumeErrors, pee
 				c.mu.Unlock()
 			}
 			return n, datagram.source, datagram.target, datagram.options, truncated, nil
-		}
-		if !c.receiveErrors && consumeErrors {
-			var queued queuedSocketError
-			queued, ok = c.errorState.pop()
-			if ok {
-				// Linux MSG_PEEK preserves queued datagrams but consumes a pending
-				// socket error returned by the ordinary receive path.
-				c.notifyReceiveLocked()
-				c.mu.Unlock()
-				return 0, netip.AddrPort{}, netip.Addr{}, ipPacketOptions{}, false, queued.err
-			}
 		}
 		if !wait {
 			c.mu.Unlock()
@@ -1377,7 +1370,8 @@ func (c *UDPConn) WriteBatch(messages []SocketMessage, flags int) (int, error) {
 		n, oobn, err := c.writeBatchMessage(message)
 		if err != nil {
 			// sendmmsg reports a completed prefix without the error that stopped
-			// the next message. A retry starting at index exposes that error.
+			// the next message. Validation errors recur on a retry; an attempted
+			// send consumes a Linux-style pending socket error.
 			if index != 0 {
 				return index, nil
 			}
@@ -1501,9 +1495,12 @@ func (c *UDPConn) prepareWrite(target netip.AddrPort, packetInfoSource netip.Add
 	if err != nil {
 		return udpWriteParameters{}, err
 	}
-	options, pathMTUDiscovery, receiveErrors := c.writeOptions(options)
 	if err = c.writeError(); err != nil {
 		return udpWriteParameters{}, err
+	}
+	options, pathMTUDiscovery, receiveErrors, pendingErr := c.writeOptions(options)
+	if pendingErr != nil {
+		return udpWriteParameters{}, pendingErr
 	}
 	requestedSource := c.local
 	packetInfoSource = packetInfoSource.Unmap()
@@ -1882,11 +1879,7 @@ func (c *UDPConn) acceptsPathMTU() bool {
 }
 
 // deliverError queues a destination-associated asynchronous network error.
-func (c *UDPConn) deliverError(target netip.AddrPort, err error) {
-	operationError := &net.OpError{
-		Op: "read", Net: c.net.name(), Source: c.LocalAddr(),
-		Addr: net.UDPAddrFromAddrPort(target), Err: err,
-	}
+func (c *UDPConn) deliverError(target netip.AddrPort, networkError ICMPError) {
 	c.mu.Lock()
 	select {
 	case <-c.closed:
@@ -1894,32 +1887,42 @@ func (c *UDPConn) deliverError(target netip.AddrPort, err error) {
 		return
 	default:
 	}
-	// Linux does not report asynchronous ICMP to an unconnected UDP socket
-	// unless IP_RECVERR or IPV6_RECVERR is enabled. Correlated PMTU updates
-	// are independent of whether the socket retains an error.
-	if !c.remote.IsValid() && !c.receiveErrors {
+	// Linux udp_err/udp6_err keep a single ordinary pending error while
+	// IP_RECVERR/IPV6_RECVERR additionally retain the extended error queue.
+	// Correlated PMTU updates are independent of this reporting decision.
+	pending, queued := linuxDatagramICMPReport(networkError, c.remote.IsValid(), c.receiveErrors, false, c.pathMTUDiscovery)
+	if !pending {
 		c.mu.Unlock()
 		return
+	}
+	operationError := &net.OpError{
+		Op: "read", Net: c.net.name(), Source: c.LocalAddr(),
+		Addr: net.UDPAddrFromAddrPort(target), Err: networkError,
 	}
 	if c.errorState == nil {
 		c.errorState = &datagramSocketErrorState{}
 	}
 	errorState := c.errorState
 	errorState.lastError = operationError
-	size := socketErrorSize(err)
+	errorState.pending = operationError
+	errorState.icmpErrors++
+	if !queued {
+		c.notifyReceiveLocked()
+		c.mu.Unlock()
+		return
+	}
+	size := socketErrorSize(networkError)
 	if size > c.receiveCapacity || c.queuedBytes+errorState.queuedBytes > c.receiveCapacity-size {
-		errorState.icmpErrors++
 		errorState.dropped++
+		c.notifyReceiveLocked()
 		c.mu.Unlock()
 		return
 	}
 	var payload []byte
-	var networkError ICMPError
-	if errors.As(err, &networkError) && len(networkError.QuotedPayload) >= udpHeaderSize {
+	if len(networkError.QuotedPayload) >= udpHeaderSize {
 		payload = networkError.QuotedPayload[udpHeaderSize:]
 	}
 	errorState.push(queuedSocketError{err: operationError, payload: payload, size: size})
-	errorState.icmpErrors++
 	c.notifyReceiveLocked()
 	c.mu.Unlock()
 }
@@ -2130,16 +2133,17 @@ func (c *UDPConn) SetReadBuffer(bytes int) error {
 	return nil
 }
 
-// SetReceiveErrors controls whether asynchronous network errors are reserved
+// SetReceiveErrors controls whether asynchronous network errors are retained
 // for ReadError. It also makes a write fail with ENOBUFS when immediate
 // admission of unicast output or the external-link copy of multicast or
 // broadcast output fails. It does not report packets displaced after admission.
 // Receive-side non-unicast loopback copies remain best effort. By default,
-// unconnected sockets do not report asynchronous ICMP errors,
-// although correlated PMTU updates still apply. Connected sockets return
-// those errors after any already queued datagrams. Disabling a previously
-// enabled option clears errors retained for ReadError. Immediate output
-// admission failures remain silent.
+// unconnected sockets do not report asynchronous ICMP errors, although
+// correlated PMTU updates still apply. Connected sockets report hard errors
+// from ordinary reads or writes before queued datagrams. When enabled,
+// eligible soft errors also reach ordinary operations and ReadError.
+// Disabling the option clears the extended queue but preserves a pending
+// ordinary error. When disabled, immediate output admission failures are silent.
 func (c *UDPConn) SetReceiveErrors(enabled bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2158,9 +2162,9 @@ func (c *UDPConn) SetReceiveErrors(enabled bool) error {
 
 // ReceiveErrors reports whether asynchronous errors are retained for
 // ReadError. When disabled, unconnected sockets do not report those errors;
-// connected sockets return them from ordinary reads. It also reports whether
-// immediate failure to admit unicast or external-link non-unicast output is
-// reported as ENOBUFS.
+// connected sockets report hard errors on ordinary reads or writes. It also
+// reports whether immediate failure to admit unicast or external-link
+// non-unicast output is reported as ENOBUFS.
 func (c *UDPConn) ReceiveErrors() (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2174,8 +2178,8 @@ func (c *UDPConn) ReceiveErrors() (bool, error) {
 
 // ReadError returns the oldest queued asynchronous network error without
 // blocking. An empty queue reports EAGAIN, like a Linux MSG_ERRQUEUE read on a
-// nonblocking descriptor. SetReceiveErrors(true) prevents ordinary reads from
-// racing this method for queued errors.
+// nonblocking descriptor. Ordinary operations may consume the pending socket
+// error without removing this entry from the extended error queue.
 func (c *UDPConn) ReadError() (*net.OpError, error) {
 	c.mu.Lock()
 	select {
@@ -2300,15 +2304,22 @@ func (c *UDPConn) SetFlowLabel(label uint32) error {
 	}
 }
 
-// writeOptions snapshots the output defaults, PMTU policy, and local-error
-// reporting mode used by one nonblocking datagram admission attempt.
-func (c *UDPConn) writeOptions(options ipPacketOptions) (ipPacketOptions, PathMTUDiscovery, bool) {
+// writeOptions snapshots output policy and consumes a pending socket error
+// under the same lock before one nonblocking datagram admission attempt.
+func (c *UDPConn) writeOptions(options ipPacketOptions) (ipPacketOptions, PathMTUDiscovery, bool, error) {
 	c.mu.Lock()
 	options = options.withDefaults(c.defaultOptions)
 	pathMTUDiscovery := c.pathMTUDiscovery
 	receiveErrors := c.receiveErrors
+	pending := c.errorState.takePending()
+	if pending != nil {
+		c.notifyReceiveLocked()
+	}
 	c.mu.Unlock()
-	return options, pathMTUDiscovery, receiveErrors
+	if pending != nil {
+		return options, pathMTUDiscovery, receiveErrors, pending.Err
+	}
+	return options, pathMTUDiscovery, receiveErrors, nil
 }
 
 // operationError wraps a UDP socket failure in the same public shape used by

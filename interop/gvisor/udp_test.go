@@ -917,29 +917,24 @@ func TestUDPClosedPortInterop(t *testing.T) {
 			if err = mipstackConnection.SetDeadline(deadline); err != nil {
 				t.Fatalf("set mipstack UDP deadline: %v", err)
 			}
-			if _, err = mipstackConnection.Write([]byte{2}); err != nil {
-				t.Fatalf("write to closed gVisor UDP port: %v", err)
-			}
 			mipstackUDP := mipstackConnection.(*mipstack.UDPConn)
 			if err = mipstackUDP.SetReceiveErrors(true); err != nil {
 				t.Fatalf("reserve gVisor ICMP error for MSG_ERRQUEUE: %v", err)
 			}
+			if _, err = mipstackConnection.Write([]byte{2}); err != nil {
+				t.Fatalf("write to closed gVisor UDP port: %v", err)
+			}
+			if count, readErr := mipstackUDP.Read(buffer); count != 0 || readErr == nil {
+				t.Fatalf("read gVisor ICMP as an ordinary pending error: %d, %v", count, readErr)
+			} else {
+				var networkError mipstack.ICMPError
+				if !errors.As(readErr, &networkError) || networkError.QuotedTarget != family.gvisorAddress || networkError.QuotedTargetPort != 44994 {
+					t.Fatalf("ordinary gVisor ICMP error lost its quote: %v", readErr)
+				}
+			}
 			message := []mipstack.SocketMessage{{Buffers: [][]byte{buffer}, OOB: make([]byte, 128)}}
-			deadlineTimer := time.NewTimer(time.Until(deadline))
-			defer deadlineTimer.Stop()
-			for {
-				count, readErr := mipstackUDP.ReadBatch(message, mipstack.MessageFlagErrorQueue)
-				if readErr == nil && count == 1 {
-					break
-				}
-				if !errors.Is(readErr, syscall.EAGAIN) {
-					t.Fatalf("read gVisor ICMP through MSG_ERRQUEUE: %d, %v", count, readErr)
-				}
-				select {
-				case <-deadlineTimer.C:
-					t.Fatal("timed out waiting for gVisor ICMP error queue entry")
-				case <-time.After(time.Millisecond):
-				}
+			if count, readErr := mipstackUDP.ReadBatch(message, mipstack.MessageFlagErrorQueue); readErr != nil || count != 1 {
+				t.Fatalf("read gVisor ICMP through MSG_ERRQUEUE after ordinary read: %d, %v", count, readErr)
 			}
 			if message[0].N != 1 || buffer[0] != 2 || message[0].Flags != mipstack.MessageFlagErrorQueue || message[0].Addr.(*net.UDPAddr).AddrPort() != netipAddrPort(family.gvisorAddress, 44994) {
 				t.Fatalf("gVisor ICMP error-queue message = %+v payload=%x", message[0], buffer[:message[0].N])
@@ -1072,6 +1067,14 @@ func TestUDPUnconnectedClosedPortErrorInterop(t *testing.T) {
 			if err = connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 				t.Fatal(err)
 			}
+			if n, _, readErr := connection.ReadFrom(payload); n != 0 || readErr == nil {
+				t.Fatalf("UDP ordinary pending error = %d, %v", n, readErr)
+			} else {
+				var pending mipstack.ICMPError
+				if !errors.Is(readErr, syscall.ECONNREFUSED) || !errors.As(readErr, &pending) || pending.QuotedTarget != enabledClosed.Addr() || pending.QuotedTargetPort != enabledClosed.Port() {
+					t.Fatalf("UDP ordinary error lost its quote: %v", readErr)
+				}
+			}
 			if _, err = peer.WriteTo([]byte{4}, net.UDPAddrFromAddrPort(local)); err != nil {
 				t.Fatal(err)
 			}
@@ -1081,7 +1084,7 @@ func TestUDPUnconnectedClosedPortErrorInterop(t *testing.T) {
 			}
 			reported, readErr := connection.ReadError()
 			var reportedError mipstack.ICMPError
-			if readErr != nil || !errors.As(reported, &reportedError) ||
+			if readErr != nil || !errors.Is(reported, syscall.ECONNREFUSED) || !errors.As(reported, &reportedError) ||
 				reportedError.QuotedSource != local.Addr() || reportedError.QuotedTarget != enabledClosed.Addr() ||
 				reportedError.QuotedSourcePort != local.Port() || reportedError.QuotedTargetPort != enabledClosed.Port() ||
 				reportedError.Type != networkError.Type || reportedError.Code != networkError.Code {

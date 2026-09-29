@@ -752,35 +752,39 @@ ICMP PMTU updates for that socket, matching Linux. The zero value is `Dont` and
 preserves MIPS's fragmentable datagram default.
 
 Socket operation failures use `*net.OpError`. `errors.Is` identifies
-`os.ErrDeadlineExceeded`, `net.ErrClosed`, and syscall errors. Orderly TCP EOF
-is returned directly as `io.EOF`, and destination-specific writes on connected
-UDP or IP sockets retain `net.ErrWriteToConnected`. Validated asynchronous ICMP
-details are available through `errors.As` to `mipstack.ICMPError`.
+`os.ErrDeadlineExceeded`, `net.ErrClosed`, and syscall errors.
+Orderly TCP EOF is returned directly as `io.EOF`, and destination-specific
+writes on connected UDP or IP sockets retain `net.ErrWriteToConnected`.
+Validated asynchronous ICMP errors also match their mapped syscall errors;
+their details remain available through `errors.As` to `mipstack.ICMPError`.
 
 `TCPConn.SetLinger` provides background graceful close, abortive close, and a
 bounded wait for acknowledgement. `UDPConn.SetReadBuffer` changes the receive
 queue's approximate retained-memory capacity; payload, per-datagram metadata,
-and asynchronous errors share the bound. `IPConn` applies the same policy.
-`SetReceiveErrors(true)` reserves asynchronous ICMP errors for nonblocking
-`ReadError`; an empty error queue returns `EAGAIN`. By default, unconnected
-sockets do not report asynchronous ICMP errors (correlated PMTU updates still
-apply), while connected sockets return queued errors after already queued
-payloads. Disabling an enabled option clears errors retained for `ReadError`.
-`ReceiveErrors` reports the current mode. UDP and IP writes make one immediate
-bounded queue-admission attempt. Published backlog is subject to flow-aware
-replacement. Failure to admit unicast output or an external-link non-unicast
-copy reports `ENOBUFS` when enabled and is otherwise a successful message
-write. The option does not report packets displaced after admission.
+and queued asynchronous errors share the bound. `IPConn` applies the same policy.
+`SetReceiveErrors(true)` retains reportable asynchronous ICMP errors for
+nonblocking `ReadError`; an empty error queue returns `EAGAIN`. Ordinary reads,
+UDP writes, and header-included IP writes also report a pending error without
+removing its `ReadError` entry; protocol-payload IP writes do not report it.
+By default, unconnected sockets do not report asynchronous ICMP errors
+(correlated PMTU updates still apply), while connected sockets report hard
+errors before queued payloads. Disabling the option clears `ReadError` entries
+but preserves an ordinary pending error. `ReceiveErrors` reports the current mode.
+UDP and IP writes make one immediate bounded queue-admission attempt.
+Published backlog is subject to flow-aware replacement. Failure to admit
+unicast output or an external-link non-unicast copy reports `ENOBUFS` when
+enabled and is otherwise a successful message write. The option does not
+report packets displaced after admission.
 Receive-side multicast and broadcast loopback copies remain best effort. UDP
 and IP sockets retain no per-socket transmit queue, so `SetWriteBuffer` is a
 validated no-op and a write deadline is checked only before the attempt.
 
 UDP and IP `ReadBatch`/`WriteBatch` also accept Linux-compatible message flags.
-`MessageFlagPeek` preserves an ordinary queued payload, while pending socket
-errors and successful `MessageFlagErrorQueue` reads are consumed like Linux. A
-`MessageFlagErrorQueue` read never blocks and returns the quoted failed payload,
-the original destination in `Addr`, and a Linux `sock_extended_err` record in
-`OOB`.
+`MessageFlagPeek` preserves a queued payload but consumes a pending socket error.
+Like Linux, a successful `MessageFlagErrorQueue` read consumes its queue entry
+and may rearm the ordinary error from the next entry. An error-queue read never
+blocks and returns the quoted failed payload, original destination in `Addr`,
+and a Linux `sock_extended_err` record in `OOB`.
 `MessageFlagDontWait` makes the first batch read nonblocking. Writes are already
 nonblocking with respect to device capacity, so the flag is accepted without
 changing their admission result.

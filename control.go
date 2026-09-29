@@ -523,36 +523,100 @@ func socketErrorControlForRead(err error) ([]byte, error) {
 	}).MarshalBinary()
 }
 
-// linuxICMPErrno applies the errno mappings used by Linux ICMP error handlers.
-func linuxICMPErrno(networkError ICMPError) uint32 {
+// icmpErrorConversion keeps Linux's wire errno and hard-error classification
+// together.
+type icmpErrorConversion struct {
+	linuxErrno uint32
+	hard       bool
+}
+
+// linuxICMPErrorConversion follows Linux icmp_err_convert and
+// icmpv6_err_convert. RFC 1122 section 3.2.2.1 treats network unreachable,
+// host unreachable, and source-route failure as hints rather than proof of
+// failure. The hard-error classification itself comes from Linux's tables.
+func linuxICMPErrorConversion(networkError ICMPError) icmpErrorConversion {
 	if networkError.Reporter.Is4() {
 		switch networkError.Type {
 		case ICMPv4TypeDestinationUnreachable:
-			values := [...]uint32{101, 113, 92, 111, 90, 95, 101, 112, 64, 101, 113, 101, 113, 113, 113, 113}
+			values := [...]icmpErrorConversion{
+				{101, false}, {113, false}, {92, true}, {111, true},
+				{90, false}, {95, false}, {101, true}, {112, true},
+				{64, true}, {101, true}, {113, true}, {101, false},
+				{113, false}, {113, true}, {113, true}, {113, true},
+			}
 			if int(networkError.Code) < len(values) {
 				return values[networkError.Code]
 			}
+			return icmpErrorConversion{113, false}
 		case ICMPv4TypeTimeExceeded:
-			return 113
+			return icmpErrorConversion{113, false}
 		case ICMPv4TypeParameterProblem:
-			return 71
+			return icmpErrorConversion{71, true}
 		}
-		return 71
+		return icmpErrorConversion{71, false}
 	}
 	switch networkError.Type {
 	case ICMPv6TypeDestinationUnreachable:
-		values := [...]uint32{101, 13, 113, 113, 111, 13, 13}
+		values := [...]icmpErrorConversion{
+			{101, false}, {13, true}, {113, false}, {113, false},
+			{111, true}, {13, true}, {13, true},
+		}
 		if int(networkError.Code) < len(values) {
 			return values[networkError.Code]
 		}
+		return icmpErrorConversion{71, true}
 	case ICMPv6TypePacketTooBig:
-		return 90
+		return icmpErrorConversion{90, false}
 	case ICMPv6TypeTimeExceeded:
-		return 113
+		return icmpErrorConversion{113, false}
 	case ICMPv6TypeParameterProblem:
-		return 71
+		return icmpErrorConversion{71, true}
 	}
-	return 71
+	return icmpErrorConversion{71, false}
+}
+
+// linuxICMPErrno encodes Linux errno numbers in the portable MSG_ERRQUEUE
+// ancillary format, even when the stack itself runs on another OS.
+func linuxICMPErrno(networkError ICMPError) uint32 {
+	return linuxICMPErrorConversion(networkError).linuxErrno
+}
+
+// linuxDatagramICMPReport applies Linux UDP/raw IPv4 and IPv6 error policy.
+// The hard-error classification comes from Linux's ICMP conversion tables;
+// the PMTU mode exceptions mirror Linux udp_err, raw_err, udp6_err, and
+// rawv6_err rather than changing RFC PMTU processing.
+// Linux's default UDP socket policy narrows RFC 1122 section 4.1.3.3's ICMP
+// reporting rule: without RECVERR, only connected hard errors are exposed.
+// Extended-error mode also sets the ordinary pending error. PMTU processing
+// is independent of this reporting decision.
+func linuxDatagramICMPReport(networkError ICMPError, connected, receiveErrors, raw bool, mode PathMTUDiscovery) (pending, queued bool) {
+	if !connected && !receiveErrors {
+		return false, false
+	}
+	if networkError.Reporter.Is4() && networkError.Type == ICMPv4TypeDestinationUnreachable && networkError.Code == ICMPv4DestinationUnreachableCodeFragmentationNeeded {
+		// Linux udp_err discards IPv4 Frag Needed with PMTUDISC_DONT even
+		// when RECVERR is enabled; raw_err still queues it in that mode.
+		if !raw && mode == PathMTUDiscoveryDont {
+			return false, false
+		}
+		return receiveErrors || mode != PathMTUDiscoveryDont, receiveErrors
+	}
+	if networkError.Reporter.Is6() && networkError.Type == ICMPv6TypePacketTooBig {
+		if !raw && !mode.acceptsPathMTU() {
+			return false, false
+		}
+		// Linux rawv6_err treats only PMTUDISC_DO as a hard PTB;
+		// udp6_err treats all modes except DONT as hard.
+		hard := mode != PathMTUDiscoveryDont
+		if raw {
+			hard = mode == PathMTUDiscoveryDo
+		}
+		return receiveErrors || hard, receiveErrors
+	}
+	if receiveErrors {
+		return true, true
+	}
+	return linuxICMPErrorConversion(networkError).hard, false
 }
 
 // parseControlMessageForWrite decodes send metadata through the public control

@@ -1634,8 +1634,16 @@ func TestIPExplicitErrorQueue(t *testing.T) {
 	if err = connection.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
+	if _, readErr := connection.Read(make([]byte, 1)); readErr == nil {
+		t.Fatal("ordinary read did not report the pending extended error")
+	} else {
+		var networkError ICMPError
+		if !errors.As(readErr, &networkError) || networkError.Code != 2 {
+			t.Fatalf("ordinary read with explicit errors = %v, want newest ICMP error", readErr)
+		}
+	}
 	if _, readErr := connection.Read(make([]byte, 1)); !errors.Is(readErr, os.ErrDeadlineExceeded) {
-		t.Fatalf("ordinary read with explicit errors = %v, want deadline", readErr)
+		t.Fatalf("ordinary read after pending error = %v, want deadline", readErr)
 	}
 	if err = connection.SetReadDeadline(time.Time{}); err != nil {
 		t.Fatal(err)
@@ -1653,6 +1661,12 @@ func TestIPExplicitErrorQueue(t *testing.T) {
 		if !errors.As(queued, &networkError) || networkError.Code != byte(index+1) {
 			t.Fatalf("ReadError %d payload = %#v", index, queued)
 		}
+		if index == 0 {
+			count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait)
+			if count != 0 || !errors.As(readErr, &networkError) || networkError.Code != 2 {
+				t.Fatalf("ordinary error after first ReadError = %d, %v", count, readErr)
+			}
+		}
 	}
 	if queued, readErr := connection.ReadError(); queued != nil || !errors.Is(readErr, syscall.EAGAIN) {
 		t.Fatalf("empty ReadError = %#v, %v", queued, readErr)
@@ -1666,6 +1680,14 @@ func TestIPExplicitErrorQueue(t *testing.T) {
 	if info := connection.Info(); info.ErrorQueueEntries != 1 || info.ErrorsDropped != 1 || info.ICMPErrors != 4 {
 		t.Fatalf("bounded IP error queue diagnostics = %+v", info)
 	}
+	if count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait); count != 0 || readErr == nil {
+		t.Fatalf("ordinary error after extended queue overflow = %d, %v", count, readErr)
+	} else {
+		var networkError ICMPError
+		if !errors.As(readErr, &networkError) || networkError.Code != 4 {
+			t.Fatalf("latest pending error after overflow = %v", readErr)
+		}
+	}
 	if _, err = connection.ReadError(); err != nil {
 		t.Fatal(err)
 	}
@@ -1677,26 +1699,34 @@ func TestIPExplicitErrorQueue(t *testing.T) {
 		t.Fatalf("disabled IP error queue = %+v", info)
 	}
 	connection.deliverError(first, ICMPError{Code: 6})
+	if count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait); count != 0 || readErr == nil {
+		t.Fatalf("unconnected IP read after disabling error queue = %d, %v", count, readErr)
+	} else {
+		var networkError ICMPError
+		if !errors.As(readErr, &networkError) || networkError.Code != 5 {
+			t.Fatalf("pending error changed when error reception was disabled: %v", readErr)
+		}
+	}
 	if count, readErr := connection.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagDontWait); count != 0 || !errors.Is(readErr, syscall.EAGAIN) {
-		t.Fatalf("unconnected IP read after ignored ICMP = %d, %v", count, readErr)
+		t.Fatalf("unconnected IP read after pending error = %d, %v", count, readErr)
 	}
 	connected := newIPConn(stack, "ip4:99", 99, local, first, socketOptionSet{})
 	defer connected.closeFromStack()
 	if err = connected.SetReceiveErrors(true); err != nil {
 		t.Fatal(err)
 	}
-	connected.deliverError(first, ICMPError{Code: 7})
+	connected.deliverError(first, ICMPError{Reporter: first, Type: ICMPv4TypeDestinationUnreachable, Code: ICMPv4DestinationUnreachableCodePort})
 	if err = connected.SetReceiveErrors(false); err != nil {
 		t.Fatal(err)
 	}
 	if info := connected.Info(); info.ErrorQueueEntries != 0 {
 		t.Fatalf("disabled connected IP error queue = %+v", info)
 	}
-	connected.deliverError(first, ICMPError{Code: 8})
+	connected.deliverError(first, ICMPError{Reporter: first, Type: ICMPv4TypeDestinationUnreachable, Code: ICMPv4DestinationUnreachableCodeProtocol})
 	if err = connected.SetReceiveErrors(false); err != nil {
 		t.Fatal(err)
 	}
-	if info := connected.Info(); info.ErrorQueueEntries != 1 {
+	if info := connected.Info(); info.ErrorQueueEntries != 0 || info.ICMPErrors != 2 {
 		t.Fatalf("repeatedly disabling connected IP error reception discarded a pending error: %+v", info)
 	}
 	if err = connected.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -1704,7 +1734,7 @@ func TestIPExplicitErrorQueue(t *testing.T) {
 	}
 	count, readErr := connected.Read(make([]byte, 1))
 	var networkError ICMPError
-	if count != 0 || !errors.As(readErr, &networkError) || networkError.Code != 8 {
+	if count != 0 || !errors.As(readErr, &networkError) || networkError.Code != ICMPv4DestinationUnreachableCodeProtocol {
 		t.Fatalf("connected IP read after disabling error queue = %d, %v", count, readErr)
 	}
 	connection.closeFromStack()
@@ -2809,18 +2839,22 @@ func TestIPConnCloseReleasesRetainedState(t *testing.T) {
 	if err = connection.SetReceiveErrors(true); err != nil {
 		t.Fatal(err)
 	}
-	connection.deliverError(remote, ICMPError{QuotedPayload: make([]byte, 1200)})
+	connection.deliverError(remote, ICMPError{Reporter: remote, Type: ICMPv4TypeDestinationUnreachable, Code: ICMPv4DestinationUnreachableCodeProtocol, QuotedPayload: make([]byte, 1200)})
 	connection.mu.Lock()
+	if connection.errorState == nil || connection.errorState.pending == nil || connection.errorState.queue.len() == 0 {
+		connection.mu.Unlock()
+		t.Fatal("IP socket did not retain an error before close")
+	}
 	connection.receiveSpare = make([]byte, 0, 1200)
 	connection.mu.Unlock()
 	connection.closeFromStack()
 	connection.rememberTarget(remote)
-	connection.deliverError(remote, ICMPError{QuotedPayload: make([]byte, 1200)})
+	connection.deliverError(remote, ICMPError{Reporter: remote, Type: ICMPv4TypeDestinationUnreachable, Code: ICMPv4DestinationUnreachableCodeProtocol, QuotedPayload: make([]byte, 1200)})
 	connection.enqueuePacket(ipPacket{payload: make([]byte, 1200), source: remote, target: local}, ipPacketOptions{})
 	connection.mu.Lock()
 	released := connection.receive.values == nil && connection.receiveSpare == nil && connection.queuedBytes == 0 &&
 		connection.errorState != nil && connection.errorState.queue.values == nil && connection.errorState.queuedBytes == 0 &&
-		connection.recentTargets.state == nil && connection.errorState.lastError == nil &&
+		connection.recentTargets.state == nil && connection.errorState.lastError == nil && connection.errorState.pending == nil &&
 		connection.readDeadline.state.Load() == stoppedDatagramSocketDeadline && connection.writeDeadline.state.Load() == stoppedDatagramSocketDeadline
 	connection.mu.Unlock()
 	if !released || connection.errorState.icmpErrors != 1 {

@@ -165,6 +165,14 @@ func TestIPUnconnectedClosedPortErrorInterop(t *testing.T) {
 			if err = connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 				t.Fatal(err)
 			}
+			if n, _, readErr := connection.ReadFrom(buffer); n != 0 || readErr == nil {
+				t.Fatalf("raw IP ordinary pending error = %d, %v", n, readErr)
+			} else {
+				var pending mipstack.ICMPError
+				if !errors.Is(readErr, syscall.ECONNREFUSED) || !errors.As(readErr, &pending) || pending.QuotedTarget != family.gvisorAddress || pending.QuotedTargetPort != enabledClosed.Port() {
+					t.Fatalf("raw IP ordinary error lost its quote: %v", readErr)
+				}
+			}
 			if _, err = peer.WriteTo([]byte{4}, net.UDPAddrFromAddrPort(netipAddrPort(family.mipstackAddress, 44998))); err != nil {
 				t.Fatal(err)
 			}
@@ -182,12 +190,66 @@ func TestIPUnconnectedClosedPortErrorInterop(t *testing.T) {
 			}
 			reported, readErr := connection.ReadError()
 			var reportedError mipstack.ICMPError
-			if readErr != nil || !errors.As(reported, &reportedError) ||
+			if readErr != nil || !errors.Is(reported, syscall.ECONNREFUSED) || !errors.As(reported, &reportedError) ||
 				reportedError.QuotedSource != family.mipstackAddress || reportedError.QuotedTarget != family.gvisorAddress ||
 				reportedError.QuotedProtocol != mipstack.ProtocolUDP ||
 				reportedError.QuotedSourcePort != outgoing.Source.Port() || reportedError.QuotedTargetPort != enabledClosed.Port() ||
 				reportedError.Type != networkError.Type || reportedError.Code != networkError.Code {
 				t.Fatalf("enabled unconnected IP error = %+v, %v", reported, readErr)
+			}
+		})
+	}
+}
+
+// TestIPConnectedClosedPortErrorInterop verifies that a gVisor Port
+// Unreachable reaches both ordinary operations and MSG_ERRQUEUE on a connected
+// raw-IP socket without losing its quoted UDP tuple.
+func TestIPConnectedClosedPortErrorInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		family := family
+		t.Run(family.name, func(t *testing.T) {
+			network := newFamilyInteropNetwork(t, family, 1500)
+			rawNetwork := "ip4:udp"
+			if family.mipstackAddress.Is6() {
+				rawNetwork = "ip6:udp"
+			}
+			connection, err := network.mipstack.DialIP(context.Background(), rawNetwork, family.mipstackAddress, family.gvisorAddress)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			if err = connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			ipConnection := connection.(*mipstack.IPConn)
+			if err = ipConnection.SetReceiveErrors(true); err != nil {
+				t.Fatal(err)
+			}
+			closed := netipAddrPort(family.gvisorAddress, 44996)
+			outgoing := mipstack.UDPDatagram{
+				Source: netipAddrPort(family.mipstackAddress, 44995), Destination: closed, Payload: []byte{7},
+			}
+			wire, err := outgoing.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, writeErr := connection.Write(wire); n != len(wire) || writeErr != nil {
+				t.Fatalf("connected raw UDP write = %d, %v", n, writeErr)
+			}
+			if n, readErr := connection.Read(make([]byte, 64)); n != 0 || readErr == nil {
+				t.Fatalf("connected raw IP ordinary error = %d, %v", n, readErr)
+			} else {
+				var networkError mipstack.ICMPError
+				if !errors.As(readErr, &networkError) || networkError.QuotedSourcePort != outgoing.Source.Port() || networkError.QuotedTargetPort != closed.Port() {
+					t.Fatalf("connected raw IP ordinary error lost its quote: %v", readErr)
+				}
+			}
+			queued, readErr := ipConnection.ReadError()
+			var networkError mipstack.ICMPError
+			if readErr != nil || !errors.As(queued, &networkError) ||
+				networkError.QuotedSource != family.mipstackAddress || networkError.QuotedTarget != family.gvisorAddress ||
+				networkError.QuotedSourcePort != outgoing.Source.Port() || networkError.QuotedTargetPort != closed.Port() {
+				t.Fatalf("connected raw IP extended error = %v, %v", queued, readErr)
 			}
 		})
 	}

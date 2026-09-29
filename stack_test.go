@@ -190,8 +190,8 @@ func TestSocketMessagePeekTruncationAndErrorQueue(t *testing.T) {
 	}
 	connected := connectedNet.(*UDPConn)
 	defer connected.Close()
-	connected.deliverError(remote, ICMPError{Code: 3})
-	if info := connected.Info(); info.ErrorQueueEntries != 1 {
+	connected.deliverError(remote, ICMPError{Reporter: reporter, Type: ICMPv4TypeDestinationUnreachable, Code: ICMPv4DestinationUnreachableCodePort})
+	if info := connected.Info(); info.ErrorQueueEntries != 0 || info.ICMPErrors != 1 {
 		t.Fatalf("connected UDP pending error = %+v", info)
 	}
 	count, readErr := connected.ReadBatch([]SocketMessage{{Buffers: [][]byte{make([]byte, 1)}}}, MessageFlagPeek|MessageFlagDontWait)
@@ -935,8 +935,8 @@ func TestDatagramQueueRetainsOnlySmallBacking(t *testing.T) {
 	}
 }
 
-// TestDatagramSocketLayouts locks the cold-state split to the intended 64-bit
-// allocation classes. These objects dominate idle UDP and raw IP socket cost.
+// TestDatagramSocketLayouts records the direct 64-bit layouts of idle sockets
+// and their optional state. Heap allocation classes may be larger.
 func TestDatagramSocketLayouts(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
 		t.Skip("64-bit layout assertion")
@@ -949,7 +949,7 @@ func TestDatagramSocketLayouts(t *testing.T) {
 		{name: "UDPConn", got: unsafe.Sizeof(UDPConn{}), want: 288},
 		{name: "IPConn", got: unsafe.Sizeof(IPConn{}), want: 288},
 		{name: "datagram write control", got: unsafe.Sizeof(datagramSocketWriteControl{}), want: 16},
-		{name: "datagram socket error state", got: unsafe.Sizeof(datagramSocketErrorState{}), want: 64},
+		{name: "datagram socket error state", got: unsafe.Sizeof(datagramSocketErrorState{}), want: 72},
 		{name: "datagram deadline state", got: unsafe.Sizeof(datagramSocketDeadlineState{}), want: 16},
 		{name: "IP socket ICMP filter", got: unsafe.Sizeof(ipConnICMPFilter{}), want: 32},
 		{name: "recent destination cache", got: unsafe.Sizeof(recentDestinationCache[netip.AddrPort]{}), want: 8},

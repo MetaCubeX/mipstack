@@ -259,12 +259,15 @@ const (
 type DatagramSocketDefaults struct {
 	// ReceiveBuffer is the approximate retained-memory receive capacity.
 	ReceiveBuffer int
-	// ReceiveErrors retains asynchronous network errors for ReadError. When
-	// disabled, unconnected sockets do not report those errors; connected sockets
-	// return them from ordinary reads after queued payloads. When enabled, it makes
-	// an immediate failure to admit unicast output, or the external-link copy of
-	// multicast or broadcast output, fail a UDP or IP write with ENOBUFS. It does
-	// not report packets displaced after admission. Receive-side non-unicast
+	// ReceiveErrors retains reportable asynchronous network errors for ReadError.
+	// When disabled, unconnected sockets do not report them; connected sockets
+	// report hard errors before queued payloads on ordinary reads. UDP and
+	// header-included IP writes may also return a pending error. IP writes of
+	// protocol payloads leave it for reads. When enabled, eligible soft errors
+	// follow the same rules, and ordinary operations do not remove their
+	// ReadError entries. It also makes failed immediate admission of unicast or
+	// external-link multicast/broadcast output return ENOBUFS.
+	// Later packet displacement is not reported. Receive-side non-unicast
 	// loopback copies remain best effort.
 	ReceiveErrors bool
 	// PathMTUDiscovery selects the Linux-compatible source-fragmentation and
@@ -783,8 +786,11 @@ type datagramSocketErrorState struct {
 	queue       datagramQueue[queuedSocketError]
 	queuedBytes int
 	lastError   *net.OpError
-	icmpErrors  uint64
-	dropped     uint64
+	// pending models Linux sk_err. It is deliberately separate from queue,
+	// which models sk_error_queue and is exposed by ReadError.
+	pending    *net.OpError
+	icmpErrors uint64
+	dropped    uint64
 }
 
 // len returns the number of queued asynchronous errors. A nil receiver is an
@@ -810,7 +816,8 @@ func (s *datagramSocketErrorState) push(queued queuedSocketError) {
 	s.queuedBytes += queued.size
 }
 
-// pop removes the oldest asynchronous error and its receive-buffer charge.
+// pop removes the oldest extended error, releases its receive-buffer charge,
+// and rearms the ordinary pending error from the next queue entry.
 func (s *datagramSocketErrorState) pop() (queuedSocketError, bool) {
 	if s == nil {
 		return queuedSocketError{}, false
@@ -818,8 +825,32 @@ func (s *datagramSocketErrorState) pop() (queuedSocketError, bool) {
 	queued, ok := s.queue.pop()
 	if ok {
 		s.queuedBytes -= queued.size
+		s.rearmPending()
 	}
 	return queued, ok
+}
+
+// takePending consumes the ordinary socket error without changing the
+// extended-error queue. The owning socket mutex protects this transition.
+func (s *datagramSocketErrorState) takePending() *net.OpError {
+	if s == nil {
+		return nil
+	}
+	pending := s.pending
+	if pending != nil {
+		s.pending = nil
+	}
+	return pending
+}
+
+// rearmPending follows Linux sock_dequeue_err_skb: after MSG_ERRQUEUE removes
+// one entry, the next queue head becomes the ordinary socket error.
+func (s *datagramSocketErrorState) rearmPending() {
+	if next, ok := s.queue.peek(); ok {
+		s.pending = next.err
+	} else {
+		s.pending = nil
+	}
 }
 
 // readMessage consumes one error into its public scatter/gather form after
@@ -831,6 +862,7 @@ func (s *datagramSocketErrorState) readMessage(message *SocketMessage, flags int
 	size, ok, err := readSocketErrorMessage(&s.queue, message, flags)
 	if ok && err == nil {
 		s.queuedBytes -= size
+		s.rearmPending()
 	}
 	return ok, err
 }
@@ -852,6 +884,7 @@ func (s *datagramSocketErrorState) releaseRetained() {
 	}
 	s.purgeQueue()
 	s.lastError = nil
+	s.pending = nil
 }
 
 // socketErrorSize returns the receive-buffer charge for an asynchronous

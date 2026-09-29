@@ -617,11 +617,14 @@ func (option synBacklogSocketOption) apply(set socketOptionSet, use socketOption
 	return set, nil
 }
 
-// ReceiveErrors controls whether newly created UDP and IP sockets reserve
-// asynchronous errors for ReadError instead of returning them from ordinary
-// reads after queued payloads. It also makes immediate failure to admit unicast
-// output, or the external-link copy of multicast or broadcast output, fail
-// writes with ENOBUFS. It does not report packets displaced after admission.
+// ReceiveErrors controls whether newly created UDP and IP sockets retain
+// reportable asynchronous errors for ReadError. Ordinary reads and UDP writes
+// still consume pending socket errors; IP writes do so only for header-included
+// packets. Connected sockets report hard errors before queued payloads, and
+// enabled sockets also report eligible soft errors.
+// It also makes writes return ENOBUFS when immediate admission of unicast
+// output or the external-link copy of multicast or broadcast output fails.
+// It does not report packets displaced after admission.
 // Receive-side non-unicast loopback copies remain best effort. It is valid for
 // the UDP and IP creation methods on ListenConfig and Dialer, and for
 // UDPForwarderRequest.Accept and UDPForwarderRequest.Listen.
