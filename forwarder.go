@@ -1836,7 +1836,9 @@ func copyForwarderRejectPacket(packet ipPacket) ipPacket {
 // slices all refer to the same backing storage.
 func copyForwarderPacket(packet ipPacket) ipPacket {
 	original := append([]byte(nil), packet.original...)
-	copied, ok := parseIPPacket(original)
+	// The source packet has already passed ingress validation, and forwarder
+	// views are read-only. Copying it does not require verifying its header again.
+	copied, ok := parseIPPacket(original, true)
 	if !ok || copied.parameterError {
 		return ipPacket{}
 	}
@@ -2061,7 +2063,7 @@ func (f *forwarderRuntime) replyIPPayload(packet ipPacket, payload []byte) error
 		flowLabel: defaults.FlowLabel, flowLabelSet: defaults.FlowLabel != 0,
 	}
 	mtu, fragmentation := f.stack.pathMTUOutputPolicy(packet.source, defaults.PathMTUDiscovery)
-	return f.stack.writeBestEffortIPPayloadForMTU(packet.target, packet.source, packet.protocol, payload, fragmentation, options, mtu)
+	return f.stack.writeBestEffortIPPayloadForMTU(packet.target, packet.source, packet.protocol, payload, fragmentation, options, mtu, false)
 }
 
 // Message returns the detached IP metadata and independently owned payload.

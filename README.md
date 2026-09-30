@@ -106,6 +106,14 @@ packets may displace queued backlog or be discarded, and `Stack.Write` itself
 does not wait for outbound capacity. A successful socket write accepts the
 message but does not guarantee that every resulting packet reaches `Stack.Read`.
 
+`SetRXChecksumOffload` delegates selected IPv4 header, TCP, UDP, ICMP, or IGMP
+checksum verification to a trusted input link; `RXChecksumOffload` returns
+the current policy. The zero value retains software checksum verification.
+Configure offload before delivering input and only when the link supplies
+valid complete packets or an equivalent checksum guarantee. Framing checks,
+IPv6 UDP's nonzero checksum requirement, reassembled transport checksums,
+and public codec validation remain enabled.
+
 For integration with userspace packet-device consumers, `Stack` also provides
 `MTU`, `Name`, and `BatchSize`. `LocalAddresses` returns an independent
 snapshot of every configured address in configuration order. Operating-system
@@ -1115,7 +1123,7 @@ Unreachable while its receive queue accepts or drops matching traffic.
 `ICMPv4Filter` follows Linux's 32-bit `ICMP_FILTER` receive mask, while
 `ICMPv6Filter` covers all 256 types defined by RFC 3542. Both may be installed
 at creation or atomically replaced on an `IPConn`; packets already queued are
-not reconsidered. ICMPv6 checksums are always verified and are inserted for
+not reconsidered. ICMPv6 checksums are verified by default and are inserted for
 ordinary payload writes. Other raw IPv6 protocols may enable RFC 3542 checksum
 insertion and verification at an even payload offset through `IPv6Checksum`.
 Checksum processing occurs before source fragmentation and after reassembly,

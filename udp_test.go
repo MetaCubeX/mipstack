@@ -550,7 +550,7 @@ func TestUDPBatchWrite(t *testing.T) {
 		source  netip.Addr
 		port    uint16
 	}{{"abcd", firstLocal, 5350}, {"efgh", secondLocal, 5351}} {
-		packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+		packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 		if !ok || packet.source != want.source || string(packet.payload[udpHeaderSize:]) != want.payload || binary.BigEndian.Uint16(packet.payload[2:4]) != want.port {
 			t.Fatalf("batch packet %d = %+v payload %q", index, packet, packet.payload)
 		}
@@ -562,7 +562,7 @@ func TestUDPBatchWrite(t *testing.T) {
 	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("spec-dst"), mixedControl, netip.AddrPortFrom(remote, 5352)); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != secondLocal || string(packet.payload[udpHeaderSize:]) != "spec-dst" {
 		t.Fatalf("mixed IPv4 packet-info source = %s payload %q, want %s/spec-dst", packet.source, packet.payload[udpHeaderSize:], secondLocal)
 	}
@@ -570,7 +570,7 @@ func TestUDPBatchWrite(t *testing.T) {
 	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("addr-only"), addrOnlyControl, netip.AddrPortFrom(remote, 5353)); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != firstLocal || string(packet.payload[udpHeaderSize:]) != "addr-only" {
 		t.Fatalf("addr-only IPv4 packet-info source = %s payload %q, want %s/addr-only", packet.source, packet.payload[udpHeaderSize:], firstLocal)
 	}
@@ -735,7 +735,7 @@ func TestUDPBatchWriteFragmentedBuffers(t *testing.T) {
 	for fragmentCount := 0; reassembled == nil && fragmentCount < 16; fragmentCount++ {
 		reassembled = receiver.reassemblePacket(readOutboundPacket(t, stack), time.Now())
 	}
-	packet, ok := parseIPPacket(reassembled)
+	packet, ok := parseIPPacket(reassembled, false)
 	if !ok || packet.protocol != ProtocolUDP || len(packet.payload) != udpHeaderSize+len(payload) ||
 		!bytes.Equal(packet.payload[udpHeaderSize:], payload) || transportChecksum(local, remote, ProtocolUDP, packet.payload) != 0 {
 		t.Fatalf("reassembled UDP batch packet = %+v, parsed = %v", packet, ok)
@@ -1667,13 +1667,13 @@ func TestUDPTypedMethods(t *testing.T) {
 	if _, err = connection.WriteToUDP([]byte("typed"), net.UDPAddrFromAddrPort(netip.AddrPortFrom(remote, 50011))); err != nil {
 		t.Fatal(err)
 	}
-	if packet, ok := parseIPPacket(readOutboundPacket(t, stack)); !ok || packet.source != local || string(packet.payload[udpHeaderSize:]) != "typed" {
+	if packet, ok := parseIPPacket(readOutboundPacket(t, stack), false); !ok || packet.source != local || string(packet.payload[udpHeaderSize:]) != "typed" {
 		t.Fatalf("WriteToUDP packet = source %v payload %q, parsed = %v", packet.source, packet.payload, ok)
 	}
 	if _, err = connection.WriteToUDPAddrPort([]byte("typed-port"), netip.AddrPortFrom(remote, 50012)); err != nil {
 		t.Fatal(err)
 	}
-	if packet, ok := parseIPPacket(readOutboundPacket(t, stack)); !ok || packet.source != local || string(packet.payload[udpHeaderSize:]) != "typed-port" {
+	if packet, ok := parseIPPacket(readOutboundPacket(t, stack), false); !ok || packet.source != local || string(packet.payload[udpHeaderSize:]) != "typed-port" {
 		t.Fatalf("WriteToUDPAddrPort packet = source %v payload %q, parsed = %v", packet.source, packet.payload, ok)
 	}
 	if _, err = connection.WriteToUDPAddrPort([]byte("invalid"), netip.AddrPort{}); err == nil {
@@ -1738,7 +1738,7 @@ func TestUDPMessagePacketInfoRoundTrip(t *testing.T) {
 			if err != nil || n != 5 || oobWritten != oobn {
 				t.Fatalf("WriteMsgUDPAddrPort = %d/%d, %v", n, oobWritten, err)
 			}
-			packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+			packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 			if !ok || packet.source != test.second || packet.target != test.remote || string(packet.payload[udpHeaderSize:]) != "reply" {
 				t.Fatalf("message packet = %v -> %v payload %q, parsed = %v", packet.source, packet.target, packet.payload, ok)
 			}
@@ -1824,7 +1824,7 @@ func TestUDPIPv6FlowLabelPolicy(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+		packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 		if !ok {
 			t.Fatal("failed to parse IPv6 UDP output")
 		}
@@ -1882,7 +1882,7 @@ func TestUDPMessageIPv6ZeroHopLimit(t *testing.T) {
 	if _, err = connection.WriteToUDPAddrPort([]byte("default-zero"), netip.AddrPortFrom(remote, 50018)); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.hopLimit != 0 || packet.target != remote {
 		t.Fatalf("IPv6 default zero hop-limit packet = target %v hop %d, parsed = %v", packet.target, packet.hopLimit, ok)
 	}
@@ -1890,7 +1890,7 @@ func TestUDPMessageIPv6ZeroHopLimit(t *testing.T) {
 	if _, _, err = connection.WriteMsgUDPAddrPort([]byte("zero"), control, netip.AddrPortFrom(remote, 50018)); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.hopLimit != 0 || packet.target != remote {
 		t.Fatalf("IPv6 zero hop-limit packet = target %v hop %d, parsed = %v", packet.target, packet.hopLimit, ok)
 	}
@@ -1948,7 +1948,7 @@ func TestUDPConnectedMessageMethods(t *testing.T) {
 	if err != nil || n != 9 || oobn != 0 {
 		t.Fatalf("connected WriteMsgUDP = %d/%d, %v", n, oobn, err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != local || packet.target != remote || string(packet.payload[udpHeaderSize:]) != "connected" {
 		t.Fatalf("connected message packet = %v -> %v payload %q, parsed = %v", packet.source, packet.target, packet.payload, ok)
 	}
@@ -1967,7 +1967,7 @@ func TestUDPConnectedMessageMethods(t *testing.T) {
 	if n, oobn, writeErr := connection.WriteMsgUDPAddrPort([]byte("netip"), nil, netip.AddrPort{}); writeErr != nil || n != 5 || oobn != 0 {
 		t.Fatalf("connected WriteMsgUDPAddrPort = %d/%d, %v", n, oobn, writeErr)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != local || packet.target != remote || string(packet.payload[udpHeaderSize:]) != "netip" {
 		t.Fatalf("connected netip message packet = %v -> %v payload %q, parsed = %v", packet.source, packet.target, packet.payload, ok)
 	}
@@ -2047,7 +2047,7 @@ func TestUDPUnconnectedMessageRequiresDestination(t *testing.T) {
 	if n, writeErr := connection.WriteTo([]byte("generic"), address); writeErr != nil || n != 7 {
 		t.Fatalf("WriteTo generic UDP address = %d, %v", n, writeErr)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != local || packet.target != remote || string(packet.payload[udpHeaderSize:]) != "generic" {
 		t.Fatalf("generic UDP packet = %v -> %v payload %q, parsed = %v", packet.source, packet.target, packet.payload, ok)
 	}
@@ -2148,14 +2148,14 @@ func TestUDPIPv4MappedNetAddrWrites(t *testing.T) {
 	if _, err = packetConnection.WriteTo([]byte("packet"), target); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.target != remote || string(packet.payload[udpHeaderSize:]) != "packet" {
 		t.Fatalf("mapped PacketConn write = %v -> %v payload %q, parsed = %v", packet.source, packet.target, packet.payload, ok)
 	}
 	if _, _, err = packetConnection.(*UDPConn).WriteMsgUDP([]byte("message"), nil, target); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.target != remote || string(packet.payload[udpHeaderSize:]) != "message" {
 		t.Fatalf("mapped WriteMsgUDP = %v -> %v payload %q, parsed = %v", packet.source, packet.target, packet.payload, ok)
 	}
@@ -2198,7 +2198,7 @@ func TestUDPDefaultsAndDiagnostics(t *testing.T) {
 	if _, err = udp.Write([]byte("query")); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.hopLimit != 37 || packet.trafficClass != 0x2e {
 		t.Fatalf("UDP output options = hop %d class %#x", packet.hopLimit, packet.trafficClass)
 	}
@@ -2206,7 +2206,7 @@ func TestUDPDefaultsAndDiagnostics(t *testing.T) {
 	if _, _, err = udp.WriteMsgUDP([]byte("zero"), zeroClass, nil); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.hopLimit != 37 || packet.trafficClass != 0 {
 		t.Fatalf("UDP explicit zero traffic class = hop %d class %#x", packet.hopLimit, packet.trafficClass)
 	}

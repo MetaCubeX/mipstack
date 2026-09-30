@@ -37,6 +37,260 @@ var _ interface {
 	DialIP(ctx context.Context, stack *Stack, network string, source, remote netip.Addr) (net.Conn, error)
 } = (*Dialer)(nil)
 
+// TestRXChecksumOffloadIngress checks each category at the public packet
+// boundary. Corruption changes only a checksum field, leaving framing intact.
+func TestRXChecksumOffloadIngress(t *testing.T) {
+	local4, remote4 := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
+	local6, remote6 := netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2")
+	echo4 := mustTestWire((ICMPMessage{Source: remote4, Destination: local4, Type: ICMPv4TypeEchoRequest,
+		Body: []byte{0, 1, 0, 1, 'x'}}).MarshalBinary())
+	echo6 := mustTestWire((ICMPMessage{Source: remote6, Destination: local6, Type: ICMPv6TypeEchoRequest,
+		Body: []byte{0, 1, 0, 1, 'x'}}).MarshalBinary())
+	for _, test := range []struct {
+		name    string
+		local   netip.Addr
+		packet  []byte
+		offset  int
+		set     func(*RXChecksumOffload, bool) *RXChecksumOffload
+		control bool
+	}{
+		{"IPv4Header", local4, buildTestUDP(remote4, local4, 49000, 49001, []byte("udp")), 10, (*RXChecksumOffload).SetIPv4Header, false},
+		{"TCPv4", local4, buildTestTCP(remote4, local4, 49000, 49001, 100, 0, TCPFlagSYN, 65535, nil, nil), 36, (*RXChecksumOffload).SetTCP, false},
+		{"TCPv6", local6, buildTestTCP(remote6, local6, 49000, 49001, 100, 0, TCPFlagSYN, 65535, nil, nil), 56, (*RXChecksumOffload).SetTCP, false},
+		{"UDPv4", local4, buildTestUDP(remote4, local4, 49000, 49001, []byte("udp")), 26, (*RXChecksumOffload).SetUDP, false},
+		{"UDPv6", local6, buildTestUDP(remote6, local6, 49000, 49001, []byte("udp")), 46, (*RXChecksumOffload).SetUDP, false},
+		{"ICMPv4", local4, buildIPPacket(remote4, local4, ProtocolICMPv4, echo4, 0, true), 22, (*RXChecksumOffload).SetICMPv4, false},
+		{"ICMPv6", local6, buildIPPacket(remote6, local6, ProtocolICMPv6, echo6, 0, true), 42, (*RXChecksumOffload).SetICMPv6, false},
+		{"IGMP", local4, mustCodecVector(t, "4500001c00000000010217ddc0000202e00000011100eeff00000000"), 22, (*RXChecksumOffload).SetIGMP, true},
+		{"MLD", netip.MustParseAddr("fe80::1"), mustCodecVector(t,
+			"6000000000200001fe800000000000000000000000000002ff020000000000000000000000000001"+
+				"3a0005020000010082007c3e03e8000000000000000000000000000000000000"), 50, (*RXChecksumOffload).SetICMPv6, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(test.local, test.local.BitLen())}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			packet := append([]byte(nil), test.packet...)
+			value := binary.BigEndian.Uint16(packet[test.offset:]) ^ 1
+			if value == 0 {
+				value = 2
+			}
+			binary.BigEndian.PutUint16(packet[test.offset:], value)
+			for _, mode := range []string{"strict", "other-categories", "matching"} {
+				var offload RXChecksumOffload
+				if mode == "other-categories" {
+					offload.flags = rxChecksumOffloadGenerated
+					test.set(&offload, false)
+				} else {
+					test.set(&offload, mode == "matching")
+				}
+				enabled := mode == "matching"
+				stack.SetRXChecksumOffload(offload)
+				if n, err := stack.Write([][]byte{packet}, 0); err != nil || n != 1 {
+					t.Fatalf("Write = %d, %v", n, err)
+				}
+				if test.control {
+					stack.mu.RLock()
+					accepted := stack.multicastSeed != nil
+					stack.mu.RUnlock()
+					if accepted != enabled {
+						t.Fatalf("multicast Query accepted = %t with offload %t", accepted, enabled)
+					}
+				} else {
+					want := 0
+					if enabled {
+						want = 1
+					}
+					if got := stack.outbound.len(); got != want {
+						t.Fatalf("response count = %d with offload %t", got, enabled)
+					}
+				}
+			}
+			if test.name == "IPv4Header" {
+				if _, err := ParseIPPacket(packet); err == nil {
+					t.Fatal("public codec accepted an invalid IPv4 checksum")
+				}
+			}
+		})
+	}
+}
+
+func TestRXChecksumOffloadRetainsFramingAndUDPZeroChecks(t *testing.T) {
+	for _, ipv6 := range []bool{false, true} {
+		family, local, remote, headerSize := "IPv4", netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"), 20
+		if ipv6 {
+			family, local, remote, headerSize = "IPv6", netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2"), 40
+		}
+		t.Run(family, func(t *testing.T) {
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			var offload RXChecksumOffload
+			offload.SetIPv4Header(true).SetTCP(true).SetUDP(true).SetICMPv4(true).SetICMPv6(true).SetIGMP(true)
+			stack.SetRXChecksumOffload(offload)
+			udp := buildTestUDP(remote, local, 49000, 49001, []byte("udp"))
+			zero := append([]byte(nil), udp...)
+			zero[headerSize+6], zero[headerSize+7] = 0, 0
+			short := append([]byte(nil), udp...)
+			binary.BigEndian.PutUint16(short[headerSize+4:headerSize+6], 7)
+			tcp := buildTestTCP(remote, local, 49000, 49001, 100, 0, TCPFlagSYN, 65535, nil, nil)
+			tcp[headerSize+12] = 0x40
+			invalid := [][]byte{short, tcp, udp[:20]}
+			if ipv6 {
+				invalid = append(invalid, zero)
+			} else {
+				ihl := append([]byte(nil), udp...)
+				ihl[0] = 0x44
+				reserved := append([]byte(nil), udp...)
+				reserved[6] |= 0x80
+				invalid = append(invalid, ihl, reserved)
+			}
+			if n, err := stack.Write(invalid, 0); err != nil || n != len(invalid) {
+				t.Fatalf("invalid batch Write = %d, %v", n, err)
+			}
+			if stats := stack.Stats(); stats.InboundDroppedPackets != uint64(len(invalid)) || stack.outbound.len() != 0 {
+				t.Fatalf("invalid framing or zero UDP checksum was admitted: %+v", stats)
+			}
+			if !ipv6 {
+				// RFC 768 permits an IPv4 UDP checksum of zero. It must reach
+				// the closed-port handler even when checksum offload is enabled.
+				if n, err := stack.Write([][]byte{zero}, 0); err != nil || n != 1 || stack.outbound.len() != 1 {
+					t.Fatalf("IPv4 zero-checksum Write = %d, %v; responses = %d", n, err, stack.outbound.len())
+				}
+			}
+		})
+	}
+}
+
+// TestLoopbackChecksumProvenance verifies that queue-slot reuse cannot confer
+// a production builder's checksum guarantee on a later raw packet.
+func TestLoopbackChecksumProvenance(t *testing.T) {
+	for _, fair := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fair-%t", fair), func(t *testing.T) {
+			var queue packetQueue
+			if fair {
+				queue.initFair(1, time.Now(), 1500, [16]byte{1})
+			} else {
+				queue.initFIFO(1, time.Now())
+			}
+			packet := buildTestUDP(netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"), 1000, 1001, []byte("queue"))
+			for _, validated := range []bool{true, false, true, false} {
+				slot, ok := queue.tryReserve()
+				if !ok || !queue.enqueueReservedPacket(slot, packet, false, validated) {
+					t.Fatal("could not publish reserved slot")
+				}
+				entry, ok := queue.tryDequeue()
+				if !ok || entry.checksumValidated != validated {
+					t.Fatalf("queue checksum provenance = %t, want %t", entry.checksumValidated, validated)
+				}
+				queue.release(entry)
+			}
+		})
+	}
+}
+
+// TestRXChecksumOffloadRawLoopbackKeepsValidation sends raw UDP payloads via
+// public IP sockets. External-link offload must not trust these local writes.
+func TestRXChecksumOffloadRawLoopbackKeepsValidation(t *testing.T) {
+	for _, local := range []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")} {
+		for _, headerIncluded := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/header-%t", local, headerIncluded), func(t *testing.T) {
+				stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer stack.Close()
+				stack.SetRXChecksumOffload(RXChecksumOffload{flags: rxChecksumOffloadGenerated})
+				if err = stack.Start(); err != nil {
+					t.Fatal(err)
+				}
+				receiver, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(local, 49001))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer receiver.Close()
+				dialer := Dialer{Options: []SocketOption{SocketOptions.IPHeaderIncludedOnWrite(headerIncluded)}}
+				sender, err := dialer.DialIP(context.Background(), stack, "ip:udp", local, local)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer sender.Close()
+				payload := []byte("raw-local")
+				wire := buildTestUDP(local, local, 49000, 49001, payload)
+				parsed, ok := parseIPPacket(wire, false)
+				if !ok {
+					t.Fatal("invalid production fixture")
+				}
+				parsed.payload[len(parsed.payload)-1] ^= 1
+				input := parsed.payload
+				if headerIncluded {
+					input = wire
+				}
+				if _, err = sender.Write(input); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, time.Second, func() bool { return stack.Stats().InboundDroppedPackets == 1 })
+				parsed.payload[len(parsed.payload)-1] ^= 1
+				if _, err = sender.Write(input); err != nil {
+					t.Fatal(err)
+				}
+				_ = receiver.SetReadDeadline(time.Now().Add(time.Second))
+				buffer := make([]byte, len(payload))
+				if n, _, err := receiver.ReadFrom(buffer); err != nil || n != len(payload) || !bytes.Equal(buffer, payload) {
+					t.Fatalf("valid raw loopback ReadFrom = %d, %v, %x", n, err, buffer)
+				}
+			})
+		}
+	}
+}
+
+// FuzzRXChecksumOffload exercises framing and protocol parsing with arbitrary
+// input policies, including packets that bypass every checksum gate.
+func FuzzRXChecksumOffload(f *testing.F) {
+	local4, remote4 := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
+	local6, remote6 := netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2")
+	f.Add([]byte(nil), byte(0))
+	f.Add([]byte{0x45, 0, 0, 20}, byte(rxChecksumOffloadGenerated))
+	f.Add(buildTestUDP(remote4, local4, 49000, 49001, []byte("udp")), byte(rxChecksumOffloadGenerated))
+	f.Add(buildTestTCP(remote6, local6, 49000, 49001, 100, 0, TCPFlagSYN, 65535, nil, nil), byte(rxChecksumOffloadGenerated))
+	for _, addresses := range [][2]netip.Addr{{remote4, local4}, {remote6, local6}} {
+		protocol, messageType := byte(ProtocolICMPv4), byte(ICMPv4TypeEchoRequest)
+		if addresses[0].Is6() {
+			protocol, messageType = ProtocolICMPv6, ICMPv6TypeEchoRequest
+		}
+		message := mustTestWire((ICMPMessage{Source: addresses[0], Destination: addresses[1], Type: messageType,
+			Body: []byte{0, 1, 0, 1, 'x'}}).MarshalBinary())
+		f.Add(buildIPPacket(addresses[0], addresses[1], protocol, message, 0, true), byte(rxChecksumOffloadGenerated))
+	}
+	f.Add(mustCodecVector(f, "4500001c00000000010217ddc0000202e00000011100eeff00000000"), byte(rxChecksumOffloadGenerated))
+	f.Add(mustCodecVector(f, "6000000000200001fe800000000000000000000000000002ff020000000000000000000000000001"+
+		"3a0005020000010082007c3e03e8000000000000000000000000000000000000"), byte(rxChecksumOffloadGenerated))
+	f.Fuzz(func(t *testing.T, packet []byte, flags byte) {
+		stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local4, 32), netip.PrefixFrom(local6, 128)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stack.Close()
+		stack.SetRXChecksumOffload(RXChecksumOffload{flags: uint32(flags) & rxChecksumOffloadGenerated})
+		if err = stack.Start(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = stack.Write([][]byte{packet}, 0); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestStackReadCompletedPacketWinsCloseRace(t *testing.T) {
 	local := netip.MustParseAddr("192.0.2.249")
 	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 32)}})
@@ -49,7 +303,7 @@ func TestStackReadCompletedPacketWinsCloseRace(t *testing.T) {
 
 	packet := buildIPPacket(local, netip.MustParseAddr("192.0.2.248"), 99, []byte("completed"), 0, true)
 	slot, ok := stack.outbound.tryReserve()
-	if !ok || !stack.outbound.enqueueReservedPacket(slot, packet, false) {
+	if !ok || !stack.outbound.enqueueReservedPacket(slot, packet, false, false) {
 		t.Fatal("failed to enqueue test packet")
 	}
 	// Fill the semaphore with a duplicate token so release blocks after it has
@@ -120,7 +374,7 @@ func TestSocketMessagePeekTruncationAndErrorQueue(t *testing.T) {
 
 	quotedPayload := []byte("quoted-udp-payload")
 	quotedPacket := buildTestUDP(local, remote.Addr(), 5300, remote.Port(), quotedPayload)
-	quoted, ok := parseIPPacket(quotedPacket)
+	quoted, ok := parseIPPacket(quotedPacket, false)
 	if !ok {
 		t.Fatal("failed to parse quoted UDP packet")
 	}
@@ -213,7 +467,7 @@ func TestSocketMessagePeekTruncationAndErrorQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 	rawPacket := buildIPPacket(local, remote.Addr(), 99, []byte("raw-quote"), 7, true)
-	raw, ok := parseIPPacket(rawPacket)
+	raw, ok := parseIPPacket(rawPacket, false)
 	if !ok {
 		t.Fatal("failed to parse raw quoted packet")
 	}
@@ -536,7 +790,7 @@ func TestFullLoopbackQueueDoesNotBlock(t *testing.T) {
 	defer stack.Close()
 	fillTestPacketQueue(t, &stack.loopback.packetQueue, []byte{0})
 	packet := buildIPPacket(local, local, ProtocolUDP, make([]byte, udpHeaderSize), 1, false)
-	if err = stack.tryWritePacket(packet); !errors.Is(err, ErrResourceLimit) {
+	if err = stack.tryWritePacket(packet, false); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("tryWritePacket to full loopback queue = %v, want ErrResourceLimit", err)
 	}
 	if got := stack.Stats().LoopbackQueueDrops; got != 1 {
@@ -557,6 +811,8 @@ func TestPacketQueueLayouts(t *testing.T) {
 	}{
 		{name: "packet queue", got: unsafe.Sizeof(packetQueue{}), want: 96},
 		{name: "loopback queue", got: unsafe.Sizeof(loopbackQueue{}), want: 104},
+		// Entries are embedded in bounded queue arrays and channel storage.
+		{name: "packet queue entry", got: unsafe.Sizeof(packetQueueEntry{}), want: 32},
 	} {
 		if test.got != test.want {
 			t.Errorf("%s size = %d, want %d", test.name, test.got, test.want)
@@ -854,7 +1110,7 @@ func TestTryWriteLoopbackPacketsCloseBeforeBatchPublication(t *testing.T) {
 	}
 	stack.loopback.batchMu.Lock()
 	writeResult := make(chan error, 1)
-	go func() { writeResult <- stack.tryWritePackets(packets, outputFlowKey{}) }()
+	go func() { writeResult <- stack.tryWritePackets(packets, outputFlowKey{}, false) }()
 	wantFree := cap(stack.loopback.free) - len(packets)
 	waitFor(t, time.Second, func() bool { return len(stack.loopback.free) == wantFree })
 
@@ -1888,7 +2144,7 @@ func enqueueTestOutputPacket(t *testing.T, queue *packetQueue, packet []byte) {
 	if !ok {
 		t.Fatal("output queue has no free slot")
 	}
-	_ = queue.enqueueReservedPacket(slot, packet, false)
+	_ = queue.enqueueReservedPacket(slot, packet, false, false)
 }
 
 func TestFairPacketQueueRotatesAfterInitialByteCredit(t *testing.T) {
@@ -1974,7 +2230,7 @@ func TestFairPacketQueueBestEffortAdmissionDropsFattestFlow(t *testing.T) {
 	if !ok {
 		t.Fatal("late flow could not reclaim published backlog")
 	}
-	if !queue.enqueueReservedPacket(replaced.slot, late, false) {
+	if !queue.enqueueReservedPacket(replaced.slot, late, false, false) {
 		t.Fatal("late flow was not admitted from published backlog")
 	}
 	counts := map[uint16]int{}
@@ -2009,7 +2265,7 @@ func TestFairPacketQueueBestEffortAdmissionRemovesDueFlow(t *testing.T) {
 	queue.initFair(capacity, time.Now(), mtu, [16]byte{9})
 	for index := 0; index < capacity; index++ {
 		slot, ok := queue.tryReserve()
-		if !ok || !queue.enqueueReservedPacketForFlow(slot, oldPacket, false, outputHashedFlowKey(1)) {
+		if !ok || !queue.enqueueReservedPacketForFlow(slot, oldPacket, false, outputHashedFlowKey(1), false) {
 			t.Fatalf("old-flow packet %d was not published", index)
 		}
 	}
@@ -2024,7 +2280,7 @@ func TestFairPacketQueueBestEffortAdmissionRemovesDueFlow(t *testing.T) {
 		queue.release(entry)
 	}
 	slot, ok := queue.tryReserve()
-	if !ok || !queue.enqueueReservedPacketForFlow(slot, newPacket, false, outputHashedFlowKey(2)) {
+	if !ok || !queue.enqueueReservedPacketForFlow(slot, newPacket, false, outputHashedFlowKey(2), false) {
 		t.Fatal("new-flow packet was not published")
 	}
 	entry, ok := queue.tryDequeue()
@@ -2037,14 +2293,14 @@ func TestFairPacketQueueBestEffortAdmissionRemovesDueFlow(t *testing.T) {
 	queue.release(entry)
 	for index := 0; index < 10; index++ {
 		slot, ok = queue.tryReserve()
-		if !ok || !queue.enqueueReservedPacketForFlow(slot, newPacket, false, outputHashedFlowKey(2)) {
+		if !ok || !queue.enqueueReservedPacketForFlow(slot, newPacket, false, outputHashedFlowKey(2), false) {
 			t.Fatalf("filler packet %d was not published", index)
 		}
 	}
 	replaced, ok := queue.replaceBestEffort()
 	replacementPacket := make([]byte, 64)
 	replacementPacket[0] = 3
-	if !ok || !queue.enqueueReservedPacketForFlow(replaced.slot, replacementPacket, false, outputHashedFlowKey(3)) {
+	if !ok || !queue.enqueueReservedPacketForFlow(replaced.slot, replacementPacket, false, outputHashedFlowKey(3), false) {
 		t.Fatal("due old-flow packet was not replaced")
 	}
 	entry, ok = queue.tryDequeue()
@@ -2108,7 +2364,7 @@ func TestFairPacketQueueContinuousNewFlowsDoNotStarveOldFlow(t *testing.T) {
 			t.Fatalf("new-flow reservation %d was unavailable", flow)
 		}
 		key := outputHashedFlowKey(uint64(flow + 2))
-		if !queue.enqueueReservedPacketForFlow(slot, newPacket, false, key) {
+		if !queue.enqueueReservedPacketForFlow(slot, newPacket, false, key, false) {
 			t.Fatalf("new-flow packet %d was not published", flow)
 		}
 		entry, ok := queue.tryDequeue()
@@ -2148,13 +2404,13 @@ func TestFairPacketQueueContinuousNewFlowsPreserveByteCredit(t *testing.T) {
 	queue.initFair(capacity, time.Now(), mtu, [16]byte{10})
 	for index := 0; index < 100; index++ {
 		slot, ok := queue.tryReserve()
-		if !ok || !queue.enqueueReservedPacketForFlow(slot, largePacket, false, outputHashedFlowKey(1)) {
+		if !ok || !queue.enqueueReservedPacketForFlow(slot, largePacket, false, outputHashedFlowKey(1), false) {
 			t.Fatalf("large old-flow packet %d was not published", index)
 		}
 	}
 	for index := 0; index < 156; index++ {
 		slot, ok := queue.tryReserve()
-		if !ok || !queue.enqueueReservedPacketForFlow(slot, smallPacket, false, outputHashedFlowKey(2)) {
+		if !ok || !queue.enqueueReservedPacketForFlow(slot, smallPacket, false, outputHashedFlowKey(2), false) {
 			t.Fatalf("small old-flow packet %d was not published", index)
 		}
 	}
@@ -2180,7 +2436,7 @@ func TestFairPacketQueueContinuousNewFlowsPreserveByteCredit(t *testing.T) {
 			t.Fatalf("new-flow reservation %d was unavailable", flow)
 		}
 		key := outputHashedFlowKey(uint64(flow + 1000))
-		if !queue.enqueueReservedPacketForFlow(slot, newPacket, false, key) {
+		if !queue.enqueueReservedPacketForFlow(slot, newPacket, false, key, false) {
 			t.Fatalf("new-flow packet %d was not published", flow)
 		}
 		entry, ok := queue.tryDequeue()
@@ -2289,7 +2545,7 @@ func TestFairPacketQueueBestEffortAdmissionDepartsTCPBacklog(t *testing.T) {
 	if !ok {
 		t.Fatal("UDP packet could not reclaim published TCP backlog")
 	}
-	if !queue.enqueueReservedPacket(replaced.slot, udpPacket, false) {
+	if !queue.enqueueReservedPacket(replaced.slot, udpPacket, false, false) {
 		t.Fatal("UDP packet did not replace published TCP backlog")
 	}
 	select {
@@ -2648,7 +2904,7 @@ func TestTryWritePacketsPreservesSinglePacketFlow(t *testing.T) {
 	if flow == wireFlow {
 		t.Fatal("test semantic flow unexpectedly matches wire classification")
 	}
-	if err = stack.tryWritePackets([][]byte{packet}, flow); err != nil {
+	if err = stack.tryWritePackets([][]byte{packet}, flow, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3092,7 +3348,7 @@ func TestFairPacketQueueReusesBoundedFlowStorage(t *testing.T) {
 	for round := 0; round < 128; round++ {
 		packet := testOutputUDPPacket(source, target, uint16(15000+round), 53, 64)
 		replaced, ok := queue.replaceBestEffort()
-		if !ok || !queue.enqueueReservedPacket(replaced.slot, packet, false) {
+		if !ok || !queue.enqueueReservedPacket(replaced.slot, packet, false, false) {
 			t.Fatalf("overload flow %d was not admitted", round)
 		}
 	}
@@ -3228,7 +3484,7 @@ func BenchmarkPacketQueueOverloadAdmission(b *testing.B) {
 		queue.initFair(capacity, time.Now(), 1500, [16]byte{15})
 		for index := 0; index < capacity; index++ {
 			slot, ok := queue.tryReserve()
-			if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, outputFlowKey{tcp: 1}) {
+			if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, outputFlowKey{tcp: 1}, false) {
 				b.Fatal("failed to fill output queue")
 			}
 		}
@@ -3248,7 +3504,7 @@ func BenchmarkPacketQueueOverloadAdmission(b *testing.B) {
 			for index := 0; index < capacity; index++ {
 				slot, ok := queue.tryReserve()
 				flow := outputFlowKey{tcp: uint64(index%flows + 1)}
-				if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
+				if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow, false) {
 					b.Fatal("failed to fill output queue")
 				}
 			}
@@ -3258,7 +3514,7 @@ func BenchmarkPacketQueueOverloadAdmission(b *testing.B) {
 			for iteration := 0; iteration < b.N; iteration++ {
 				replaced, ok := queue.replaceBestEffort()
 				flow := outputFlowKey{tcp: uint64(iteration%flows + 1)}
-				if !ok || !queue.enqueueReservedPacketForFlow(replaced.slot, packet, false, flow) {
+				if !ok || !queue.enqueueReservedPacketForFlow(replaced.slot, packet, false, flow, false) {
 					b.Fatal("failed to replace published backlog")
 				}
 			}
@@ -3271,7 +3527,7 @@ func BenchmarkPacketQueueOverloadAdmission(b *testing.B) {
 			for index := 0; index < capacity; index++ {
 				slot, ok := queue.tryReserve()
 				flow := outputFlowKey{tcp: uint64(index%flows + 1)}
-				if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
+				if !ok || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow, false) {
 					b.Fatal("failed to fill output queue")
 				}
 			}
@@ -3281,7 +3537,7 @@ func BenchmarkPacketQueueOverloadAdmission(b *testing.B) {
 			for iteration := 0; iteration < b.N; iteration++ {
 				slot, err := stack.replaceBestEffortPacket(queue)
 				flow := outputFlowKey{tcp: uint64(iteration%flows + 1)}
-				if err != nil || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
+				if err != nil || !queue.enqueueReservedPacketForFlow(slot, packet, false, flow, false) {
 					b.Fatal("failed to replace and count published backlog")
 				}
 			}

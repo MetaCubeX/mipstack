@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +37,123 @@ func TestICMPEchoInterop(t *testing.T) {
 				testGVisorICMPEcho(t, network, family, mtu)
 			})
 		}
+	}
+}
+
+// TestICMPRXChecksumOffloadInterop verifies that an offloaded echo request
+// produces a software-checksummed reply accepted by gVisor's ping endpoint.
+func TestICMPRXChecksumOffloadInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		t.Run(family.name, func(t *testing.T) {
+			var network *interopNetwork
+			var mutated atomic.Bool
+			network = newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					offset := header.IPv6MinimumSize
+					if family.mipstackAddress.Is4() {
+						offset = int(header.IPv4(packet).HeaderLength())
+						if packet[9] != byte(family.icmpProtocol) {
+							return true
+						}
+					} else if packet[6] != byte(family.icmpProtocol) {
+						return true
+					}
+					if len(packet) < offset+8 ||
+						family.mipstackAddress.Is4() && packet[offset] != byte(header.ICMPv4Echo) ||
+						family.mipstackAddress.Is6() && packet[offset] != byte(header.ICMPv6EchoRequest) ||
+						!mutated.CompareAndSwap(false, true) {
+						return true
+					}
+					modified := append([]byte(nil), packet...)
+					if family.mipstackAddress.Is4() {
+						icmp := header.ICMPv4(modified[offset:])
+						icmp.SetChecksum(icmp.Checksum() ^ 1)
+					} else {
+						icmp := header.ICMPv6(modified[offset:])
+						icmp.SetChecksum(icmp.Checksum() ^ 1)
+					}
+					if err := network.deliverToMipstack(modified); err != nil {
+						network.reportBridgeError(err)
+					}
+					return false
+				},
+			})
+			var offload mipstack.RXChecksumOffload
+			offload.SetICMPv4(family.mipstackAddress.Is4()).SetICMPv6(family.mipstackAddress.Is6())
+			network.mipstack.SetRXChecksumOffload(offload)
+			testGVisorICMPEcho(t, network, family, network.mtu)
+			if !mutated.Load() {
+				t.Fatal("offload echo mutation did not run")
+			}
+		})
+	}
+}
+
+// TestICMPErrorRXChecksumOffloadInterop delivers a native gVisor closed-port
+// error to a connected mipstack UDP socket with delegated ICMP verification.
+func TestICMPErrorRXChecksumOffloadInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		t.Run(family.name, func(t *testing.T) {
+			var network *interopNetwork
+			var mutated atomic.Bool
+			wantType, wantCode := byte(header.ICMPv4DstUnreachable), byte(header.ICMPv4PortUnreachable)
+			if family.mipstackAddress.Is6() {
+				wantType, wantCode = byte(header.ICMPv6DstUnreachable), byte(header.ICMPv6PortUnreachable)
+			}
+			network = newInteropNetworkWithOptions(t, interopNetworkOptions{
+				families: []interopFamily{family}, mtu: 1500,
+				gvisorToMipstack: func(packet []byte) bool {
+					offset := header.IPv6MinimumSize
+					if family.mipstackAddress.Is4() {
+						offset = int(header.IPv4(packet).HeaderLength())
+						if packet[9] != byte(family.icmpProtocol) {
+							return true
+						}
+					} else if packet[6] != byte(family.icmpProtocol) {
+						return true
+					}
+					if len(packet) < offset+8 || packet[offset] != wantType || packet[offset+1] != wantCode || !mutated.CompareAndSwap(false, true) {
+						return true
+					}
+					modified := append([]byte(nil), packet...)
+					if family.mipstackAddress.Is4() {
+						icmp := header.ICMPv4(modified[offset:])
+						icmp.SetChecksum(icmp.Checksum() ^ 1)
+					} else {
+						icmp := header.ICMPv6(modified[offset:])
+						icmp.SetChecksum(icmp.Checksum() ^ 1)
+					}
+					if err := network.deliverToMipstack(modified); err != nil {
+						network.reportBridgeError(err)
+					}
+					return false
+				},
+			})
+			var offload mipstack.RXChecksumOffload
+			offload.SetICMPv4(family.mipstackAddress.Is4()).SetICMPv6(family.mipstackAddress.Is6())
+			network.mipstack.SetRXChecksumOffload(offload)
+			target := netipAddrPort(family.gvisorAddress, 44023)
+			connection, err := network.mipstack.DialUDP(context.Background(), family.udpNetwork, netip.AddrPort{}, target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			_ = connection.SetReadDeadline(time.Now().Add(3 * time.Second))
+			if _, err = connection.Write([]byte("offload-closed-port")); err != nil {
+				t.Fatal(err)
+			}
+			var received mipstack.ICMPError
+			if n, readErr := connection.Read(make([]byte, 1)); n != 0 || !errors.As(readErr, &received) ||
+				received.Type != wantType || received.Code != wantCode || received.Reporter != family.gvisorAddress ||
+				received.QuotedSourcePort != uint16(connection.LocalAddr().(*net.UDPAddr).Port) ||
+				received.QuotedTargetPort != target.Port() || received.QuotedSource != family.mipstackAddress || received.QuotedTarget != family.gvisorAddress {
+				t.Fatalf("native closed-port error = %d, %v; ICMP %+v", n, readErr, received)
+			}
+			if !mutated.Load() {
+				t.Fatal("offload error mutation did not run")
+			}
+		})
 	}
 }
 

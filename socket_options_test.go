@@ -859,7 +859,7 @@ func TestIPHeaderIncludedOnWriteSelectsErrorQueueRepresentationAtDelivery(t *tes
 	}
 
 	packet := buildIPPacket(local, remote, 99, []byte("quoted-payload"), 7, true)
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok {
 		t.Fatal("failed to parse quoted packet")
 	}
@@ -1076,7 +1076,7 @@ func TestIPReceiveHeaderPreservesCompleteReassembledPacket(t *testing.T) {
 			}
 			buffer := make([]byte, 65535)
 			n, _, readErr := connection.ReadFrom(buffer)
-			packet, ok := parseIPPacket(buffer[:n])
+			packet, ok := parseIPPacket(buffer[:n], false)
 			if readErr != nil || !ok || packet.source != test.remote || packet.target != test.local || packet.protocol != 99 || !bytes.Equal(packet.payload, payload) {
 				t.Fatalf("complete reassembled packet = %d bytes, %+v, parsed=%v, error=%v", n, packet, ok, readErr)
 			}

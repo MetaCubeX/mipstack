@@ -1476,7 +1476,7 @@ func (c *IPConn) writeHeaderIncluded(input []byte, target, packetInfoSource neti
 		err = c.stack.tryWriteNonUnicastPacket(len(input), external, loopback, func(destination []byte) bool {
 			c.marshalHeaderIncludedPacket(destination, input, layout)
 			return true
-		})
+		}, false)
 	} else {
 		queue, loopback := c.stack.outputQueueFor(parameters.target)
 		var slot uint16
@@ -1493,7 +1493,7 @@ func (c *IPConn) writeHeaderIncluded(input []byte, target, packetInfoSource neti
 				packet, reusable = c.stack.acquireLargeOutputBuffer(len(input))
 			}
 			c.marshalHeaderIncludedPacket(packet, input, layout)
-			if !queue.enqueueReservedPacket(slot, packet, reusable) {
+			if !queue.enqueueReservedPacket(slot, packet, reusable, false) {
 				err = ErrClosed
 			} else {
 				c.stack.recordOutput(loopback)
@@ -1783,7 +1783,7 @@ func (c *IPConn) writePayloadBuffersForMTU(source, target netip.Addr, buffers []
 		queue.releaseReserved(slot)
 		return err
 	}
-	if !queue.enqueueReservedPacket(slot, packet, reusable) {
+	if !queue.enqueueReservedPacket(slot, packet, reusable, false) {
 		return ErrClosed
 	}
 	c.stack.recordOutput(loopback)

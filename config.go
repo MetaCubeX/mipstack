@@ -7,6 +7,136 @@ import (
 	"syscall"
 )
 
+const (
+	// rxChecksumOffloadIPv4Header delegates IPv4 header checksums to the link.
+	rxChecksumOffloadIPv4Header uint32 = 1 << iota
+	// rxChecksumOffloadTCP delegates complete TCP checksums to the link.
+	rxChecksumOffloadTCP
+	// rxChecksumOffloadUDP delegates nonzero UDP checksums to the link.
+	rxChecksumOffloadUDP
+	// rxChecksumOffloadICMPv4 delegates outer ICMPv4 checksums to the link.
+	rxChecksumOffloadICMPv4
+	// rxChecksumOffloadICMPv6 delegates ICMPv6 and MLD checksums to the link.
+	rxChecksumOffloadICMPv6
+	// rxChecksumOffloadIGMP delegates IGMP checksums to the link.
+	rxChecksumOffloadIGMP
+)
+
+// rxChecksumOffloadGenerated covers checksums produced by the Stack's protocol
+// builders. Raw output never acquires this guarantee solely from its IP header.
+const rxChecksumOffloadGenerated = rxChecksumOffloadIPv4Header | rxChecksumOffloadTCP | rxChecksumOffloadUDP |
+	rxChecksumOffloadICMPv4 | rxChecksumOffloadICMPv6 | rxChecksumOffloadIGMP
+
+// RXChecksumOffload selects checksum verification delegated to the input
+// link. Its zero value retains all verification. An enabled category requires
+// the caller to supply valid complete packets with correct checksums or an
+// equivalent validation guarantee.
+//
+// Offload does not disable framing or protocol checks, including IPv6 UDP's
+// zero-checksum prohibition. Reassembled payloads, public codecs, checksums
+// configured for other raw IPv6 protocols, and independent ICMP extension
+// checksums retain their verification. Configure the policy before delivering
+// input packets.
+type RXChecksumOffload struct {
+	flags uint32
+}
+
+// SetIPv4Header controls IPv4 header checksum offload, including fragment
+// headers, and returns o for chained configuration.
+func (o *RXChecksumOffload) SetIPv4Header(enabled bool) *RXChecksumOffload {
+	if enabled {
+		o.flags |= rxChecksumOffloadIPv4Header
+	} else {
+		o.flags &^= rxChecksumOffloadIPv4Header
+	}
+	return o
+}
+
+// IPv4Header reports whether IPv4 header checksum offload is enabled.
+func (o RXChecksumOffload) IPv4Header() bool { return o.flags&rxChecksumOffloadIPv4Header != 0 }
+
+// SetTCP controls TCP checksum offload for both address families and returns
+// o for chained configuration.
+func (o *RXChecksumOffload) SetTCP(enabled bool) *RXChecksumOffload {
+	if enabled {
+		o.flags |= rxChecksumOffloadTCP
+	} else {
+		o.flags &^= rxChecksumOffloadTCP
+	}
+	return o
+}
+
+// TCP reports whether TCP checksum offload is enabled.
+func (o RXChecksumOffload) TCP() bool { return o.flags&rxChecksumOffloadTCP != 0 }
+
+// SetUDP controls UDP checksum offload for both address families and returns
+// o for chained configuration. IPv6 zero-checksum datagrams remain invalid.
+func (o *RXChecksumOffload) SetUDP(enabled bool) *RXChecksumOffload {
+	if enabled {
+		o.flags |= rxChecksumOffloadUDP
+	} else {
+		o.flags &^= rxChecksumOffloadUDP
+	}
+	return o
+}
+
+// UDP reports whether UDP checksum offload is enabled.
+func (o RXChecksumOffload) UDP() bool { return o.flags&rxChecksumOffloadUDP != 0 }
+
+// SetICMPv4 controls outer ICMPv4 checksum offload and returns o for chained
+// configuration. Independent extension checksums remain verified.
+func (o *RXChecksumOffload) SetICMPv4(enabled bool) *RXChecksumOffload {
+	if enabled {
+		o.flags |= rxChecksumOffloadICMPv4
+	} else {
+		o.flags &^= rxChecksumOffloadICMPv4
+	}
+	return o
+}
+
+// ICMPv4 reports whether outer ICMPv4 checksum offload is enabled.
+func (o RXChecksumOffload) ICMPv4() bool { return o.flags&rxChecksumOffloadICMPv4 != 0 }
+
+// SetICMPv6 controls ICMPv6 checksum offload, including MLD, and returns o
+// for chained configuration. Independent extension checksums remain verified.
+func (o *RXChecksumOffload) SetICMPv6(enabled bool) *RXChecksumOffload {
+	if enabled {
+		o.flags |= rxChecksumOffloadICMPv6
+	} else {
+		o.flags &^= rxChecksumOffloadICMPv6
+	}
+	return o
+}
+
+// ICMPv6 reports whether ICMPv6 checksum offload is enabled.
+func (o RXChecksumOffload) ICMPv6() bool { return o.flags&rxChecksumOffloadICMPv6 != 0 }
+
+// SetIGMP controls IGMP checksum offload and returns o for chained configuration.
+func (o *RXChecksumOffload) SetIGMP(enabled bool) *RXChecksumOffload {
+	if enabled {
+		o.flags |= rxChecksumOffloadIGMP
+	} else {
+		o.flags &^= rxChecksumOffloadIGMP
+	}
+	return o
+}
+
+// IGMP reports whether IGMP checksum offload is enabled.
+func (o RXChecksumOffload) IGMP() bool { return o.flags&rxChecksumOffloadIGMP != 0 }
+
+// SetRXChecksumOffload replaces the input link's checksum verification policy.
+// Configure it before delivering packets; changes do not establish a processing
+// boundary for input already in progress. It does not affect socket defaults.
+func (s *Stack) SetRXChecksumOffload(offload RXChecksumOffload) {
+	s.rxChecksumOffload.Store(offload.flags)
+}
+
+// RXChecksumOffload returns an independent copy of the input link's checksum
+// verification policy.
+func (s *Stack) RXChecksumOffload() RXChecksumOffload {
+	return RXChecksumOffload{flags: s.rxChecksumOffload.Load()}
+}
+
 // AddressProperties supplies RFC 6724 source-selection state that cannot be
 // represented by a netip.Prefix alone.
 type AddressProperties struct {

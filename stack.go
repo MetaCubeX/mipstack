@@ -365,22 +365,25 @@ type Stack struct {
 	// follows aggregate demand instead of being reserved per destination path.
 	largeBuffers atomic.Pointer[largePacketBufferCache]
 
-	mu            sync.RWMutex
-	started       bool
-	closed        bool
-	tcp           map[tcpKey]*TCPConn
-	tcpPassive    tcpPassiveEndpoints
-	tcpForwarder  tcpForwarderEndpoints
-	udp           map[udpKey]*UDPConn
-	udpReuse      udpReuseEndpoints
-	udpForwarded  map[udpFlowKey]*UDPConn
-	udpForwarder  udpForwarderEndpoints
-	ip            ipEndpoints
-	ipForwarder   ipForwarderEndpoints
-	multicast     multicastEndpoints
-	multicastSeed *multicastQuerierSeed
-	icmpForwarder icmpForwarderEndpoints
-	nextPort      [2]automaticPortCursor
+	mu      sync.RWMutex
+	started bool
+	closed  bool
+	// rxChecksumOffload is the external link policy, read once per input batch.
+	// Local output uses queue-entry provenance rather than this mutable setting.
+	rxChecksumOffload atomic.Uint32
+	tcp               map[tcpKey]*TCPConn
+	tcpPassive        tcpPassiveEndpoints
+	tcpForwarder      tcpForwarderEndpoints
+	udp               map[udpKey]*UDPConn
+	udpReuse          udpReuseEndpoints
+	udpForwarded      map[udpFlowKey]*UDPConn
+	udpForwarder      udpForwarderEndpoints
+	ip                ipEndpoints
+	ipForwarder       ipForwarderEndpoints
+	multicast         multicastEndpoints
+	multicastSeed     *multicastQuerierSeed
+	icmpForwarder     icmpForwarderEndpoints
+	nextPort          [2]automaticPortCursor
 
 	// tcpTimeWaitReplacer is installed lazily by passive TCP endpoints. Keeping
 	// the optional replacement implementation behind this hook lets the linker
@@ -1751,6 +1754,10 @@ type packetQueueEntry struct {
 	// storage within packetReusableBufferLimit itself; consumers return larger
 	// storage through Stack.releaseOutputBuffer before releasing the slot.
 	reusable bool
+	// checksumValidated marks header and protocol checksums completed by a
+	// production builder. Local delivery may reuse that guarantee; caller-owned
+	// raw protocol content does not acquire it from IP header construction.
+	checksumValidated bool
 }
 
 // largePacketBufferCache retains a bounded output working set for packets that
@@ -2136,38 +2143,40 @@ func (q *packetQueue) releaseReserved(slot uint16) { q.free <- slot }
 // serialized headers to rediscover an identity TCP already has. loopback must
 // be true exactly when q is stack.loopback because the returned ticket uses
 // that bit to find its queue without retaining a pointer. published is false
-// when queue closure wins the publication race.
+// when queue closure wins the publication race. The packet must come from the
+// TCP builder with complete IP and transport checksums.
 func (q *packetQueue) enqueueReservedTCP(slot uint16, packet []byte, reusable bool, flowID uint64, loopback bool) (ticket packetQueueTicket, published bool) {
 	queuedAt := monotonicStampAt(q.epoch, time.Now())
-	generation, published := q.publishReserved(slot, packet, reusable, outputFlowKey{tcp: flowID})
+	generation, published := q.publishReserved(slot, packet, reusable, outputFlowKey{tcp: flowID}, true)
 	return packetQueueTicket{token: packetQueueTicketToken(slot, generation, loopback), queuedAt: queuedAt}, published
 }
 
 // enqueueReservedPacket publishes a packet that does not need TCP host-queue
 // loss tracking and therefore avoids reading the clock. It reports whether
-// publication completed before queue closure.
-func (q *packetQueue) enqueueReservedPacket(slot uint16, packet []byte, reusable bool) bool {
-	_, published := q.publishReserved(slot, packet, reusable, outputFlowKey{})
+// publication completed before queue closure. checksumValidated carries a
+// production builder's guarantee to local delivery, never a caller assertion.
+func (q *packetQueue) enqueueReservedPacket(slot uint16, packet []byte, reusable, checksumValidated bool) bool {
+	_, published := q.publishReserved(slot, packet, reusable, outputFlowKey{}, checksumValidated)
 	return published
 }
 
 // enqueueReservedPacketForFlow publishes a packet using the caller's semantic
 // identity. A zero flow lets the scheduler classify the serialized packet.
-func (q *packetQueue) enqueueReservedPacketForFlow(slot uint16, packet []byte, reusable bool, flow outputFlowKey) bool {
-	_, published := q.publishReserved(slot, packet, reusable, flow)
+func (q *packetQueue) enqueueReservedPacketForFlow(slot uint16, packet []byte, reusable bool, flow outputFlowKey, checksumValidated bool) bool {
+	_, published := q.publishReserved(slot, packet, reusable, flow, checksumValidated)
 	return published
 }
 
 // publishReserved marks and publishes one already-reserved slot. A publisher
 // that raced with close removes any late publication without making Close wait.
-func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool, flow outputFlowKey) (uint64, bool) {
+func (q *packetQueue) publishReserved(slot uint16, packet []byte, reusable bool, flow outputFlowKey, checksumValidated bool) (uint64, bool) {
 	state := q.slots[slot].Load()
 	generation := (state>>packetQueueSlotGenerationShift + 1) & packetQueueTicketGenerationMask
 	if generation == 0 {
 		generation = 1
 	}
 	q.slots[slot].Store(generation<<packetQueueSlotGenerationShift | packetQueueSlotPending)
-	entry := packetQueueEntry{packet: packet, slot: slot, reusable: reusable}
+	entry := packetQueueEntry{packet: packet, slot: slot, reusable: reusable, checksumValidated: checksumValidated}
 	if q.scheduler == nil {
 		q.packets <- entry
 	} else {
@@ -2252,7 +2261,7 @@ func (q *packetQueue) tryEnqueue(packet []byte) bool {
 	if !ok {
 		return false
 	}
-	return q.enqueueReservedPacket(slot, packet, false)
+	return q.enqueueReservedPacket(slot, packet, false, false)
 }
 
 // acquireBuffer returns bounded queue-owned storage for one complete packet.
@@ -2387,7 +2396,7 @@ func (q *loopbackQueue) close() {
 // tryWritePackets reserves a complete local packet sequence before publishing
 // its first member. Multi-packet publishers do not interleave with each other,
 // and close cannot split an admitted sequence.
-func (q *loopbackQueue) tryWritePackets(packets [][]byte, closeCh <-chan struct{}) error {
+func (q *loopbackQueue) tryWritePackets(packets [][]byte, closeCh <-chan struct{}, checksumValidated bool) error {
 	if len(packets) == 0 {
 		return nil
 	}
@@ -2433,7 +2442,7 @@ func (q *loopbackQueue) tryWritePackets(packets [][]byte, closeCh <-chan struct{
 		return ErrClosed
 	}
 	for index, packet := range packets {
-		if !q.enqueueReservedPacket(slots[index], packet, false) {
+		if !q.enqueueReservedPacket(slots[index], packet, false, checksumValidated) {
 			for _, slot := range slots[index+1:] {
 				q.releaseReserved(slot)
 			}
@@ -3148,7 +3157,11 @@ func (s *Stack) runLoopback() {
 			return
 		default:
 		}
-		_ = s.handleInboundPacket(entry.packet, time.Now(), true)
+		rxOffload := uint32(0)
+		if entry.checksumValidated {
+			rxOffload = rxChecksumOffloadGenerated
+		}
+		_ = s.handleInboundPacket(entry.packet, time.Now(), true, rxOffload)
 		if entry.reusable && cap(entry.packet) > packetReusableBufferLimit {
 			if cache := s.largeBuffers.Load(); cache != nil {
 				cache.release(entry.packet)
@@ -3762,12 +3775,15 @@ func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 		return 0, err
 	}
 	receivedAt := time.Now()
+	// One link-policy read serves the complete batch, including callers that
+	// supply only one packet. The policy is not retained with packet storage.
+	rxOffload := s.rxChecksumOffload.Load()
 	count := 0
 	for _, buffer := range buffers {
 		if offset < 0 || offset > len(buffer) {
 			return count, errors.New("mipstack: invalid Write offset")
 		}
-		if err := s.handleInboundPacket(buffer[offset:], receivedAt, false); err != nil {
+		if err := s.handleInboundPacket(buffer[offset:], receivedAt, false, rxOffload); err != nil {
 			if errors.Is(err, ErrClosed) {
 				return count, os.ErrClosed
 			}
@@ -3780,15 +3796,15 @@ func (s *Stack) Write(buffers [][]byte, offset int) (int, error) {
 
 // tryWritePacket queues one already-built best-effort packet without waiting
 // for device space.
-func (s *Stack) tryWritePacket(packet []byte) error {
+func (s *Stack) tryWritePacket(packet []byte, checksumValidated bool) error {
 	queue, loopback := s.outputQueue(packet)
-	return s.tryWritePacketToFlow(packet, queue, loopback, outputFlowKey{})
+	return s.tryWritePacketToFlow(packet, queue, loopback, outputFlowKey{}, checksumValidated)
 }
 
 // tryWritePacketToFlow publishes one packet to an already selected queue. A
 // zero flow asks the queue to classify the wire packet; a nonzero flow retains
 // a semantic identity shared by a source-fragmented sequence.
-func (s *Stack) tryWritePacketToFlow(packet []byte, queue *packetQueue, loopback bool, flow outputFlowKey) error {
+func (s *Stack) tryWritePacketToFlow(packet []byte, queue *packetQueue, loopback bool, flow outputFlowKey, checksumValidated bool) error {
 	slot, err := s.tryReservePacket(queue)
 	if err == ErrResourceLimit {
 		slot, err = s.replaceBestEffortPacket(queue)
@@ -3796,7 +3812,7 @@ func (s *Stack) tryWritePacketToFlow(packet []byte, queue *packetQueue, loopback
 	if err != nil {
 		return err
 	}
-	if !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
+	if !queue.enqueueReservedPacketForFlow(slot, packet, false, flow, checksumValidated) {
 		return ErrClosed
 	}
 	s.recordOutput(loopback)
@@ -3861,16 +3877,16 @@ func (s *Stack) recordQueueDrops(queue *packetQueue, count uint64) {
 // semantic link flow. Link output applies bounded admission to each packet in
 // wire order. Loopback ignores flow and retains all-or-none admission so the
 // local reassembler cannot observe a capacity-truncated sequence.
-func (s *Stack) tryWritePackets(packets [][]byte, flow outputFlowKey) error {
+func (s *Stack) tryWritePackets(packets [][]byte, flow outputFlowKey, checksumValidated bool) error {
 	if len(packets) == 0 {
 		return nil
 	}
 	queue, loopback := s.outputQueue(packets[0])
 	if len(packets) == 1 {
-		return s.tryWritePacketToFlow(packets[0], queue, loopback, flow)
+		return s.tryWritePacketToFlow(packets[0], queue, loopback, flow, checksumValidated)
 	}
 	if loopback {
-		return s.tryWriteLoopbackPackets(packets)
+		return s.tryWriteLoopbackPackets(packets, checksumValidated)
 	}
 	select {
 	case <-s.closeCh:
@@ -3885,7 +3901,7 @@ func (s *Stack) tryWritePackets(packets [][]byte, flow outputFlowKey) error {
 		if err != nil {
 			return err
 		}
-		if !queue.enqueueReservedPacketForFlow(slot, packet, false, flow) {
+		if !queue.enqueueReservedPacketForFlow(slot, packet, false, flow, checksumValidated) {
 			return ErrClosed
 		}
 		s.recordOutput(false)
@@ -3895,8 +3911,8 @@ func (s *Stack) tryWritePackets(packets [][]byte, flow outputFlowKey) error {
 
 // tryWriteLoopbackPackets admits one complete local packet sequence or none of
 // it and records every successfully admitted packet.
-func (s *Stack) tryWriteLoopbackPackets(packets [][]byte) error {
-	if err := s.loopback.tryWritePackets(packets, s.closeCh); err != nil {
+func (s *Stack) tryWriteLoopbackPackets(packets [][]byte, checksumValidated bool) error {
+	if err := s.loopback.tryWritePackets(packets, s.closeCh, checksumValidated); err != nil {
 		if err == ErrResourceLimit {
 			s.stats.loopbackQueueDrops.Add(uint64(len(packets)))
 		}
@@ -4230,17 +4246,17 @@ func (s *Stack) recordOutput(loopback bool) {
 // dispatching it to ICMP, TCP, UDP, or a raw IP endpoint. receivedAt is shared
 // by packets from one device batch so transport timing does not depend on
 // parsing order.
-func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopback bool) error {
+func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopback bool, rxOffload uint32) error {
 	select {
 	case <-s.closeCh:
 		return ErrClosed
 	default:
 	}
 	s.stats.inboundPackets.Add(1)
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, rxOffload&rxChecksumOffloadIPv4Header != 0)
 	if !ok {
 		network := s.network.Load()
-		fragment, validFragment := parseFragment(packet)
+		fragment, validFragment := parseFragment(packet, rxOffload&rxChecksumOffloadIPv4Header != 0)
 		if validFragment && s.acceptsInboundDestination(network, fragment.target, loopback) &&
 			validInboundFragmentSource(network, fragment.source, fragment.target, fragment.protocol) {
 			if fragment.truncated || fragment.parameter {
@@ -4260,7 +4276,11 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 		}
 		if validFragment {
 			if reassembled, pending := s.reassembleParsedFragmentStatus(fragment, receivedAt, loopback); reassembled != nil {
-				parsed, ok = parseIPPacket(reassembled)
+				// Fragment trust does not prove that a reassembled datagram belongs
+				// to one original transmission. Verify the resulting payload without
+				// retaining offload provenance in the reassembly cache.
+				rxOffload = 0
+				parsed, ok = parseIPPacket(reassembled, false)
 			} else if pending {
 				return nil
 			}
@@ -4311,15 +4331,24 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 	// RFC 3542 requires the kernel to verify every received ICMPv6 checksum
 	// before exposing the message to a raw socket. Raw fan-out precedes the
 	// built-in ICMP handler below, so this validation belongs at the common
-	// dispatch boundary rather than in the handler alone.
+	// dispatch boundary rather than in the handler alone. A trusted input link
+	// may supply the equivalent verification guarantee.
 	if parsed.source.Is6() && parsed.protocol == ProtocolICMPv6 &&
-		(len(parsed.payload) < 4 || transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0) {
+		(len(parsed.payload) < 4 || rxOffload&rxChecksumOffloadICMPv6 == 0 && transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0) {
 		s.stats.inboundDroppedPackets.Add(1)
 		return nil
 	}
 	multicastControl := isMulticastControlPacket(parsed)
+	skipControlChecksum := false
 	if multicastControl {
-		multicast = s.multicastStateForQuery(parsed, multicast, receivedAt)
+		if parsed.protocol == ProtocolIGMP {
+			skipControlChecksum = rxOffload&rxChecksumOffloadIGMP != 0
+		} else {
+			// MLD shares the ICMPv6 checksum already verified or delegated at
+			// the common dispatch boundary above, which applies only to IPv6.
+			skipControlChecksum = parsed.source.Is6()
+		}
+		multicast = s.multicastStateForQuery(parsed, multicast, receivedAt, skipControlChecksum)
 	}
 	// UDP and raw sockets apply equivalent per-socket filters during fanout.
 	// Built-in ICMP processing needs the aggregate interface filter here.
@@ -4346,28 +4375,28 @@ func (s *Stack) handleInboundPacket(packet []byte, receivedAt time.Time, loopbac
 	}
 	if multicastControl {
 		if multicast != nil {
-			multicast.handleControl(parsed, receivedAt)
+			multicast.handleControl(parsed, receivedAt, skipControlChecksum)
 		}
 		return nil
 	}
 	switch parsed.protocol {
 	case ProtocolTCP:
 		if destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast {
-			return s.handleTCP(parsed, receivedAt, destination == inboundDestinationLocalUnicast)
+			return s.handleTCP(parsed, receivedAt, destination == inboundDestinationLocalUnicast, rxOffload&rxChecksumOffloadTCP != 0)
 		}
 		return nil
 	case ProtocolUDP:
-		return s.handleUDP(parsed, destination)
+		return s.handleUDP(parsed, destination, rxOffload&rxChecksumOffloadUDP != 0)
 	case ProtocolICMPv4:
 		if parsed.source.Is4() && (destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast) {
-			return s.handleICMP(parsed, destination == inboundDestinationLocalUnicast)
+			return s.handleICMP(parsed, destination == inboundDestinationLocalUnicast, rxOffload&rxChecksumOffloadICMPv4 != 0)
 		}
 	case ProtocolICMPv6:
 		if parsed.source.Is6() && destination == inboundDestinationMulticast {
 			return s.handleMulticastICMPv6(parsed)
 		}
 		if parsed.source.Is6() && (destination == inboundDestinationLocalUnicast || destination == inboundDestinationPromiscuousUnicast) {
-			return s.handleICMP(parsed, destination == inboundDestinationLocalUnicast)
+			return s.handleICMP(parsed, destination == inboundDestinationLocalUnicast, false)
 		}
 	default:
 	}

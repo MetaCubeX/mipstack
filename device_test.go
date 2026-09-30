@@ -46,7 +46,7 @@ func TestPacketDeviceIO(t *testing.T) {
 	if count, readErr := stack.Read([][]byte{buffer}, sizes, 8); readErr != nil || count != 1 {
 		t.Fatalf("Read = %d, %v", count, readErr)
 	}
-	packet, ok := parseIPPacket(buffer[8 : 8+sizes[0]])
+	packet, ok := parseIPPacket(buffer[8:8+sizes[0]], false)
 	if !ok || packet.source != netip.MustParseAddr("192.168.1.2") || packet.target != destination.AddrPort().Addr() {
 		t.Fatalf("unexpected outbound packet: source=%s target=%s", packet.source, packet.target)
 	}
@@ -63,7 +63,7 @@ func TestPacketDeviceIO(t *testing.T) {
 	if count, readErr := stack.Read([][]byte{buffer}, sizes, 0); readErr != nil || count != 1 {
 		t.Fatalf("Read echo = %d, %v", count, readErr)
 	}
-	reply, ok := parseIPPacket(buffer[:sizes[0]])
+	reply, ok := parseIPPacket(buffer[:sizes[0]], false)
 	if !ok || reply.payload[0] != 0 || reply.source != netip.MustParseAddr("192.168.1.2") {
 		t.Fatalf("unexpected echo reply: %x", buffer[:sizes[0]])
 	}
@@ -129,14 +129,14 @@ func TestPacketDeviceCloseDiscardsOutput(t *testing.T) {
 	}
 	inFlightBuffer, inFlightReusable := stack.outbound.acquireBuffer(len(packet))
 	copy(inFlightBuffer, packet)
-	if !stack.outbound.enqueueReservedPacket(inFlightSlot, inFlightBuffer, inFlightReusable) {
+	if !stack.outbound.enqueueReservedPacket(inFlightSlot, inFlightBuffer, inFlightReusable, false) {
 		t.Fatal("failed to publish in-flight output")
 	}
 	inFlight, available := stack.outbound.tryDequeue()
 	if !available || !inFlight.reusable {
 		t.Fatal("failed to retain reusable packet across Close")
 	}
-	if err = stack.tryWritePacket(packet); err != nil {
+	if err = stack.tryWritePacket(packet, false); err != nil {
 		t.Fatal(err)
 	}
 	lateSlot, reserved := stack.outbound.tryReserve()
@@ -148,7 +148,7 @@ func TestPacketDeviceCloseDiscardsOutput(t *testing.T) {
 	if err = stack.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if stack.outbound.enqueueReservedPacket(lateSlot, lateBuffer, lateReusable) {
+	if stack.outbound.enqueueReservedPacket(lateSlot, lateBuffer, lateReusable, false) {
 		t.Fatal("packet publication succeeded after Close")
 	}
 	stack.outbound.release(inFlight)
@@ -202,7 +202,7 @@ func TestPacketDeviceCloseDiscardsLargeOutput(t *testing.T) {
 	if err = stack.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if stack.outbound.enqueueReservedPacket(lateSlot, lateBuffer, lateReusable) {
+	if stack.outbound.enqueueReservedPacket(lateSlot, lateBuffer, lateReusable, false) {
 		t.Fatal("jumbo packet publication succeeded after Close")
 	}
 	if cache := stack.largeBuffers.Load(); cache != nil {
@@ -236,7 +236,7 @@ func TestPacketDeviceConcurrentCloseAndPublish(t *testing.T) {
 		}
 		packet := buildIPPacket(local, remote, ProtocolUDP, make([]byte, udpHeaderSize), uint16(round), false)
 		for index := 0; index < outboundPacketQueue; index++ {
-			if writeErr := stack.tryWritePacket(packet); writeErr != nil {
+			if writeErr := stack.tryWritePacket(packet, false); writeErr != nil {
 				t.Fatalf("round %d fill packet %d: %v", round, index, writeErr)
 			}
 		}
@@ -249,7 +249,7 @@ func TestPacketDeviceConcurrentCloseAndPublish(t *testing.T) {
 			go func() {
 				defer writers.Done()
 				<-start
-				if writeErr := stack.tryWritePacket(packet); writeErr != nil {
+				if writeErr := stack.tryWritePacket(packet, false); writeErr != nil {
 					ready.Done()
 					t.Errorf("round %d initial publisher: %v", round, writeErr)
 					return
@@ -257,7 +257,7 @@ func TestPacketDeviceConcurrentCloseAndPublish(t *testing.T) {
 				ready.Done()
 				<-publish
 				for {
-					err := stack.tryWritePacket(packet)
+					err := stack.tryWritePacket(packet, false)
 					if errors.Is(err, ErrClosed) {
 						return
 					}
@@ -397,7 +397,7 @@ func TestPacketDeviceLargeBufferCacheBestEffortReplacement(t *testing.T) {
 			t.Fatalf("jumbo packet %d is not reusable", index)
 		}
 		packet[0] = marker
-		if !stack.outbound.enqueueReservedPacketForFlow(slot, packet, reusable, outputHashedFlowKey(1)) {
+		if !stack.outbound.enqueueReservedPacketForFlow(slot, packet, reusable, outputHashedFlowKey(1), false) {
 			t.Fatalf("jumbo packet %d was not published", index)
 		}
 	}
@@ -623,7 +623,7 @@ func TestPacketDeviceBatchRead(t *testing.T) {
 		if !bytes.Equal(buffers[index][:wireguardOffset], bytes.Repeat([]byte{0xa5}, wireguardOffset)) {
 			t.Fatalf("batch packet %d overwrote offset prefix", index)
 		}
-		packet, ok := parseIPPacket(buffers[index][wireguardOffset : wireguardOffset+sizes[index]])
+		packet, ok := parseIPPacket(buffers[index][wireguardOffset:wireguardOffset+sizes[index]], false)
 		if !ok || len(packet.payload) != udpHeaderSize+1 || packet.payload[udpHeaderSize] != byte(index) {
 			t.Fatalf("batch packet %d = %x", index, buffers[index][wireguardOffset:wireguardOffset+sizes[index]])
 		}

@@ -937,7 +937,7 @@ func prepareICMPForwarderIPPacket(input []byte, destination netip.Addr) (icmpFor
 	default:
 		return icmpForwarderIPPacket{}, syscall.EINVAL
 	}
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok || parsed.parameterError || len(parsed.payload) < 8 || parsed.target != destination {
 		return icmpForwarderIPPacket{}, syscall.EINVAL
 	}
@@ -982,7 +982,7 @@ func (s *Stack) writeICMPForwarderIPPacket(request ipPacket, reply icmpForwarder
 	if len(packets) > 1 {
 		flow = s.outbound.ipFlowKey(reply.parsed.source, reply.parsed.target, reply.parsed.protocol, reply.parsed.flowLabel, reply.parsed.payload)
 	}
-	err = s.tryWritePackets(packets, flow)
+	err = s.tryWritePackets(packets, flow, true)
 	if err == ErrResourceLimit {
 		return nil
 	}
@@ -1090,13 +1090,13 @@ func makeICMPEchoReply(protocol byte, request []byte) ([]byte, bool) {
 // handleICMP replies to owned-address echo requests, dispatches validated
 // asynchronous errors, and offers otherwise unhandled messages to the ICMP
 // forwarder.
-func (s *Stack) handleICMP(packet ipPacket, localDestination bool) error {
+func (s *Stack) handleICMP(packet ipPacket, localDestination, skipChecksum bool) error {
 	icmp := packet.payload
 	if len(icmp) < 8 {
 		return nil
 	}
 	if packet.protocol == ProtocolICMPv4 {
-		if checksum(icmp) != 0 {
+		if !skipChecksum && checksum(icmp) != 0 {
 			return nil
 		}
 		if localDestination {
@@ -1313,7 +1313,9 @@ func (s *Stack) sendFragmentReassemblyTimeout(entry *ipPacketReassemblyEntry) er
 	if !s.isLocal(state.target) {
 		return nil
 	}
-	fragment, ok := parseFragment(state.firstPacket)
+	// Reassembly retains an owned copy of a fragment accepted at ingress.
+	// Reuse its header validation, including a trusted link's guarantee.
+	fragment, ok := parseFragment(state.firstPacket, true)
 	if !ok || fragment.offset != 0 || packetInvokesICMPError(state.firstPacket) || !s.allowICMPErrorResponseTo(icmpErrorResponseFragmentTimeout, state.source) {
 		return nil
 	}

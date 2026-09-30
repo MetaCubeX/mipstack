@@ -4747,10 +4747,11 @@ func (s *Stack) tcpInitialSequence(key tcpKey, now time.Time) uint32 {
 }
 
 // handleTCP preserves ordinary listener ownership while allowing established
-// forwarded tuples to use nonlocal destinations.
-func (s *Stack) handleTCP(packet ipPacket, receivedAt time.Time, localDestination bool) error {
+// forwarded tuples to use nonlocal destinations. skipChecksum reuses the input
+// link or local builder's guarantee; TCP header and state checks still apply.
+func (s *Stack) handleTCP(packet ipPacket, receivedAt time.Time, localDestination, skipChecksum bool) error {
 	tcp := packet.payload
-	if len(tcp) < tcpHeaderSize || transportChecksum(packet.source, packet.target, ProtocolTCP, tcp) != 0 {
+	if len(tcp) < tcpHeaderSize || !skipChecksum && transportChecksum(packet.source, packet.target, ProtocolTCP, tcp) != 0 {
 		s.stats.inboundDroppedPackets.Add(1)
 		s.stats.tcpInvalidSegments.Add(1)
 		return nil
@@ -5206,7 +5207,7 @@ func (s *Stack) tryWriteTCPControl(source, target netip.Addr, sourcePort, target
 		queue.releaseReserved(slot)
 		return err
 	}
-	if !queue.enqueueReservedPacketForFlow(slot, built, reusable, flow) {
+	if !queue.enqueueReservedPacketForFlow(slot, built, reusable, flow, true) {
 		return ErrClosed
 	}
 	s.recordOutput(loopback)

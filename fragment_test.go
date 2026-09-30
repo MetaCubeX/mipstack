@@ -159,7 +159,7 @@ func TestIPv6AtomicFragmentReservedBits(t *testing.T) {
 	binary.BigEndian.PutUint16(fragment[2:4], 0x0002)
 	binary.BigEndian.PutUint32(fragment[4:8], 1)
 	packet := buildIPPacket(source, target, 44, fragment, 0, false)
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok || parsed.protocol != ProtocolUDP || len(parsed.payload) != udpHeaderSize {
 		t.Fatalf("IPv6 atomic fragment with reserved bits = %+v, parsed = %v", parsed, ok)
 	}
@@ -180,7 +180,7 @@ func TestIPv6FragmentReservedBitsAreIgnored(t *testing.T) {
 			t.Fatal("reserved bits completed IPv6 reassembly early")
 		}
 		if index == len(fragments)-1 {
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok || parsed.protocol != ProtocolUDP || len(parsed.payload) != 24 {
 				t.Fatalf("reserved-bit IPv6 reassembly = %+v, parsed = %v", parsed, ok)
 			}
@@ -301,7 +301,7 @@ func TestIPv6FragmentAfterRepeatedExtensionHeaders(t *testing.T) {
 	payload = append(payload, 44, 0, 0, 0, 0, 0, 0, 0)
 	payload = append(payload, 99, 0, 0, 1, 0, 0, 0, 7)
 	payload = append(payload, 1, 2, 3, 4, 5, 6, 7, 8)
-	fragment, ok := parseFragment(buildIPPacket(remote, local, 60, payload, 0, false))
+	fragment, ok := parseFragment(buildIPPacket(remote, local, 60, payload, 0, false), false)
 	if !ok || !fragment.v6 || fragment.protocol != 99 || fragment.offset != 0 || !fragment.more || len(fragment.header) != 80 {
 		t.Fatalf("fragment after repeated extension headers = %+v, parsed = %t", fragment, ok)
 	}
@@ -354,7 +354,7 @@ func TestIPv6UnfragmentableHeaderErrors(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			fragment, ok := parseFragment(packet)
+			fragment, ok := parseFragment(packet, false)
 			if !ok || !fragment.parameter || fragment.parameterCode != test.wantCode || fragment.parameterAt != test.wantAt {
 				t.Fatalf("unfragmentable-header parse = %+v, parsed=%t", fragment, ok)
 			}
@@ -368,7 +368,7 @@ func TestIPv6UnfragmentableHeaderErrors(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("timed out waiting for unfragmentable-header Parameter Problem")
 			}
-			parsed, ok := parseIPPacket(response)
+			parsed, ok := parseIPPacket(response, false)
 			if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != test.wantCode || binary.BigEndian.Uint32(parsed.payload[4:8]) != test.wantAt {
 				t.Fatalf("unfragmentable-header response = %x", response)
 			}
@@ -395,7 +395,7 @@ func TestIPv6FirstFragmentRequiresCompleteHeaderChain(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for RFC 7112 Parameter Problem")
 	}
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 3 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 0 {
 		t.Fatalf("incomplete first-fragment response = %x", response)
 	}
@@ -495,7 +495,7 @@ func TestIPv6NonFinalFragmentRequiresEightBytePayload(t *testing.T) {
 	}
 	select {
 	case response := <-link.outbound:
-		parsed, ok := parseIPPacket(response)
+		parsed, ok := parseIPPacket(response, false)
 		if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 0 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 4 {
 			t.Fatalf("misaligned IPv6 fragment response = %x", response)
 		}
@@ -527,7 +527,7 @@ func TestIPv4NonFinalFragmentTrimsPartialOffsetUnit(t *testing.T) {
 		t.Fatal("trimmed first fragment completed datagram early")
 	}
 	packet := stack.reassemblePacket(second, time.Now())
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok || len(parsed.payload) != 16 || !bytes.Equal(parsed.payload[:8], firstPayload[:8]) || !bytes.Equal(parsed.payload[8:], second[20:]) {
 		t.Fatalf("Linux-compatible trimmed IPv4 reassembly = %x parsed=%+v ok=%t", packet, parsed, ok)
 	}
@@ -550,7 +550,7 @@ func TestIPv6FragmentReassemblyLengthOverflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary.BigEndian.PutUint16(overflow[42:44], 0xfff9)
-	fragment, valid := parseFragment(overflow)
+	fragment, valid := parseFragment(overflow, false)
 	if !valid || !fragment.parameter || fragment.parameterAt != 42 {
 		t.Fatalf("overflow fragment parse = %+v, valid=%t", fragment, valid)
 	}
@@ -563,7 +563,7 @@ func TestIPv6FragmentReassemblyLengthOverflow(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for oversized-fragment Parameter Problem")
 	}
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 0 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 42 {
 		t.Fatalf("IPv6 oversized-reassembly response = %x", response)
 	}
@@ -603,7 +603,7 @@ func TestIPv6IncompleteFirstFragmentDiscardsPriorTail(t *testing.T) {
 	}
 	select {
 	case response := <-link.outbound:
-		parsed, ok := parseIPPacket(response)
+		parsed, ok := parseIPPacket(response, false)
 		if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 3 {
 			t.Fatalf("incomplete first-fragment response = %x", response)
 		}
@@ -682,6 +682,67 @@ func TestUDPFragmentationAndReassembly(t *testing.T) {
 			bridge.mu.Unlock()
 			if fragments < 3 {
 				t.Fatalf("fragment writes = %d, want at least 3", fragments)
+			}
+		})
+	}
+}
+
+// TestRXChecksumOffloadReassembly verifies the complete transport checksum
+// even when every fragment arrived from a trusted external link.
+func TestRXChecksumOffloadReassembly(t *testing.T) {
+	for _, local := range []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")} {
+		t.Run(local.String(), func(t *testing.T) {
+			remote := netip.MustParseAddr("192.0.2.2")
+			if local.Is6() {
+				remote = netip.MustParseAddr("2001:db8::2")
+			}
+			stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, local.BitLen())}, MTU: 1280})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			stack.SetRXChecksumOffload(RXChecksumOffload{flags: rxChecksumOffloadGenerated})
+			if err = stack.Start(); err != nil {
+				t.Fatal(err)
+			}
+			receiver, err := stack.ListenUDP(context.Background(), "udp", netip.AddrPortFrom(local, 49001))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer receiver.Close()
+			payload := bytes.Repeat([]byte{0x5a}, 3000)
+			for index, corrupt := range []bool{true, false} {
+				datagram, err := (UDPDatagram{Source: netip.AddrPortFrom(remote, 49000), Destination: netip.AddrPortFrom(local, 49001), Payload: payload}).MarshalBinary()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if corrupt {
+					datagram[len(datagram)-1] ^= 1
+				}
+				packet := IPPacket{Source: remote, Destination: local, Protocol: ProtocolUDP, HopLimit: 64, Payload: datagram}
+				if local.Is4() {
+					packet.Identification = uint16(index + 1)
+				}
+				fragments, err := packet.MarshalFragments(1280, uint32(index+1))
+				if err != nil || len(fragments) < 2 {
+					t.Fatalf("MarshalFragments = %d, %v", len(fragments), err)
+				}
+				for _, fragment := range fragments {
+					if local.Is4() {
+						fragment[10] ^= 1
+					}
+				}
+				if n, err := stack.Write(fragments, 0); err != nil || n != len(fragments) {
+					t.Fatalf("fragment Write = %d, %v", n, err)
+				}
+				if corrupt && stack.Stats().InboundDroppedPackets != 1 {
+					t.Fatal("corrupt reassembled UDP was not rejected")
+				}
+			}
+			_ = receiver.SetReadDeadline(time.Now().Add(time.Second))
+			buffer := make([]byte, len(payload))
+			if n, _, err := receiver.ReadFrom(buffer); err != nil || n != len(payload) || !bytes.Equal(buffer, payload) {
+				t.Fatalf("valid reassembled UDP = %d, %v", n, err)
 			}
 		})
 	}
@@ -822,7 +883,12 @@ func TestDirectIPv6FragmentOutputOverwritesReusableHeader(t *testing.T) {
 	defer stack.Close()
 	dirty := bytes.Repeat([]byte{0xff}, 1280)
 	stack.outbound.buffers <- dirty[:0]
-	if err = stack.writeIPPayload(local, remote, ProtocolUDP, make([]byte, 1300), true); err != nil {
+	datagram, err := (UDPDatagram{Source: netip.AddrPortFrom(local, 1000), Destination: netip.AddrPortFrom(remote, 1001),
+		Payload: make([]byte, 1300-udpHeaderSize)}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = stack.writeIPPayload(local, remote, ProtocolUDP, datagram, true); err != nil {
 		t.Fatal(err)
 	}
 	entry, ok := stack.outbound.tryDequeue()
@@ -973,7 +1039,7 @@ func TestDirectFragmentedLoopbackOutputUsesAllOrNoneAdmission(t *testing.T) {
 		}
 	}
 	before := stack.loopback.len()
-	if err = stack.tryWriteIPFragmentsLayout(local, local, 99, first, second, layout); !errors.Is(err, ErrResourceLimit) {
+	if err = stack.tryWriteIPFragmentsLayout(local, local, 99, first, second, layout, false); !errors.Is(err, ErrResourceLimit) {
 		t.Fatalf("fragmented loopback write = %v, want ErrResourceLimit", err)
 	}
 	if after := stack.loopback.len(); after != before {
@@ -1011,7 +1077,7 @@ func TestMinimumSizeFragmentsReassembleRequiredPacket(t *testing.T) {
 			for _, fragment := range fragments {
 				packet = stack.reassemblePacket(fragment, time.Now())
 			}
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok || len(packet) != 1500 || !bytes.Equal(parsed.payload, payload) {
 				t.Fatalf("minimum-fragment reassembly = packet %d payload %d parsed %v", len(packet), len(parsed.payload), ok)
 			}
@@ -1073,7 +1139,7 @@ func TestDuplicateFragmentPreservesReassembly(t *testing.T) {
 			for _, fragment := range fragments[1:] {
 				packet = stack.reassemblePacket(fragment, time.Now())
 			}
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok || !bytes.Equal(parsed.payload, payload) {
 				t.Fatalf("duplicate-preserving reassembly = parsed %v payload %d", ok, len(parsed.payload))
 			}
@@ -1160,7 +1226,7 @@ func TestIPv6FragmentUsesFirstNextHeader(t *testing.T) {
 		t.Fatal("first fragment completed an incomplete datagram")
 	}
 	packet := stack.reassemblePacket(fragments[1], time.Now())
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok || parsed.protocol != ProtocolUDP || !bytes.Equal(parsed.payload, payload) {
 		t.Fatalf("reassembled packet uses wrong first-fragment metadata: protocol=%d payload=%x", parsed.protocol, parsed.payload)
 	}
@@ -1211,7 +1277,7 @@ func TestIPv6ReassemblyPreservesUnfragmentableHeaders(t *testing.T) {
 		t.Fatal("tail fragment completed IPv6 datagram")
 	}
 	packet := stack.reassemblePacket(fragments[0], time.Now())
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok || parsed.protocol != 99 || !bytes.Equal(parsed.payload, payload) || len(packet) != 64 || packet[6] != 0 || packet[40] != 99 {
 		t.Fatalf("extension-preserving IPv6 reassembly = %x parsed=%+v ok=%v", packet, parsed, ok)
 	}
@@ -1356,7 +1422,7 @@ func TestFragmentTimesDoNotFollowLockAcquisitionOrder(t *testing.T) {
 	if packet, pending := stack.reassemblePacketStatus(fragments[2], base, false); packet != nil || !pending {
 		t.Fatalf("earlier fragment = packet %x pending %t", packet, pending)
 	}
-	parsed, ok := parseFragment(fragments[1])
+	parsed, ok := parseFragment(fragments[1], false)
 	if !ok {
 		t.Fatal("test fragment did not parse")
 	}
@@ -1396,8 +1462,10 @@ func TestFragmentReassemblyTimeoutResponse(t *testing.T) {
 		protocol      byte
 		messageType   byte
 		lifetime      time.Duration
+		offload       bool
 	}{
 		{name: "IPv4", local: netip.MustParseAddr("192.0.2.43"), remote: netip.MustParseAddr("198.51.100.43"), protocol: ProtocolICMPv4, messageType: 11, lifetime: fragmentIPv4Lifetime},
+		{name: "IPv4-offload", local: netip.MustParseAddr("192.0.2.43"), remote: netip.MustParseAddr("198.51.100.43"), protocol: ProtocolICMPv4, messageType: 11, lifetime: fragmentIPv4Lifetime, offload: true},
 		{name: "IPv6", local: netip.MustParseAddr("2001:db8::43"), remote: netip.MustParseAddr("2001:db8:1::43"), protocol: ProtocolICMPv6, messageType: 3, lifetime: fragmentIPv6Lifetime},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1409,15 +1477,25 @@ func TestFragmentReassemblyTimeoutResponse(t *testing.T) {
 			} else {
 				fragments = buildIPv6FragmentsWithOptions(test.remote, test.local, ProtocolUDP, payload, 1280, 42, ipPacketOptions{})
 			}
+			if test.offload {
+				var offload RXChecksumOffload
+				offload.SetIPv4Header(true)
+				stack.SetRXChecksumOffload(offload)
+				fragments[0][10] ^= 1
+			}
 			start := time.Now()
-			if packet := stack.reassemblePacket(fragments[0], start); packet != nil {
-				t.Fatal("first fragment completed a datagram")
+			if err := writeTestPacket(stack, fragments[0]); err != nil {
+				t.Fatal(err)
 			}
 			stack.expireFragments(start.Add(test.lifetime + time.Second))
 			select {
 			case response := <-link.outbound:
-				parsed, ok := parseIPPacket(response)
-				if !ok || parsed.protocol != test.protocol || len(parsed.payload) < 8 || parsed.payload[0] != test.messageType || parsed.payload[1] != 1 {
+				parsed, err := ParseIPPacket(response)
+				if err != nil || parsed.Protocol != int(test.protocol) {
+					t.Fatalf("fragment timeout response = %x, %v", response, err)
+				}
+				message, err := parsed.ICMPMessage()
+				if err != nil || message.Type != test.messageType || message.Code != 1 {
 					t.Fatalf("fragment timeout response = %x", response)
 				}
 				if test.local.Is6() && len(response) > ipv6MinimumMTU {
@@ -1483,7 +1561,7 @@ func FuzzFragmentParsing(f *testing.F) {
 			packet = packet[:65575]
 		}
 		before := append([]byte(nil), packet...)
-		fragment, ok := parseFragment(packet)
+		fragment, ok := parseFragment(packet, false)
 		if !bytes.Equal(packet, before) {
 			t.Fatal("parseFragment modified its input")
 		}
@@ -1590,7 +1668,7 @@ func FuzzFragmentReassemblyOrder(f *testing.F) {
 			if packet == nil {
 				continue
 			}
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok || parsed.protocol != ProtocolUDP || !bytes.Equal(parsed.payload, payload) {
 				t.Fatalf("reassembled fuzz datagram = protocol %d payload %d parsed %t", parsed.protocol, len(parsed.payload), ok)
 			}
@@ -1641,7 +1719,7 @@ func FuzzFragmentReassemblyOverlap(f *testing.F) {
 		maximumEnd := 0
 		for offset := 0; offset+4 <= len(events); offset += 4 {
 			packet := append([]byte(nil), fragments[int(events[offset])%len(fragments)]...)
-			fragment, ok := parseFragment(packet)
+			fragment, ok := parseFragment(packet, false)
 			if !ok || len(fragment.payload) == 0 {
 				t.Fatal("generated base fragment is not parseable")
 			}
@@ -1675,7 +1753,7 @@ func FuzzFragmentReassemblyOverlap(f *testing.F) {
 			if reassembled == nil {
 				continue
 			}
-			parsed, valid := parseIPPacket(reassembled)
+			parsed, valid := parseIPPacket(reassembled, false)
 			if !valid || parsed.protocol != ProtocolUDP || len(parsed.payload) > maximumEnd {
 				t.Fatalf("overlap reassembly produced invalid packet: parsed=%t protocol=%d payload=%d", valid, parsed.protocol, len(parsed.payload))
 			}
@@ -1740,7 +1818,7 @@ func FuzzIPPayloadFragmentationRoundTrip(f *testing.F) {
 				t.Fatalf("fragment %d has %d bytes, want at most MTU %d", index, len(packet), mtu)
 			}
 			if len(packets) > 1 {
-				if _, ok := parseFragment(packet); !ok {
+				if _, ok := parseFragment(packet, false); !ok {
 					t.Fatalf("generated fragment %d is not parseable", index)
 				}
 			}
@@ -1766,7 +1844,7 @@ func FuzzIPPayloadFragmentationRoundTrip(f *testing.F) {
 			}
 			checkFragmentFuzzResources(t, stack)
 		}
-		parsed, ok := parseIPPacket(completed)
+		parsed, ok := parseIPPacket(completed, false)
 		if !ok || parsed.parameterError {
 			t.Fatalf("fragmentation round trip produced an invalid packet: parsed=%t metadata=%+v", ok, parsed)
 		}
@@ -1797,7 +1875,7 @@ func TestFragmentECNReassembly(t *testing.T) {
 		t.Fatal("first fragment completed a datagram")
 	}
 	packet := stack.reassemblePacket(fragments[1], time.Now())
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok || parsed.ecn != 3 {
 		t.Fatalf("reassembled ECN = %d, valid = %v, want CE", parsed.ecn, ok)
 	}
@@ -1817,7 +1895,7 @@ func TestFragmentECNReassembly(t *testing.T) {
 	_ = stack.reassemblePacket(fragments[0], time.Now())
 	_ = stack.reassemblePacket(fragments[1], time.Now())
 	packet = stack.reassemblePacket(fragments[2], time.Now())
-	parsed, ok = parseIPPacket(packet)
+	parsed, ok = parseIPPacket(packet, false)
 	if !ok || parsed.ecn != 3 {
 		t.Fatalf("mixed ECT(0)/ECT(1)/CE reassembly = %d, valid = %v, want CE", parsed.ecn, ok)
 	}
@@ -1876,7 +1954,7 @@ func TestIPv4FragmentsWithDontFragmentAreAccepted(t *testing.T) {
 			t.Fatalf("retained first-fragment bytes = %d, want allocation size %d", stack.fragmentBytes, len(fragments[index]))
 		}
 	}
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok || parsed.protocol != ProtocolUDP || !bytes.Equal(parsed.payload, payload) {
 		t.Fatalf("DF fragment reassembly = %+v, parsed = %v", parsed, ok)
 	}
@@ -1895,7 +1973,7 @@ func TestIPv4FragmentWithReservedFlagIsRejected(t *testing.T) {
 	binary.BigEndian.PutUint16(fragments[0][6:8], field)
 	fragments[0][10], fragments[0][11] = 0, 0
 	binary.BigEndian.PutUint16(fragments[0][10:12], checksum(fragments[0][:20]))
-	if _, ok := parseFragment(fragments[0]); ok {
+	if _, ok := parseFragment(fragments[0], false); ok {
 		t.Fatal("fragment with reserved flag was accepted")
 	}
 }
@@ -2171,7 +2249,7 @@ func TestStackIPv6NonInitialFragmentMaximumIgnoresLocalPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fragment, valid := parseFragment(wire)
+	fragment, valid := parseFragment(wire, false)
 	if !valid || fragment.parameter || fragment.maximum != fragmentMaximumDatagram {
 		t.Fatalf("non-initial fragment = valid %t parameter %t maximum %d", valid, fragment.parameter, fragment.maximum)
 	}

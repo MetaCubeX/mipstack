@@ -551,7 +551,7 @@ func TestIPConnWriteMsgSourceAndHeaderOptions(t *testing.T) {
 	if err != nil || n != 10 || oobn != len(oob) {
 		t.Fatalf("WriteMsgIP = %d/%d, %v", n, oobn, err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != second || packet.target != remote || packet.protocol != 99 || packet.hopLimit != options.hopLimit || packet.trafficClass != options.trafficClass || string(packet.payload) != "raw-output" {
 		t.Fatalf("raw output = %+v, parsed = %v", packet, ok)
 	}
@@ -560,7 +560,7 @@ func TestIPConnWriteMsgSourceAndHeaderOptions(t *testing.T) {
 	if err != nil || n != len("spec-dst") || oobn != len(mixedControl) {
 		t.Fatalf("mixed WriteMsgIP = %d/%d, %v", n, oobn, err)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != second || string(packet.payload) != "spec-dst" {
 		t.Fatalf("mixed IPv4 packet-info source = %s payload %q, want %s/spec-dst", packet.source, packet.payload, second)
 	}
@@ -569,7 +569,7 @@ func TestIPConnWriteMsgSourceAndHeaderOptions(t *testing.T) {
 	if err != nil || n != len("addr-only") || oobn != len(addrOnlyControl) {
 		t.Fatalf("addr-only WriteMsgIP = %d/%d, %v", n, oobn, err)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != first || string(packet.payload) != "addr-only" {
 		t.Fatalf("addr-only IPv4 packet-info source = %s payload %q, want %s/addr-only", packet.source, packet.payload, first)
 	}
@@ -625,13 +625,13 @@ func TestIPConnTypedWritesAndDeadlines(t *testing.T) {
 	if n, writeErr := connection.(*IPConn).WriteToIP([]byte("typed"), ipNetAddr(remote)); writeErr != nil || n != len("typed") {
 		t.Fatalf("WriteToIP = %d, %v", n, writeErr)
 	}
-	if packet, ok := parseIPPacket(readOutboundPacket(t, stack)); !ok || string(packet.payload) != "typed" || packet.target != remote {
+	if packet, ok := parseIPPacket(readOutboundPacket(t, stack), false); !ok || string(packet.payload) != "typed" || packet.target != remote {
 		t.Fatalf("typed output = %+v, parsed = %v", packet, ok)
 	}
 	if n, writeErr := connection.WriteTo([]byte("generic"), ipNetAddr(remote)); writeErr != nil || n != len("generic") {
 		t.Fatalf("WriteTo = %d, %v", n, writeErr)
 	}
-	if packet, ok := parseIPPacket(readOutboundPacket(t, stack)); !ok || string(packet.payload) != "generic" || packet.target != remote {
+	if packet, ok := parseIPPacket(readOutboundPacket(t, stack), false); !ok || string(packet.payload) != "generic" || packet.target != remote {
 		t.Fatalf("generic output = %+v, parsed = %v", packet, ok)
 	}
 	if err = connection.SetWriteDeadline(time.Now()); err != nil {
@@ -687,7 +687,7 @@ func TestConnectedIPConnAndICMPv6Checksum(t *testing.T) {
 	if n, writeErr := connection.Write(payload); writeErr != nil || n != len(payload) {
 		t.Fatalf("connected IP Write = %d, %v", n, writeErr)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || transportChecksum(local, remote, ProtocolICMPv6, packet.payload) != 0 {
 		t.Fatalf("ICMPv6 raw checksum is invalid: %x", packet.payload)
 	}
@@ -963,7 +963,7 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 	if !bytes.Equal(outbound, original) {
 		t.Fatalf("WriteToIP mutated caller payload: %x", outbound)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || transportChecksum(local, remote, 99, packet.payload) != 0 {
 		t.Fatalf("checksummed output = %+v, parsed=%v", packet, ok)
 	}
@@ -977,7 +977,7 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 	if !bytes.Equal(batchPayload, batchOriginal) {
 		t.Fatalf("WriteBatch mutated caller payload: %x", batchPayload)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || transportChecksum(local, remote, 99, packet.payload) != 0 {
 		t.Fatalf("checksummed batch output = %+v, parsed=%v", packet, ok)
 	}
@@ -1000,12 +1000,47 @@ func TestIPConnIPv6ChecksumPolicy(t *testing.T) {
 	for count := 0; reassembled == nil && count < 16; count++ {
 		reassembled = receiver.reassemblePacket(readOutboundPacket(t, stack), time.Now())
 	}
-	packet, ok = parseIPPacket(reassembled)
+	packet, ok = parseIPPacket(reassembled, false)
 	if !ok || transportChecksum(local, remote, 99, packet.payload) != 0 || len(packet.payload) != len(fragmented) {
 		t.Fatalf("checksummed fragmented output = %+v, parsed=%v", packet, ok)
 	}
 	if _, writeErr := connection.(*IPConn).WriteToIP([]byte{1, 2, 3}, ipNetAddr(remote)); !errors.Is(writeErr, syscall.EINVAL) {
 		t.Fatalf("short checksummed write = %v, want EINVAL", writeErr)
+	}
+}
+
+// TestRXChecksumOffloadKeepsRawIPv6Policy verifies that external transport
+// offload cannot disable an independently configured RFC 3542 raw checksum.
+func TestRXChecksumOffloadKeepsRawIPv6Policy(t *testing.T) {
+	local, remote := netip.MustParseAddr("2001:db8::151"), netip.MustParseAddr("2001:db8::152")
+	stack, err := New(Config{LocalAddresses: []netip.Prefix{netip.PrefixFrom(local, 128)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	stack.SetRXChecksumOffload(RXChecksumOffload{flags: rxChecksumOffloadGenerated})
+	if err = stack.Start(); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := (&ListenConfig{Options: []SocketOption{SocketOptions.IPv6Checksum(true, 2)}}).ListenIP(context.Background(), stack, "ip6:99", local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	payload := []byte{1, 2, 0, 0, 5, 6, 7, 8}
+	binary.BigEndian.PutUint16(payload[2:4], transportChecksum(remote, local, 99, payload))
+	bad := append([]byte(nil), payload...)
+	bad[len(bad)-1] ^= 1
+	if n, err := stack.Write([][]byte{buildIPPacket(remote, local, 99, bad, 0, true), buildIPPacket(remote, local, 99, payload, 0, true)}, 0); err != nil || n != 2 {
+		t.Fatalf("raw input Write = %d, %v", n, err)
+	}
+	buffer := make([]byte, len(payload))
+	messages := []SocketMessage{{Buffers: [][]byte{buffer}}}
+	if n, err := connection.(*IPConn).ReadBatch(messages, MessageFlagDontWait); err != nil || n != 1 || !bytes.Equal(buffer, payload) {
+		t.Fatalf("raw receive = %d, %v, %x", n, err, buffer)
+	}
+	if n, err := connection.(*IPConn).ReadBatch(messages, MessageFlagDontWait); n != 0 || !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("invalid raw payload queued: %d, %v", n, err)
 	}
 }
 
@@ -1036,7 +1071,7 @@ func TestIPConnDualStackIPv6ChecksumIsolation(t *testing.T) {
 	if _, err = connection.WriteTo(payload4, ipNetAddr(remote4)); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != local4 || !bytes.Equal(packet.payload, original4) || !bytes.Equal(payload4, original4) {
 		t.Fatalf("dual-stack IPv4 checksum isolation = %+v payload=%x", packet, payload4)
 	}
@@ -1045,7 +1080,7 @@ func TestIPConnDualStackIPv6ChecksumIsolation(t *testing.T) {
 	if _, err = connection.WriteTo(payload6, ipNetAddr(remote6)); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != local6 || transportChecksum(local6, remote6, 99, packet.payload) != 0 || !bytes.Equal(payload6, original6) {
 		t.Fatalf("dual-stack IPv6 checksum output = %+v payload=%x", packet, payload6)
 	}
@@ -1060,7 +1095,7 @@ func TestIPConnDualStackIPv6ChecksumIsolation(t *testing.T) {
 	if _, err = protocol58.WriteTo(icmpNumberOverIPv4, ipNetAddr(remote4)); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != local4 || packet.protocol != ProtocolICMPv6 || !bytes.Equal(packet.payload, want) || !bytes.Equal(icmpNumberOverIPv4, want) {
 		t.Fatalf("IPv4 protocol 58 was treated as ICMPv6: %+v payload=%x", packet, icmpNumberOverIPv4)
 	}
@@ -1479,7 +1514,7 @@ func TestIPIPv6FlowLabelPolicy(t *testing.T) {
 		if _, writeErr := connection.(*IPConn).WriteToIP([]byte("flow"), ipNetAddr(remote)); writeErr != nil {
 			t.Fatal(writeErr)
 		}
-		packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+		packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 		if !ok {
 			t.Fatal("failed to parse IPv6 IP output")
 		}
@@ -1863,7 +1898,7 @@ func TestIPBatchReadAndWrite(t *testing.T) {
 		t.Fatalf("WriteBatch = %d, %v", n, err)
 	}
 	for index, source := range []netip.Addr{firstLocal, secondLocal} {
-		packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+		packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 		if !ok || packet.source != source || string(packet.payload) != []string{"abcd", "efgh"}[index] {
 			t.Fatalf("IP batch packet %d = %+v payload %q", index, packet, packet.payload)
 		}
@@ -1963,7 +1998,7 @@ func TestIPBatchWriteIPv6ChecksumAndFlowLabel(t *testing.T) {
 	if !bytes.Equal(payload, original) {
 		t.Fatalf("WriteBatch mutated caller payload: %x", payload)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.source != local || packet.target != remote || packet.protocol != ProtocolICMPv6 ||
 		transportChecksum(local, remote, ProtocolICMPv6, packet.payload) != 0 {
 		t.Fatalf("IPv6 ICMP batch packet = %+v, parsed = %v", packet, ok)
@@ -2005,7 +2040,7 @@ func TestIPBatchWriteFragmentedBuffers(t *testing.T) {
 	for fragmentCount := 0; reassembled == nil && fragmentCount < 16; fragmentCount++ {
 		reassembled = receiver.reassemblePacket(readOutboundPacket(t, stack), time.Now())
 	}
-	packet, ok := parseIPPacket(reassembled)
+	packet, ok := parseIPPacket(reassembled, false)
 	if !ok || packet.protocol != 99 || !bytes.Equal(packet.payload, payload) {
 		t.Fatalf("reassembled IP batch packet = %+v, parsed = %v", packet, ok)
 	}
@@ -2574,7 +2609,7 @@ func TestIPDefaultsAndDiagnostics(t *testing.T) {
 	if _, err = ip.Write([]byte("query")); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.hopLimit != 41 || packet.trafficClass != 0x2e || packet.protocol != 99 {
 		t.Fatalf("IP output options = protocol %d hop %d class %#x", packet.protocol, packet.hopLimit, packet.trafficClass)
 	}
@@ -2629,7 +2664,7 @@ func TestIPZeroHopLimitFamilyValidation(t *testing.T) {
 	if _, err = ip6.Write([]byte("zero")); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.hopLimit != 0 || packet.target != remote6 {
 		t.Fatalf("IPv6 default zero hop-limit packet = target %v hop %d, parsed = %v", packet.target, packet.hopLimit, ok)
 	}

@@ -878,7 +878,7 @@ func TestPublicIPv4HeaderOptionsNormalizeEOLPadding(t *testing.T) {
 	if err != nil || !bytes.Equal(rawReencoded, wantRaw) {
 		t.Fatalf("in-place raw IPv4 packet round trip: error=%v\n got %x\nwant %x", err, rawReencoded, wantRaw)
 	}
-	internal, ok := parseIPPacket(raw)
+	internal, ok := parseIPPacket(raw, false)
 	if !ok || internal.parameterError {
 		t.Fatalf("runtime parser rejected Linux-compatible EOL padding: %+v, ok=%t", internal, ok)
 	}
@@ -1971,7 +1971,7 @@ func TestPublicIPv6NoNextHeaderAndLinkPadding(t *testing.T) {
 	if err != nil || len(parsed.Payload) != 0 {
 		t.Fatalf("parse padded zero-payload IPv6: packet=%+v error=%v", parsed, err)
 	}
-	internal, ok := parseIPPacket(padded)
+	internal, ok := parseIPPacket(padded, false)
 	if !ok || len(internal.payload) != 0 || len(internal.original) != len(wire) {
 		t.Fatalf("internal padded zero-payload IPv6 = %+v, %v", internal, ok)
 	}
@@ -2071,7 +2071,7 @@ func TestIPv6MappedAddressesAreRejected(t *testing.T) {
 	if _, err := ParseIPPacket(packet); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("mapped IPv6 ParseIPPacket error = %v", err)
 	}
-	if _, ok := parseIPPacket(packet); ok {
+	if _, ok := parseIPPacket(packet, false); ok {
 		t.Fatal("internal parser accepted a mapped IPv6 source")
 	}
 }
@@ -2854,11 +2854,11 @@ func FuzzIPPacketParsing(f *testing.F) {
 			packet = packet[:65575]
 		}
 		before := append([]byte(nil), packet...)
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !bytes.Equal(packet, before) {
 			t.Fatal("parseIPPacket modified its input")
 		}
-		repeated, repeatedOK := parseIPPacket(packet)
+		repeated, repeatedOK := parseIPPacket(packet, false)
 		if repeatedOK != ok {
 			t.Fatal("parseIPPacket returned a nondeterministic validity result")
 		}
@@ -2911,11 +2911,11 @@ func FuzzIPv4OptionParsing(f *testing.F) {
 		options := paddedIPv4FuzzOptions(input)
 		packet := buildTestIPv4Options(remote, local, options)
 		before := append([]byte(nil), packet...)
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !bytes.Equal(packet, before) {
 			t.Fatal("parseIPPacket modified an IPv4 option packet")
 		}
-		repeated, repeatedOK := parseIPPacket(packet)
+		repeated, repeatedOK := parseIPPacket(packet, false)
 		if repeatedOK != ok || parsed.parameterError != repeated.parameterError || parsed.parameterAt != repeated.parameterAt ||
 			parsed.parameterCode != repeated.parameterCode || parsed.protocol != repeated.protocol || !bytes.Equal(parsed.payload, repeated.payload) {
 			t.Fatal("IPv4 option parsing was nondeterministic")
@@ -2982,11 +2982,11 @@ func FuzzIPv6OptionParsing(f *testing.F) {
 		}
 		packet := buildTestIPv6Extension(remote, target, extensionType, header)
 		before := append([]byte(nil), packet...)
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !bytes.Equal(packet, before) {
 			t.Fatal("parseIPPacket modified an IPv6 option packet")
 		}
-		repeated, repeatedOK := parseIPPacket(packet)
+		repeated, repeatedOK := parseIPPacket(packet, false)
 		if repeatedOK != ok || parsed.parameterError != repeated.parameterError || parsed.parameterAt != repeated.parameterAt ||
 			parsed.parameterCode != repeated.parameterCode || parsed.protocol != repeated.protocol || !bytes.Equal(parsed.payload, repeated.payload) {
 			t.Fatal("IPv6 option parsing was nondeterministic")
@@ -3034,12 +3034,12 @@ func TestIPv6FlowLabelEncodingAndFragmentation(t *testing.T) {
 	packet := buildIPPacketWithOptions(source, target, ProtocolUDP, make([]byte, udpHeaderSize), 0, true, ipPacketOptions{
 		trafficClass: 0x2e, flowLabel: label, flowLabelSet: true,
 	})
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok || parsed.trafficClass != 0x2e || parsed.flowLabel != label {
 		t.Fatalf("IPv6 flow header = class %#x label %#x, parsed=%v", parsed.trafficClass, parsed.flowLabel, ok)
 	}
 	setPacketECN(packet, 3)
-	parsed, ok = parseIPPacket(packet)
+	parsed, ok = parseIPPacket(packet, false)
 	if !ok || parsed.ecn != 3 || parsed.flowLabel != label {
 		t.Fatalf("IPv6 ECN update changed flow label: ECN %d label %#x", parsed.ecn, parsed.flowLabel)
 	}
@@ -3067,11 +3067,11 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	local4 := netip.MustParseAddr("192.0.2.50")
 	remote4 := netip.MustParseAddr("198.51.100.50")
 	validIPv4 := buildTestIPv4Options(remote4, local4, []byte{1, 0, 0, 0})
-	if _, ok := parseIPPacket(validIPv4); !ok {
+	if _, ok := parseIPPacket(validIPv4, false); !ok {
 		t.Fatal("valid IPv4 options were rejected")
 	}
 	for _, options := range [][]byte{{7, 1, 0, 0}, {30, 1, 0, 0}} {
-		parsed, ok := parseIPPacket(buildTestIPv4Options(remote4, local4, options))
+		parsed, ok := parseIPPacket(buildTestIPv4Options(remote4, local4, options), false)
 		if !ok || !parsed.parameterError || parsed.parameterCode != 0 {
 			t.Fatalf("malformed IPv4 options = %+v, %v for %x", parsed, ok, options)
 		}
@@ -3087,7 +3087,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		{[]byte{148, 3, 0, 0}, 21},
 		{[]byte{131, 2, 0, 0}, 21},
 	} {
-		parsed, ok := parseIPPacket(buildTestIPv4Options(remote4, local4, test.options))
+		parsed, ok := parseIPPacket(buildTestIPv4Options(remote4, local4, test.options), false)
 		if !ok || !parsed.parameterError || parsed.parameterAt != test.pointer {
 			t.Fatalf("IPv4 option %x = %+v, %v; want pointer %d", test.options, parsed, ok, test.pointer)
 		}
@@ -3096,24 +3096,24 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	// RFC 791 defines only 0, 1, and 3; strict validation is limited to locally
 	// generated options without CAP_NET_RAW.
 	reservedTimestampFlag := buildTestIPv4Options(remote4, local4, []byte{68, 4, 5, 2})
-	if parsed, ok := parseIPPacket(reservedTimestampFlag); !ok || parsed.parameterError {
+	if parsed, ok := parseIPPacket(reservedTimestampFlag, false); !ok || parsed.parameterError {
 		t.Fatalf("Linux-compatible reserved timestamp flag = %+v, parsed=%t", parsed, ok)
 	}
 	duplicateRoute := buildTestIPv4Options(remote4, local4, []byte{7, 3, 4, 7, 3, 4, 0, 0})
-	parsedRoute, ok := parseIPPacket(duplicateRoute)
+	parsedRoute, ok := parseIPPacket(duplicateRoute, false)
 	if !ok || !parsedRoute.parameterError || parsedRoute.parameterAt != 23 {
 		t.Fatalf("duplicate IPv4 record route = %+v, %v", parsedRoute, ok)
 	}
-	if _, ok := parseIPPacket(buildTestIPv4Options(remote4, local4, []byte{131, 3, 4, 0})); ok {
+	if _, ok := parseIPPacket(buildTestIPv4Options(remote4, local4, []byte{131, 3, 4, 0}), false); ok {
 		t.Fatal("unsupported IPv4 source route was accepted")
 	}
 
 	local6 := netip.MustParseAddr("2001:db8::50")
 	remote6 := netip.MustParseAddr("2001:db8::51")
-	if _, ok := parseIPPacket(buildTestIPv6Extension(remote6, local6, 60, []byte{ProtocolUDP, 0, 0x40, 0, 0, 0, 0, 0})); ok {
+	if _, ok := parseIPPacket(buildTestIPv6Extension(remote6, local6, 60, []byte{ProtocolUDP, 0, 0x40, 0, 0, 0, 0, 0}), false); ok {
 		t.Fatal("IPv6 discard-action option was accepted")
 	}
-	routingError, ok := parseIPPacket(buildTestIPv6Extension(remote6, local6, 43, []byte{ProtocolUDP, 0, 99, 1, 0, 0, 0, 0}))
+	routingError, ok := parseIPPacket(buildTestIPv6Extension(remote6, local6, 43, []byte{ProtocolUDP, 0, 99, 1, 0, 0, 0, 0}), false)
 	if !ok || !routingError.parameterError || routingError.parameterCode != 0 || routingError.parameterAt != 42 {
 		t.Fatalf("active IPv6 routing header = %+v, parsed = %v", routingError, ok)
 	}
@@ -3128,13 +3128,13 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	misplacedHopError, ok := parseIPPacket(misplacedHop)
+	misplacedHopError, ok := parseIPPacket(misplacedHop, false)
 	if !ok || !misplacedHopError.parameterError || misplacedHopError.parameterCode != 1 || misplacedHopError.parameterAt != 40 {
 		t.Fatalf("misplaced IPv6 Hop-by-Hop header = %+v, parsed = %v", misplacedHopError, ok)
 	}
 	paddedEmptyPacket := buildIPPacket(remote6, local6, ProtocolUDP, []byte{1}, 0, true)
 	paddedEmptyPacket[4], paddedEmptyPacket[5] = 0, 0
-	parsedEmptyPacket, ok := parseIPPacket(paddedEmptyPacket)
+	parsedEmptyPacket, ok := parseIPPacket(paddedEmptyPacket, false)
 	if !ok || len(parsedEmptyPacket.payload) != 0 || len(parsedEmptyPacket.original) != 40 {
 		t.Fatalf("zero-length IPv6 payload with link padding = %+v, parsed=%t", parsedEmptyPacket, ok)
 	}
@@ -3157,7 +3157,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	jumbogram[4], jumbogram[5] = 0, 0
-	if _, ok = parseIPPacket(jumbogram); ok {
+	if _, ok = parseIPPacket(jumbogram, false); ok {
 		t.Fatal("unsupported IPv6 jumbogram was accepted")
 	}
 
@@ -3177,7 +3177,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readOutboundPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 2 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 42 {
 		t.Fatalf("IPv6 unsupported-option response = %x", response)
 	}
@@ -3186,7 +3186,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	response = readOutboundPacket(t, stack)
-	parsed, ok = parseIPPacket(response)
+	parsed, ok = parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv4 || len(parsed.payload) < 8 || parsed.payload[0] != 12 || parsed.payload[1] != 0 || parsed.payload[4] != 20 {
 		t.Fatalf("IPv4 malformed-option response = %x", response)
 	}
@@ -3207,7 +3207,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	response = readOutboundPacket(t, stack)
-	parsed, ok = parseIPPacket(response)
+	parsed, ok = parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 0 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 42 {
 		t.Fatalf("IPv6 routing-header response = %x", response)
 	}
@@ -3215,7 +3215,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	response = readOutboundPacket(t, stack)
-	parsed, ok = parseIPPacket(response)
+	parsed, ok = parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 1 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 40 {
 		t.Fatalf("misplaced IPv6 Hop-by-Hop response = %x", response)
 	}
@@ -3233,7 +3233,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	response = readOutboundPacket(t, stack)
-	parsed, ok = parseIPPacket(response)
+	parsed, ok = parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv4 || len(parsed.payload) < 8 || parsed.payload[0] != 3 || parsed.payload[1] != 2 {
 		t.Fatalf("IPv4 unsupported-protocol response = %x", response)
 	}
@@ -3241,7 +3241,7 @@ func TestStrictIPOptionsAndUnsupportedProtocols(t *testing.T) {
 		t.Fatal(err)
 	}
 	response = readOutboundPacket(t, stack)
-	parsed, ok = parseIPPacket(response)
+	parsed, ok = parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 1 || binary.BigEndian.Uint32(parsed.payload[4:8]) != 6 {
 		t.Fatalf("IPv6 unsupported-protocol response = %x", response)
 	}
@@ -3284,7 +3284,7 @@ func TestIPv6ExtensionHeadersFollowReceiverRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, ok := parseIPPacket(wire)
+	parsed, ok := parseIPPacket(wire, false)
 	if !ok || parsed.protocol != ProtocolUDP || len(parsed.payload) != 8 {
 		t.Fatalf("repeated IPv6 extension headers = %+v, parsed = %t", parsed, ok)
 	}
@@ -3398,7 +3398,7 @@ func TestICMPProtocolMustMatchIPFamily(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for cross-family protocol error")
 	}
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv6 || len(parsed.payload) < 8 || parsed.payload[0] != 4 || parsed.payload[1] != 1 {
 		t.Fatalf("cross-family ICMP response = %x", response)
 	}
@@ -3526,7 +3526,7 @@ func BenchmarkStackPacketParsing(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(test.packet)))
 			for index := 0; index < b.N; index++ {
-				if _, ok := parseIPPacket(test.packet); !ok {
+				if _, ok := parseIPPacket(test.packet, false); !ok {
 					b.Fatal("valid packet was rejected")
 				}
 			}

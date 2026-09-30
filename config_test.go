@@ -11,6 +11,57 @@ import (
 	"time"
 )
 
+func TestRXChecksumOffloadPolicy(t *testing.T) {
+	settings := []struct {
+		name string
+		set  func(*RXChecksumOffload, bool) *RXChecksumOffload
+		get  func(RXChecksumOffload) bool
+	}{
+		{"IPv4Header", (*RXChecksumOffload).SetIPv4Header, RXChecksumOffload.IPv4Header},
+		{"TCP", (*RXChecksumOffload).SetTCP, RXChecksumOffload.TCP},
+		{"UDP", (*RXChecksumOffload).SetUDP, RXChecksumOffload.UDP},
+		{"ICMPv4", (*RXChecksumOffload).SetICMPv4, RXChecksumOffload.ICMPv4},
+		{"ICMPv6", (*RXChecksumOffload).SetICMPv6, RXChecksumOffload.ICMPv6},
+		{"IGMP", (*RXChecksumOffload).SetIGMP, RXChecksumOffload.IGMP},
+	}
+	for index, setting := range settings {
+		t.Run(setting.name, func(t *testing.T) {
+			var offload RXChecksumOffload
+			if setting.get(offload) || setting.set(&offload, true) != &offload {
+				t.Fatal("zero policy or chained setter is incorrect")
+			}
+			for other, query := range settings {
+				if got := query.get(offload); got != (other == index) {
+					t.Fatalf("%s enabled = %t after setting %s", query.name, got, setting.name)
+				}
+			}
+			if setting.set(&offload, false) != &offload || setting.get(offload) {
+				t.Fatal("setter did not clear its category")
+			}
+		})
+	}
+	config := Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")}}
+	stack, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stack.Close()
+	var offload RXChecksumOffload
+	offload.SetIPv4Header(true).SetTCP(true).SetUDP(true).SetICMPv4(true).SetICMPv6(true).SetIGMP(true)
+	stack.SetRXChecksumOffload(offload)
+	offload.SetTCP(false)
+	copy := stack.RXChecksumOffload()
+	copy.SetUDP(false)
+	if err = stack.UpdateConfig(config); err != nil {
+		t.Fatal(err)
+	}
+	for _, setting := range settings {
+		if !setting.get(stack.RXChecksumOffload()) {
+			t.Fatalf("%s was changed through a copied value or UpdateConfig", setting.name)
+		}
+	}
+}
+
 func TestMTUAndRouteFamilyValidation(t *testing.T) {
 	ipv4 := netip.MustParsePrefix("192.0.2.15/32")
 	if _, err := New(Config{LocalAddresses: []netip.Prefix{ipv4}, MTU: 68}); err != nil {
@@ -514,7 +565,7 @@ func TestTCPSocketDefaultConfiguration(t *testing.T) {
 		_, _ = stack.DialTCP(ctx, "tcp4", netip.AddrPort{}, netip.MustParseAddrPort("198.51.100.130:443"))
 		close(dialDone)
 	}()
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || packet.protocol != ProtocolTCP || packet.trafficClass != 0xa8 {
 		t.Fatalf("default TCP SYN traffic class = %#x, want %#x", packet.trafficClass, 0xa8)
 	}

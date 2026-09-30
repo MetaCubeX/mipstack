@@ -401,8 +401,9 @@ func (reuseAddressUDPSocketBinding) register(stack *Stack, connection *UDPConn) 
 }
 
 // handleUDP validates and dispatches one unicast, broadcast, or multicast UDP
-// datagram according to its already classified IP destination.
-func (s *Stack) handleUDP(packet ipPacket, destination inboundDestinationClass) error {
+// datagram according to its already classified IP destination. skipChecksum
+// requires a link or builder guarantee and does not allow zero IPv6 checksums.
+func (s *Stack) handleUDP(packet ipPacket, destination inboundDestinationClass, skipChecksum bool) error {
 	udp := packet.payload
 	length, valid := udpWireLength(udp)
 	if !valid {
@@ -410,7 +411,7 @@ func (s *Stack) handleUDP(packet ipPacket, destination inboundDestinationClass) 
 		return nil
 	}
 	checksumValue := binary.BigEndian.Uint16(udp[6:8])
-	if packet.source.Is6() && checksumValue == 0 || checksumValue != 0 && transportChecksum(packet.source, packet.target, ProtocolUDP, udp[:length]) != 0 {
+	if packet.source.Is6() && checksumValue == 0 || !skipChecksum && checksumValue != 0 && transportChecksum(packet.source, packet.target, ProtocolUDP, udp[:length]) != 0 {
 		s.stats.inboundDroppedPackets.Add(1)
 		return nil
 	}
@@ -1661,7 +1662,7 @@ func (s *Stack) writeBestEffortUDPDatagram(source, target netip.Addr, sourcePort
 			return syscall.EMSGSIZE
 		}
 		marshalUDPDatagram(packet[ipSize:], source, target, sourcePort, targetPort, payload)
-		if !queue.enqueueReservedPacket(slot, packet, reusable) {
+		if !queue.enqueueReservedPacket(slot, packet, reusable, true) {
 			return ErrClosed
 		}
 		s.recordOutput(loopback)
@@ -1674,7 +1675,7 @@ func (s *Stack) writeBestEffortUDPDatagram(source, target netip.Addr, sourcePort
 	var udpHeader [udpHeaderSize]byte
 	marshalUDPHeaderFields(udpHeader[:], sourcePort, targetPort, udpSize)
 	writeUDPChecksumValue(udpHeader[:], transportChecksumParts(source, target, ProtocolUDP, udpSize, udpHeader[:], payload))
-	err := s.tryWriteIPFragmentsLayout(source, target, ProtocolUDP, udpHeader[:], payload, layout)
+	err := s.tryWriteIPFragmentsLayout(source, target, ProtocolUDP, udpHeader[:], payload, layout, true)
 	if err == ErrResourceLimit {
 		return nil
 	}
@@ -1731,7 +1732,7 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 		}
 		udp := packet[ipSize:]
 		marshalUDPDatagram(udp, source, target, sourcePort, targetPort, payload)
-		if !queue.enqueueReservedPacket(slot, packet, reusable) {
+		if !queue.enqueueReservedPacket(slot, packet, reusable, true) {
 			return ErrClosed
 		}
 		c.stack.recordOutput(loopback)
@@ -1744,7 +1745,7 @@ func (c *UDPConn) writeDatagramForMTU(source, target netip.Addr, sourcePort, tar
 	var udpHeader [udpHeaderSize]byte
 	marshalUDPHeaderFields(udpHeader[:], sourcePort, targetPort, udpSize)
 	writeUDPChecksumValue(udpHeader[:], transportChecksumParts(source, target, ProtocolUDP, udpSize, udpHeader[:], payload))
-	return c.stack.tryWriteIPFragmentsLayout(source, target, ProtocolUDP, udpHeader[:], payload, layout)
+	return c.stack.tryWriteIPFragmentsLayout(source, target, ProtocolUDP, udpHeader[:], payload, layout, true)
 }
 
 // writeDatagramBuffersForMTU is the allocation-free scatter/gather form of
@@ -1806,7 +1807,7 @@ func (c *UDPConn) writeDatagramBuffersForMTU(source, target netip.Addr, sourcePo
 		return syscall.EINVAL
 	}
 	writeUDPChecksumValue(udp[:udpHeaderSize], transportChecksum(source, target, ProtocolUDP, udp))
-	if !queue.enqueueReservedPacket(slot, packet, reusable) {
+	if !queue.enqueueReservedPacket(slot, packet, reusable, true) {
 		return ErrClosed
 	}
 	c.stack.recordOutput(loopback)

@@ -1314,8 +1314,9 @@ func packetDestination(packet []byte) (netip.Addr, bool) {
 }
 
 // parseIPPacket validates one unfragmented packet and locates its transport
-// payload through supported IPv6 extension headers.
-func parseIPPacket(packet []byte) (ipPacket, bool) {
+// payload through supported IPv6 extension headers. skipChecksum delegates only
+// the IPv4 header checksum; framing and option validation remain mandatory.
+func parseIPPacket(packet []byte, skipChecksum bool) (ipPacket, bool) {
 	if len(packet) == 0 {
 		return ipPacket{}, false
 	}
@@ -1326,12 +1327,13 @@ func parseIPPacket(packet []byte) (ipPacket, bool) {
 		}
 		headerSize := int(packet[0]&0x0f) * 4
 		totalSize := int(binary.BigEndian.Uint16(packet[2:4]))
-		if headerSize < 20 || totalSize < headerSize || totalSize > len(packet) || checksum(packet[:headerSize]) != 0 || binary.BigEndian.Uint16(packet[6:8])&0x8000 != 0 {
+		// Fragments belong to reassembly, which validates their headers. Reject
+		// them here before calculating the same header checksum a second time.
+		// RFC 791 also requires the reserved flag to remain zero; DF is allowed.
+		if headerSize < 20 || totalSize < headerSize || totalSize > len(packet) || binary.BigEndian.Uint16(packet[6:8])&0xbfff != 0 {
 			return ipPacket{}, false
 		}
-		// Fragmented packets are handled by the reassembly layer added before
-		// production selection; never expose a partial transport header.
-		if binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
+		if !skipChecksum && checksum(packet[:headerSize]) != 0 {
 			return ipPacket{}, false
 		}
 		source := netip.AddrFrom4([4]byte(packet[12:16]))

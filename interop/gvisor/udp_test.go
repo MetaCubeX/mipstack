@@ -765,6 +765,60 @@ func TestUDPChecksumInterop(t *testing.T) {
 	}
 }
 
+// TestUDPRXChecksumOffloadInterop exercises admission of a link-validated
+// checksum and checks the response through gVisor's native UDP socket. Larger
+// datagrams retain ordinary checksum validation after source reassembly.
+func TestUDPRXChecksumOffloadInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		for _, category := range []string{"UDP", "IPv4Header"} {
+			if category == "IPv4Header" && family.mipstackAddress.Is6() {
+				continue
+			}
+			t.Run(family.name+"/"+category, func(t *testing.T) {
+				var network *interopNetwork
+				var mutated atomic.Bool
+				network = newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 1500,
+					gvisorToMipstack: func(packet []byte) bool {
+						offset, ok := udpHeaderOffset(packet)
+						if !ok || !mutated.CompareAndSwap(false, true) {
+							return true
+						}
+						modified := append([]byte(nil), packet...)
+						if category == "IPv4Header" {
+							ip := header.IPv4(modified)
+							ip.SetChecksum(ip.Checksum() ^ 1)
+						} else {
+							udp := header.UDP(modified[offset:])
+							value := udp.Checksum() ^ 1
+							if value == 0 {
+								value = 2
+							}
+							udp.SetChecksum(value)
+						}
+						if err := network.deliverToMipstack(modified); err != nil {
+							network.reportBridgeError(err)
+						}
+						return false
+					},
+				})
+				var offload mipstack.RXChecksumOffload
+				offload.SetUDP(category == "UDP").SetIPv4Header(category == "IPv4Header")
+				network.mipstack.SetRXChecksumOffload(offload)
+				ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+				defer cancel()
+				connected, unconnected := openUDPPair(t, ctx, network, family, false)
+				defer connected.Close()
+				defer unconnected.Close()
+				exerciseUDP(t, connected, unconnected, network.mtu)
+				if !mutated.Load() {
+					t.Fatal("offload packet mutation did not run")
+				}
+			})
+		}
+	}
+}
+
 // TestPublicChecksumPartsInterop compares the multipart API with gVisor's
 // independent checksum implementation and sends its UDP result through a
 // native gVisor endpoint in both address families.

@@ -2022,7 +2022,7 @@ func TestTCPActiveHandshakeProcessesSYNACKText(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for active SYN")
 	}
-	parsed, ok := parseIPPacket(synPacket)
+	parsed, ok := parseIPPacket(synPacket, false)
 	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("active SYN = %x", synPacket)
 	}
@@ -2069,7 +2069,7 @@ func TestTCPActiveHandshakeRejectsInvalidTimestampEcho(t *testing.T) {
 	go func() { result <- testTCPHandshake(connection, 1000) }()
 	select {
 	case synPacket := <-link.outbound:
-		parsed, ok := parseIPPacket(synPacket)
+		parsed, ok := parseIPPacket(synPacket, false)
 		if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 			t.Fatalf("active SYN = %x", synPacket)
 		}
@@ -2115,7 +2115,7 @@ func TestTCPActiveHandshakeAcceptsZeroTimestampEcho(t *testing.T) {
 	go func() { result <- testTCPHandshake(connection, 1000) }()
 	select {
 	case synPacket := <-link.outbound:
-		parsed, ok := parseIPPacket(synPacket)
+		parsed, ok := parseIPPacket(synPacket, false)
 		if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 			t.Fatalf("active SYN = %x", synPacket)
 		}
@@ -2167,7 +2167,7 @@ func TestTCPPassiveHandshakeProcessesSYNText(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for passive SYN-ACK")
 	}
-	parsed, ok := parseIPPacket(synACKPacket)
+	parsed, ok := parseIPPacket(synACKPacket, false)
 	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("passive SYN-ACK = %x", synACKPacket)
 	}
@@ -2227,7 +2227,7 @@ func TestTCPPassiveHandshakeAcceptsMissingTimestamp(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for passive timestamp SYN-ACK")
 	}
-	parsed, ok := parseIPPacket(synACK)
+	parsed, ok := parseIPPacket(synACK, false)
 	if !ok || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("passive timestamp SYN-ACK = %x", synACK)
 	}
@@ -2264,7 +2264,7 @@ func TestTCPPassiveHandshakeAcceptsZeroTimestampEcho(t *testing.T) {
 	var serverTimestamp uint32
 	select {
 	case packet := <-link.outbound:
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 			t.Fatalf("passive SYN-ACK = %x", packet)
 		}
@@ -2340,7 +2340,7 @@ func TestTCPPassiveHandshakeChallengeAndResetResponses(t *testing.T) {
 			_ = readPacket() // initial SYN-ACK
 			enqueueTCPTestSegment(t, connection, test.segment)
 			response := readPacket()
-			parsed, ok := parseIPPacket(response)
+			parsed, ok := parseIPPacket(response, false)
 			if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 				t.Fatalf("passive-handshake response = %x", response)
 			}
@@ -2422,7 +2422,7 @@ func TestTCPPassiveHandshakeECNFallback(t *testing.T) {
 	readFlags := func() byte {
 		select {
 		case packet := <-link.outbound:
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok || len(parsed.payload) < tcpHeaderSize {
 				t.Fatalf("passive-handshake response = %x", packet)
 			}
@@ -2471,7 +2471,7 @@ func TestTCPPassiveRetransmittedSYNUpdatesTimestampEcho(t *testing.T) {
 	readTimestamp := func() (uint32, uint32) {
 		select {
 		case packet := <-link.outbound:
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok || len(parsed.payload) < tcpHeaderSize {
 				t.Fatalf("passive SYN-ACK = %x", packet)
 			}
@@ -2524,7 +2524,7 @@ func TestTCPPassiveHandshakeRejectsInvalidTimestampEcho(t *testing.T) {
 	var serverTimestamp uint32
 	select {
 	case packet := <-link.outbound:
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 			t.Fatalf("passive SYN-ACK = %x", packet)
 		}
@@ -2572,7 +2572,7 @@ func TestTCPHandshakeMaintenanceDoesNotConsumeRTOBudget(t *testing.T) {
 		read := func() byte {
 			select {
 			case packet := <-link.outbound:
-				parsed, ok := parseIPPacket(packet)
+				parsed, ok := parseIPPacket(packet, false)
 				if !ok || len(parsed.payload) < tcpHeaderSize {
 					t.Fatalf("active-handshake packet = %x", packet)
 				}
@@ -4111,7 +4111,7 @@ func TestTCPEstablishedActorSurvivesStoppedDeviceRead(t *testing.T) {
 			break
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if valid && packet.protocol == ProtocolTCP {
 			if err := link.handleOutboundPacket(wire); err != nil {
 				t.Fatal(err)
@@ -4142,7 +4142,7 @@ func TestTCPEstablishedActorSurvivesStoppedDeviceRead(t *testing.T) {
 			break
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if valid && packet.protocol == ProtocolTCP {
 			if err := link.handleOutboundPacket(wire); err != nil {
 				t.Fatal(err)
@@ -4166,7 +4166,7 @@ func TestTCPEstablishedActorSurvivesStoppedDeviceRead(t *testing.T) {
 			break
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("post-capacity packet is not TCP: %x", wire)
 		}
@@ -4233,7 +4233,7 @@ func TestTCPEstablishedActorsShareReturnedOutputCapacity(t *testing.T) {
 		if !available {
 			break
 		}
-		packet, valid := parseIPPacket(consumeTestPacket(&stack.outbound, entry))
+		packet, valid := parseIPPacket(consumeTestPacket(&stack.outbound, entry), false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatal("returned capacity published a non-TCP packet")
 		}
@@ -4339,7 +4339,7 @@ func TestTCPPersistProbeSurvivesStoppedDeviceRead(t *testing.T) {
 				t.Fatal("persist-blocked output did not resume when device capacity returned")
 			}
 			wire := consumeTestPacket(&stack.outbound, entry)
-			packet, valid := parseIPPacket(wire)
+			packet, valid := parseIPPacket(wire, false)
 			if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 				t.Fatalf("persist capacity-wakeup packet is not TCP: %x", wire)
 			}
@@ -4465,7 +4465,7 @@ func TestTCPKeepAliveProbeSurvivesStoppedDeviceRead(t *testing.T) {
 				t.Fatal("keepalive-blocked output did not resume when device capacity returned")
 			}
 			wire := consumeTestPacket(&stack.outbound, entry)
-			packet, valid := parseIPPacket(wire)
+			packet, valid := parseIPPacket(wire, false)
 			if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 				t.Fatalf("keepalive capacity-wakeup packet is not TCP: %x", wire)
 			}
@@ -4568,7 +4568,7 @@ func TestTCPLivenessTimeoutSurvivesStoppedDeviceRead(t *testing.T) {
 			t.Fatal("initial keepalive probe was not published")
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize || int(packet.payload[12]>>4)*4 != len(packet.payload) {
 			t.Fatalf("initial keepalive output is not a payload-free TCP segment: %x", wire)
 		}
@@ -4625,7 +4625,7 @@ func TestTCPSACKRecoverySurvivesStoppedDeviceRead(t *testing.T) {
 			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("initial output is not TCP: %x", wire)
 		}
@@ -4708,7 +4708,7 @@ func TestTCPSACKRecoverySurvivesStoppedDeviceRead(t *testing.T) {
 		t.Fatal("SACK recovery did not resume when device capacity returned")
 	}
 	retransmissionWire := consumeTestPacket(&stack.outbound, entry)
-	retransmission, valid := parseIPPacket(retransmissionWire)
+	retransmission, valid := parseIPPacket(retransmissionWire, false)
 	if !valid || retransmission.protocol != ProtocolTCP || len(retransmission.payload) < tcpHeaderSize {
 		t.Fatalf("recovery output is not TCP: %x", retransmissionWire)
 	}
@@ -4797,7 +4797,7 @@ func TestTCPTailLossProbeSurvivesStoppedDeviceRead(t *testing.T) {
 			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("initial output is not TCP: %x", wire)
 		}
@@ -4873,7 +4873,7 @@ func TestTCPTailLossProbeSurvivesStoppedDeviceRead(t *testing.T) {
 		t.Fatal("tail-loss probe did not resume when device capacity returned")
 	}
 	probeWire := consumeTestPacket(&stack.outbound, entry)
-	probe, valid := parseIPPacket(probeWire)
+	probe, valid := parseIPPacket(probeWire, false)
 	if !valid || probe.protocol != ProtocolTCP || len(probe.payload) < tcpHeaderSize {
 		t.Fatalf("tail-loss probe is not TCP: %x", probeWire)
 	}
@@ -4906,7 +4906,7 @@ func TestTCPTailLossProbeNewDataSurvivesStoppedDeviceRead(t *testing.T) {
 			t.Fatalf("initial TCP flight = %d bytes, want congestion window %d", queuedBytes, before.CongestionWindow)
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("initial output is not TCP: %x", wire)
 		}
@@ -4970,7 +4970,7 @@ func TestTCPTailLossProbeNewDataSurvivesStoppedDeviceRead(t *testing.T) {
 		t.Fatal("new-data tail-loss probe did not resume when device capacity returned")
 	}
 	probeWire := consumeTestPacket(&stack.outbound, entry)
-	probe, valid := parseIPPacket(probeWire)
+	probe, valid := parseIPPacket(probeWire, false)
 	if !valid || probe.protocol != ProtocolTCP || len(probe.payload) < tcpHeaderSize {
 		t.Fatalf("new-data tail-loss probe is not TCP: %x", probeWire)
 	}
@@ -5021,7 +5021,7 @@ func TestTCPRTORecoverySurvivesStoppedDeviceRead(t *testing.T) {
 			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("initial output is not TCP: %x", wire)
 		}
@@ -5047,7 +5047,7 @@ func TestTCPRTORecoverySurvivesStoppedDeviceRead(t *testing.T) {
 		t.Fatal("tail-loss probe was not published before the RTO")
 	}
 	probeWire := consumeTestPacket(&stack.outbound, probeEntry)
-	probe, valid := parseIPPacket(probeWire)
+	probe, valid := parseIPPacket(probeWire, false)
 	if !valid || probe.protocol != ProtocolTCP || len(probe.payload) < tcpHeaderSize || binary.BigEndian.Uint32(probe.payload[4:8]) != segments[len(segments)-1].sequence {
 		t.Fatalf("pre-RTO output is not the final-range tail-loss probe: %x", probeWire)
 	}
@@ -5101,7 +5101,7 @@ func TestTCPRTORecoverySurvivesStoppedDeviceRead(t *testing.T) {
 		t.Fatal("RTO retransmission did not resume when device capacity returned")
 	}
 	rtoWire := consumeTestPacket(&stack.outbound, rtoEntry)
-	rtoPacket, valid := parseIPPacket(rtoWire)
+	rtoPacket, valid := parseIPPacket(rtoWire, false)
 	if !valid || rtoPacket.protocol != ProtocolTCP || len(rtoPacket.payload) < tcpHeaderSize {
 		t.Fatalf("RTO recovery output is not TCP: %x", rtoWire)
 	}
@@ -5147,7 +5147,7 @@ func TestTCPRTOPendingOutputCanceledByLateACK(t *testing.T) {
 			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("initial output is not TCP: %x", wire)
 		}
@@ -5244,7 +5244,7 @@ func TestTCPRTOPendingOutputCanceledAfterCongestionControlChange(t *testing.T) {
 			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("initial output is not TCP: %x", wire)
 		}
@@ -5353,7 +5353,7 @@ func TestTCPRTOPendingPathMTURetransmissionStartsFRTO(t *testing.T) {
 			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("initial output is not TCP: %x", wire)
 		}
@@ -5417,7 +5417,7 @@ func TestTCPRTOPendingPathMTURetransmissionStartsFRTO(t *testing.T) {
 		t.Fatal("path-MTU replacement did not resume when device capacity returned")
 	}
 	replacementWire := consumeTestPacket(&stack.outbound, replacementEntry)
-	replacement, valid := parseIPPacket(replacementWire)
+	replacement, valid := parseIPPacket(replacementWire, false)
 	if !valid || replacement.protocol != ProtocolTCP || len(replacement.payload) < tcpHeaderSize {
 		t.Fatalf("path-MTU replacement is not TCP: %x", replacementWire)
 	}
@@ -5451,7 +5451,7 @@ func TestTCPRTOPendingPathMTURetransmissionStartsFRTO(t *testing.T) {
 		t.Fatal("path-MTU F-RTO fallback was not published")
 	}
 	fallbackWire := consumeTestPacket(&stack.outbound, fallbackEntry)
-	fallback, valid := parseIPPacket(fallbackWire)
+	fallback, valid := parseIPPacket(fallbackWire, false)
 	if !valid || fallback.protocol != ProtocolTCP || len(fallback.payload) < tcpHeaderSize {
 		t.Fatalf("path-MTU F-RTO fallback is not TCP: %x", fallbackWire)
 	}
@@ -5506,7 +5506,7 @@ func testTCPFRTOFallbackSurvivesStoppedDeviceRead(t *testing.T, closeWrite, supe
 			t.Fatalf("queued TCP bytes = %d, want %d; FIN queued = %t, want %t", queuedBytes, len(payload), finQueued, closeWrite)
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("initial output is not TCP: %x", wire)
 		}
@@ -5542,7 +5542,7 @@ func testTCPFRTOFallbackSurvivesStoppedDeviceRead(t *testing.T, closeWrite, supe
 		t.Fatal("initial RTO retransmission was not published")
 	}
 	rtoWire := consumeTestPacket(&stack.outbound, rtoEntry)
-	rtoPacket, valid := parseIPPacket(rtoWire)
+	rtoPacket, valid := parseIPPacket(rtoWire, false)
 	if !valid || rtoPacket.protocol != ProtocolTCP || len(rtoPacket.payload) < tcpHeaderSize || binary.BigEndian.Uint32(rtoPacket.payload[4:8]) != segments[0].sequence {
 		t.Fatalf("initial RTO output does not retransmit the first range: %x", rtoWire)
 	}
@@ -5616,7 +5616,7 @@ func testTCPFRTOFallbackSurvivesStoppedDeviceRead(t *testing.T, closeWrite, supe
 		t.Fatal("F-RTO output did not resume when device capacity returned")
 	}
 	fallbackWire := consumeTestPacket(&stack.outbound, fallbackEntry)
-	fallback, valid := parseIPPacket(fallbackWire)
+	fallback, valid := parseIPPacket(fallbackWire, false)
 	if !valid || fallback.protocol != ProtocolTCP || len(fallback.payload) < tcpHeaderSize {
 		t.Fatalf("F-RTO fallback output is not TCP: %x", fallbackWire)
 	}
@@ -5694,7 +5694,7 @@ func TestTCPLostRetransmissionSurvivesStoppedDeviceRead(t *testing.T) {
 			t.Fatalf("queued TCP bytes = %d, want %d", queuedBytes, len(payload))
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("initial output is not TCP: %x", wire)
 		}
@@ -5780,7 +5780,7 @@ func TestTCPLostRetransmissionSurvivesStoppedDeviceRead(t *testing.T) {
 			t.Fatalf("retransmission %#x was not published", wantSequence)
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		packet, valid := parseIPPacket(wire)
+		packet, valid := parseIPPacket(wire, false)
 		if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 			t.Fatalf("recovery output is not TCP: %x", wire)
 		}
@@ -5858,7 +5858,7 @@ func TestTCPPathMTURetransmissionSurvivesStoppedDeviceRead(t *testing.T) {
 		t.Fatal("initial TCP data was not published")
 	}
 	originalWire := consumeTestPacket(&stack.outbound, entry)
-	original, valid := parseIPPacket(originalWire)
+	original, valid := parseIPPacket(originalWire, false)
 	if !valid || original.protocol != ProtocolTCP || len(original.payload) < tcpHeaderSize {
 		t.Fatalf("initial output is not TCP: %x", originalWire)
 	}
@@ -5913,7 +5913,7 @@ func TestTCPPathMTURetransmissionSurvivesStoppedDeviceRead(t *testing.T) {
 		t.Fatalf("path-MTU retransmission did not resume within %v of returned capacity", wait)
 	}
 	retransmissionWire := consumeTestPacket(&stack.outbound, entry)
-	retransmission, valid := parseIPPacket(retransmissionWire)
+	retransmission, valid := parseIPPacket(retransmissionWire, false)
 	if !valid || retransmission.protocol != ProtocolTCP || len(retransmission.payload) < tcpHeaderSize {
 		t.Fatalf("path-MTU recovery output is not TCP: %x", retransmissionWire)
 	}
@@ -6061,7 +6061,7 @@ func TestTCPImmediateACKReplacesDelayedACKWhileDeviceReadStopped(t *testing.T) {
 	// A controlled future arrival keeps the original delayed-ACK deadline far
 	// beyond the assertion window. This avoids using a sub-25 ms wall-clock
 	// threshold to distinguish immediate capacity wakeup from timer expiry.
-	if err := stack.handleInboundPacket(packet, time.Now().Add(10*time.Second), false); err != nil {
+	if err := stack.handleInboundPacket(packet, time.Now().Add(10*time.Second), false, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
@@ -6088,7 +6088,7 @@ func TestTCPImmediateACKReplacesDelayedACKWhileDeviceReadStopped(t *testing.T) {
 		t.Fatal("immediate ACK remained gated by the replaced delayed-ACK deadline")
 	}
 	wire := consumeTestPacket(&stack.outbound, entry)
-	parsed, valid := parseIPPacket(wire)
+	parsed, valid := parseIPPacket(wire, false)
 	if !valid || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("capacity wakeup packet is not TCP: %x", wire)
 	}
@@ -6142,7 +6142,7 @@ func TestTCPEstablishedControlResponseDoesNotWaitForDeviceQueue(t *testing.T) {
 			break
 		}
 		packet := consumeTestPacket(&stack.outbound, entry)
-		parsed, valid := parseIPPacket(packet)
+		parsed, valid := parseIPPacket(packet, false)
 		if valid && parsed.protocol == ProtocolTCP && len(parsed.payload) >= tcpHeaderSize &&
 			binary.BigEndian.Uint16(parsed.payload[0:2]) == clientPort &&
 			binary.BigEndian.Uint16(parsed.payload[2:4]) == 8080 &&
@@ -7766,12 +7766,12 @@ func TestTCPDispatchPreservesPacketArrivalTime(t *testing.T) {
 	key := tcpKey{local: netip.AddrPortFrom(local, 8080), remote: netip.AddrPortFrom(remote, 50000)}
 	connection := newTCPConn(stack, "tcp4", key, 1500, tcpSocketOptionSet{})
 	stack.tcp[key] = connection
-	packet, ok := parseIPPacket(buildTestTCP(remote, local, key.remote.Port(), key.local.Port(), 1, 1, TCPFlagACK, 65535, nil, nil))
+	packet, ok := parseIPPacket(buildTestTCP(remote, local, key.remote.Port(), key.local.Port(), 1, 1, TCPFlagACK, 65535, nil, nil), false)
 	if !ok {
 		t.Fatal("test TCP packet did not parse")
 	}
 	receivedAt := stack.timestampEpoch.Add(250 * time.Millisecond)
-	if err = stack.handleTCP(packet, receivedAt, true); err != nil {
+	if err = stack.handleTCP(packet, receivedAt, true, false); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -8670,7 +8670,7 @@ func BenchmarkTCPHandlePureACK(b *testing.B) {
 	stack.mu.Lock()
 	stack.tcp[key] = connection
 	stack.mu.Unlock()
-	packet, ok := parseIPPacket(buildTestTCP(remote, local, key.remote.Port(), key.local.Port(), 100, 200, TCPFlagACK, 65535, tcpTimestampOptions(123, 456), nil))
+	packet, ok := parseIPPacket(buildTestTCP(remote, local, key.remote.Port(), key.local.Port(), 100, 200, TCPFlagACK, 65535, tcpTimestampOptions(123, 456), nil), false)
 	if !ok {
 		b.Fatal("failed to parse benchmark packet")
 	}
@@ -8678,7 +8678,7 @@ func BenchmarkTCPHandlePureACK(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for index := 0; index < b.N; index++ {
-		if err := stack.handleTCP(packet, receivedAt, true); err != nil {
+		if err := stack.handleTCP(packet, receivedAt, true, false); err != nil {
 			b.Fatal(err)
 		}
 		if _, ok = connection.inbound.dequeue(); !ok {
@@ -8784,7 +8784,7 @@ func TestTCPPublishReservationLifecycle(t *testing.T) {
 	if !available {
 		t.Fatal("published TCP packet is not queued")
 	}
-	packet, valid := parseIPPacket(entry.packet)
+	packet, valid := parseIPPacket(entry.packet, false)
 	if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize || !bytes.Equal(packet.payload[tcpHeaderSize:], payloadBytes) {
 		t.Fatalf("published TCP packet = %x", entry.packet)
 	}
@@ -8905,7 +8905,7 @@ func TestTCPSegmentTimestampOptionsUseFixedWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	timestamp := published.timestamp
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || len(packet.payload) < tcpHeaderSize {
 		t.Fatal("timestamped TCP segment could not be parsed")
 	}
@@ -8925,7 +8925,7 @@ func TestTCPSegmentTimestampOptionsUseFixedWorkspace(t *testing.T) {
 	if err = connection.trySendSegmentWithOptions(101, 201, TCPFlagACK, 32768, extra); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok = parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok = parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || len(packet.payload) < tcpHeaderSize {
 		t.Fatal("best-effort timestamped TCP segment could not be parsed")
 	}
@@ -9596,7 +9596,7 @@ func TestTCPZeroWindowProbePreservesSequenceSpace(t *testing.T) {
 	}
 	select {
 	case packet := <-link.outbound:
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !ok || parsed.protocol != ProtocolTCP {
 			t.Fatalf("invalid persist packet: %x", packet)
 		}
@@ -9616,7 +9616,7 @@ func TestTCPZeroWindowProbePreservesSequenceSpace(t *testing.T) {
 	}
 	select {
 	case packet := <-link.outbound:
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !ok || parsed.protocol != ProtocolTCP {
 			t.Fatalf("invalid post-persist packet: %x", packet)
 		}
@@ -9668,7 +9668,7 @@ drained:
 	for !initialData {
 		select {
 		case packet := <-link.outbound:
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 				continue
 			}
@@ -9731,7 +9731,7 @@ func TestTCPZeroWindowConsumesInOrderFIN(t *testing.T) {
 		for {
 			select {
 			case packet := <-link.outbound:
-				parsed, ok := parseIPPacket(packet)
+				parsed, ok := parseIPPacket(packet, false)
 				if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 					continue
 				}
@@ -9921,7 +9921,7 @@ func TestTCPMissingTimestampRemainsCompatible(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for seed TCP packet")
 	}
-	seedParsed, ok := parseIPPacket(seedPacket)
+	seedParsed, ok := parseIPPacket(seedPacket, false)
 	if !ok || len(seedParsed.payload) < tcpHeaderSize {
 		t.Fatalf("seed TCP packet = %x", seedPacket)
 	}
@@ -9945,7 +9945,7 @@ func TestTCPMissingTimestampRemainsCompatible(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for missing-timestamp ACK")
 	}
-	ackParsed, ok := parseIPPacket(ackPacket)
+	ackParsed, ok := parseIPPacket(ackPacket, false)
 	if !ok || len(ackParsed.payload) < tcpHeaderSize {
 		t.Fatalf("missing-timestamp ACK = %x", ackPacket)
 	}
@@ -9995,7 +9995,7 @@ func TestTCPPAWSPrecedesWindowAdmission(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for pending TCP packet")
 	}
-	dataParsed, ok := parseIPPacket(dataPacket)
+	dataParsed, ok := parseIPPacket(dataPacket, false)
 	if !ok || dataParsed.protocol != ProtocolTCP || len(dataParsed.payload) < tcpHeaderSize {
 		t.Fatalf("pending TCP packet = %x", dataPacket)
 	}
@@ -10016,7 +10016,7 @@ func TestTCPPAWSPrecedesWindowAdmission(t *testing.T) {
 	for {
 		select {
 		case challenge := <-link.outbound:
-			candidate, candidateOK := parseIPPacket(challenge)
+			candidate, candidateOK := parseIPPacket(challenge, false)
 			if !candidateOK || candidate.protocol != ProtocolTCP || len(candidate.payload) < tcpHeaderSize {
 				continue
 			}
@@ -10333,12 +10333,12 @@ func TestTCPDelayedECNSYNACKDoesNotUndoFallback(t *testing.T) {
 		}
 	}
 	first := readSYN()
-	parsed, ok := parseIPPacket(first)
+	parsed, ok := parseIPPacket(first, false)
 	if !ok || len(parsed.payload) < tcpHeaderSize || parsed.payload[13]&(TCPFlagECE|TCPFlagCWR) != TCPFlagECE|TCPFlagCWR {
 		t.Fatalf("initial setup SYN = %x", first)
 	}
 	second := readSYN()
-	parsed, ok = parseIPPacket(second)
+	parsed, ok = parseIPPacket(second, false)
 	if !ok || len(parsed.payload) < tcpHeaderSize || parsed.payload[13]&(TCPFlagECE|TCPFlagCWR) != 0 {
 		t.Fatalf("fallback SYN = %x", second)
 	}
@@ -10368,7 +10368,7 @@ func TestTCPRejectsUnboundPort(t *testing.T) {
 	}
 	select {
 	case response := <-link.outbound:
-		parsed, ok := parseIPPacket(response)
+		parsed, ok := parseIPPacket(response, false)
 		if !ok || len(parsed.payload) < tcpHeaderSize || parsed.payload[13] != TCPFlagRST|TCPFlagACK || binary.BigEndian.Uint32(parsed.payload[8:12]) != 101 {
 			t.Fatalf("invalid TCP reset: %x", response)
 		}
@@ -10401,7 +10401,7 @@ func TestTCPReservedHeaderBitsAreIgnored(t *testing.T) {
 	}
 	if entry, ok := waitTestPacketEntry(&stack.outbound, time.Second); ok {
 		response := consumeTestPacket(&stack.outbound, entry)
-		parsed, ok := parseIPPacket(response)
+		parsed, ok := parseIPPacket(response, false)
 		if !ok || len(parsed.payload) < tcpHeaderSize || parsed.payload[13] != TCPFlagRST|TCPFlagACK {
 			t.Fatalf("reserved TCP header response = %x", response)
 		}
@@ -11432,7 +11432,7 @@ trafficClassPackets:
 	for {
 		select {
 		case packet := <-link.outbound:
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 				continue
 			}
@@ -11578,7 +11578,7 @@ func TestTCPPassiveHandshakeRTOStartsAfterDeviceDeparture(t *testing.T) {
 	if depth := stack.outbound.len(); depth != 0 {
 		t.Fatalf("passive handshake retransmitted at device departure: depth %d", depth)
 	}
-	packet, valid := parseIPPacket(wire)
+	packet, valid := parseIPPacket(wire, false)
 	if !valid || packet.protocol != ProtocolTCP || len(packet.payload) < tcpHeaderSize {
 		t.Fatal("passive handshake output was not TCP")
 	}

@@ -66,6 +66,49 @@ func TestTCPInterop(t *testing.T) {
 	}
 }
 
+// TestTCPRXChecksumOffloadInterop covers active and passive handshakes,
+// acknowledgments, and bidirectional streams when the input link guarantees
+// TCP checksums. gVisor still verifies every packet emitted by mipstack.
+func TestTCPRXChecksumOffloadInterop(t *testing.T) {
+	for _, family := range interopFamilies {
+		for _, mipstackListens := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/listens-%t", family.name, mipstackListens), func(t *testing.T) {
+				var network *interopNetwork
+				var mutations atomic.Uint64
+				network = newInteropNetworkWithOptions(t, interopNetworkOptions{
+					families: []interopFamily{family}, mtu: 9000,
+					gvisorToMipstack: func(packet []byte) bool {
+						if _, _, ok := tcpSegment(packet); !ok {
+							return true
+						}
+						modified := append([]byte(nil), packet...)
+						segment, _, _ := tcpSegment(modified)
+						segment.SetChecksum(segment.Checksum() ^ 1)
+						mutations.Add(1)
+						if err := network.deliverToMipstack(modified); err != nil {
+							network.reportBridgeError(err)
+						}
+						return false
+					},
+				})
+				var offload mipstack.RXChecksumOffload
+				offload.SetTCP(true)
+				network.mipstack.SetRXChecksumOffload(offload)
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				client, server, listener := openTCPPair(t, ctx, network, family, mipstackListens)
+				defer listener.Close()
+				defer client.Close()
+				defer server.Close()
+				exerciseFullDuplexTCP(t, client, server, 512*1024)
+				if mutations.Load() < 3 {
+					t.Fatal("offload did not cover both handshake and established traffic")
+				}
+			})
+		}
+	}
+}
+
 // TestTCPPeerMSSWithTimestampInterop configures a native gVisor TCP socket
 // with TCP_MAXSEG, then verifies that mipstack uses the peer's advertised MSS
 // after charging the negotiated timestamp option on the wire.

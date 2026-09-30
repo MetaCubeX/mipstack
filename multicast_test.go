@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"syscall"
@@ -72,7 +73,7 @@ func nextMulticastTestPacket(t testing.TB, stack *Stack, match func(ipPacket) bo
 			break
 		}
 		packet := consumeTestPacket(&stack.outbound, entry)
-		parsed, valid := parseIPPacket(packet)
+		parsed, valid := parseIPPacket(packet, false)
 		if valid && match(parsed) {
 			return parsed
 		}
@@ -90,7 +91,7 @@ func expectNoMulticastTestPacket(t testing.TB, stack *Stack, wait time.Duration,
 			return
 		}
 		packet := consumeTestPacket(&stack.outbound, entry)
-		if parsed, valid := parseIPPacket(packet); valid && match(parsed) {
+		if parsed, valid := parseIPPacket(packet, false); valid && match(parsed) {
 			t.Fatalf("unexpected matching multicast test packet: %x", packet)
 		}
 	}
@@ -267,7 +268,7 @@ func TestMulticastQueryKnownAnswerVectors(t *testing.T) {
 			if !bytes.Equal(test.built, wire) {
 				t.Fatalf("query helper output:\n got %x\nwant %x", test.built, wire)
 			}
-			packet, valid := parseIPPacket(wire)
+			packet, valid := parseIPPacket(wire, false)
 			if !valid {
 				t.Fatal("known-answer IP envelope did not parse")
 			}
@@ -281,9 +282,9 @@ func TestMulticastQueryKnownAnswerVectors(t *testing.T) {
 			}
 			var query multicastQuery
 			if test.v6 {
-				query, _, valid = parseMLDQuery(packet, test.network)
+				query, _, valid = parseMLDQuery(packet, test.network, false)
 			} else {
-				query, _, valid = parseIGMPQuery(packet, test.network)
+				query, _, valid = parseIGMPQuery(packet, test.network, false)
 			}
 			sourcesEqual := len(query.sources) == len(test.sources)
 			for index := range query.sources {
@@ -427,11 +428,11 @@ func FuzzMulticastQueryParsing(f *testing.F) {
 			}
 			packet[10], packet[11] = 0, 0
 			binary.BigEndian.PutUint16(packet[10:12], checksum(packet[:headerSize]))
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok {
 				t.Fatal("generated IGMP query has an invalid IPv4 envelope")
 			}
-			query, expected, valid := parseIGMPQuery(parsed, network4)
+			query, expected, valid := parseIGMPQuery(parsed, network4, false)
 			if !valid {
 				return
 			}
@@ -511,11 +512,11 @@ func FuzzMulticastQueryParsing(f *testing.F) {
 			target := netip.AddrFrom16([16]byte(packet[24:40]))
 			binary.BigEndian.PutUint16(packet[50:52], transportChecksum(source, target, ProtocolICMPv6, packet[48:]))
 		}
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !ok {
 			t.Fatal("generated MLD query has an invalid IPv6 envelope")
 		}
-		query, expected, valid := parseMLDQuery(parsed, network6)
+		query, expected, valid := parseMLDQuery(parsed, network6, false)
 		if !valid {
 			return
 		}
@@ -820,7 +821,7 @@ func TestASMMulticastIPv4AndIPv6(t *testing.T) {
 					break
 				}
 				wire := consumeTestPacket(&stack.outbound, entry)
-				candidate, valid := parseIPPacket(wire)
+				candidate, valid := parseIPPacket(wire, false)
 				if valid && candidate.protocol == ProtocolUDP && candidate.target == test.group {
 					t.Fatal("zero-hop multicast escaped to the link")
 				}
@@ -1197,7 +1198,7 @@ func TestFragmentedMulticastOutputReachesLinkAndLoopback(t *testing.T) {
 	fragments := 0
 	for {
 		wire := readOutboundPacket(t, sender)
-		fragment, valid := parseFragment(wire)
+		fragment, valid := parseFragment(wire, false)
 		if !valid || fragment.source != source || fragment.target != group || fragment.protocol != ProtocolUDP {
 			t.Fatalf("invalid outbound multicast fragment: %x", wire)
 		}
@@ -1265,7 +1266,7 @@ func TestMulticastRawSocketAndNoBroadcastAmplification(t *testing.T) {
 			break
 		}
 		wire := consumeTestPacket(&stack.outbound, entry)
-		candidate, valid := parseIPPacket(wire)
+		candidate, valid := parseIPPacket(wire, false)
 		if valid && candidate.protocol == ProtocolICMPv4 && len(candidate.payload) != 0 && candidate.payload[0] == 0 {
 			t.Fatal("broadcast Echo Request caused an amplified Echo Reply")
 		}
@@ -2066,7 +2067,7 @@ func TestMulticastQueryAcceptsAdditionalData(t *testing.T) {
 	binary.BigEndian.PutUint16(query4[10:12], checksum(query4[:headerLength]))
 	query4[headerLength+2], query4[headerLength+3] = 0, 0
 	binary.BigEndian.PutUint16(query4[headerLength+2:headerLength+4], checksum(query4[headerLength:]))
-	parsed4, ok := parseIPPacket(query4)
+	parsed4, ok := parseIPPacket(query4, false)
 	if !ok {
 		t.Fatal("IGMP test packet did not parse as IP")
 	}
@@ -2074,18 +2075,18 @@ func TestMulticastQueryAcceptsAdditionalData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, valid := parseIGMPQuery(parsed4, network4); !valid {
+	if _, _, valid := parseIGMPQuery(parsed4, network4, false); !valid {
 		t.Fatal("IGMPv3 Query rejected checksum-covered Additional Data")
 	}
 	malformed4 := append([]byte(nil), query4...)
 	binary.BigEndian.PutUint16(malformed4[headerLength+10:headerLength+12], 2)
 	malformed4[headerLength+2], malformed4[headerLength+3] = 0, 0
 	binary.BigEndian.PutUint16(malformed4[headerLength+2:headerLength+4], checksum(malformed4[headerLength:]))
-	parsedMalformed4, ok := parseIPPacket(malformed4)
+	parsedMalformed4, ok := parseIPPacket(malformed4, false)
 	if !ok {
 		t.Fatal("malformed IGMP test packet did not parse as IP")
 	}
-	if _, _, valid := parseIGMPQuery(parsedMalformed4, network4); valid {
+	if _, _, valid := parseIGMPQuery(parsedMalformed4, network4, false); valid {
 		t.Fatal("IGMPv3 Query accepted a source count beyond the available data")
 	}
 
@@ -2098,7 +2099,7 @@ func TestMulticastQueryAcceptsAdditionalData(t *testing.T) {
 	payload6 := query6[48:]
 	payload6[2], payload6[3] = 0, 0
 	binary.BigEndian.PutUint16(payload6[2:4], transportChecksum(remote6, group6, ProtocolICMPv6, payload6))
-	parsed6, ok := parseIPPacket(query6)
+	parsed6, ok := parseIPPacket(query6, false)
 	if !ok {
 		t.Fatal("MLD test packet did not parse as IP")
 	}
@@ -2106,7 +2107,7 @@ func TestMulticastQueryAcceptsAdditionalData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, valid := parseMLDQuery(parsed6, network6); !valid {
+	if _, _, valid := parseMLDQuery(parsed6, network6, false); !valid {
 		t.Fatal("MLDv2 Query rejected checksum-covered Additional Data")
 	}
 	malformed6 := append([]byte(nil), query6...)
@@ -2114,11 +2115,11 @@ func TestMulticastQueryAcceptsAdditionalData(t *testing.T) {
 	binary.BigEndian.PutUint16(payloadMalformed6[26:28], 2)
 	payloadMalformed6[2], payloadMalformed6[3] = 0, 0
 	binary.BigEndian.PutUint16(payloadMalformed6[2:4], transportChecksum(remote6, group6, ProtocolICMPv6, payloadMalformed6))
-	parsedMalformed6, ok := parseIPPacket(malformed6)
+	parsedMalformed6, ok := parseIPPacket(malformed6, false)
 	if !ok {
 		t.Fatal("malformed MLD test packet did not parse as IP")
 	}
-	if _, _, valid := parseMLDQuery(parsedMalformed6, network6); valid {
+	if _, _, valid := parseMLDQuery(parsedMalformed6, network6, false); valid {
 		t.Fatal("MLDv2 Query accepted a source count beyond the available data")
 	}
 }
@@ -2156,83 +2157,120 @@ func TestMLDv2QueryCurrentState(t *testing.T) {
 }
 
 func TestIGMPv2CompatibilityReportSuppressionAndLeave(t *testing.T) {
-	local := netip.MustParseAddr("192.0.2.110")
-	querier := netip.MustParseAddr("192.0.2.111")
-	group := netip.MustParseAddr("239.110.0.1")
-	allHosts := netip.MustParseAddr("224.0.0.1")
-	stack := newMulticastTestStack(t, []netip.Prefix{netip.PrefixFrom(local, 24)}, 1400)
-	connection, err := stack.ListenMulticastUDP(context.Background(), "udp4", netip.AddrPortFrom(group, 51000))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.Close()
-	clearMulticastTestControl(stack)
-	v2Query := buildMulticastTestIGMPQuery(querier, allHosts, netip.IPv4Unspecified(), 1, nil, true)
-	if _, err = stack.Write([][]byte{v2Query}, 0); err != nil {
-		t.Fatal(err)
-	}
-	report := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == 2 && len(packet.payload) == 8 && packet.payload[0] == igmpV2MembershipReport
-	})
-	if report.target != group || !report.hasRouterAlert() {
-		t.Fatalf("IGMPv2 report target/alert = %s/%v", report.target, report.hasRouterAlert())
-	}
-	if err = connection.LeaveGroup(group); err != nil {
-		t.Fatal(err)
-	}
-	leave := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == 2 && len(packet.payload) == 8 && packet.payload[0] == igmpV2LeaveGroup
-	})
-	if leave.target != netip.MustParseAddr("224.0.0.2") {
-		t.Fatalf("IGMPv2 leave target = %s", leave.target)
-	}
-	stack.mu.RLock()
-	state := stack.multicast.(*multicastState)
-	state.mu.Lock()
-	_, pendingLeave := state.retransmissions[group]
-	state.mu.Unlock()
-	stack.mu.RUnlock()
-	if pendingLeave {
-		t.Fatal("IGMPv2 leave retained a duplicate retransmission")
-	}
+	for _, offload := range []bool{false, true} {
+		t.Run(fmt.Sprintf("offload-%t", offload), func(t *testing.T) {
+			local := netip.MustParseAddr("192.0.2.110")
+			querier := netip.MustParseAddr("192.0.2.111")
+			group := netip.MustParseAddr("239.110.0.1")
+			allHosts := netip.MustParseAddr("224.0.0.1")
+			stack := newMulticastTestStack(t, []netip.Prefix{netip.PrefixFrom(local, 24)}, 1400)
+			var policy RXChecksumOffload
+			policy.SetIGMP(offload)
+			stack.SetRXChecksumOffload(policy)
+			connection, err := stack.ListenMulticastUDP(context.Background(), "udp4", netip.AddrPortFrom(group, 51000))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			clearMulticastTestControl(stack)
+			v2Query := buildMulticastTestIGMPQuery(querier, allHosts, netip.IPv4Unspecified(), 1, nil, true)
+			if _, err = stack.Write([][]byte{v2Query}, 0); err != nil {
+				t.Fatal(err)
+			}
+			report := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
+				return packet.protocol == 2 && len(packet.payload) == 8 && packet.payload[0] == igmpV2MembershipReport
+			})
+			if report.target != group || !report.hasRouterAlert() {
+				t.Fatalf("IGMPv2 report target/alert = %s/%v", report.target, report.hasRouterAlert())
+			}
+			if err = connection.LeaveGroup(group); err != nil {
+				t.Fatal(err)
+			}
+			leave := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
+				return packet.protocol == 2 && len(packet.payload) == 8 && packet.payload[0] == igmpV2LeaveGroup
+			})
+			if leave.target != netip.MustParseAddr("224.0.0.2") {
+				t.Fatalf("IGMPv2 leave target = %s", leave.target)
+			}
+			stack.mu.RLock()
+			state := stack.multicast.(*multicastState)
+			state.mu.Lock()
+			_, pendingLeave := state.retransmissions[group]
+			state.mu.Unlock()
+			stack.mu.RUnlock()
+			if pendingLeave {
+				t.Fatal("IGMPv2 leave retained a duplicate retransmission")
+			}
 
-	if err = connection.JoinGroup(group); err != nil {
-		t.Fatal(err)
-	}
-	_ = nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == 2 && len(packet.payload) == 8 && packet.payload[0] == igmpV2MembershipReport
-	})
-	heard := make([]byte, 8)
-	heard[0] = igmpV2MembershipReport
-	groupBytes := group.As4()
-	copy(heard[4:8], groupBytes[:])
-	binary.BigEndian.PutUint16(heard[2:4], checksum(heard))
-	withoutAlert := buildMulticastTestIGMPQuery(querier, group, group, 1, nil, false)
-	withoutAlertHeader := int(withoutAlert[0]&0x0f) * 4
-	copy(withoutAlert[withoutAlertHeader:], heard)
-	if _, err = stack.Write([][]byte{withoutAlert}, 0); err != nil {
-		t.Fatal(err)
-	}
-	state.mu.Lock()
-	_, pendingWithoutAlert := state.retransmissions[group]
-	lastReporterWithoutAlert := state.groups[group].lastReporter
-	state.mu.Unlock()
-	if !pendingWithoutAlert || !lastReporterWithoutAlert {
-		t.Fatalf("IGMPv2 report without Router Alert changed state: pending %v lastReporter %v", pendingWithoutAlert, lastReporterWithoutAlert)
-	}
-	// RFC 9776 section 4.2.15 requires accepting a legacy Report sent to
-	// any address assigned to the receiving interface, including unicast.
-	heardPacket := buildMulticastTestIGMPQuery(querier, local, group, 1, nil, true)
-	copy(heardPacket[24:], heard)
-	if _, err = stack.Write([][]byte{heardPacket}, 0); err != nil {
-		t.Fatal(err)
-	}
-	state.mu.Lock()
-	_, pendingReport := state.retransmissions[group]
-	lastReporter := state.groups[group].lastReporter
-	state.mu.Unlock()
-	if pendingReport || lastReporter {
-		t.Fatalf("heard report suppression = pending %v lastReporter %v", pendingReport, lastReporter)
+			if err = connection.JoinGroup(group); err != nil {
+				t.Fatal(err)
+			}
+			joinedReport := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
+				return packet.protocol == 2 && len(packet.payload) == 8 && packet.payload[0] == igmpV2MembershipReport
+			})
+			heard := make([]byte, 8)
+			heard[0] = igmpV2MembershipReport
+			groupBytes := group.As4()
+			copy(heard[4:8], groupBytes[:])
+			binary.BigEndian.PutUint16(heard[2:4], checksum(heard))
+			withoutAlert := buildMulticastTestIGMPQuery(querier, group, group, 1, nil, false)
+			withoutAlertHeader := int(withoutAlert[0]&0x0f) * 4
+			copy(withoutAlert[withoutAlertHeader:], heard)
+			if _, err = stack.Write([][]byte{withoutAlert}, 0); err != nil {
+				t.Fatal(err)
+			}
+			state.mu.Lock()
+			_, pendingWithoutAlert := state.retransmissions[group]
+			lastReporterWithoutAlert := state.groups[group].lastReporter
+			state.mu.Unlock()
+			if !pendingWithoutAlert || !lastReporterWithoutAlert {
+				t.Fatalf("IGMPv2 report without Router Alert changed state: pending %v lastReporter %v", pendingWithoutAlert, lastReporterWithoutAlert)
+			}
+			// RFC 9776 section 4.2.15 requires accepting a legacy Report sent to
+			// any address assigned to the receiving interface, including unicast.
+			heardPacket := buildMulticastTestIGMPQuery(querier, local, group, 1, nil, true)
+			copy(heardPacket[24:], heard)
+			corrupt := append([]byte(nil), joinedReport.original...)
+			corrupt[26] ^= 1
+			_, _ = stack.Write([][]byte{corrupt}, 0)
+			state.mu.Lock()
+			_, pendingCorrupt := state.retransmissions[group]
+			lastReporterCorrupt := state.groups[group].lastReporter
+			state.mu.Unlock()
+			if pendingCorrupt == offload || lastReporterCorrupt == offload {
+				t.Fatalf("bad-checksum IGMPv2 report with offload %t: pending %t lastReporter %t", offload, pendingCorrupt, lastReporterCorrupt)
+			}
+			if offload {
+				// A new membership restores the suppression precondition after the
+				// delegated-checksum Report, so the unicast Report is tested independently.
+				if err = connection.LeaveGroup(group); err != nil {
+					t.Fatal(err)
+				}
+				if err = connection.JoinGroup(group); err != nil {
+					t.Fatal(err)
+				}
+				_ = nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
+					return packet.protocol == 2 && len(packet.payload) == 8 && packet.payload[0] == igmpV2MembershipReport
+				})
+			}
+			state.mu.Lock()
+			_, pendingBeforeReport := state.retransmissions[group]
+			lastReporterBeforeReport := state.groups[group].lastReporter
+			state.mu.Unlock()
+			if !pendingBeforeReport || !lastReporterBeforeReport {
+				t.Fatal("unicast IGMPv2 Report did not start with suppression pending")
+			}
+			if _, err = stack.Write([][]byte{heardPacket}, 0); err != nil {
+				t.Fatal(err)
+			}
+			state.mu.Lock()
+			_, pendingReport := state.retransmissions[group]
+			lastReporter := state.groups[group].lastReporter
+			state.mu.Unlock()
+			if pendingReport || lastReporter {
+				t.Fatalf("heard report suppression = pending %v lastReporter %v", pendingReport, lastReporter)
+			}
+		})
 	}
 }
 
@@ -2351,6 +2389,68 @@ func TestInvalidQueryDoesNotCreateMulticastState(t *testing.T) {
 	stack.mu.RUnlock()
 	if seed != nil || state != nil {
 		t.Fatalf("invalid Query retained multicast state: seed %+v full %T", seed, state)
+	}
+}
+
+// TestMLDChecksumReuseRequiresIPv6 keeps the common ICMPv6 validation guarantee
+// from being applied to an IPv4 packet carrying the same protocol number.
+func TestMLDChecksumReuseRequiresIPv6(t *testing.T) {
+	for _, offload := range []bool{false, true} {
+		for _, joined := range []bool{false, true} {
+			t.Run(fmt.Sprintf("offload-%t/joined-%t", offload, joined), func(t *testing.T) {
+				local := netip.MustParseAddr("169.254.0.1")
+				remote := netip.MustParseAddr("169.254.0.2")
+				stack := newMulticastTestStack(t, []netip.Prefix{netip.PrefixFrom(local, 16)}, 1400)
+				var policy RXChecksumOffload
+				policy.SetICMPv6(offload)
+				stack.SetRXChecksumOffload(policy)
+				var state *multicastState
+				var before multicastQuerierState
+				if joined {
+					connection, err := stack.ListenMulticastUDP(context.Background(), "udp4", netip.MustParseAddrPort("239.121.0.1:43121"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer connection.Close()
+					stack.mu.RLock()
+					state = stack.multicast.(*multicastState)
+					stack.mu.RUnlock()
+					state.mu.Lock()
+					before = state.multicastQuerierState
+					state.mu.Unlock()
+				}
+				packet := IPPacket{
+					Source: remote, Destination: local, Protocol: ProtocolICMPv6, HopLimit: 1,
+					Payload: mustCodecVector(t, "820000010001000000000000000000000000000000000000"),
+				}
+				var alert IPv4HeaderOption
+				alert.SetRouterAlert(0)
+				if err := packet.SetIPv4HeaderOptions([]IPv4HeaderOption{alert}); err != nil {
+					t.Fatal(err)
+				}
+				wire, err := packet.MarshalBinary()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = stack.Write([][]byte{wire}, 0); err != nil {
+					t.Fatal(err)
+				}
+				stack.mu.RLock()
+				seed := stack.multicastSeed
+				stack.mu.RUnlock()
+				if seed != nil {
+					t.Fatal("unchecked IPv4 MLD payload created querier state")
+				}
+				if state != nil {
+					state.mu.Lock()
+					after := state.multicastQuerierState
+					state.mu.Unlock()
+					if after != before {
+						t.Fatal("unchecked IPv4 MLD payload changed querier state")
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -2533,7 +2633,7 @@ func TestIGMPReportAcceptsUnspecifiedSourceOnly(t *testing.T) {
 			copy(packet[headerLength+4:headerLength+8], groupBytes[:])
 			binary.BigEndian.PutUint16(packet[headerLength+2:headerLength+4], checksum(packet[headerLength:]))
 		}
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !ok {
 			t.Fatal("test packet did not parse")
 		}
@@ -2828,7 +2928,7 @@ func TestFragmentedNonUnicastLocalCopiesUseAllOrNoneAdmission(t *testing.T) {
 	if err := stack.tryWriteNonUnicastPacket(len(dummy), false, true, func(packet []byte) bool {
 		copy(packet, dummy)
 		return true
-	}); err != nil {
+	}, false); err != nil {
 		t.Fatalf("local-only non-unicast packet with full queue: %v", err)
 	}
 	if got := stack.Stats().LoopbackQueueDrops; got != 1 {
@@ -2841,7 +2941,7 @@ func TestFragmentedNonUnicastLocalCopiesUseAllOrNoneAdmission(t *testing.T) {
 	stack.loopback.release(entry)
 	beforeLocal := stack.loopback.len()
 	flow := outputFlowKey{hash: 1}
-	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow); err != nil {
+	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow, false); err != nil {
 		t.Fatalf("external non-unicast write with full local copy queue: %v", err)
 	}
 	if after := stack.loopback.len(); after != beforeLocal {
@@ -2866,7 +2966,7 @@ func TestFragmentedNonUnicastLocalCopiesUseAllOrNoneAdmission(t *testing.T) {
 		}
 	}
 	beforeExternal := stack.outbound.len()
-	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow); err != nil {
+	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow, false); err != nil {
 		t.Fatalf("external non-unicast write over published backlog: %v", err)
 	}
 	if after := stack.outbound.len(); after != beforeExternal+1 {
@@ -2878,7 +2978,7 @@ func TestFragmentedNonUnicastLocalCopiesUseAllOrNoneAdmission(t *testing.T) {
 	if stats := stack.Stats(); stats.OutboundQueueDrops != uint64(len(packets)-1) || stats.LoopbackQueueDrops != uint64(1+2*len(packets)) {
 		t.Fatalf("fragment replacement with rejected local copy statistics = %+v", stats)
 	}
-	if err := stack.tryWriteNonUnicastPackets(packets, false, true, flow); err != nil {
+	if err := stack.tryWriteNonUnicastPackets(packets, false, true, flow, false); err != nil {
 		t.Fatalf("local-only non-unicast write with full queue: %v", err)
 	}
 	if after := stack.loopback.len(); after != beforeLocal {
@@ -2917,10 +3017,10 @@ func TestFragmentedNonUnicastLocalCopiesUseAllOrNoneAdmission(t *testing.T) {
 	if err := stack.tryWriteNonUnicastPacket(len(dummy), true, true, func(packet []byte) bool {
 		copy(packet, dummy)
 		return true
-	}); !errors.Is(err, ErrClosed) {
+	}, false); !errors.Is(err, ErrClosed) {
 		t.Fatalf("external packet with closed local queue = %v, want ErrClosed", err)
 	}
-	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow); !errors.Is(err, ErrClosed) {
+	if err := stack.tryWriteNonUnicastPackets(packets, true, true, flow, false); !errors.Is(err, ErrClosed) {
 		t.Fatalf("external write with closed local queue = %v, want ErrClosed", err)
 	}
 	if got, want := stack.Stats().LoopbackQueueDrops, uint64(1+3*len(packets)); got != want {
@@ -2944,7 +3044,7 @@ func TestNonUnicastMarshalFailureDoesNotCountQueueDrop(t *testing.T) {
 	}
 	if err = stack.tryWriteNonUnicastPacket(len(dummy), true, true, func([]byte) bool {
 		return false
-	}); !errors.Is(err, syscall.EMSGSIZE) {
+	}, false); !errors.Is(err, syscall.EMSGSIZE) {
 		t.Fatalf("non-unicast marshal failure = %v, want EMSGSIZE", err)
 	}
 	if stats := stack.Stats(); stats.OutboundPackets != 0 || stats.OutboundQueueDrops != 0 || stats.LoopbackQueueDrops != 0 {
@@ -2953,61 +3053,110 @@ func TestNonUnicastMarshalFailureDoesNotCountQueueDrop(t *testing.T) {
 }
 
 func TestMLDv1CompatibilityReportAndDone(t *testing.T) {
-	local := netip.MustParseAddr("fe80::b0")
-	querier := netip.MustParseAddr("fe80::b1")
-	group := netip.MustParseAddr("ff02::b123")
-	allNodes := netip.MustParseAddr("ff02::1")
-	stack := newMulticastTestStack(t, []netip.Prefix{netip.PrefixFrom(local, 64)}, 1400)
-	connection, err := stack.ListenMulticastUDP(context.Background(), "udp6", netip.AddrPortFrom(group, 52000))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.Close()
-	clearMulticastTestControl(stack)
-	query := buildMulticastTestMLDQuery(querier, allNodes, netip.IPv6Unspecified(), 1, nil)
-	if _, err = stack.Write([][]byte{query}, 0); err != nil {
-		t.Fatal(err)
-	}
-	report := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == ProtocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1MembershipReport
-	})
-	if report.target != group || !report.hasRouterAlert() || report.hopLimit != 1 {
-		t.Fatalf("MLDv1 report envelope = target %s alert %v hop %d", report.target, report.hasRouterAlert(), report.hopLimit)
-	}
-	if err = connection.LeaveGroup(group); err != nil {
-		t.Fatal(err)
-	}
-	done := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == ProtocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1ListenerDone
-	})
-	if done.target != netip.MustParseAddr("ff02::2") {
-		t.Fatalf("MLDv1 Done target = %s", done.target)
-	}
+	for _, offload := range []bool{false, true} {
+		t.Run(fmt.Sprintf("offload-%t", offload), func(t *testing.T) {
+			local := netip.MustParseAddr("fe80::b0")
+			querier := netip.MustParseAddr("fe80::b1")
+			group := netip.MustParseAddr("ff02::b123")
+			allNodes := netip.MustParseAddr("ff02::1")
+			stack := newMulticastTestStack(t, []netip.Prefix{netip.PrefixFrom(local, 64)}, 1400)
+			var policy RXChecksumOffload
+			policy.SetICMPv6(offload)
+			stack.SetRXChecksumOffload(policy)
+			connection, err := stack.ListenMulticastUDP(context.Background(), "udp6", netip.AddrPortFrom(group, 52000))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			clearMulticastTestControl(stack)
+			query := buildMulticastTestMLDQuery(querier, allNodes, netip.IPv6Unspecified(), 1, nil)
+			if _, err = stack.Write([][]byte{query}, 0); err != nil {
+				t.Fatal(err)
+			}
+			report := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
+				return packet.protocol == ProtocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1MembershipReport
+			})
+			if report.target != group || !report.hasRouterAlert() || report.hopLimit != 1 {
+				t.Fatalf("MLDv1 report envelope = target %s alert %v hop %d", report.target, report.hasRouterAlert(), report.hopLimit)
+			}
+			if err = connection.LeaveGroup(group); err != nil {
+				t.Fatal(err)
+			}
+			done := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
+				return packet.protocol == ProtocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1ListenerDone
+			})
+			if done.target != netip.MustParseAddr("ff02::2") {
+				t.Fatalf("MLDv1 Done target = %s", done.target)
+			}
 
-	if err = connection.JoinGroup(group); err != nil {
-		t.Fatal(err)
-	}
-	_ = nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
-		return packet.protocol == ProtocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1MembershipReport
-	})
-	// RFC 3810 section 5.2.14 has the same assigned-address exception as
-	// IGMP. Reuse a valid MLD envelope but direct the peer Report to the
-	// local unicast address.
-	heardPacket := buildMulticastTestMLDQuery(querier, local, group, 1, nil)
-	heard := heardPacket[48:]
-	heard[0], heard[4], heard[5] = mldV1MembershipReport, 0, 0
-	heard[2], heard[3] = 0, 0
-	binary.BigEndian.PutUint16(heard[2:4], transportChecksum(querier, local, ProtocolICMPv6, heard))
-	if _, err = stack.Write([][]byte{heardPacket}, 0); err != nil {
-		t.Fatal(err)
-	}
-	state := stack.multicast.(*multicastState)
-	state.mu.Lock()
-	_, pendingReport := state.retransmissions[group]
-	lastReporter := state.groups[group].lastReporter
-	state.mu.Unlock()
-	if pendingReport || lastReporter {
-		t.Fatalf("unicast-destination MLDv1 suppression = pending %v lastReporter %v", pendingReport, lastReporter)
+			if err = connection.JoinGroup(group); err != nil {
+				t.Fatal(err)
+			}
+			joinedReport := nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
+				return packet.protocol == ProtocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1MembershipReport
+			})
+			// RFC 3810 section 5.2.14 has the same assigned-address exception as
+			// IGMP. Reuse a valid MLD envelope but direct the peer Report to the
+			// local unicast address.
+			heardPacket := buildMulticastTestMLDQuery(querier, local, group, 1, nil)
+			heard := heardPacket[48:]
+			heard[0], heard[4], heard[5] = mldV1MembershipReport, 0, 0
+			heard[2], heard[3] = 0, 0
+			binary.BigEndian.PutUint16(heard[2:4], transportChecksum(querier, local, ProtocolICMPv6, heard))
+			state := stack.multicast.(*multicastState)
+			badHopLimit := append([]byte(nil), heardPacket...)
+			badHopLimit[7] = 2
+			badRouterAlert := append([]byte(nil), heardPacket...)
+			badRouterAlert[45] = 1
+			_, _ = stack.Write([][]byte{badHopLimit, badRouterAlert}, 0)
+			state.mu.Lock()
+			_, pendingEnvelope := state.retransmissions[group]
+			lastReporterEnvelope := state.groups[group].lastReporter
+			state.mu.Unlock()
+			if !pendingEnvelope || !lastReporterEnvelope {
+				t.Fatalf("invalid MLD envelope with offload %t: pending %t lastReporter %t", offload, pendingEnvelope, lastReporterEnvelope)
+			}
+			corrupt := append([]byte(nil), joinedReport.original...)
+			corrupt[50] ^= 1
+			_, _ = stack.Write([][]byte{corrupt}, 0)
+			state.mu.Lock()
+			_, pendingCorrupt := state.retransmissions[group]
+			lastReporterCorrupt := state.groups[group].lastReporter
+			state.mu.Unlock()
+			if pendingCorrupt == offload || lastReporterCorrupt == offload {
+				t.Fatalf("bad-checksum MLDv1 report with offload %t: pending %t lastReporter %t", offload, pendingCorrupt, lastReporterCorrupt)
+			}
+			if offload {
+				// A new membership restores the suppression precondition after the
+				// delegated-checksum Report, so the unicast Report is tested independently.
+				if err = connection.LeaveGroup(group); err != nil {
+					t.Fatal(err)
+				}
+				if err = connection.JoinGroup(group); err != nil {
+					t.Fatal(err)
+				}
+				_ = nextMulticastTestPacket(t, stack, func(packet ipPacket) bool {
+					return packet.protocol == ProtocolICMPv6 && len(packet.payload) == 24 && packet.payload[0] == mldV1MembershipReport
+				})
+			}
+			state.mu.Lock()
+			_, pendingBeforeReport := state.retransmissions[group]
+			lastReporterBeforeReport := state.groups[group].lastReporter
+			state.mu.Unlock()
+			if !pendingBeforeReport || !lastReporterBeforeReport {
+				t.Fatal("unicast MLDv1 Report did not start with suppression pending")
+			}
+			if _, err = stack.Write([][]byte{heardPacket}, 0); err != nil {
+				t.Fatal(err)
+			}
+			state.mu.Lock()
+			_, pendingReport := state.retransmissions[group]
+			lastReporter := state.groups[group].lastReporter
+			state.mu.Unlock()
+			if pendingReport || lastReporter {
+				t.Fatalf("unicast-destination MLDv1 suppression = pending %v lastReporter %v", pendingReport, lastReporter)
+			}
+		})
 	}
 }
 

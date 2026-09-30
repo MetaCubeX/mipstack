@@ -902,7 +902,7 @@ func TestUDPForwarderUsesCompleteFlowTuple(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != target || parsed.target != firstRemote || parsed.protocol != ProtocolUDP {
 		t.Fatalf("forwarded UDP response = %x", response)
 	}
@@ -975,7 +975,7 @@ func TestUDPForwarderListenUnconnected(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != target || parsed.target != secondRemote || parsed.protocol != ProtocolUDP {
 		t.Fatalf("listened UDP response = %x", response)
 	}
@@ -1267,7 +1267,7 @@ func TestUDPForwarderReceivesReassembledNonlocalDatagram(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := bytes.Repeat([]byte{0x5a}, 1800)
-	complete, ok := parseIPPacket(buildTestUDP(remote, target, 52501, 52502, payload))
+	complete, ok := parseIPPacket(buildTestUDP(remote, target, 52501, 52502, payload), false)
 	if !ok {
 		t.Fatal("failed to parse complete UDP test packet")
 	}
@@ -1320,12 +1320,12 @@ func TestICMPForwarderRepliesFromOriginalDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != ProtocolICMPv4 || parsed.payload[0] != 0 || !bytes.Equal(parsed.payload[4:], icmp[4:]) || checksum(parsed.payload) != 0 {
 		t.Fatalf("forwarded ICMP response = %x", response)
 	}
 	response = readForwarderTestPacket(t, stack)
-	parsed, ok = parseIPPacket(response)
+	parsed, ok = parseIPPacket(response, false)
 	if !ok || parsed.payload[0] != 0 || checksum(parsed.payload) != 0 {
 		t.Fatalf("second forwarded ICMP response = %x", response)
 	}
@@ -1487,7 +1487,7 @@ func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 			t.Fatal(err)
 		}
 		response := readForwarderTestPacket(t, stack)
-		parsed, ok := parseIPPacket(response)
+		parsed, ok := parseIPPacket(response, false)
 		if !ok || parsed.source != target || parsed.target != remote || parsed.payload[13] != TCPFlagRST|TCPFlagACK || binary.BigEndian.Uint32(parsed.payload[8:12]) != 100 {
 			t.Fatalf("forwarded TCP rejection = %x", response)
 		}
@@ -1526,12 +1526,12 @@ func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 			t.Fatal(err)
 		}
 		response := readForwarderTestPacket(t, stack)
-		parsed, ok := parseIPPacket(response)
+		parsed, ok := parseIPPacket(response, false)
 		if !ok || parsed.source != target || parsed.target != remote || binary.BigEndian.Uint16(parsed.payload[0:2]) != 53 || binary.BigEndian.Uint16(parsed.payload[2:4]) != 53003 || string(parsed.payload[udpHeaderSize:]) != "answer" {
 			t.Fatalf("forwarded UDP reply = %x", response)
 		}
 		response = readForwarderTestPacket(t, stack)
-		parsed, ok = parseIPPacket(response)
+		parsed, ok = parseIPPacket(response, false)
 		if !ok || string(parsed.payload[udpHeaderSize:]) != "second answer" {
 			t.Fatalf("second forwarded UDP reply = %x", response)
 		}
@@ -1577,7 +1577,7 @@ func TestForwarderRequestReplyAndRejectActions(t *testing.T) {
 				t.Fatal(err)
 			}
 			response := readForwarderTestPacket(t, stack)
-			parsed, ok := parseIPPacket(response)
+			parsed, ok := parseIPPacket(response, false)
 			validChecksum := false
 			if ok {
 				validChecksum = checksum(parsed.payload) == 0
@@ -1652,7 +1652,7 @@ func TestUDPForwarderReplyAllowsTerminalActions(t *testing.T) {
 			}
 
 			packet := readForwarderTestPacket(t, stack)
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != ProtocolUDP || string(parsed.payload[udpHeaderSize:]) != "request reply" {
 				t.Fatalf("request Reply output = %x", packet)
 			}
@@ -1672,7 +1672,7 @@ func TestUDPForwarderReplyAllowsTerminalActions(t *testing.T) {
 					t.Fatalf("responder Reply after request Reply: %v", err)
 				}
 				packet = readForwarderTestPacket(t, stack)
-				parsed, ok = parseIPPacket(packet)
+				parsed, ok = parseIPPacket(packet, false)
 				if !ok || string(parsed.payload[udpHeaderSize:]) != "responder reply" {
 					t.Fatalf("responder Reply output = %x", packet)
 				}
@@ -1692,7 +1692,7 @@ func TestUDPForwarderReplyAllowsTerminalActions(t *testing.T) {
 
 			if action.request == "Reject" || action.responder == "Reject" {
 				packet = readForwarderTestPacket(t, stack)
-				parsed, ok = parseIPPacket(packet)
+				parsed, ok = parseIPPacket(packet, false)
 				if !ok || parsed.protocol != ProtocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 3 {
 					t.Fatalf("UDP rejection after Reply = %x", packet)
 				}
@@ -1829,7 +1829,7 @@ func TestIPAndICMPForwarderReplyAllowsTerminalActions(t *testing.T) {
 				}
 
 				packet := readForwarderTestPacket(t, stack)
-				parsed, ok := parseIPPacket(packet)
+				parsed, ok := parseIPPacket(packet, false)
 				if !ok || parsed.source != target || parsed.target != remote {
 					t.Fatalf("request Reply output = %x", packet)
 				}
@@ -1846,7 +1846,7 @@ func TestIPAndICMPForwarderReplyAllowsTerminalActions(t *testing.T) {
 						t.Fatalf("responder Reply after request Reply: %v", err)
 					}
 					packet = readForwarderTestPacket(t, stack)
-					parsed, ok = parseIPPacket(packet)
+					parsed, ok = parseIPPacket(packet, false)
 					if !ok || parsed.source != target || parsed.target != remote {
 						t.Fatalf("responder Reply output = %x", packet)
 					}
@@ -1859,7 +1859,7 @@ func TestIPAndICMPForwarderReplyAllowsTerminalActions(t *testing.T) {
 				}
 				if action == "Reject" || action == "Detach/Reject" {
 					packet = readForwarderTestPacket(t, stack)
-					parsed, ok = parseIPPacket(packet)
+					parsed, ok = parseIPPacket(packet, false)
 					if !ok || parsed.protocol != ProtocolICMPv4 {
 						t.Fatalf("%s rejection after Reply = %x", protocol, packet)
 					}
@@ -1949,7 +1949,7 @@ func TestUDPForwarderRequestConcurrentReplyAndTerminalAction(t *testing.T) {
 			break
 		}
 		packet := consumeTestPacket(&stack.outbound, entry)
-		parsed, valid := parseIPPacket(packet)
+		parsed, valid := parseIPPacket(packet, false)
 		if !valid || parsed.source != target || parsed.target != remote || parsed.protocol != ProtocolUDP || len(parsed.payload) != udpHeaderSize+1 {
 			t.Fatalf("concurrent Reply output = %x", packet)
 		}
@@ -2214,7 +2214,7 @@ func TestTCPForwarderAcceptResumesAfterFullPacketQueue(t *testing.T) {
 	var synACK ipPacket
 	for attempts := cap(stack.outbound.free) + 1; attempts != 0; attempts-- {
 		packet := readOutboundPacket(t, stack)
-		parsed, valid := parseIPPacket(packet)
+		parsed, valid := parseIPPacket(packet, false)
 		if valid && parsed.protocol == ProtocolTCP && len(parsed.payload) >= tcpHeaderSize && parsed.payload[13]&byte(TCPFlagSYN|TCPFlagACK) == byte(TCPFlagSYN|TCPFlagACK) {
 			synACK = parsed
 			break
@@ -2339,7 +2339,7 @@ func TestUDPForwarderReplyUsesSocketDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != ProtocolUDP {
 		t.Fatalf("configured UDP forwarder response = %x", response)
 	}
@@ -2367,7 +2367,7 @@ func TestUDPForwarderReplyUsesAutomaticFlowLabel(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok {
 		t.Fatalf("automatic-label UDP forwarder response = %x", response)
 	}
@@ -2421,7 +2421,7 @@ func TestUDPForwarderDetachedReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != target || parsed.target != remote || string(parsed.payload[udpHeaderSize:]) != "async answer" {
 		t.Fatalf("detached UDP response = %x", response)
 	}
@@ -2429,7 +2429,7 @@ func TestUDPForwarderDetachedReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	response = readForwarderTestPacket(t, stack)
-	parsed, ok = parseIPPacket(response)
+	parsed, ok = parseIPPacket(response, false)
 	if !ok || string(parsed.payload[udpHeaderSize:]) != "second answer" {
 		t.Fatalf("second detached UDP response = %x", response)
 	}
@@ -2495,7 +2495,7 @@ func TestUDPForwarderReplyFrom(t *testing.T) {
 				t.Fatal(err)
 			}
 			response := readForwarderTestPacket(t, stack)
-			parsed, ok := parseIPPacket(response)
+			parsed, ok := parseIPPacket(response, false)
 			if !ok || parsed.source != test.source || parsed.target != test.remote || parsed.protocol != ProtocolUDP ||
 				binary.BigEndian.Uint16(parsed.payload[:2]) != sourcePort || binary.BigEndian.Uint16(parsed.payload[2:4]) != remotePort ||
 				string(parsed.payload[udpHeaderSize:]) != "selected" || transportChecksum(parsed.source, parsed.target, ProtocolUDP, parsed.payload) != 0 {
@@ -2546,7 +2546,7 @@ func TestUDPForwarderReplyFromPreservesConfiguredBroadcastSource(t *testing.T) {
 		t.Fatalf("Drop after configured-broadcast ReplyFrom = %v", resultErrors[1])
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != broadcast || parsed.target != remote || string(parsed.payload[udpHeaderSize:]) != "answer" {
 		t.Fatalf("configured-broadcast ReplyFrom output = %x", response)
 	}
@@ -2597,7 +2597,7 @@ func TestICMPForwarderReplyIPPacketPreservesConfiguredBroadcastSource(t *testing
 		t.Fatalf("Drop after configured-broadcast ReplyIPPacket = %v", resultErrors[1])
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != broadcast || parsed.target != remote || string(parsed.payload[8:]) != "answer" {
 		t.Fatalf("configured-broadcast ReplyIPPacket output = %x", response)
 	}
@@ -2642,7 +2642,7 @@ func TestUDPForwarderReplyFromPreservesSpecialSources(t *testing.T) {
 				}
 			}
 			packet := readForwarderTestPacket(t, stack)
-			parsed, ok := parseIPPacket(packet)
+			parsed, ok := parseIPPacket(packet, false)
 			if !ok || parsed.source != test.source.WithZone("").Unmap() || parsed.target != test.remote || string(parsed.payload[udpHeaderSize:]) != "answer" {
 				t.Fatalf("special-source ReplyFrom output = %x", packet)
 			}
@@ -2744,7 +2744,7 @@ func TestUDPForwarderReplyPreservesLoopbackSourceForRemotePeer(t *testing.T) {
 	}
 	for index := 0; index < 2; index++ {
 		packet := readForwarderTestPacket(t, stack)
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !ok || parsed.source != local || parsed.target != remote || string(parsed.payload[udpHeaderSize:]) != "answer" {
 			t.Fatalf("loopback source reply %d output = %x", index, packet)
 		}
@@ -2794,7 +2794,7 @@ func TestUDPForwarderDetachedReplyFromConcurrent(t *testing.T) {
 	}
 	seen := make(map[netip.AddrPort]byte, len(sources))
 	for range sources {
-		parsed, ok := parseIPPacket(readForwarderTestPacket(t, stack))
+		parsed, ok := parseIPPacket(readForwarderTestPacket(t, stack), false)
 		if !ok || parsed.protocol != ProtocolUDP || parsed.target != remote || len(parsed.payload) != udpHeaderSize+1 {
 			t.Fatalf("detached ReplyFrom output = %+v", parsed)
 		}
@@ -2853,7 +2853,7 @@ func TestUDPForwarderDetachedTerminalActions(t *testing.T) {
 					t.Fatalf("rejected detached UDP info = %+v", info)
 				}
 				response := readForwarderTestPacket(t, stack)
-				parsed, ok := parseIPPacket(response)
+				parsed, ok := parseIPPacket(response, false)
 				if !ok || parsed.protocol != ProtocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 3 {
 					t.Fatalf("detached UDP rejection = %x", response)
 				}
@@ -2863,64 +2863,97 @@ func TestUDPForwarderDetachedTerminalActions(t *testing.T) {
 }
 
 func TestICMPForwarderDetachedReply(t *testing.T) {
-	owned := netip.MustParseAddr("192.0.2.118")
-	remote := netip.MustParseAddr("192.0.2.119")
-	target := netip.MustParseAddr("198.51.100.118")
-	stack := newForwarderTestStack(t, owned, true)
-	detached := make(chan *ICMPForwarderResponder, 1)
-	forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
-		responder, detachErr := request.Detach()
-		if detachErr != nil {
-			t.Errorf("Detach ICMP: %v", detachErr)
-			return
-		}
-		detached <- responder
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer forwarder.Close()
-	icmp := make([]byte, 12)
-	icmp[0] = 8
-	copy(icmp[8:], "ping")
-	binary.BigEndian.PutUint16(icmp[2:4], checksum(icmp))
-	packet := buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)
-	if err = writeTestPacket(stack, packet); err != nil {
-		t.Fatal(err)
-	}
-	responder := <-detached
-	for index := range packet {
-		packet[index] = 0
-	}
-	message := responder.Message()
-	if message.Source != remote || message.Destination != target || message.Type != 8 || message.Code != 0 || string(message.Payload[8:]) != "ping" {
-		t.Fatalf("detached ICMP message = %+v", message)
-	}
-	fullPacket := responder.IPPacket()
-	parsedSnapshot, ok := parseIPPacket(fullPacket)
-	if !ok || !bytes.Equal(fullPacket, parsedSnapshot.original) || len(message.Payload) == 0 || &message.Payload[0] != &parsedSnapshot.payload[0] {
-		t.Fatal("detached ICMP packet and message do not share one owned snapshot")
-	}
-	result := make(chan error, 1)
-	go func() { result <- responder.ReplyEcho() }()
-	if err = <-result; err != nil {
-		t.Fatal(err)
-	}
-	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
-	if !ok || parsed.source != target || parsed.target != remote || parsed.payload[0] != 0 || checksum(parsed.payload) != 0 {
-		t.Fatalf("detached ICMP response = %x", response)
-	}
-	if err = responder.ReplyEcho(); err != nil {
-		t.Fatal(err)
-	}
-	response = readForwarderTestPacket(t, stack)
-	parsed, ok = parseIPPacket(response)
-	if !ok || parsed.payload[0] != 0 || checksum(parsed.payload) != 0 {
-		t.Fatalf("second detached ICMP response = %x", response)
-	}
-	if info := forwarder.Info(); info.Pending != 0 || info.Replies != 2 {
-		t.Fatalf("completed detached ICMP forwarder info = %+v", info)
+	for _, offload := range []bool{false, true} {
+		t.Run(fmt.Sprintf("header-offload-%t", offload), func(t *testing.T) {
+			owned := netip.MustParseAddr("192.0.2.118")
+			remote := netip.MustParseAddr("192.0.2.119")
+			target := netip.MustParseAddr("198.51.100.118")
+			stack := newForwarderTestStack(t, owned, true)
+			var policy RXChecksumOffload
+			policy.SetIPv4Header(offload)
+			stack.SetRXChecksumOffload(policy)
+			detached := make(chan *ICMPForwarderResponder, 1)
+			forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
+				responder, detachErr := request.Detach()
+				if detachErr != nil {
+					t.Errorf("Detach ICMP: %v", detachErr)
+					return
+				}
+				detached <- responder
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer forwarder.Close()
+			echo := ICMPMessage{Source: remote, Destination: target}
+			if err = echo.SetEchoRequest(0, 0, []byte("ping")); err != nil {
+				t.Fatal(err)
+			}
+			icmp, err := echo.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			packet := buildIPPacket(remote, target, ProtocolICMPv4, icmp, 1, true)
+			badHeader := append([]byte(nil), packet...)
+			badHeader[10] ^= 1
+			if offload {
+				packet = badHeader
+			} else {
+				if err = writeTestPacket(stack, badHeader); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case <-detached:
+					t.Fatal("invalid IPv4 header reached the forwarder without offload")
+				default:
+				}
+			}
+			before := append([]byte(nil), packet...)
+			if err = writeTestPacket(stack, packet); err != nil {
+				t.Fatal(err)
+			}
+			var responder *ICMPForwarderResponder
+			select {
+			case responder = <-detached:
+			default:
+				t.Fatal("synchronous ICMP handler did not detach the accepted request")
+			}
+			for index := range packet {
+				packet[index] = 0
+			}
+			message := responder.Message()
+			if message.Source != remote || message.Destination != target || message.Type != 8 || message.Code != 0 || string(message.Payload[8:]) != "ping" {
+				t.Fatalf("detached ICMP message = %+v", message)
+			}
+			fullPacket := responder.IPPacket()
+			if !bytes.Equal(fullPacket, before) || len(message.Payload) == 0 || &message.Payload[0] != &fullPacket[20] {
+				t.Fatal("detached ICMP packet and message do not share one owned snapshot")
+			}
+			if _, parseErr := ParseIPPacket(fullPacket); (parseErr != nil) != offload {
+				t.Fatalf("public snapshot checksum validation with offload %t = %v", offload, parseErr)
+			}
+			result := make(chan error, 1)
+			go func() { result <- responder.ReplyEcho() }()
+			if err = <-result; err != nil {
+				t.Fatal(err)
+			}
+			response := readForwarderTestPacket(t, stack)
+			parsed, ok := parseIPPacket(response, false)
+			if !ok || parsed.source != target || parsed.target != remote || parsed.payload[0] != 0 || checksum(parsed.payload) != 0 {
+				t.Fatalf("detached ICMP response = %x", response)
+			}
+			if err = responder.ReplyEcho(); err != nil {
+				t.Fatal(err)
+			}
+			response = readForwarderTestPacket(t, stack)
+			parsed, ok = parseIPPacket(response, false)
+			if !ok || parsed.payload[0] != 0 || checksum(parsed.payload) != 0 {
+				t.Fatalf("second detached ICMP response = %x", response)
+			}
+			if info := forwarder.Info(); info.Pending != 0 || info.Replies != 2 {
+				t.Fatalf("completed detached ICMP forwarder info = %+v", info)
+			}
+		})
 	}
 }
 
@@ -2933,7 +2966,7 @@ func TestICMPForwarderIPPacketRequestLifetime(t *testing.T) {
 	forwarder, err := NewICMPForwarder(stack, ICMPForwarderOptions{}, func(request *ICMPForwarderRequest) {
 		message := request.Message()
 		packet := request.IPPacket()
-		parsed, ok := parseIPPacket(packet)
+		parsed, ok := parseIPPacket(packet, false)
 		if !ok || parsed.source != remote || parsed.target != target || len(message.Payload) == 0 || &message.Payload[0] != &parsed.payload[0] {
 			result <- syscall.EINVAL
 			return
@@ -3058,7 +3091,7 @@ func TestICMPForwarderReplyIPPacketKnownAnswers(t *testing.T) {
 			if !bytes.Equal(input, before) {
 				t.Fatal("ReplyIPPacket normalization modified caller storage")
 			}
-			parsed, ok := parseIPPacket(reply.packet)
+			parsed, ok := parseIPPacket(reply.packet, false)
 			if !ok || parsed.parameterError || parsed.target != test.destination || parsed.protocol != ProtocolICMPv4 && parsed.protocol != ProtocolICMPv6 {
 				t.Fatalf("normalized ReplyIPPacket metadata = %+v, valid %t", parsed, ok)
 			}
@@ -3127,7 +3160,7 @@ func TestICMPForwarderReplyIPPacketNormalization(t *testing.T) {
 				t.Fatal(err)
 			}
 			output := readForwarderTestPacket(t, stack)
-			parsed, ok := parseIPPacket(output)
+			parsed, ok := parseIPPacket(output, false)
 			if !ok || parsed.source != test.target || parsed.target != test.remote || !bytes.Equal(parsed.payload[8:], requestPacket) {
 				t.Fatalf("ReplyIPPacket output = %x", output)
 			}
@@ -3183,7 +3216,7 @@ func TestICMPForwarderReplyIPPacketValidationAllowsLaterAction(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != netip.MustParseAddr("127.0.0.1") || parsed.target != remote {
 		t.Fatalf("loopback-source ReplyIPPacket output = %x", response)
 	}
@@ -3289,7 +3322,7 @@ func TestICMPForwarderReplyIPPacketFragmentation(t *testing.T) {
 			if fragments < 2 || len(reassembled) == 0 {
 				t.Fatalf("ReplyIPPacket fragments = %d, reassembled=%d", fragments, len(reassembled))
 			}
-			parsed, ok := parseIPPacket(reassembled)
+			parsed, ok := parseIPPacket(reassembled, false)
 			if !ok || parsed.source != test.target || parsed.target != test.remote || !bytes.Equal(parsed.payload[8:], quoted) {
 				t.Fatalf("reassembled ReplyIPPacket = %x", reassembled)
 			}
@@ -3348,7 +3381,7 @@ func TestICMPForwarderReplyIPPacketIPv6AtomicFragment(t *testing.T) {
 				if output[6] != 44 || output[40] != ProtocolICMPv6 || output[41] != 0 || binary.BigEndian.Uint16(output[42:44]) != 0 || binary.BigEndian.Uint32(output[44:48]) != test.identification {
 					t.Fatalf("fitting atomic Fragment header = %x", output[40:48])
 				}
-				parsed, ok := parseIPPacket(output)
+				parsed, ok := parseIPPacket(output, false)
 				if !ok || !bytes.Equal(parsed.payload[8:], payload) || transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0 {
 					t.Fatalf("fitting atomic ReplyIPPacket = %x", output)
 				}
@@ -3375,7 +3408,7 @@ func TestICMPForwarderReplyIPPacketIPv6AtomicFragment(t *testing.T) {
 			if fragments < 2 || len(reassembled) == 0 {
 				t.Fatalf("atomic refragmentation produced %d fragments and %d reassembled bytes", fragments, len(reassembled))
 			}
-			parsed, ok := parseIPPacket(reassembled)
+			parsed, ok := parseIPPacket(reassembled, false)
 			if !ok || !bytes.Equal(parsed.payload[8:], payload) || transportChecksum(parsed.source, parsed.target, ProtocolICMPv6, parsed.payload) != 0 {
 				t.Fatalf("reassembled atomic ReplyIPPacket = %x", reassembled)
 			}
@@ -3421,7 +3454,7 @@ func TestICMPForwarderReplyIPPacketIPv6StaticValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != netip.IPv6Loopback() || parsed.target != remote {
 		t.Fatalf("IPv6 loopback-source ReplyIPPacket output = %x", response)
 	}
@@ -3577,7 +3610,7 @@ func FuzzICMPForwarderReplyIPPacket(f *testing.F) {
 		if err != nil {
 			return
 		}
-		parsed, ok := parseIPPacket(reply.packet)
+		parsed, ok := parseIPPacket(reply.packet, false)
 		if !ok || parsed.parameterError || parsed.target != destination || parsed.protocol != protocol || len(parsed.payload) < 8 {
 			t.Fatalf("accepted ReplyIPPacket is not parseable: %+v, valid=%t", parsed, ok)
 		}
@@ -3679,7 +3712,7 @@ func FuzzICMPForwarderReplyIPPacketFragmentation(f *testing.F) {
 				t.Fatalf("ReplyIPPacket emitted %d fragments but did not reassemble", len(packets))
 			}
 		}
-		parsed, ok := parseIPPacket(completed)
+		parsed, ok := parseIPPacket(completed, false)
 		if !ok || parsed.parameterError || parsed.source != expectedSource || parsed.target != expectedTarget ||
 			parsed.protocol != expectedProtocol || !bytes.Equal(parsed.payload, expectedPayload) {
 			t.Fatalf("ReplyIPPacket reassembly = valid %t %s -> %s protocol %d payload %d, want %s -> %s protocol %d payload %d",
@@ -3921,7 +3954,7 @@ func TestICMPForwarderDetachedTerminalActions(t *testing.T) {
 					t.Fatalf("rejected detached ICMP info = %+v", info)
 				}
 				response := readForwarderTestPacket(t, stack)
-				parsed, ok := parseIPPacket(response)
+				parsed, ok := parseIPPacket(response, false)
 				if !ok || parsed.payload[0] != 3 || parsed.payload[1] != 13 {
 					t.Fatalf("detached ICMP rejection = %x", response)
 				}
@@ -3971,7 +4004,7 @@ func TestICMPForwarderDetachedRejectUsesIndependentQuote(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv4 || parsed.payload[0] != 3 || parsed.payload[1] != 13 || checksum(parsed.payload) != 0 || !bytes.Equal(parsed.payload[8:], wantQuote) {
 		t.Fatalf("detached rejection did not preserve its independent quote: %x", response)
 	}
@@ -4038,7 +4071,7 @@ func TestUDPForwarderDetachedReplyCanRetry(t *testing.T) {
 		t.Fatalf("retry detached UDP Reply: %v", err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || string(parsed.payload[udpHeaderSize:]) != "answer" {
 		t.Fatalf("retried detached UDP response = %x", response)
 	}
@@ -4392,7 +4425,7 @@ func TestICMPForwarderResponderConcurrentReplyIPPacketAndDrop(t *testing.T) {
 			break
 		}
 		packet := consumeTestPacket(&stack.outbound, entry)
-		parsed, valid := parseIPPacket(packet)
+		parsed, valid := parseIPPacket(packet, false)
 		if !valid || parsed.source != target || parsed.target != remote || string(parsed.payload[8:]) != "concurrent" {
 			t.Fatalf("concurrent ReplyIPPacket output = %x", packet)
 		}
@@ -4487,7 +4520,7 @@ func TestIPForwarderReplyAndMetadata(t *testing.T) {
 			}
 			for _, payload := range []string{"first", "second"} {
 				response := readForwarderTestPacket(t, stack)
-				parsed, ok := parseIPPacket(response)
+				parsed, ok := parseIPPacket(response, false)
 				if !ok || parsed.source != test.target || parsed.target != test.remote || parsed.protocol != 99 || string(parsed.payload) != payload {
 					t.Fatalf("forwarded IP reply = %+v payload %q", parsed, parsed.payload)
 				}
@@ -4783,7 +4816,7 @@ func TestIPForwarderDetachAndReject(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != local || parsed.target != remote || parsed.protocol != 100 || string(parsed.payload) != "async" {
 		t.Fatalf("detached IP reply = %+v", parsed)
 	}
@@ -4810,7 +4843,7 @@ func TestIPForwarderDetachAndReject(t *testing.T) {
 		t.Fatal(err)
 	}
 	response = readForwarderTestPacket(t, stack)
-	parsed, ok = parseIPPacket(response)
+	parsed, ok = parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolICMPv4 || len(parsed.payload) < 2 || parsed.payload[0] != 3 || parsed.payload[1] != 2 {
 		t.Fatalf("IP forwarder rejection = %+v", parsed)
 	}
@@ -4917,7 +4950,7 @@ func TestICMPv6ForwarderReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readForwarderTestPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.source != target || parsed.target != remote || parsed.payload[0] != 129 || transportChecksum(target, remote, ProtocolICMPv6, parsed.payload) != 0 {
 		t.Fatalf("forwarded ICMPv6 reply = %x", response)
 	}
@@ -5244,12 +5277,12 @@ func TestUDPForwarderRepliesOnlyResponder(t *testing.T) {
 				t.Fatal(err)
 			}
 			response := readForwarderTestPacket(t, stack)
-			parsed, ok := parseIPPacket(response)
+			parsed, ok := parseIPPacket(response, false)
 			if !ok || parsed.source != target || parsed.target != remote || string(parsed.payload[udpHeaderSize:]) != "default source" {
 				t.Fatalf("replies-only UDP Reply output = %x", response)
 			}
 			response = readForwarderTestPacket(t, stack)
-			parsed, ok = parseIPPacket(response)
+			parsed, ok = parseIPPacket(response, false)
 			if !ok || parsed.source != alternate || parsed.target != remote || binary.BigEndian.Uint16(parsed.payload[:2]) != 5353 || string(parsed.payload[udpHeaderSize:]) != "selected source" {
 				t.Fatalf("replies-only UDP ReplyFrom output = %x", response)
 			}
@@ -5335,7 +5368,7 @@ func TestIPForwarderRepliesOnlyResponder(t *testing.T) {
 				t.Fatal(err)
 			}
 			response := readForwarderTestPacket(t, stack)
-			parsed, ok := parseIPPacket(response)
+			parsed, ok := parseIPPacket(response, false)
 			if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != 100 || string(parsed.payload) != "asynchronous reply" {
 				t.Fatalf("replies-only IP Reply output = %x", response)
 			}
@@ -5401,7 +5434,7 @@ func TestICMPForwarderRepliesOnlyResponder(t *testing.T) {
 				if !bytes.Equal(retainedMessage, icmp) {
 					t.Fatalf("previously returned ICMP message = %x", retainedMessage)
 				}
-				if parsed, ok := parseIPPacket(retainedPacket); !ok || !bytes.Equal(parsed.payload, icmp) {
+				if parsed, ok := parseIPPacket(retainedPacket, false); !ok || !bytes.Equal(parsed.payload, icmp) {
 					t.Fatalf("previously returned ICMP packet = %x", retainedPacket)
 				}
 			}
@@ -5417,7 +5450,7 @@ func TestICMPForwarderRepliesOnlyResponder(t *testing.T) {
 				t.Fatal(err)
 			}
 			response := readForwarderTestPacket(t, stack)
-			parsed, ok := parseIPPacket(response)
+			parsed, ok := parseIPPacket(response, false)
 			if !ok || parsed.source != target || parsed.target != remote || parsed.protocol != ProtocolICMPv4 || !bytes.Equal(parsed.payload[4:], reply[4:]) || checksum(parsed.payload) != 0 {
 				t.Fatalf("replies-only ICMP Reply output = %x", response)
 			}
@@ -5426,7 +5459,7 @@ func TestICMPForwarderRepliesOnlyResponder(t *testing.T) {
 				t.Fatal(err)
 			}
 			response = readForwarderTestPacket(t, stack)
-			parsed, ok = parseIPPacket(response)
+			parsed, ok = parseIPPacket(response, false)
 			if !ok || parsed.source != target || parsed.target != remote || string(parsed.payload[8:]) != "raw reply" || checksum(parsed.payload) != 0 {
 				t.Fatalf("replies-only ICMP ReplyIPPacket output = %x", response)
 			}

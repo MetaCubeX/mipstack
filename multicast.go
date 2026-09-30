@@ -149,7 +149,7 @@ type multicastEndpoints interface {
 	// all-hosts delivery inherited by raw IP sockets.
 	deliverImplicitIP(ipPacket, ipEndpoints) bool
 	// handleControl processes one validated IGMP or MLD control packet.
-	handleControl(ipPacket, time.Time)
+	handleControl(ipPacket, time.Time, bool)
 	// removeEndpoint drops every membership owned by a closing socket.
 	removeEndpoint(multicastEndpoint)
 	// updateConfig reconciles memberships with a new interface configuration.
@@ -1488,7 +1488,7 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 			}
 			marshalUDPDatagram(packet[ipSize:], source, target, sourcePort, targetPort, payload)
 			return true
-		})
+		}, true)
 	}
 	var layout ipFragmentLayout
 	if err := c.stack.ipFragmentLayoutForMTU(source, target, udpSize, fragmentation, options, mtu, &layout); err != nil {
@@ -1501,7 +1501,7 @@ func (c *UDPConn) writeNonUnicastDatagram(source, target netip.Addr, sourcePort,
 	if external {
 		flow = c.stack.outbound.ipFlowKey(source, target, ProtocolUDP, layout.options.flowLabel, datagram)
 	}
-	return c.stack.tryWriteNonUnicastPackets(packets, external, loopback, flow)
+	return c.stack.tryWriteNonUnicastPackets(packets, external, loopback, flow, true)
 }
 
 // writeNonUnicastPayload is the raw-protocol counterpart of UDP multicast and
@@ -1540,7 +1540,7 @@ func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byt
 			}
 			copy(packet[ipSize:], payload)
 			return true
-		})
+		}, false)
 	}
 	var layout ipFragmentLayout
 	if err := c.stack.ipFragmentLayoutForMTU(source, target, len(payload), fragmentation, options, mtu, &layout); err != nil {
@@ -1551,14 +1551,14 @@ func (c *IPConn) writeNonUnicastPayload(source, target netip.Addr, payload []byt
 	if external {
 		flow = c.stack.outbound.ipFlowKey(source, target, c.protocol, layout.options.flowLabel, payload)
 	}
-	return c.stack.tryWriteNonUnicastPackets(packets, external, loopback, flow)
+	return c.stack.tryWriteNonUnicastPackets(packets, external, loopback, flow, false)
 }
 
 // tryWriteNonUnicastPacket serializes one unfragmented packet directly into
 // queue-owned storage. External and local admission are independent: a link
 // admission failure is reported to the socket policy while local delivery
 // remains best effort, matching a kernel multicast receive queue.
-func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, marshal func([]byte) bool) error {
+func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, marshal func([]byte) bool, checksumValidated bool) error {
 	if !external && !loopback {
 		return nil
 	}
@@ -1629,7 +1629,7 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 			}
 			copy(localPacket, packet)
 		}
-		if !s.outbound.enqueueReservedPacket(externalSlot, packet, reusable) {
+		if !s.outbound.enqueueReservedPacket(externalSlot, packet, reusable, checksumValidated) {
 			if localReserved {
 				s.releaseOutputBuffer(&s.loopback.packetQueue, localPacket, localReusable)
 				s.loopback.releaseReserved(localSlot)
@@ -1638,7 +1638,7 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 		}
 		s.recordOutput(false)
 		if localReserved {
-			if !s.loopback.enqueueReservedPacket(localSlot, localPacket, localReusable) {
+			if !s.loopback.enqueueReservedPacket(localSlot, localPacket, localReusable, checksumValidated) {
 				return ErrClosed
 			}
 			s.recordOutput(true)
@@ -1649,7 +1649,7 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 		}
 		return nil
 	}
-	if !s.loopback.enqueueReservedPacket(localSlot, packet, reusable) {
+	if !s.loopback.enqueueReservedPacket(localSlot, packet, reusable, checksumValidated) {
 		return ErrClosed
 	}
 	s.recordOutput(true)
@@ -1660,14 +1660,14 @@ func (s *Stack) tryWriteNonUnicastPacket(size int, external, loopback bool, mars
 // wire order and the local copy as one complete sequence. External link
 // admission may discard any queued fragment as ordinary packet loss, while a
 // local reassembler never receives a capacity-truncated datagram.
-func (s *Stack) tryWriteNonUnicastPackets(packets [][]byte, external, loopback bool, flow outputFlowKey) error {
+func (s *Stack) tryWriteNonUnicastPackets(packets [][]byte, external, loopback bool, flow outputFlowKey, checksumValidated bool) error {
 	if len(packets) == 0 || !external && !loopback {
 		return nil
 	}
 	var externalErr error
 	if external {
 		for _, packet := range packets {
-			if externalErr = s.tryWritePacketToFlow(packet, &s.outbound, false, flow); externalErr != nil {
+			if externalErr = s.tryWritePacketToFlow(packet, &s.outbound, false, flow, checksumValidated); externalErr != nil {
 				break
 			}
 		}
@@ -1676,7 +1676,7 @@ func (s *Stack) tryWriteNonUnicastPackets(packets [][]byte, external, loopback b
 		}
 	}
 	if loopback {
-		localErr := s.tryWriteLoopbackPackets(packets)
+		localErr := s.tryWriteLoopbackPackets(packets, checksumValidated)
 		if localErr == ErrClosed {
 			return localErr
 		}
@@ -1702,7 +1702,7 @@ func isMulticastControlPacket(packet ipPacket) bool {
 // multicastStateForQuery records interface protocol variables when a Query
 // arrives before the first socket joins a group. It deliberately retains only
 // a lightweight seed; the first membership promotes it to multicastState.
-func (s *Stack) multicastStateForQuery(packet ipPacket, current multicastEndpoints, receivedAt time.Time) multicastEndpoints {
+func (s *Stack) multicastStateForQuery(packet ipPacket, current multicastEndpoints, receivedAt time.Time, skipChecksum bool) multicastEndpoints {
 	if current != nil || len(packet.payload) == 0 {
 		return current
 	}
@@ -1715,12 +1715,12 @@ func (s *Stack) multicastStateForQuery(packet ipPacket, current multicastEndpoin
 		if packet.payload[0] != igmpMembershipQuery {
 			return nil
 		}
-		query, expected, valid = parseIGMPQuery(packet, network)
+		query, expected, valid = parseIGMPQuery(packet, network, skipChecksum)
 	case ProtocolICMPv6:
 		if packet.payload[0] != mldMembershipQuery {
 			return nil
 		}
-		query, expected, valid = parseMLDQuery(packet, network)
+		query, expected, valid = parseMLDQuery(packet, network, skipChecksum)
 	default:
 		return nil
 	}
@@ -1746,25 +1746,25 @@ func (s *Stack) multicastStateForQuery(packet ipPacket, current multicastEndpoin
 
 // handleControl consumes IGMP and MLD host-side control messages. Raw sockets
 // receive their copy before this method runs, matching the kernel IP path.
-func (s *multicastState) handleControl(packet ipPacket, receivedAt time.Time) {
+func (s *multicastState) handleControl(packet ipPacket, receivedAt time.Time, skipChecksum bool) {
 	if packet.protocol == ProtocolIGMP {
-		s.handleIGMP(packet, receivedAt)
+		s.handleIGMP(packet, receivedAt, skipChecksum)
 	} else {
-		s.handleMLD(packet, receivedAt)
+		s.handleMLD(packet, receivedAt, skipChecksum)
 	}
 }
 
 // handleIGMP validates one host-relevant IGMP message before changing timers.
-func (s *multicastState) handleIGMP(packet ipPacket, receivedAt time.Time) {
+func (s *multicastState) handleIGMP(packet ipPacket, receivedAt time.Time, skipChecksum bool) {
 	payload := packet.payload
 	if len(payload) != 0 && payload[0] == igmpMembershipQuery {
-		query, expected, valid := parseIGMPQuery(packet, s.stack.network.Load())
+		query, expected, valid := parseIGMPQuery(packet, s.stack.network.Load(), skipChecksum)
 		if valid && s.acceptsControlDestination(packet.target, expected) {
 			s.scheduleQuery(query, receivedAt)
 		}
 		return
 	}
-	if len(payload) < 8 || packet.hopLimit != 1 || checksum(payload) != 0 {
+	if len(payload) < 8 || packet.hopLimit != 1 || !skipChecksum && checksum(payload) != 0 {
 		return
 	}
 	switch payload[0] {
@@ -1780,10 +1780,10 @@ func (s *multicastState) handleIGMP(packet ipPacket, receivedAt time.Time) {
 }
 
 // handleMLD validates the RFC 3810 link-local envelope and query/report body.
-func (s *multicastState) handleMLD(packet ipPacket, receivedAt time.Time) {
+func (s *multicastState) handleMLD(packet ipPacket, receivedAt time.Time, skipChecksum bool) {
 	payload := packet.payload
 	if len(payload) != 0 && payload[0] == mldMembershipQuery {
-		query, expected, valid := parseMLDQuery(packet, s.stack.network.Load())
+		query, expected, valid := parseMLDQuery(packet, s.stack.network.Load(), skipChecksum)
 		if valid && s.acceptsControlDestination(packet.target, expected) {
 			s.scheduleQuery(query, receivedAt)
 		}
@@ -1791,7 +1791,7 @@ func (s *multicastState) handleMLD(packet ipPacket, receivedAt time.Time) {
 	}
 	if len(payload) < 8 || payload[1] != 0 || packet.hopLimit != 1 || !packet.hasRouterAlert() ||
 		!packet.source.IsLinkLocalUnicast() ||
-		transportChecksum(packet.source, packet.target, ProtocolICMPv6, payload) != 0 {
+		!skipChecksum && transportChecksum(packet.source, packet.target, ProtocolICMPv6, payload) != 0 {
 		return
 	}
 	switch payload[0] {
@@ -1807,9 +1807,9 @@ func (s *multicastState) handleMLD(packet ipPacket, receivedAt time.Time) {
 
 // parseIGMPQuery validates one complete IGMP Query and returns its scheduling
 // data plus the destination assigned to its group form.
-func parseIGMPQuery(packet ipPacket, network *networkState) (multicastQuery, netip.Addr, bool) {
+func parseIGMPQuery(packet ipPacket, network *networkState, skipChecksum bool) (multicastQuery, netip.Addr, bool) {
 	payload := packet.payload
-	if len(payload) < 8 || payload[0] != igmpMembershipQuery || packet.hopLimit != 1 || checksum(payload) != 0 {
+	if len(payload) < 8 || payload[0] != igmpMembershipQuery || packet.hopLimit != 1 || !skipChecksum && checksum(payload) != 0 {
 		return multicastQuery{}, netip.Addr{}, false
 	}
 	query := multicastQuery{version: 3, maximum: decodeIGMPTime(payload[1])}
@@ -1858,11 +1858,11 @@ func parseIGMPQuery(packet ipPacket, network *networkState) (multicastQuery, net
 
 // parseMLDQuery validates one complete MLD Query and returns its scheduling
 // data plus the destination assigned to its group form.
-func parseMLDQuery(packet ipPacket, network *networkState) (multicastQuery, netip.Addr, bool) {
+func parseMLDQuery(packet ipPacket, network *networkState, skipChecksum bool) (multicastQuery, netip.Addr, bool) {
 	payload := packet.payload
 	if len(payload) < 24 || payload[0] != mldMembershipQuery || payload[1] != 0 || packet.hopLimit != 1 ||
 		!packet.hasRouterAlert() || !packet.source.IsLinkLocalUnicast() ||
-		transportChecksum(packet.source, packet.target, ProtocolICMPv6, payload) != 0 {
+		!skipChecksum && transportChecksum(packet.source, packet.target, ProtocolICMPv6, payload) != 0 {
 		return multicastQuery{}, netip.Addr{}, false
 	}
 	legacyResponse := time.Duration(binary.BigEndian.Uint16(payload[4:6])) * time.Millisecond
@@ -2570,7 +2570,7 @@ func (s *multicastState) sendIGMPPacket(target netip.Addr, payload []byte, route
 		return
 	default:
 	}
-	_ = s.stack.tryWritePacket(packet)
+	_ = s.stack.tryWritePacket(packet, true)
 }
 
 // sendMLDPacket adds the IPv6 Router Alert Hop-by-Hop header and repairs the
@@ -2598,7 +2598,7 @@ func (s *multicastState) sendMLDPacket(target netip.Addr, payload []byte, cancel
 		return
 	default:
 	}
-	_ = s.stack.tryWritePacket(packet)
+	_ = s.stack.tryWritePacket(packet, true)
 }
 
 // reportSource selects the address required by IGMP or MLD. RFC 3590 permits

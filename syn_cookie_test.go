@@ -50,7 +50,7 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readOutboundPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("invalid SYN-cookie response: %x", response)
 	}
@@ -90,7 +90,7 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	missingTimestampResponse := readOutboundPacket(t, stack)
-	missingParsed, ok := parseIPPacket(missingTimestampResponse)
+	missingParsed, ok := parseIPPacket(missingTimestampResponse, false)
 	if !ok || missingParsed.protocol != ProtocolTCP || len(missingParsed.payload) < tcpHeaderSize {
 		t.Fatalf("invalid missing-timestamp SYN-cookie response: %x", missingTimestampResponse)
 	}
@@ -126,7 +126,7 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	reset := readOutboundPacket(t, stack)
-	if parsedReset, parsedResetOK := parseIPPacket(reset); !parsedResetOK || len(parsedReset.payload) < tcpHeaderSize || parsedReset.payload[13]&TCPFlagRST == 0 {
+	if parsedReset, parsedResetOK := parseIPPacket(reset, false); !parsedResetOK || len(parsedReset.payload) < tcpHeaderSize || parsedReset.payload[13]&TCPFlagRST == 0 {
 		t.Fatalf("forged cookie ACK response = %x", reset)
 	}
 	ack := buildTestTCP(remote, local, 43001, 47002, clientSequence+1, serverSequence+1, TCPFlagACK, 1234, ackOptions, nil)
@@ -163,7 +163,7 @@ func TestSYNCookieBacklogHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 	zeroEchoResponse := readOutboundPacket(t, stack)
-	zeroEchoParsed, ok := parseIPPacket(zeroEchoResponse)
+	zeroEchoParsed, ok := parseIPPacket(zeroEchoResponse, false)
 	if !ok || zeroEchoParsed.protocol != ProtocolTCP || len(zeroEchoParsed.payload) < tcpHeaderSize {
 		t.Fatalf("invalid zero-TSecr SYN-cookie response: %x", zeroEchoResponse)
 	}
@@ -242,7 +242,7 @@ func TestSYNCookieFastOpenFallsBackToFinalACK(t *testing.T) {
 		t.Fatal(err)
 	}
 	response := readOutboundPacket(t, stack)
-	parsed, ok := parseIPPacket(response)
+	parsed, ok := parseIPPacket(response, false)
 	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("invalid SYN-cookie response: %x", response)
 	}
@@ -312,7 +312,7 @@ func TestSYNCookieListenerCloseResetsPendingConnection(t *testing.T) {
 	const initialSequence = uint32(0x87654321)
 	connection.runPassiveCookie(listener.(*TCPListener), tcpSegment{}, initialSequence)
 	packet := readOutboundPacket(t, stack)
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok || parsed.protocol != ProtocolTCP || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("invalid abort reset: %x", packet)
 	}
@@ -342,7 +342,7 @@ func TestSYNCookieHonorsConfiguredReceiveWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	packet := readOutboundPacket(t, stack)
-	parsed, ok := parseIPPacket(packet)
+	parsed, ok := parseIPPacket(packet, false)
 	if !ok || len(parsed.payload) < tcpHeaderSize {
 		t.Fatalf("invalid SYN-cookie packet: %x", packet)
 	}
@@ -375,7 +375,7 @@ func TestSYNCookieHonorsListenerCreationOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	packet := readOutboundPacket(t, stack)
-	parsedPacket, ok := parseIPPacket(packet)
+	parsedPacket, ok := parseIPPacket(packet, false)
 	if !ok || len(parsedPacket.payload) < tcpHeaderSize {
 		t.Fatalf("invalid listener-option SYN-cookie packet: %x", packet)
 	}
@@ -395,7 +395,7 @@ func TestSYNCookieHonorsListenerCreationOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	packet = readOutboundPacket(t, stack)
-	parsedPacket, ok = parseIPPacket(packet)
+	parsedPacket, ok = parseIPPacket(packet, false)
 	if !ok || parsedPacket.flowLabel != 0 {
 		t.Fatalf("explicit zero SYN-cookie flow label = %#x, parsed=%v", parsedPacket.flowLabel, ok)
 	}
@@ -546,7 +546,7 @@ func TestSYNCookieWithoutTimestampClearsRecoveredExtensions(t *testing.T) {
 	if err = state.sendSYNCookie(stack, nil, key, syn, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	packet, ok := parseIPPacket(readOutboundPacket(t, stack))
+	packet, ok := parseIPPacket(readOutboundPacket(t, stack), false)
 	if !ok || len(packet.payload) < tcpHeaderSize {
 		t.Fatalf("invalid SYN-cookie packet: %+v", packet)
 	}
